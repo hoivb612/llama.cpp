@@ -306,7 +306,6 @@ int slm_inference(xbapp_params& xbparams) {
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, min_keep));  
     llama_sampler_chain_add(smpl, llama_sampler_init_temp (temp));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(xbparams.seed));
-
     // llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
     // printf("%s: start decoding @n_past = %d - inference size = %zd\n", __func__, n_past, embd.size());
@@ -319,7 +318,6 @@ int slm_inference(xbapp_params& xbparams) {
             n_eval = xbparams.n_batch;
         }
 
-        // if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
         if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
             printf("%s : failed to eval\n", __func__);
             return 1;
@@ -377,9 +375,9 @@ int slm_inference(xbapp_params& xbparams) {
     while (n_past <= max_len) {
 
         // sample the last token just received
-        {
-            const llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+        llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
+        {
             // is it an end of generation - are we done?
             if (llama_token_is_eog(model, new_token_id)) {
                 break;
@@ -407,10 +405,6 @@ int slm_inference(xbapp_params& xbparams) {
                 break;
             }
 
-            // save this new token for next evaluation
-            embd.clear();
-            embd.push_back(new_token_id);
-
             n_tokens_generated += 1;
             total_tokens_generated += 1;
         }
@@ -419,8 +413,7 @@ int slm_inference(xbapp_params& xbparams) {
         n_past += 1;
 
         // decode the output for the new generated token
-        // if (llama_decode(ctx, llama_batch_get_one(&embd[0], 1, n_past, 0))) {
-        if (llama_decode(ctx, llama_batch_get_one(&embd[0], 1))) {
+        if (llama_decode(ctx, llama_batch_get_one(&new_token_id, 1))) {
             printf("%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
@@ -457,7 +450,7 @@ void slm_terminate() {
             total_tokens_generated, (t_token_generation / 1000000.0f), 
             total_tokens_generated / (t_token_generation / 1000000.0f));
 
-    // llama_print_timings(ctx);
+    llama_perf_dump_yaml(stdout, ctx);
 
     llama_free(ctx);
     llama_free_model(model);
