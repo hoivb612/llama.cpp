@@ -450,7 +450,7 @@ void slm_terminate() {
             total_tokens_generated, (t_token_generation / 1000000.0f), 
             total_tokens_generated / (t_token_generation / 1000000.0f));
 
-    llama_perf_dump_yaml(stdout, ctx);
+    llama_perf_context_print(ctx);
 
     llama_free(ctx);
     llama_free_model(model);
