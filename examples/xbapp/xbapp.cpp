@@ -141,8 +141,120 @@ bool processCustomPromptsFromFile(xbapp_params& xbparams) {
     return true;
 }
 
+#ifdef _WIN32
+
+uint64_t l1_cache_size = 32ull * 1024ull;
+uint64_t l2_cache_size = 1024ull * 1024ull;
+
+typedef struct {
+    uint64_t mask;
+    uint16_t group;
+    uint16_t reserved[3];
+} group_affinity_t;
+
+void
+ggml_set_process_affinity (
+    uint32_t n_threads
+    )
+{
+
+
+    //
+    // Get number of logical processors per physical core and the maximum number of logical
+    // processsors.
+    //
+
+    struct {
+        uint32_t eax;
+        uint32_t ebx;
+        uint32_t ecx;
+        uint32_t edx;
+    } cpu_info;
+
+    //
+    // Get L1 cache size.
+    //
+
+    __cpuid((int *)&cpu_info, 0x80000005);
+    l1_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
+    printf("%s: l1 cache size in kbytes %zd\n", __func__, l1_cache_size);
+
+    //
+    // Get l2 cache size
+    //
+
+    __cpuid((int *)&cpu_info, 0x80000006);
+    l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
+    printf("%s: l2 cache size in kbytes %zd\n", __func__, l2_cache_size); 
+
+    printf("%s: n_threads specified %d\n", __func__, n_threads);
+    __cpuid((int *)&cpu_info, 0x8000001e);
+    const uint32_t logical_per_physical_core = ((cpu_info.ebx & 0x300) >> 8) + 1;
+    printf("%s: number of logical processors per physical core %d\n", __func__, logical_per_physical_core);
+
+    if (logical_per_physical_core == 1) {
+        printf("%s: bypassing set process affinity - not SMT system\n", __func__);
+        return;
+    }
+
+    __cpuid((int *)&cpu_info, 0x00000001);
+    const uint32_t maximum_logical = (cpu_info.ebx & 0xff0000) >> 16;
+    printf("%s: maximum number of logical processors %d\n", __func__, maximum_logical);
+
+    //
+    // Check the specified number of threads against the maximum logical processor count.
+    //
+
+    const uint32_t maximum_smt_threads = maximum_logical / 2;
+    if ((n_threads & 1) || (n_threads > maximum_smt_threads)) {
+        printf("%s: bypassing set process affinity - number threads odd or gt maximum logical / 2\n", __func__);
+        return;
+    }
+
+    //
+    // Get the current process group count.
+    //
+
+#if 0
+    uint16_t group_array[4];
+    uint16_t group_count = 4;
+
+    if (GetProcessGroupAffinity(GetCurrentProcess(), &group_count, group_array)) {
+        printf("%s: GetProcessGroupAffinity succeeded with %d groups\n", __func__, group_count);
+        if (group_count != 1) {
+            printf("%s: bypassing set affinity process because group count is greater than one\n", __func__);
+            return;
+        }
+
+    } else {
+        printf("%s: GetProcessGroupAffinity failed\n", __fucn__);
+        return;
+    }
+#endif // if 0
+
+    //
+    // Set process affinity.
+    //
+
+    int64_t affinity_mask = ((1ull << (n_threads * 2)) - 1) & 0x55555555ull;
+    if (SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
+        printf("%s: process group affinity set to 0x%08llx\n", __func__, affinity_mask);
+
+    } else {
+        printf("%s: failed to set process affinity mask\n", __func__);
+    }
+
+    return;
+}
+
+#else
+
+#define ggml_set_process_affinity(n)
+
+#endif // _WIN32
+
 static void print_usage(int, char ** argv) {
-    printf("\nexample usage:\n");
+    printf("\n%s: example usage:\n", __func__);
     printf("\n    %s -m model.gguf [-n n_seqlen] [-ngl n_gpu_layers] [-t n_threads] [-cpf cpf_prompt] \n"
            "                       [-pfc] [-omp] [-vl 1 | 2 | ... | 4] [-vv] [prompt...]\n\n", argv[0]);
 }
@@ -171,7 +283,9 @@ int main(int argc, char** argv) {
     {
         int i = 1;
         for (; i < argc; i++) {
-            if (strcmp(argv[i], "-cpf") == 0) {
+            if (strcmp(argv[i], "-affin") == 0) {
+                xbparams.process_affinity = true;
+            } else if (strcmp(argv[i], "-cpf") == 0) {
                 if (i + 1 < argc) {
                     try {
                         xbparams.custom_p_file = argv[++i];
@@ -264,6 +378,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("%s: Number of hw threads asked: %d\n", __func__, xbparams.n_threads);
     if (xbparams.n_threads <= 0) {
         int32_t n_threads = std::thread::hardware_concurrency();
         if (n_threads > 0) {
@@ -272,21 +387,21 @@ int main(int argc, char** argv) {
             n_threads = 4;
         }
         xbparams.n_threads = n_threads;
+    }
 
 #ifdef GGML_USE_OPENMP
-        xbparams.n_threads = MIN(n_threads, omp_get_max_threads());
-        if (xbparams.openmp) {
-            printf("%s: OpenMP selected\n", __func__);
-            // default mode if GGML_USE_OPENMP is defined
-            // ggml_select_omp();
-        }
-#else
-        xbparams.n_threads = n_threads;
+    xbparams.n_threads = MIN(n_threads, omp_get_max_threads());
+    if (xbparams.openmp) {
+        printf("%s: OpenMP selected\n", __func__);
+        // default mode if GGML_USE_OPENMP is defined
+        // ggml_select_omp();
+    }
 #endif
 
-        // ggml_set_process_affinity(xbparams.n_threads);
+    printf("%s: Actual using: %d threads\n", __func__, xbparams.n_threads);
 
-        printf("%s: Number of hw threads asked: %d - actual number: %d\n", __func__, n_threads, xbparams.n_threads);
+    if (xbparams.process_affinity) {
+        ggml_set_process_affinity(xbparams.n_threads);
     }
 
     console::init(true);

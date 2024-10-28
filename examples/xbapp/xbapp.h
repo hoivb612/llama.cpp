@@ -51,6 +51,7 @@ struct xbapp_params {
     bool first_prompt                  = true;  // indicate first time through
     bool openmp                        = false; // true when openmp is present
     bool verbose_extra                 = false; // true for extra llama logging (i.e. debug messages)
+    bool process_affinity              = false; // true if set process affinity is enabled
 };
 
 
