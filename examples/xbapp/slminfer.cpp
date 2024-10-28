@@ -257,10 +257,7 @@ int slm_inference(xbapp_params& xbparams) {
     // make sure the KV cache is big enough to hold all the prompt and generated tokens
     if (n_kv_req > n_ctx) {
         printf("%s: error: n_kv_req(%d-%d) > n_ctx(%d), the required KV cache size is not big enough\n",
-            __func__,
-            n_kv_pfx,
-            n_kv_req,
-            n_ctx);
+            __func__, n_kv_pfx, n_kv_req, n_ctx);
         printf("%s:        either reduce n_len or increase n_ctx\n", __func__);
         return 1;
     }
@@ -435,10 +432,12 @@ int slm_inference(xbapp_params& xbparams) {
     fflush(stdout);
 
     int64_t t_end_generation = ggml_time_us();
-    printf("> token generation time = %.2fms (%d) (%.2ft/s)\n", 
-        ((t_end_generation - t_start_generation) / 1000.0f),
+    double t_ms = (t_end_generation - t_start_generation) / 1000.0f;
+    printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
+        t_ms,
         n_tokens_generated, 
-        n_tokens_generated / ((t_end_generation - t_start_generation) / 1000000.0f));
+        n_tokens_generated / (t_ms / 1000.0f),
+        (t_ms / n_tokens_generated));
 
     t_token_generation += (t_end_generation - t_start_generation);
     return 0;

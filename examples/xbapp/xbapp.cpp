@@ -153,7 +153,7 @@ typedef struct {
 } group_affinity_t;
 
 void
-ggml_set_process_affinity (
+xb_set_process_affinity (
     uint32_t n_threads
     )
 {
@@ -401,7 +401,7 @@ int main(int argc, char** argv) {
     printf("%s: Actual using: %d threads\n", __func__, xbparams.n_threads);
 
     if (xbparams.process_affinity) {
-        ggml_set_process_affinity(xbparams.n_threads);
+        xb_set_process_affinity(xbparams.n_threads);
     }
 
     console::init(true);
