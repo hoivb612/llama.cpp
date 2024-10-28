@@ -59,6 +59,8 @@ void llama_batch_add(struct llama_batch & batch, llama_token id, llama_pos pos, 
 }
 
 std::string pfx_file_path(std::string pfx) {
+#ifdef _WIN32    
+
     static std::hash<std::string> hasher;
     static std::string dir = "./llama_cache";
     
@@ -73,6 +75,24 @@ std::string pfx_file_path(std::string pfx) {
 
     // default generated file name
     std::string full_file_path = dir + "/" + std::to_string(hasher(pfx));
+
+#elif defined(__linux__)
+
+    static std::hash<std::string> hasher;
+    static std::__fs::filesystem::path dir = "./llama_cache";
+
+    // create the cache dir if it does not exist yet
+    std::__fs::filesystem::create_directory(dir);
+
+    // default generated file name
+    sd::string pfx_path(dir.c_str());
+    std::string full_file_path = pfx_path + "/" + std::to_string(hasher(pfx));
+
+#else
+
+    #error "no implementation for prefix cache"
+
+#endif // _WIN32
 
     return full_file_path;
 }
@@ -97,7 +117,7 @@ int slm_init(xbapp_params& xbparams) {
     ctx_params.n_ctx = xbparams.n_ctx;
     if ((xbparams.n_len + xbparams.n_seqlen - 1) > xbparams.n_ctx) {
         printf("%s: context size (%d) < prompt (%d) + seq generated length (%d)\n",
-            xbparams.n_ctx, xbparams.n_len, xbparams.n_seqlen);
+            __func__, xbparams.n_ctx, xbparams.n_len, xbparams.n_seqlen);
         return 1;
     }
     // n_batch is the max number of tokens processed in a single call to llama_decode()
@@ -206,7 +226,6 @@ int slm_init(xbapp_params& xbparams) {
 
 int slm_inference(xbapp_params& xbparams) {
     std::vector<llama_token> embd_inp;
-    int n_consumed = 0;
     int n_past = 0;
     int n_kv_pfx = 0;
 
@@ -214,7 +233,6 @@ int slm_inference(xbapp_params& xbparams) {
         // remove any "future" tokens that we might have inherited from the previous session
         llama_kv_cache_seq_rm(ctx, -1, tokens_shared.size(), -1);
         embd_inp.insert(embd_inp.end(), tokens_shared.begin(), tokens_shared.end());
-        n_consumed = tokens_shared.size();
         n_past = tokens_shared.size();
         n_kv_pfx = tokens_shared.size();
 
@@ -223,23 +241,9 @@ int slm_inference(xbapp_params& xbparams) {
     } else {
         // start from a known point for each new user prompt
         llama_kv_cache_clear(ctx);
-
-        n_consumed = 0;
         n_past = 0;
         n_kv_pfx = 0;
     }
-
-#if 0
-    // find the number of tokens in the prompt
-    const int n_prompt = -llama_tokenize(model, prompt.c_str(), prompt.size(), NULL, 0, true, true);
-
-    // allocate space for the tokens and tokenize the prompt
-    std::vector<llama_token> prompt_tokens(n_prompt);
-    if (llama_tokenize(model, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
-        fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
-        return 1;
-    }
-#endif
 
     // tokenize the remaining prompt or full prompt if pfc_mode is off
     std::vector<llama_token> tokens_input = llama_tokenize(model, xbparams.prompt, false, false);
@@ -328,7 +332,7 @@ int slm_inference(xbapp_params& xbparams) {
     }
 
     int64_t t_start_generation = ggml_time_us();
-    printf("Prompt TTFT = %.2fms (size = %d)\n", 
+    printf("Prompt TTFT = %.2fms (size = %lld)\n", 
         ((t_start_generation - t_start_decoding) / 1000.0f), 
         embd.size());
 
@@ -442,8 +446,6 @@ int slm_inference(xbapp_params& xbparams) {
 
 void slm_terminate() {
     printf("\n");
-
-    int64_t t_main_end = ggml_time_us();
 
     printf("%s: generated %d tokens in %.2f s, speed: %.2f t/s\n",
             __func__, 
