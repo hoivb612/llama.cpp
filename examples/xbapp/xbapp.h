@@ -40,6 +40,7 @@ struct xbapp_params {
     int32_t n_batch                    = 512;  // size for a single batch (could be as large as prompt size)
     int32_t n_ngl                      = 0;    // number of layers offloaded to GPU
     int32_t n_seqlen                   = 128;  // max sequence length to generate
+    int32_t verbose_level              = 0;    // verbose level (0 - none, 1 - info, 2 - warn, 3 - error, 4 - debug)
     std::string model_path             = "";   // model path
     std::string prompt                 = "";
     std::string custom_p_file          = "custom_prompts.txt";  // custom prompts input file
@@ -49,6 +50,7 @@ struct xbapp_params {
     bool pfc_mode                      = false; // prefix cache mode
     bool first_prompt                  = true;  // indicate first time through
     bool openmp                        = false; // true when openmp is present
+    bool verbose_extra                 = false; // true for extra llama logging (i.e. debug messages)
 };
 
 

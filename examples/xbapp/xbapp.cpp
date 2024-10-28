@@ -143,8 +143,21 @@ bool processCustomPromptsFromFile(xbapp_params& xbparams) {
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_seqlen] [-ngl n_gpu_layers] [-t n_threads] [-cpf cpf_prompt] [-pfc] [-omp] [prompt...]\n", argv[0]);
-    printf("\n");
+    printf("\n    %s -m model.gguf [-n n_seqlen] [-ngl n_gpu_layers] [-t n_threads] [-cpf cpf_prompt] \n"
+           "                       [-pfc] [-omp] [-vl 1 | 2 | ... | 4] [-vv] [prompt...]\n\n", argv[0]);
+}
+
+void xbapp_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    GGML_UNUSED(text);
+
+    ggml_log_level xbapp_log_level = GGML_LOG_LEVEL_NONE;
+    if (user_data != nullptr) {
+        xbapp_log_level = *(ggml_log_level *)user_data;
+    }
+
+    if ((xbapp_log_level != GGML_LOG_LEVEL_NONE) && (level <= xbapp_log_level)) {
+        fputs(text, stdout);
+    }
 }
 
 int64_t t0;
@@ -158,7 +171,19 @@ int main(int argc, char** argv) {
     {
         int i = 1;
         for (; i < argc; i++) {
-            if (strcmp(argv[i], "-m") == 0) {
+            if (strcmp(argv[i], "-cpf") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        xbparams.custom_p_file = argv[++i];
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-m") == 0) {
                 if (i + 1 < argc) {
                     xbparams.model_path = argv[++i];
                 } else {
@@ -169,30 +194,6 @@ int main(int argc, char** argv) {
                 if (i + 1 < argc) {
                     try {
                         xbparams.n_seqlen = std::stoi(argv[++i]);
-                    } catch (...) {
-                        print_usage(argc, argv);
-                        return 1;
-                    }
-                } else {
-                    print_usage(argc, argv);
-                    return 1;
-                }
-            } else if (strcmp(argv[i], "-t") == 0) {
-                if (i + 1 < argc) {
-                    try {
-                        xbparams.n_threads = std::stoi(argv[++i]);
-                    } catch (...) {
-                        print_usage(argc, argv);
-                        return 1;
-                    }
-                } else {
-                    print_usage(argc, argv);
-                    return 1;
-                }
-            } else if (strcmp(argv[i], "-cpf") == 0) {
-                if (i + 1 < argc) {
-                    try {
-                        xbparams.custom_p_file = argv[++i];
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -217,6 +218,32 @@ int main(int argc, char** argv) {
                 xbparams.openmp = true;
             } else if (strcmp(argv[i], "-pfc") == 0) {
                 xbparams.pfc_mode = true;
+            } else if (strcmp(argv[i], "-t") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        xbparams.n_threads = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-vl") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        xbparams.verbose_level = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-vv") == 0) {
+                xbparams.verbose_extra = true;
             } else {
                 // single prompt starts here
                 break;
@@ -250,6 +277,7 @@ int main(int argc, char** argv) {
         xbparams.n_threads = MIN(n_threads, omp_get_max_threads());
         if (xbparams.openmp) {
             printf("%s: OpenMP selected\n", __func__);
+            // default mode if GGML_USE_OPENMP is defined
             // ggml_select_omp();
         }
 #else
@@ -265,6 +293,13 @@ int main(int argc, char** argv) {
     printf("[%s]: processing cpf input file [%s]\n", __func__, xbparams.custom_p_file.c_str());
     processCustomPromptsFromFile(xbparams);
     custom_prompts_it = custom_prompts.begin();
+
+    if (xbparams.verbose_extra ) {
+        // default logging mode
+    } else {
+        // xbapp logging mode
+        llama_log_set(xbapp_log_callback, &(xbparams.verbose_level));
+    } 
 
     // initialize the model
     if (slm_init(xbparams) != 0) {
