@@ -157,13 +157,11 @@ xb_set_process_affinity (
     uint32_t n_threads
     )
 {
-
-
+#if defined(__x86_64__)
     //
     // Get number of logical processors per physical core and the maximum number of logical
     // processsors.
     //
-
     struct {
         uint32_t eax;
         uint32_t ebx;
@@ -174,7 +172,6 @@ xb_set_process_affinity (
     //
     // Get L1 cache size.
     //
-
     __cpuid((int *)&cpu_info, 0x80000005);
     l1_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
     printf("%s: l1 cache size in kbytes %zd\n", __func__, l1_cache_size);
@@ -182,7 +179,6 @@ xb_set_process_affinity (
     //
     // Get l2 cache size
     //
-
     __cpuid((int *)&cpu_info, 0x80000006);
     l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
     printf("%s: l2 cache size in kbytes %zd\n", __func__, l2_cache_size); 
@@ -243,6 +239,8 @@ xb_set_process_affinity (
     } else {
         printf("%s: failed to set process affinity mask\n", __func__);
     }
+
+#endif // __x86_64__
 
     return;
 }
