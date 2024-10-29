@@ -46,6 +46,7 @@ namespace console {
     //
 
     void init(bool use_color) {
+    #ifdef _WIN32
         color_display = use_color;
 
         // Windows-specific console initialization
@@ -66,6 +67,7 @@ namespace console {
             // Set console output codepage to UTF8
             SetConsoleOutputCP(CP_UTF8);
         }
+    #endif // _WIN32
     }
 
     void cleanup() {
@@ -272,7 +274,7 @@ void xbapp_log_callback(ggml_log_level level, const char * text, void * user_dat
 
 int64_t t0;
 int main(int argc, char** argv) {
-    xbapp_params xbparams = {0};
+    xbapp_params xbparams;
 
     ggml_time_init();
     t0 = ggml_time_us();
@@ -399,7 +401,9 @@ int main(int argc, char** argv) {
     printf("%s: Actual using: %d threads\n", __func__, xbparams.n_threads);
 
     if (xbparams.process_affinity) {
+        #ifdef _WIN32        
         xb_set_process_affinity(xbparams.n_threads);
+        #endif
     }
 
     console::init(true);
