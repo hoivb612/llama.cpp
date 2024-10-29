@@ -76,7 +76,7 @@ std::string pfx_file_path(std::string pfx) {
     // default generated file name
     std::string full_file_path = dir + "/" + std::to_string(hasher(pfx));
 
-#elif defined(__linux__)
+#else
 
     static std::hash<std::string> hasher;
     static std::__fs::filesystem::path dir = "./llama_cache";
@@ -87,10 +87,6 @@ std::string pfx_file_path(std::string pfx) {
     // default generated file name
     sd::string pfx_path(dir.c_str());
     std::string full_file_path = pfx_path + "/" + std::to_string(hasher(pfx));
-
-#else
-
-    #error "no implementation for prefix cache"
 
 #endif // _WIN32
 
