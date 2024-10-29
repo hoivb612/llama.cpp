@@ -117,13 +117,13 @@ bool processCustomPromptsFromFile(xbapp_params& xbparams) {
 
     // process CUSTOM_TEMPLATE_PROMPT
     while (std::getline(cpfile, line)) {
-        if (line == "CUSTOM_TEMPLATE_PROMPT") {
+        if (line.find("CUSTOM_TEMPLATE_PROMPT") != std::string::npos) {
             templatePromptMode = true;
             continue;
-        } else if (line == "CUSTOM_PROMPT") {
+        } else if (line.find("CUSTOM_PROMPT") != std::string::npos) {
             userPromptMode = true;
             continue;
-        } else if (line == "END_SECTION") {
+        } else if (line.find("END_SECTION") != std::string::npos) {
             templatePromptMode = false;
             userPromptMode = false;
             continue;
@@ -252,6 +252,24 @@ xb_set_process_affinity (
 #define ggml_set_process_affinity(n)
 
 #endif // _WIN32
+
+void print_system_info(xbapp_params& xb_params) {
+    std::ostringstream os;
+
+    os << "system_info: n_threads = " << xb_params.n_threads;
+    if (xb_params.n_threads != -1) {
+    os << " (n_batch = " << xb_params.n_batch << ")";
+    }
+#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
+    // TODO: windows + arm64 + mingw64
+    DWORD logicalProcessorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    os << " / " << logicalProcessorCount << " | " << llama_print_system_info();
+#else
+    os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
+#endif
+
+    printf("\n%s: %s\n\n", __func__, os.str().c_str());
+}
 
 static void print_usage(int, char ** argv) {
     printf("\n%s: example usage:\n", __func__);
@@ -417,6 +435,8 @@ int main(int argc, char** argv) {
         // xbapp logging mode
         llama_log_set(xbapp_log_callback, &(xbparams.verbose_level));
     } 
+
+    print_system_info(xbparams);
 
     // initialize the model
     if (slm_init(xbparams) != 0) {

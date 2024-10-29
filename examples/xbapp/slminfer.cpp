@@ -85,7 +85,7 @@ std::string pfx_file_path(std::string pfx) {
     std::__fs::filesystem::create_directory(dir);
 
     // default generated file name
-    sd::string pfx_path(dir.c_str());
+    std::string pfx_path(dir.c_str());
     std::string full_file_path = pfx_path + "/" + std::to_string(hasher(pfx));
 
 #endif // _WIN32
