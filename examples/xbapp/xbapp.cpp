@@ -273,8 +273,13 @@ void print_system_info(xbapp_params& xb_params) {
 
 static void print_usage(int, char ** argv) {
     printf("\n%s: example usage:\n", __func__);
-    printf("\n    %s -m model.gguf [-n n_seqlen] [-ngl n_gpu_layers] [-t n_threads] [-cpf cpf_prompt] \n"
-           "                       [-pfc] [-omp] [-vl 1 | 2 | ... | 4] [-vv] [prompt...]\n\n", argv[0]);
+    printf("\n    %s -m model.gguf \n"
+           "                [-n n_seqlen] [-t n_threads] [-cpf cpf_prompt] \n"
+           "                [-pfc] [-ngl n_gpu_layers] [-vl 1|2|...|4] [-vv]\n"
+#ifdef GGML_USE_OPENMP
+           "                [-omp]\n"
+#endif           
+           "                [prompt...]\n", argv[0]);
 }
 
 void xbapp_log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -408,7 +413,7 @@ int main(int argc, char** argv) {
     }
 
 #ifdef GGML_USE_OPENMP
-    xbparams.n_threads = MIN(n_threads, omp_get_max_threads());
+    xbparams.n_threads = MIN(xbparams.n_threads, omp_get_max_threads());
     if (xbparams.openmp) {
         printf("%s: OpenMP selected\n", __func__);
         // default mode if GGML_USE_OPENMP is defined
