@@ -145,6 +145,8 @@ bool processCustomPromptsFromFile(xbapp_params& xbparams) {
 
 #ifdef _WIN32
 
+#include <intrin.h>
+
 uint64_t l1_cache_size = 32ull * 1024ull;
 uint64_t l2_cache_size = 1024ull * 1024ull;
 
@@ -159,7 +161,7 @@ xb_set_process_affinity (
     uint32_t n_threads
     )
 {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     //
     // Get number of logical processors per physical core and the maximum number of logical
     // processsors.
@@ -242,7 +244,11 @@ xb_set_process_affinity (
         printf("%s: failed to set process affinity mask\n", __func__);
     }
 
-#endif // __x86_64__
+#else
+
+    printf("%s: set process affinity is only available for x86 architecture\n", __func__);
+
+#endif // __x86_64__ || _M_X64
 
     return;
 }
