@@ -79,13 +79,16 @@ std::string pfx_file_path(std::string pfx) {
 #else
 
     static std::hash<std::string> hasher;
-    static std::__fs::filesystem::path dir = "./llama_cache";
+    static const char* dir = "./llama_cache";
 
     // create the cache dir if it does not exist yet
-    std::__fs::filesystem::create_directory(dir);
+    struct stat info;
+    if (stat(dir, &info) != 0) {
+        mkdir(dir, 0777);
+    }
 
     // default generated file name
-    std::string pfx_path(dir.c_str());
+    std::string pfx_path(dir);
     std::string full_file_path = pfx_path + "/" + std::to_string(hasher(pfx));
 
 #endif // _WIN32
@@ -325,7 +328,7 @@ int slm_inference(xbapp_params& xbparams) {
     }
 
     int64_t t_start_generation = ggml_time_us();
-    printf("Prompt TTFT = %.2fms (size = %lld)\n", 
+    printf("Prompt TTFT = %.2fms (size = %zu)\n", 
         ((t_start_generation - t_start_decoding) / 1000.0f), 
         embd.size());
 

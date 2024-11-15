@@ -18,6 +18,7 @@
 #include <filesystem>
 
 #ifdef _WIN32
+
 #if !defined WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
 #endif // WIN32_LEAN_AND_MEAN
@@ -30,6 +31,12 @@
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
+
+#else
+
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #endif // WIN32
 
 struct xbapp_params {
