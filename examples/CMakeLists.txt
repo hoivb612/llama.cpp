@@ -47,6 +47,7 @@ else()
     add_subdirectory(speculative-simple)
     add_subdirectory(tokenize)
     add_subdirectory(xbapp)
+    add_subdirectory(chatbot)
     if (NOT GGML_BACKEND_DL)
         # these examples use the backends directly and cannot be built with dynamic loading
         add_subdirectory(convert-llama2c-to-ggml)
