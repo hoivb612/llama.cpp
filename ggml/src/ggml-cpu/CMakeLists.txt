@@ -8,11 +8,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     ggml_add_backend_library(${GGML_CPU_NAME})
 
     list (APPEND GGML_CPU_SOURCES
-        ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
         ggml-cpu/ggml-cpu-aarch64.c
         ggml-cpu/ggml-cpu-aarch64.h
-        ggml-cpu/ggml-cpu-quants.c
         ggml-cpu/ggml-cpu-quants.h
         ggml-cpu/amx/amx.cpp
         ggml-cpu/amx/amx.h
@@ -20,6 +18,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/amx/mmq.h
         ggml-cpu/ggml-cpu-impl.h
         )
+
+    if (GGML_XBOX)
+        list (APPEND GGML_CPU_SOURCES
+            ggml-cpu/ggml-cpu-b612.c
+            ggml-cpu/ggml-cpu-quants-b612.c
+        )
+    else()
+        list (APPEND GGML_CPU_SOURCES
+            ggml-cpu/ggml-cpu.c
+            ggml-cpu/ggml-cpu-quants.c
+        )
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
@@ -188,6 +198,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 # AVX512 extensions, neither it defines the
                 # macros corresponding to the extensions.
                 # Do it manually.
+                if (GGML_XBOX)
+                    if ((NOT ${CMAKE_C_COMPILER_ID} MATCHES "Clang") AND (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang"))
+                        message(STATUS "no Clang - enable /fp:fast")
+                        list(APPEND ARCH_FLAGS /fp:fast)
+                    endif()
+                    list(APPEND ARCH_FLAGS /arch:AVX /arch:AVX2 /d2jumptablerdata /Zc:forScope /O2 /Ob1)
+                    message(STATUS "Add flag to generate B612 intrinsics: __GEN_AVX512__")
+                    list(APPEND ARCH_DEFINITIONS __GEN_AVX512__)
+                    list(APPEND ARCH_DEFINITIONS GGML_B612)
+                endif()
                 list(APPEND ARCH_DEFINITIONS GGML_AVX512)
                 if (GGML_AVX512_VBMI)
                     list(APPEND ARCH_DEFINITIONS __AVX512VBMI__)

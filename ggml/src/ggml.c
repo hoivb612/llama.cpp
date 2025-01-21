@@ -365,6 +365,7 @@ ggml_bf16_t ggml_fp32_to_bf16(float x) {
     return GGML_FP32_TO_BF16(x);
 }
 
+#if !defined(GGML_B612)
 void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         y[i] = GGML_FP16_TO_FP32(x[i]);
@@ -426,6 +427,7 @@ void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
         y[i] = GGML_BF16_TO_FP32(x[i]);
     }
 }
+#endif // GGML_B612
 
 void ggml_fp32_to_bf16_row_ref(const float * x, ggml_bf16_t * y, int64_t n) {
     for (int i = 0; i < n; i++) {
@@ -433,6 +435,7 @@ void ggml_fp32_to_bf16_row_ref(const float * x, ggml_bf16_t * y, int64_t n) {
     }
 }
 
+#if !defined(GGML_B612)
 void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
   int i = 0;
 #if defined(__AVX512BF16__)
@@ -448,6 +451,7 @@ void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
         y[i] = GGML_FP32_TO_BF16(x[i]);
     }
 }
+#endif // GGML_B612
 
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
     return memcmp(guid_a, guid_b, sizeof(ggml_guid)) == 0;
