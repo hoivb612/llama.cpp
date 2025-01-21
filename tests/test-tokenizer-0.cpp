@@ -170,6 +170,55 @@ int main(int argc, char **argv) {
         }
     }
 
+    {
+        const std::string text = "<|im_start|>Hello World<|im_end|>";
+        printf("text: '%s'\n\n", text.c_str());
+
+        // tokenize with parse_special == false
+        const std::vector<llama_token> res = llama_tokenize(ctx, text, false, false);
+        printf("parse_special == false:\n");
+        for (const auto & tok : res) {
+            printf("\t%7d ('%s')\n", tok, llama_token_to_piece(ctx, tok).c_str());
+        }
+        printf("\n");
+
+        // tokenize with parse_special == true
+        const std::vector<llama_token> res2 = llama_tokenize(ctx, text, false, true);
+        printf("parse_special  == true:\n");
+        for (const auto & tok : res2) {
+            printf("\t%7d ('%s')\n", tok, llama_token_to_piece(ctx, tok).c_str());
+        }
+        printf("\n");
+
+        exit(0);
+
+        /*
+            text: '<|im_start|>Hello World<|im_end|>'
+
+            parse_special == false:
+            	    27 ('<')
+            	    91 ('|')
+            	   318 ('im')
+            	  4906 ('_start')
+            	    91 ('|')
+            	    29 ('>')
+            	  9707 ('Hello')
+            	  4337 (' World')
+            	    27 ('<')
+            	    91 ('|')
+            	   318 ('im')
+            	  6213 ('_end')
+            	    91 ('|')
+            	    29 ('>')
+
+            parse_special  == true:
+            	151644 ('<|im_start|>')
+            	  9707 ('Hello')
+            	  4337 (' World')
+            	151645 ('<|im_end|>')
+        */
+    }
+
 #ifdef _WIN32
     // We need this for unicode console support
     console::init(false, false);
