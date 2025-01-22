@@ -2125,6 +2125,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+#if defined(GGML_B612)
+    add_opt(common_arg(
+        {"-paffin", "--proc-affin"},
+        "use Windows process thread affinity support",
+        [](common_params & params) {
+            params.proc_affinity = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"-pfc", "--prefix-cache"},
+        "use prefix cache support",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache_file = value;
+            params.prefix_cache_on = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_XBAPP}));
+    add_opt(common_arg(
+        {"-pfxdir", "--prefix-cache-dir"},
+        "prefix cache directory for prefix cache support",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_XBAPP}));
+    add_opt(common_arg(
+        {"-cpf", "--custom-prompt-file"},
+        "use custom prompt support",
+        [](common_params & params, const std::string & value) {
+            params.custom_p_file = value;
+            params.custom_prompts_on = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_XBAPP}));
+#endif // GGML_B612
     add_opt(common_arg(
         {"-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",
@@ -2132,6 +2164,5 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.model = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
-
     return ctx_arg;
 }

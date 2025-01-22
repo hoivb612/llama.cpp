@@ -81,6 +81,10 @@ enum llama_example {
     LLAMA_EXAMPLE_LOOKUP,
     LLAMA_EXAMPLE_PARALLEL,
 
+#if defined(GGML_B612)    
+    LLAMA_EXAMPLE_XBAPP,
+#endif
+
     LLAMA_EXAMPLE_COUNT,
 };
 
@@ -229,6 +233,11 @@ struct common_params {
     std::string lookup_cache_dynamic = ""; // path of dynamic ngram cache file for lookup decoding          // NOLINT
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
     std::string rpc_servers          = ""; // comma separated list of RPC servers                           // NOLINT
+#if defined(GGML_B612)    
+    std::string custom_p_file        = "";  // custom prompts input file
+    std::string prefix_cache_dir     = "./pfx_cache"; // default prefix cache directory
+    std::string prefix_cache_file    = "pfx_default";  // prefix cache file 
+#endif
 
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
@@ -285,6 +294,12 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
+#if defined(GGML_B612)    
+    bool custom_prompts_on = false; // custom prompts are available
+    bool prefix_cache_on   = false; // use prefix cache if it exists or create one if not present
+    bool use_omp           = false; // use open MP threading (NOP currently - dictated by GGML_USE_OPENMP)
+    bool proc_affinity     = false; // use process affinity
+#endif
 
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V

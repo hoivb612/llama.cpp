@@ -1,6 +1,7 @@
 #pragma warning (disable:4267) //  conversion from 'size_t' to 'int' ...
 
 #include "xbapp.h"
+#include "b612-cpu.h"
 
 llama_context *ctx;
 llama_context_params ctx_params;
@@ -219,6 +220,12 @@ int slm_init(xbapp_params& xbparams) {
         // No pfc mode
         tokens_shared.clear();
     }
+
+#ifdef _WIN32
+	if (xbparams.process_affinity) {
+        ggml_b612::xb_set_optimal_process_affinity(xbparams.n_threads);
+    }
+#endif
 
     return 0;
 }

@@ -71,6 +71,13 @@
 
 using json = nlohmann::ordered_json;
 
+
+#if 0
+    #if defined(GGML_B612)
+        #include "b612-cpu.h"
+    #endif // GGML_B612
+#endif
+
 //
 // CPU utils
 //

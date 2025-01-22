@@ -165,6 +165,10 @@ struct cmd_params {
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
+#if defined(GGML_B612)
+    std::vector<int>                 n_threads_prompt;
+    std::vector<int>                 n_threads_gen;
+#endif
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
@@ -179,6 +183,9 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     ggml_numa_strategy               numa;
     int                              reps;
+#if defined(GGML_B612)
+    bool                             process_affinity;
+#endif
     ggml_sched_priority              prio;
     int                              delay;
     bool                             verbose;
@@ -197,6 +204,10 @@ static const cmd_params cmd_params_defaults = {
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { cpu_get_num_math() },
+#if defined(GGML_B612)
+    /* n_threads_prompt     */ {8},
+    /* n_threads_gen        */ {8},
+#endif
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
@@ -211,6 +222,9 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
+#if defined(GGML_B612)
+    /* process_affinity     */ false,
+#endif
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
     /* delay                */ 0,
     /* verbose              */ false,
@@ -272,6 +286,9 @@ static void print_usage(int /* argc */, char ** argv) {
            output_format_str(cmd_params_defaults.output_format));
     printf("  -oe, --output-err <csv|json|jsonl|md|sql> (default: %s)\n",
            output_format_str(cmd_params_defaults.output_format_stderr));
+#if defined(GGML_B612)
+    printf("  -affin, --process_affinity                (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
+#endif
     printf("  -v, --verbose                             (default: %s)\n", cmd_params_defaults.verbose ? "1" : "0");
     printf("  --progress                                (default: %s)\n", cmd_params_defaults.progress ? "1" : "0");
     printf("\n");
@@ -320,6 +337,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
+#if defined(GGML_B612)
+    params.process_affinity     = cmd_params_defaults.process_affinity;
+#endif // GGML_B612
     params.numa                 = cmd_params_defaults.numa;
     params.prio                 = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;
@@ -425,6 +445,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             }
             auto p = string_split<int>(argv[i], split_delim);
             params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
+#if defined(GGML_B612)
+        } else if (arg == "-tp" || arg == "--threads-prompt") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.n_threads_prompt.insert(params.n_threads_prompt.end(), p.begin(), p.end());
+        } else if (arg == "-tg" || arg == "--threads-gen") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.n_threads_gen.insert(params.n_threads_gen.end(), p.begin(), p.end());
+#endif // GGML_B612
         } else if (arg == "-C" || arg == "--cpu-mask") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -589,6 +625,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             invalid_param = !output_format_from_str(argv[i], params.output_format_stderr);
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+#if defined(GGML_B612)
+        } else if (arg == "-paffin" || arg == "--process-affinity") {
+            params.process_affinity = true;
+#endif
         } else if (arg == "--progress") {
             params.progress = true;
         } else {
@@ -679,6 +719,10 @@ struct cmd_params_instance {
     ggml_type          type_k;
     ggml_type          type_v;
     int                n_threads;
+#if defined(GGML_B612)
+    int                n_threads_prompt;
+    int                n_threads_gen;
+#endif    
     std::string        cpu_mask;
     bool               cpu_strict;
     int                poll;
@@ -749,6 +793,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
+#if defined(GGML_B612)
+    for (const auto & ntp : params.n_threads_prompt)
+    for (const auto & ntg : params.n_threads_gen)
+#endif
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & pl : params.poll) {
@@ -765,6 +813,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
                 /* .n_threads    = */ nt,
+#if defined(GGML_B612)
+                /* .n_threads_prompt = */ ntp,
+                /* .n_threads_prompt = */ ntg,
+#endif
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
                 /* .poll         = */ pl,
@@ -794,6 +846,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
                 /* .n_threads    = */ nt,
+#if defined(GGML_B612)
+                /* .n_threads_prompt = */ ntp,
+                /* .n_threads_prompt = */ ntg,
+#endif
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
                 /* .poll         = */ pl,
@@ -823,6 +879,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
                 /* .n_threads    = */ nt,
+#if defined(GGML_B612)
+                /* .n_threads_prompt = */ ntp,
+                /* .n_threads_prompt = */ ntg,
+#endif
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
                 /* .poll         = */ pl,
@@ -856,6 +916,10 @@ struct test {
     int                      n_batch;
     int                      n_ubatch;
     int                      n_threads;
+#if defined(GGML_B612)
+    int                      n_threads_prompt;
+    int                      n_threads_gen;
+#endif
     std::string              cpu_mask;
     bool                     cpu_strict;
     int                      poll;
@@ -884,6 +948,10 @@ struct test {
         n_batch        = inst.n_batch;
         n_ubatch       = inst.n_ubatch;
         n_threads      = inst.n_threads;
+#if defined(GGML_B612)
+        n_threads_prompt = inst.n_threads_prompt;
+        n_threads_gen = inst.n_threads_gen;
+#endif
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
         poll           = inst.poll;
@@ -1575,6 +1643,16 @@ int main(int argc, char ** argv) {
             if (params.progress) {
                 fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup prompt run\n", params_idx, params_count);
             }
+
+#if defined(GGML_B612)
+            if (params.process_affinity) {
+                ggml_b612::xb_set_optimal_process_affinity(t.n_threads_prompt);
+            }
+
+            // for printer.print_test() to print the correct thread count
+            t.n_threads = t.n_threads_prompt;
+#endif
+
             //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
             test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
         }
@@ -1582,6 +1660,16 @@ int main(int argc, char ** argv) {
             if (params.progress) {
                 fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup generation run\n", params_idx, params_count);
             }
+
+#if defined(GGML_B612)
+            if (params.process_affinity) {
+                ggml_b612::xb_set_optimal_process_affinity(t.n_threads_gen);
+            }
+
+            // for printer.print_test() to print the correct thread count
+            t.n_threads = t.n_threads_gen;
+#endif
+
             test_gen(ctx, 1, t.n_threads);
         }
 

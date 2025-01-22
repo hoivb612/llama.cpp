@@ -3803,8 +3803,12 @@ void ggml_aarch64_repack_tensor(struct ggml_tensor * cur, enum ggml_type repack_
 
 enum ggml_type ggml_aarch64_get_optimal_repack_type(const struct ggml_tensor * cur) {
     if (cur->type == GGML_TYPE_Q4_0) {
+#if !defined(GGML_B612)        
         // TODO: enable for AVX2 - currently disabled due to bad gemv performance
         if (/* ggml_cpu_has_avx2() || */ (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
+#else
+        if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
+#endif // GGML_B612            
             return GGML_TYPE_Q4_0_8_8;
         }
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
