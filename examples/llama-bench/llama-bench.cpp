@@ -23,11 +23,17 @@
 #include "llama.h"
 
 #ifdef _WIN32
-#    define WIN32_LEAN_AND_MEAN
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
+#   define WIN32_LEAN_AND_MEAN
+#   ifndef NOMINMAX
+#       define NOMINMAX
+#   endif
+#   include <windows.h>
+#endif
+
+#if defined(GGML_B612)
+    #include <iostream>
+    #include <intrin.h>
+    #include "b612-cpu.h"
 #endif
 
 // utils
@@ -339,6 +345,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.reps                 = cmd_params_defaults.reps;
 #if defined(GGML_B612)
     params.process_affinity     = cmd_params_defaults.process_affinity;
+    params.n_threads_prompt     = cmd_params_defaults.n_threads_prompt;
+    params.n_threads_gen        = cmd_params_defaults.n_threads_gen;
 #endif // GGML_B612
     params.numa                 = cmd_params_defaults.numa;
     params.prio                 = cmd_params_defaults.prio;

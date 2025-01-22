@@ -26,12 +26,12 @@
     #define NOMINMAX
 #endif
 
- #include <locale>
- #include <iostream>
- #include <windows.h>
- #include <fcntl.h>
- #include <io.h>
- #include <intrin.h>
+#include <locale>
+#include <iostream>
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <intrin.h>
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
