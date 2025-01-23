@@ -2136,21 +2136,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-pfc", "--prefix-cache"},
         "use prefix cache support",
-        [](common_params & params, const std::string & value) {
-            params.prefix_cache_file = value;
+        [](common_params & params) {
             params.prefix_cache_on = true;
         }
     ).set_examples({LLAMA_EXAMPLE_XBAPP}));
     add_opt(common_arg(
-        {"-pfxdir", "--prefix-cache-dir"},
-        "prefix cache directory for prefix cache support",
-        [](common_params & params, const std::string & value) {
-            params.prefix_cache_dir = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_XBAPP}));
-    add_opt(common_arg(
-        {"-cpf", "--custom-prompt-file"},
-        "use custom prompt support",
+        {"-cpf", "--custom-prompt-file"}, "FNAME",
+        "use custom prompt support - there is no default",
         [](common_params & params, const std::string & value) {
             params.custom_p_file = value;
             params.custom_prompts_on = true;
@@ -2164,5 +2156,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.model = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+
     return ctx_arg;
 }
