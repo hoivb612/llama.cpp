@@ -211,8 +211,8 @@ static const cmd_params cmd_params_defaults = {
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { cpu_get_num_math() },
 #if defined(GGML_B612)
-    /* n_threads_prompt     */ {8},
-    /* n_threads_gen        */ {8},
+    /* n_threads_prompt     */ {0},
+    /* n_threads_gen        */ {0},
 #endif
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -345,8 +345,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.reps                 = cmd_params_defaults.reps;
 #if defined(GGML_B612)
     params.process_affinity     = cmd_params_defaults.process_affinity;
-    params.n_threads_prompt     = cmd_params_defaults.n_threads_prompt;
-    params.n_threads_gen        = cmd_params_defaults.n_threads_gen;
 #endif // GGML_B612
     params.numa                 = cmd_params_defaults.numa;
     params.prio                 = cmd_params_defaults.prio;
@@ -508,7 +506,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
-            auto                          p = string_split<std::string>(argv[i], split_delim);
+            auto p = string_split<std::string>(argv[i], split_delim);
             std::vector<llama_split_mode> modes;
             for (const auto & m : p) {
                 llama_split_mode mode;
@@ -713,6 +711,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.poll.empty()) {
         params.poll = cmd_params_defaults.poll;
+    }
+    if (params.n_threads_prompt.empty()) {
+        params.n_threads_prompt = params.n_threads;
+    }
+    if (params.n_threads_gen.empty()) {
+        params.n_threads_gen = params.n_threads;
     }
 
     return params;
@@ -1652,15 +1656,6 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup prompt run\n", params_idx, params_count);
             }
 
-#if defined(GGML_B612)
-            if (params.process_affinity) {
-                ggml_b612::xb_set_optimal_process_affinity(t.n_threads_prompt);
-            }
-
-            // for printer.print_test() to print the correct thread count
-            t.n_threads = t.n_threads_prompt;
-#endif
-
             //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
             test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
         }
@@ -1668,15 +1663,6 @@ int main(int argc, char ** argv) {
             if (params.progress) {
                 fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup generation run\n", params_idx, params_count);
             }
-
-#if defined(GGML_B612)
-            if (params.process_affinity) {
-                ggml_b612::xb_set_optimal_process_affinity(t.n_threads_gen);
-            }
-
-            // for printer.print_test() to print the correct thread count
-            t.n_threads = t.n_threads_gen;
-#endif
 
             test_gen(ctx, 1, t.n_threads);
         }
@@ -1691,6 +1677,14 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%ld: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+#if defined(GGML_B612)
+                if (params.process_affinity) {
+                    ggml_b612::xb_set_optimal_process_affinity(t.n_threads_prompt);
+                }
+
+                // for printer.print_test() to print the correct thread count
+                t.n_threads = t.n_threads_prompt;
+#endif
                 test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
             }
             if (t.n_gen > 0) {
@@ -1698,6 +1692,14 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%ld: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+#if defined(GGML_B612)
+                if (params.process_affinity) {
+                    ggml_b612::xb_set_optimal_process_affinity(t.n_threads_gen);
+                }
+
+                // for printer.print_test() to print the correct thread count
+                t.n_threads = t.n_threads_gen;
+#endif
                 test_gen(ctx, t.n_gen, t.n_threads);
             }
 

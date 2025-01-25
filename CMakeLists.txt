@@ -93,7 +93,7 @@ set(GGML_FATAL_WARNINGS     ${LLAMA_FATAL_WARNINGS})
 
 # change the default for these ggml options
 if (NOT DEFINED GGML_LLAMAFILE)
-    set(GGML_LLAMAFILE_DEFAULT ON)
+    set(GGML_LLAMAFILE_DEFAULT OFF)
 endif()
 
 if (NOT DEFINED GGML_CUDA_GRAPHS)

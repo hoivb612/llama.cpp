@@ -19,7 +19,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu-impl.h
         )
 
-    if (GGML_XBOX)
+    if (GGML_B612)
         list (APPEND GGML_CPU_SOURCES
             ggml-cpu/ggml-cpu-b612.c
             ggml-cpu/ggml-cpu-quants-b612.c
@@ -192,18 +192,19 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 include(ggml-cpu/cmake/FindSIMD.cmake)
             endif ()
             if (GGML_AVX512)
+                message(STATUS "MSVC - enable AVX512")
                 list(APPEND ARCH_FLAGS /arch:AVX512)
                 # /arch:AVX512 includes: __AVX512F__, __AVX512CD__, __AVX512BW__, __AVX512DQ__, and __AVX512VL__
                 # MSVC has no compile-time flags enabling specific
                 # AVX512 extensions, neither it defines the
                 # macros corresponding to the extensions.
                 # Do it manually.
-                if (GGML_XBOX)
+                if (GGML_B612)
                     if ((NOT ${CMAKE_C_COMPILER_ID} MATCHES "Clang") AND (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang"))
-                        message(STATUS "no Clang - enable /fp:fast")
+                        message(STATUS "MSVC - enable /fp:fast")
                         list(APPEND ARCH_FLAGS /fp:fast)
                     endif()
-                    list(APPEND ARCH_FLAGS /arch:AVX /arch:AVX2 /d2jumptablerdata /Zc:forScope /O2 /Ob1)
+                    list(APPEND ARCH_FLAGS /d2jumptablerdata /Zc:forScope /O2 /Ob1)
                     message(STATUS "Add flag to generate B612 intrinsics: __GEN_AVX512__ / GGML_B612")
                     add_compile_definitions(__GEN_AVX512__)
                     add_compile_definitions(GGML_B612)

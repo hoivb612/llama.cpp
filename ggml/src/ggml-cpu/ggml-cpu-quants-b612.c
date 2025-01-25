@@ -2450,77 +2450,6 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     const block_q4_0 * restrict x = vx;
     const block_q8_0 * restrict y = vy;
 
-#if defined(GGML_B612)
-
-#if (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
-// #if defined(__AVX2__) || defined(__AVX512__) // original check
-
-    __m256 acc = _mm256_setzero_ps();
-    __m256i zero256 = _mm256_setzero_si256();
-
-    const __m256i offset = _mm256_set1_epi8(8);
-    const __m256i m4 = _mm256_set1_epi8(0xf);
-
-    for (uint64_t i = 0; i < nb; ++i) {
-
-        //
-        // Compute combined scale for the block.
-        //
-
-        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
-
-        //
-        // Get the q4_0 quant vector with nibbles in the [0..15] interval, and convert to
-        // bytes in the [-8..+7] interval.
-        //
-
-        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[i].qs);
-        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
-        __m256i qx = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
-        qx = _mm256_and_si256(m4, qx);
-        qx = _mm256_sub_epi8(qx, offset);
-
-        //
-        // Get the q8_0 quant vector.
-        //
-
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
-
-        //
-        // Get the absolute value of qx.
-        //
-
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
-
-        //
-        // Get the signed value of qy. 
-        //
-
-        const __m256i sy = _mm256_sign_epi8(qy, qx);
-
-        //
-        // mul (ax * sy) + 0 directly to epi32.
-        //
-        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
-        //
-
-        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
-        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
-
-        //
-        // Multiply q with scale and accumulate.
-        //
-
-        acc = _mm256_fmadd_ps(d, q, acc);
-    }
-
-    *s = hsum_float_8(acc);
-    return;
-
-#endif // __AVX512F__
-
-#endif // GGML_B612
-
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     if (nrc == 2) {
         const block_q4_0 * restrict vx0 = vx;
@@ -2776,6 +2705,73 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+#elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
+// #if defined(__AVX2__) || defined(__AVX512__) // original check
+#pragma message("buiding AVX512F vec_dot_q4_0_q8_0 version")
+
+    __m256 acc = _mm256_setzero_ps();
+    __m256i zero256 = _mm256_setzero_si256();
+
+    const __m256i offset = _mm256_set1_epi8(8);
+    const __m256i m4 = _mm256_set1_epi8(0xf);
+
+    for (uint64_t i = 0; i < nb; ++i) {
+
+        //
+        // Compute combined scale for the block.
+        //
+
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+
+        //
+        // Get the q4_0 quant vector with nibbles in the [0..15] interval, and convert to
+        // bytes in the [-8..+7] interval.
+        //
+
+        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[i].qs);
+        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
+        __m256i qx = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
+        qx = _mm256_and_si256(m4, qx);
+        qx = _mm256_sub_epi8(qx, offset);
+
+        //
+        // Get the q8_0 quant vector.
+        //
+
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
+
+        //
+        // Get the absolute value of qx.
+        //
+
+        const __m256i ax = _mm256_sign_epi8(qx, qx);
+
+        //
+        // Get the signed value of qy. 
+        //
+
+        const __m256i sy = _mm256_sign_epi8(qy, qx);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32.
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
+        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and accumulate.
+        //
+
+        acc = _mm256_fmadd_ps(d, q, acc);
+    }
+
+    *s = hsum_float_8(acc);
+    return;
+
 #elif defined(__AVX2__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -4123,62 +4119,6 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     const block_q8_0 * restrict x = vx;
     const block_q8_0 * restrict y = vy;
 
-#if defined(GGML_B612)
-
-#if (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
-// #if defined(__AVX2__) || defined(__AVX512F__) // original code for both AVX2 and AVX512
-
-    // Initialize accumulator with zeros
-    __m256 acc = _mm256_setzero_ps();
-    __m256i zero256 = _mm256_setzero_si256();
-
-    // Main loop
-    for (uint64_t i = 0; i < nb; ++i) {
-
-        //
-        // Compute combined scale for the entire 32 block_q8_K quant values in one
-        // fell swoop.
-        //
-
-        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
-
-        __m256i qx = _mm256_loadu_si256((const __m256i *)x[i].qs);
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
-
-        //
-        // Get the absolute values of qx
-        //
-
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
-
-        //
-        // Get the signed values of qy
-        //
-
-        const __m256i sy = _mm256_sign_epi8(qy, qx);
-
-        //
-        // mul (ax * sy) + 0 directly to epi32
-        //
-        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
-        //
-
-        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
-        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
-
-        //
-        // Multiply q with scale and accumulate
-        //
-
-        acc = _mm256_fmadd_ps(d, q, acc);
-    }
-
-    *s = hsum_float_8(acc);
-
-#endif // __AVX_512__
-
-#endif // GGML_B612
-
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     if (nrc == 2) {
         const block_q8_0 * restrict vx0 = vx;
@@ -4394,6 +4334,59 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+#elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
+// #if defined(__AVX2__) || defined(__AVX512F__) // original code for both AVX2 and AVX512
+#pragma message("buiding AVX512F vec_dot_q8_0_q8_0 version")
+
+    // Initialize accumulator with zeros
+    __m256 acc = _mm256_setzero_ps();
+    __m256i zero256 = _mm256_setzero_si256();
+
+    // Main loop
+    for (uint64_t i = 0; i < nb; ++i) {
+
+        //
+        // Compute combined scale for the entire 32 block_q8_K quant values in one
+        // fell swoop.
+        //
+
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+
+        __m256i qx = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
+
+        //
+        // Get the absolute values of qx
+        //
+
+        const __m256i ax = _mm256_sign_epi8(qx, qx);
+
+        //
+        // Get the signed values of qy
+        //
+
+        const __m256i sy = _mm256_sign_epi8(qy, qx);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
+        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and accumulate
+        //
+
+        acc = _mm256_fmadd_ps(d, q, acc);
+    }
+
+    *s = hsum_float_8(acc);
+    return;
+
 #elif defined(__AVX2__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -5028,9 +5021,76 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
     const uint64_t nb = n / QK_K;
 
-#if defined(GGML_B612)
+#ifdef __ARM_NEON
+    const uint8x16_t m3 = vdupq_n_u8(0x3);
+    const uint8x16_t m4 = vdupq_n_u8(0xF);
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__)
+    const int32x4_t vzero = vdupq_n_s32(0);
+
+    ggml_int8x16x2_t q2bytes;
+    uint8_t aux[16];
+
+    float sum = 0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+        const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
+
+        const uint8_t * restrict q2 = x[i].qs;
+        const int8_t  * restrict q8 = y[i].qs;
+        const uint8_t * restrict sc = x[i].scales;
+
+        const uint8x16_t mins_and_scales = vld1q_u8(sc);
+        const uint8x16_t scales = vandq_u8(mins_and_scales, m4);
+        vst1q_u8(aux, scales);
+
+        const uint8x16_t mins = vshrq_n_u8(mins_and_scales, 4);
+        const ggml_int16x8x2_t q8sums = ggml_vld1q_s16_x2(y[i].bsums);
+        const ggml_int16x8x2_t mins16 = {{vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins))), vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins)))}};
+        const int32x4_t s0 = vaddq_s32(vmull_s16(vget_low_s16 (mins16.val[0]), vget_low_s16 (q8sums.val[0])),
+                                       vmull_s16(vget_high_s16(mins16.val[0]), vget_high_s16(q8sums.val[0])));
+        const int32x4_t s1 = vaddq_s32(vmull_s16(vget_low_s16 (mins16.val[1]), vget_low_s16 (q8sums.val[1])),
+                                       vmull_s16(vget_high_s16(mins16.val[1]), vget_high_s16(q8sums.val[1])));
+        sum += dmin * vaddvq_s32(vaddq_s32(s0, s1));
+
+        int isum = 0;
+        int is = 0;
+
+// We use this macro instead of a function call because for some reason
+// the code runs 2-3% slower, even if the function is declared inline
+#define MULTIPLY_ACCUM_WITH_SCALE(index)\
+        isum += vaddvq_s32(ggml_vdotq_s32(vzero, q2bytes.val[0], q8bytes.val[0])) * aux[is+(index)];\
+        isum += vaddvq_s32(ggml_vdotq_s32(vzero, q2bytes.val[1], q8bytes.val[1])) * aux[is+1+(index)];
+
+#define SHIFT_MULTIPLY_ACCUM_WITH_SCALE(shift, index)\
+        q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;\
+        q2bytes.val[0] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q2bits.val[0], (shift)), m3));\
+        q2bytes.val[1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q2bits.val[1], (shift)), m3));\
+        MULTIPLY_ACCUM_WITH_SCALE((index));
+
+        for (int j = 0; j < QK_K/128; ++j) {
+            const ggml_uint8x16x2_t q2bits = ggml_vld1q_u8_x2(q2); q2 += 32;
+
+            ggml_int8x16x2_t q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            q2bytes.val[0] = vreinterpretq_s8_u8(vandq_u8(q2bits.val[0], m3));
+            q2bytes.val[1] = vreinterpretq_s8_u8(vandq_u8(q2bits.val[1], m3));
+
+            MULTIPLY_ACCUM_WITH_SCALE(0);
+
+            SHIFT_MULTIPLY_ACCUM_WITH_SCALE(2, 2);
+            SHIFT_MULTIPLY_ACCUM_WITH_SCALE(4, 4);
+            SHIFT_MULTIPLY_ACCUM_WITH_SCALE(6, 6);
+
+            is += 8;
+        }
+
+        sum += d * isum;
+    }
+
+    *s = sum;
+
+#elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
+#pragma message("buiding AVX512F vec_dot_q2_K_q8_K version")
 
     static __declspec(align(64)) const uint16_t perm0[32] = {
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -5152,79 +5212,6 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     res = _mm256_add_ps(res, _mm512_castps512_ps256(acc));
 //    __debugbreak();
     *s = hsum_float_8(res);
-    return;
-
-#endif // __AVX_512__
-
-#endif // GGML_B612
-
-#ifdef __ARM_NEON
-    const uint8x16_t m3 = vdupq_n_u8(0x3);
-    const uint8x16_t m4 = vdupq_n_u8(0xF);
-
-    const int32x4_t vzero = vdupq_n_s32(0);
-
-    ggml_int8x16x2_t q2bytes;
-    uint8_t aux[16];
-
-    float sum = 0;
-
-    for (int i = 0; i < nb; ++i) {
-        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
-        const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
-
-        const uint8_t * restrict q2 = x[i].qs;
-        const int8_t  * restrict q8 = y[i].qs;
-        const uint8_t * restrict sc = x[i].scales;
-
-        const uint8x16_t mins_and_scales = vld1q_u8(sc);
-        const uint8x16_t scales = vandq_u8(mins_and_scales, m4);
-        vst1q_u8(aux, scales);
-
-        const uint8x16_t mins = vshrq_n_u8(mins_and_scales, 4);
-        const ggml_int16x8x2_t q8sums = ggml_vld1q_s16_x2(y[i].bsums);
-        const ggml_int16x8x2_t mins16 = {{vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins))), vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins)))}};
-        const int32x4_t s0 = vaddq_s32(vmull_s16(vget_low_s16 (mins16.val[0]), vget_low_s16 (q8sums.val[0])),
-                                       vmull_s16(vget_high_s16(mins16.val[0]), vget_high_s16(q8sums.val[0])));
-        const int32x4_t s1 = vaddq_s32(vmull_s16(vget_low_s16 (mins16.val[1]), vget_low_s16 (q8sums.val[1])),
-                                       vmull_s16(vget_high_s16(mins16.val[1]), vget_high_s16(q8sums.val[1])));
-        sum += dmin * vaddvq_s32(vaddq_s32(s0, s1));
-
-        int isum = 0;
-        int is = 0;
-
-// We use this macro instead of a function call because for some reason
-// the code runs 2-3% slower, even if the function is declared inline
-#define MULTIPLY_ACCUM_WITH_SCALE(index)\
-        isum += vaddvq_s32(ggml_vdotq_s32(vzero, q2bytes.val[0], q8bytes.val[0])) * aux[is+(index)];\
-        isum += vaddvq_s32(ggml_vdotq_s32(vzero, q2bytes.val[1], q8bytes.val[1])) * aux[is+1+(index)];
-
-#define SHIFT_MULTIPLY_ACCUM_WITH_SCALE(shift, index)\
-        q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;\
-        q2bytes.val[0] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q2bits.val[0], (shift)), m3));\
-        q2bytes.val[1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q2bits.val[1], (shift)), m3));\
-        MULTIPLY_ACCUM_WITH_SCALE((index));
-
-        for (int j = 0; j < QK_K/128; ++j) {
-            const ggml_uint8x16x2_t q2bits = ggml_vld1q_u8_x2(q2); q2 += 32;
-
-            ggml_int8x16x2_t q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
-            q2bytes.val[0] = vreinterpretq_s8_u8(vandq_u8(q2bits.val[0], m3));
-            q2bytes.val[1] = vreinterpretq_s8_u8(vandq_u8(q2bits.val[1], m3));
-
-            MULTIPLY_ACCUM_WITH_SCALE(0);
-
-            SHIFT_MULTIPLY_ACCUM_WITH_SCALE(2, 2);
-            SHIFT_MULTIPLY_ACCUM_WITH_SCALE(4, 4);
-            SHIFT_MULTIPLY_ACCUM_WITH_SCALE(6, 6);
-
-            is += 8;
-        }
-
-        sum += d * isum;
-    }
-
-    *s = sum;
 
 #elif defined __AVX2__
 
@@ -5740,10 +5727,102 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
     const uint64_t nb = n / QK_K;
 
-#if defined(GGML_B612)
+#ifdef __ARM_NEON
 
-#if (defined(__AVX512F__) && defined(__GEN_AVX512__))
+    uint32_t aux[3];
+    uint32_t utmp[4];
 
+    const uint8x16_t m3b = vdupq_n_u8(0x3);
+    const int32x4_t  vzero = vdupq_n_s32(0);
+
+    const uint8x16_t m0 = vdupq_n_u8(1);
+    const uint8x16_t m1 = vshlq_n_u8(m0, 1);
+    const uint8x16_t m2 = vshlq_n_u8(m0, 2);
+    const uint8x16_t m3 = vshlq_n_u8(m0, 3);
+    const int8_t m32 = 32;
+
+    ggml_int8x16x4_t q3bytes;
+
+    float sum = 0;
+
+    for (int i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+
+        const uint8_t * restrict q3 = x[i].qs;
+        const uint8_t * restrict qh = x[i].hmask;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        ggml_uint8x16x2_t qhbits = ggml_vld1q_u8_x2(qh);
+
+        ggml_uint8x16x4_t q3h;
+
+        int32_t isum = 0;
+
+        // Set up scales
+        memcpy(aux, x[i].scales, 12);
+        utmp[3] = ((aux[1] >> 4) & kmask2) | (((aux[2] >> 6) & kmask1) << 4);
+        utmp[2] = ((aux[0] >> 4) & kmask2) | (((aux[2] >> 4) & kmask1) << 4);
+        utmp[1] = (aux[1] & kmask2) | (((aux[2] >> 2) & kmask1) << 4);
+        utmp[0] = (aux[0] & kmask2) | (((aux[2] >> 0) & kmask1) << 4);
+
+        int8_t * scale = (int8_t *)utmp;
+        for (int j = 0; j < 16; ++j) scale[j] -= m32;
+
+        for (int j = 0; j < QK_K/128; ++j) {
+
+            const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3); q3 += 32;
+            const ggml_int8x16x4_t q8bytes_1 = ggml_vld1q_s8_x4(q8); q8 += 64;
+            const ggml_int8x16x4_t q8bytes_2 = ggml_vld1q_s8_x4(q8); q8 += 64;
+
+            q3h.val[0] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2);
+            q3h.val[1] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2);
+            q3h.val[2] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1);
+            q3h.val[3] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1);
+
+            q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+            q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+            q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+            q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0])) * scale[0];
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1])) * scale[1];
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2])) * scale[2];
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3])) * scale[3];
+
+            scale += 4;
+
+            q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
+            q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
+            q3h.val[2] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1);
+            q3h.val[3] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1);
+
+            q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h.val[0]));
+            q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h.val[1]));
+            q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
+            q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
+
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0])) * scale[0];
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1])) * scale[1];
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2])) * scale[2];
+            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3])) * scale[3];
+
+            scale += 4;
+
+            if (j == 0) {
+                qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
+                qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
+            }
+
+        }
+        sum += d * isum;
+
+    }
+
+    *s = sum;
+
+#elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
+#pragma message("buiding AVX512F vec_dot_q3_K_q8_K version")
     static const uint16_t k_perm[8][16] = {
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
         2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -5889,104 +5968,6 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
     *s = hsum_float_8(acc);
     return;
-
-#endif // __AVX_512__
-
-#endif // GGML_B612
-
-#ifdef __ARM_NEON
-
-    uint32_t aux[3];
-    uint32_t utmp[4];
-
-    const uint8x16_t m3b = vdupq_n_u8(0x3);
-    const int32x4_t  vzero = vdupq_n_s32(0);
-
-    const uint8x16_t m0 = vdupq_n_u8(1);
-    const uint8x16_t m1 = vshlq_n_u8(m0, 1);
-    const uint8x16_t m2 = vshlq_n_u8(m0, 2);
-    const uint8x16_t m3 = vshlq_n_u8(m0, 3);
-    const int8_t m32 = 32;
-
-    ggml_int8x16x4_t q3bytes;
-
-    float sum = 0;
-
-    for (int i = 0; i < nb; ++i) {
-
-        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
-
-        const uint8_t * restrict q3 = x[i].qs;
-        const uint8_t * restrict qh = x[i].hmask;
-        const int8_t  * restrict q8 = y[i].qs;
-
-        ggml_uint8x16x2_t qhbits = ggml_vld1q_u8_x2(qh);
-
-        ggml_uint8x16x4_t q3h;
-
-        int32_t isum = 0;
-
-        // Set up scales
-        memcpy(aux, x[i].scales, 12);
-        utmp[3] = ((aux[1] >> 4) & kmask2) | (((aux[2] >> 6) & kmask1) << 4);
-        utmp[2] = ((aux[0] >> 4) & kmask2) | (((aux[2] >> 4) & kmask1) << 4);
-        utmp[1] = (aux[1] & kmask2) | (((aux[2] >> 2) & kmask1) << 4);
-        utmp[0] = (aux[0] & kmask2) | (((aux[2] >> 0) & kmask1) << 4);
-
-        int8_t * scale = (int8_t *)utmp;
-        for (int j = 0; j < 16; ++j) scale[j] -= m32;
-
-        for (int j = 0; j < QK_K/128; ++j) {
-
-            const ggml_uint8x16x2_t q3bits = ggml_vld1q_u8_x2(q3); q3 += 32;
-            const ggml_int8x16x4_t q8bytes_1 = ggml_vld1q_s8_x4(q8); q8 += 64;
-            const ggml_int8x16x4_t q8bytes_2 = ggml_vld1q_s8_x4(q8); q8 += 64;
-
-            q3h.val[0] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2);
-            q3h.val[1] = vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2);
-            q3h.val[2] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1);
-            q3h.val[3] = vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1);
-
-            q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)), vreinterpretq_s8_u8(q3h.val[0]));
-            q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)), vreinterpretq_s8_u8(q3h.val[1]));
-            q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
-            q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
-
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_1.val[0])) * scale[0];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_1.val[1])) * scale[1];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_1.val[2])) * scale[2];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_1.val[3])) * scale[3];
-
-            scale += 4;
-
-            q3h.val[0] = vbicq_u8(m2, qhbits.val[0]);
-            q3h.val[1] = vbicq_u8(m2, qhbits.val[1]);
-            q3h.val[2] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1);
-            q3h.val[3] = vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1);
-
-            q3bytes.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h.val[0]));
-            q3bytes.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h.val[1]));
-            q3bytes.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h.val[2]));
-            q3bytes.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h.val[3]));
-
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[0], q8bytes_2.val[0])) * scale[0];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[1], q8bytes_2.val[1])) * scale[1];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[2], q8bytes_2.val[2])) * scale[2];
-            isum += vaddvq_s32(ggml_vdotq_s32(vzero, q3bytes.val[3], q8bytes_2.val[3])) * scale[3];
-
-            scale += 4;
-
-            if (j == 0) {
-                qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
-                qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
-            }
-
-        }
-        sum += d * isum;
-
-    }
-
-    *s = sum;
 
 #elif defined __AVX2__
 
@@ -6678,9 +6659,71 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
     uint32_t utmp[4];
 
-#if defined(GGML_B612)
+#ifdef __ARM_NEON
+    const uint8x16_t m4b = vdupq_n_u8(0xf);
+    const int32x4_t mzero = vdupq_n_s32(0);
 
-#if (defined(__AVX512F__) && defined(__GEN_AVX512__))
+    ggml_int8x16x2_t q4bytes;
+    ggml_int8x16x2_t q8bytes;
+
+    float sumf = 0;
+
+    for (int i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+        const float dmin = y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
+
+        const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
+
+        memcpy(utmp, x[i].scales, 12);
+
+        uint32x2_t mins8 = { 0 };
+        mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
+        mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4), mins8, 1);
+
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[0] &= kmask1;
+
+        const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+        const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
+                                         vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
+        sumf -= dmin * vaddvq_s32(prod);
+
+        const uint8_t * scales = (const uint8_t *)utmp;
+
+        const uint8_t * restrict q4 = x[i].qs;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        int32_t sumi1 = 0;
+        int32_t sumi2 = 0;
+
+        for (int j = 0; j < QK_K/64; ++j) {
+            const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
+
+            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[0], m4b));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[1], m4b));
+
+            const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+            sumi1 += vaddvq_s32(p1) * scales[2*j+0];
+
+            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
+            q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
+            q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
+
+            const int32x4_t p2 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
+
+            sumi2 += vaddvq_s32(p2) * scales[2*j+1];
+        }
+
+        sumf += d * (sumi1 + sumi2);
+
+    }
+
+    *s = sumf;
+
+#elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
+#pragma message("buiding AVX512F vec_dot_q4_K_q8_K version")
 
     static const uint16_t k_perm[8][16] = {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -6754,74 +6797,8 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     *s = hsum_float_8(acc);
     return;
 
-#endif // __AVX_512__
-
-#endif // GGML_B612
-
-#ifdef __ARM_NEON
-    const uint8x16_t m4b = vdupq_n_u8(0xf);
-    const int32x4_t mzero = vdupq_n_s32(0);
-
-    ggml_int8x16x2_t q4bytes;
-    ggml_int8x16x2_t q8bytes;
-
-    float sumf = 0;
-
-    for (int i = 0; i < nb; ++i) {
-
-        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
-        const float dmin = y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
-
-        const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y[i].bsums), vld1q_s16(y[i].bsums + 8));
-
-        memcpy(utmp, x[i].scales, 12);
-
-        uint32x2_t mins8 = { 0 };
-        mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
-        mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4), mins8, 1);
-
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[0] &= kmask1;
-
-        const int16x8_t mins = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
-        const int32x4_t prod = vaddq_s32(vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
-                                         vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
-        sumf -= dmin * vaddvq_s32(prod);
-
-        const uint8_t * scales = (const uint8_t *)utmp;
-
-        const uint8_t * restrict q4 = x[i].qs;
-        const int8_t  * restrict q8 = y[i].qs;
-
-        int32_t sumi1 = 0;
-        int32_t sumi2 = 0;
-
-        for (int j = 0; j < QK_K/64; ++j) {
-            const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
-
-            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
-            q4bytes.val[0] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[0], m4b));
-            q4bytes.val[1] = vreinterpretq_s8_u8(vandq_u8  (q4bits.val[1], m4b));
-
-            const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
-            sumi1 += vaddvq_s32(p1) * scales[2*j+0];
-
-            q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
-            q4bytes.val[0] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[0], 4));
-            q4bytes.val[1] = vreinterpretq_s8_u8(vshrq_n_u8(q4bits.val[1], 4));
-
-            const int32x4_t p2 = ggml_vdotq_s32(ggml_vdotq_s32(mzero, q4bytes.val[0], q8bytes.val[0]), q4bytes.val[1], q8bytes.val[1]);
-
-            sumi2 += vaddvq_s32(p2) * scales[2*j+1];
-        }
-
-        sumf += d * (sumi1 + sumi2);
-
-    }
-
-    *s = sumf;
-
 #elif defined __AVX2__
+#pragma message("buiding AVX2 vec_dot_q4_K_q8_K version")
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
 

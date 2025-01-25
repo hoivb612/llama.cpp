@@ -6,7 +6,9 @@ if (WIN32)
 endif()
 
 llama_add_compile_flags()
-add_compile_definitions(GGML_B612)
+if (GGML_B612)
+    add_compile_definitions(GGML_B612)
+endif()
 
 #
 # libraries

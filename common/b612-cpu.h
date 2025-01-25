@@ -193,7 +193,7 @@ CPUInfo::CPUInfo() {
         mNumLogCpus = (cpuID1.EBX() & 0xff0000) >> 16;
         CPUID cpuID8000001E(0x8000001E, 0);
 		mNumSMT = ((cpuID8000001E.EBX() & 0x300) >> 8) + 1;
-        printf("%s: AMD mNumSMT %d\n", __func__, mNumSMT);
+        // printf("%s: AMD mNumSMT %d\n", __func__, mNumSMT);
 		if ((mNumLogCpus > 0) && (mNumSMT > 0)) {
 			mNumCores = mNumLogCpus / mNumSMT;
 		}
@@ -228,9 +228,12 @@ CPUInfo::CPUInfo() {
 }
 
 uint64_t l1d_cache_size = 48ull * 1024ull;
+const int32_t l1d_cache_sharing = 0;
 uint64_t l1i_cache_size = 32ull * 1024ull;
 uint64_t l2_cache_size = 1024ull * 1024ull;
+const int32_t l2_cache_sharing = 0;
 uint64_t l3_cache_size = 1024ull * 1024ull;
+const int32_t l3_cache_sharing = 0;
 
 typedef struct {
     uint64_t mask;
@@ -279,7 +282,8 @@ char * ggml_cache_type[4] = {
 void
 xb_set_process_affinity (
     uint32_t n_threads,
-    uint64_t affinity_mask_requested
+    uint64_t affinity_mask_requested,
+    bool verbose
     )
 {
 
@@ -328,7 +332,9 @@ xb_set_process_affinity (
 
     }
 
-    printf("mxcsr 0x%08x, default rounding mode - %s\n", mxcsr, default_mode);
+    if (verbose) {
+        printf("mxcsr 0x%08x, default rounding mode - %s\n", mxcsr, default_mode);
+    }
 
     //
     // Get cpuid information.
@@ -341,187 +347,189 @@ xb_set_process_affinity (
         uint32_t edx;
     } cpu_info;
 
-    //
-    // Get avx features for the current system.
-    //
+    if (verbose) {        
+        //
+        // Get avx features for the current system.
+        //
 
-    printf("host system AVX capabilities:\n");
-    __cpuid((int *)&cpu_info, 0x00000001);
-    printf("  cpuid function 0x00000001\n");  
-    if (cpu_info.ecx & (1 << 28)) {
-        printf("    Avx\n");
+        printf("host system AVX capabilities:\n");
+        __cpuid((int *)&cpu_info, 0x00000001);
+        printf("  cpuid function 0x00000001\n");  
+        if (cpu_info.ecx & (1 << 28)) {
+            printf("    Avx\n");
+        }
+
+        __cpuidex((int *)&cpu_info, 0x00000007, 0);
+        printf("  cpuidex function 0x00000007, subleaf 0\n");
+        if (cpu_info.ebx & (1 << 5)) {
+            printf("    Avx2\n");
+        }
+
+        if (cpu_info.ebx & (1 << 16)) {
+            printf("    Avx512F\n");
+        }
+
+        if (cpu_info.ebx & (1 << 17)) {
+            printf("    Avx512DQ\n");
+        }
+
+        if (cpu_info.ebx & (1 << 21)) {
+            printf("    Avx512Ifma\n");
+        }
+
+        if (cpu_info.ebx & (1 << 27)) {
+            printf("    Avx512CD\n");
+        }
+
+        if (cpu_info.ebx & (1 << 29)) {
+            printf("    Avx512BW\n");
+        }
+
+        if (cpu_info.ebx & (1 << 30)) {
+            printf("    Avx512VL\n");
+        }
+
+        if (cpu_info.ecx & (1 << 1)) {
+            printf("    Avx512Vbmi\n");
+        }
+
+        if (cpu_info.ecx & (1 << 6)) {
+            printf("    Avx512Vbmi2\n");
+        }
+
+        if (cpu_info.ecx & (1 << 11)) {
+            printf("    Avx512Vnni\n");
+        }
+
+        if (cpu_info.ecx & (1 << 12)) {
+            printf("    Avx512Bitalg\n");
+        }
+
+        if (cpu_info.ecx & (1 << 14)) {
+            printf("    Avx512Vpopcntdq\n");
+        }
+
+        if (cpu_info.edx & (1 << 8)) {
+            printf("    Avx512Vp2Intersect\n");
+        }
+
+        if (cpu_info.edx & (1 << 23)) {
+            printf("    Avx512FP16\n");
+        }
+
+        __cpuidex((int *)&cpu_info, 0x00000007, 1);
+        printf("  cpuidex function 0x00000007, subleaf 1\n");
+        if (cpu_info.eax & (1 << 4)) {
+            printf("    AvxVnni\n");
+        }
+
+        if (cpu_info.eax & (1 << 5)) {
+            printf("    Avx512Bfloat16\n");
+        }
+
+        if (cpu_info.eax & (1 << 23)) {
+            printf("    AvxIfma\n");
+        }
+
+        if (cpu_info.edx & (1 << 4)) {
+            printf("    AvxVnniInt8\n");
+        }
+
+        if (cpu_info.edx & (1 << 5)) {
+            printf("    AvxNeConvert\n");
+        }
+
+        if (cpu_info.edx & (1 << 9)) {
+            printf("    AvxVnniInt16\n");
+        }
+
+        if (cpu_info.edx & (1 << 19)) {
+            printf("    Avx10\n");
+        }
+
+        printf("\n");
+
+        //
+        // Get L1 instruction and data cache attributes.
+        //
+
+        __cpuid((int *)&cpu_info, 0x80000005);
+
+        //    printf("l1 d-cache line size %d\n", cpu_info.ecx & 0xff);
+        //    printf("l1 d-cache lines per tag %d\n", (cpu_info.ecx >> 8) & 0xff);
+        //    printf("l1 d-cache associativity %d\n", (cpu_info.ecx >> 16) & 0xff);
+
+        l1d_cache_size = ((cpu_info.ecx >> 24) & 0xff) * 1024ull;
+
+        //    printf("l1 i-cache line size %d\n", cpu_info.edx & 0xff);
+        //    printf("l1 i-cache lines per tag %d\n", (cpu_info.edx >> 8) & 0xff);
+        //    printf("l1 i-cache associativity %d\n", (cpu_info.edx >> 16) & 0xff);
+
+        l1i_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
+
+        __cpuidex((int *)&cpu_info, 0x8000001d, 0);
+
+        const int32_t l1d_cache_type = cpu_info.eax & 0x3;
+        const int32_t l1d_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+
+        __cpuidex((int *)&cpu_info, 0x8000001d, 1);
+
+        const int32_t l1i_cache_type = cpu_info.eax & 0x3;
+        const int32_t l1i_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+
+        printf("l1 d-cache size %zdkb, type - %s, SMT sharing %d\n",
+               l1d_cache_size / 1024,
+               ggml_cache_type[l1d_cache_type],
+               l1d_cache_sharing);
+
+        printf("l1 i-cache size %zdkb, type - %s, SMT sharing %d\n",
+               l1i_cache_size / 1024,
+               ggml_cache_type[l1i_cache_type],
+               l1i_cache_sharing);
+
+        //
+        // Get l2 cache information.
+        //
+
+        __cpuid((int *)&cpu_info, 0x80000006);
+
+        l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
+
+        __cpuidex((int *)&cpu_info, 0x8000001d, 2);
+
+        const int32_t l2_cache_type = cpu_info.eax & 0x3;
+        const int32_t l2_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+
+        printf("l2 cache size %zdkb, type - %s. SMT sharing %d\n",
+               l2_cache_size / 1024,
+               ggml_cache_type[l2_cache_type],
+               l2_cache_sharing);
+    
+        //
+        // Get l3 cache information.
+        //
+
+        __cpuidex((int *)&cpu_info, 0x8000001d, 3);
+
+        uint32_t line_size = (cpu_info.ebx & 0xfff) + 1;
+        uint32_t partitions = ((cpu_info.ebx >> 12) & 0x3ff) + 1;
+        uint32_t associativity = ((cpu_info.ebx >> 22) & 0x3ff) + 1;
+        uint32_t sets = cpu_info.ecx + 1;
+
+        //    printf("l3 line size %d\n", line_size);
+        //    printf("l3 partitions %d\n", partitions);
+        //    printf("l3 associativity %d\n", associativity);
+        //    printf("l3 sets %d\n", sets);
+
+        l3_cache_size = line_size * partitions * associativity * sets;
+        const int32_t l3_cache_type = cpu_info.eax & 0x3;
+        const int32_t l3_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+
+        printf("l3 cache size %zdmb, type - %s, SMT sharing %d\n\n",
+               l3_cache_size / (1024 * 1024),
+               ggml_cache_type[l3_cache_type],
+               l3_cache_sharing);
     }
-
-    __cpuidex((int *)&cpu_info, 0x00000007, 0);
-    printf("  cpuidex function 0x00000007, subleaf 0\n");
-    if (cpu_info.ebx & (1 << 5)) {
-        printf("    Avx2\n");
-    }
-
-    if (cpu_info.ebx & (1 << 16)) {
-        printf("    Avx512F\n");
-    }
-
-    if (cpu_info.ebx & (1 << 17)) {
-        printf("    Avx512DQ\n");
-    }
-
-    if (cpu_info.ebx & (1 << 21)) {
-        printf("    Avx512Ifma\n");
-    }
-
-    if (cpu_info.ebx & (1 << 27)) {
-        printf("    Avx512CD\n");
-    }
-
-    if (cpu_info.ebx & (1 << 29)) {
-        printf("    Avx512BW\n");
-    }
-
-    if (cpu_info.ebx & (1 << 30)) {
-        printf("    Avx512VL\n");
-    }
-
-    if (cpu_info.ecx & (1 << 1)) {
-        printf("    Avx512Vbmi\n");
-    }
-
-    if (cpu_info.ecx & (1 << 6)) {
-        printf("    Avx512Vbmi2\n");
-    }
-
-    if (cpu_info.ecx & (1 << 11)) {
-        printf("    Avx512Vnni\n");
-    }
-
-    if (cpu_info.ecx & (1 << 12)) {
-        printf("    Avx512Bitalg\n");
-    }
-
-    if (cpu_info.ecx & (1 << 14)) {
-        printf("    Avx512Vpopcntdq\n");
-    }
-
-    if (cpu_info.edx & (1 << 8)) {
-        printf("    Avx512Vp2Intersect\n");
-    }
-
-    if (cpu_info.edx & (1 << 23)) {
-        printf("    Avx512FP16\n");
-    }
-
-    __cpuidex((int *)&cpu_info, 0x00000007, 1);
-    printf("  cpuidex function 0x00000007, subleaf 1\n");
-    if (cpu_info.eax & (1 << 4)) {
-        printf("    AvxVnni\n");
-    }
-
-    if (cpu_info.eax & (1 << 5)) {
-        printf("    Avx512Bfloat16\n");
-    }
-
-    if (cpu_info.eax & (1 << 23)) {
-        printf("    AvxIfma\n");
-    }
-
-    if (cpu_info.edx & (1 << 4)) {
-        printf("    AvxVnniInt8\n");
-    }
-
-    if (cpu_info.edx & (1 << 5)) {
-        printf("    AvxNeConvert\n");
-    }
-
-    if (cpu_info.edx & (1 << 9)) {
-        printf("    AvxVnniInt16\n");
-    }
-
-    if (cpu_info.edx & (1 << 19)) {
-        printf("    Avx10\n");
-    }
-
-    printf("\n");
-
-    //
-    // Get L1 instruction and data cache attributes.
-    //
-
-    __cpuid((int *)&cpu_info, 0x80000005);
-
-//    printf("l1 d-cache line size %d\n", cpu_info.ecx & 0xff);
-//    printf("l1 d-cache lines per tag %d\n", (cpu_info.ecx >> 8) & 0xff);
-//    printf("l1 d-cache associativity %d\n", (cpu_info.ecx >> 16) & 0xff);
-
-    l1d_cache_size = ((cpu_info.ecx >> 24) & 0xff) * 1024ull;
-
-//    printf("l1 i-cache line size %d\n", cpu_info.edx & 0xff);
-//    printf("l1 i-cache lines per tag %d\n", (cpu_info.edx >> 8) & 0xff);
-//    printf("l1 i-cache associativity %d\n", (cpu_info.edx >> 16) & 0xff);
-
-    l1i_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
-
-    __cpuidex((int *)&cpu_info, 0x8000001d, 0);
-
-    const int32_t l1d_cache_type = cpu_info.eax & 0x3;
-    const int32_t l1d_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
-    __cpuidex((int *)&cpu_info, 0x8000001d, 1);
-
-    const int32_t l1i_cache_type = cpu_info.eax & 0x3;
-    const int32_t l1i_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
-    printf("l1 d-cache size %zdkb, type - %s, SMT sharing %d\n",
-           l1d_cache_size / 1024,
-           ggml_cache_type[l1d_cache_type],
-           l1d_cache_sharing);
-
-    printf("l1 i-cache size %zdkb, type - %s, SMT sharing %d\n",
-           l1i_cache_size / 1024,
-           ggml_cache_type[l1i_cache_type],
-           l1i_cache_sharing);
-
-    //
-    // Get l2 cache information.
-    //
-
-    __cpuid((int *)&cpu_info, 0x80000006);
-
-    l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
-
-    __cpuidex((int *)&cpu_info, 0x8000001d, 2);
-
-    const int32_t l2_cache_type = cpu_info.eax & 0x3;
-    const int32_t l2_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
-    printf("l2 cache size %zdkb, type - %s. SMT sharing %d\n",
-           l2_cache_size / 1024,
-           ggml_cache_type[l2_cache_type],
-           l2_cache_sharing);
-
-    //
-    // Get l3 cache information.
-    //
-
-    __cpuidex((int *)&cpu_info, 0x8000001d, 3);
-
-    uint32_t line_size = (cpu_info.ebx & 0xfff) + 1;
-    uint32_t partitions = ((cpu_info.ebx >> 12) & 0x3ff) + 1;
-    uint32_t associativity = ((cpu_info.ebx >> 22) & 0x3ff) + 1;
-    uint32_t sets = cpu_info.ecx + 1;
-
-//    printf("l3 line size %d\n", line_size);
-//    printf("l3 partitions %d\n", partitions);
-//    printf("l3 associativity %d\n", associativity);
-//    printf("l3 sets %d\n", sets);
-
-    l3_cache_size = line_size * partitions * associativity * sets;
-    const int32_t l3_cache_type = cpu_info.eax & 0x3;
-    const int32_t l3_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
-    printf("l3 cache size %zdmb, type - %s, SMT sharing %d\n\n",
-           l3_cache_size / (1024 * 1024),
-           ggml_cache_type[l3_cache_type],
-           l3_cache_sharing);
 
     //
     // Get logical processors per core and maximum logical processsors.
@@ -537,31 +545,35 @@ xb_set_process_affinity (
     // Compute the total l1, l2, and l3 cache.
     //
 
-    float total_l1_cache = (float)(l1d_cache_size + l1i_cache_size);
-    total_l1_cache *= (float)(maximum_logical / l1d_cache_sharing);
-    total_l1_cache /= (1024.f * 1024.f);
-    printf("total l1 cache %6.1fmb\n", total_l1_cache);
+    if (verbose) {
+        float total_l1_cache = (float)(l1d_cache_size + l1i_cache_size);
+        total_l1_cache *= (float)(maximum_logical / l1d_cache_sharing);
+        total_l1_cache /= (1024.f * 1024.f);
+        printf("total l1 cache %6.1fmb\n", total_l1_cache);
 
-    float total_l2_cache = (float)(l2_cache_size);
-    total_l2_cache *= (float)(maximum_logical / l2_cache_sharing);
-    total_l2_cache /= (1024.f * 1024.f);
-    printf("total l2 cache %6.1fmb\n", total_l2_cache);
+        float total_l2_cache = (float)(l2_cache_size);
+        total_l2_cache *= (float)(maximum_logical / l2_cache_sharing);
+        total_l2_cache /= (1024.f * 1024.f);
+        printf("total l2 cache %6.1fmb\n", total_l2_cache);
 
-    float total_l3_cache = (float)(l3_cache_size);
-    total_l3_cache *= (float)(maximum_logical / l3_cache_sharing);
-    total_l3_cache /= (1024.f * 1024.f);
-    printf("total l3 cache %6.1fmb\n\n", total_l3_cache);
+        float total_l3_cache = (float)(l3_cache_size);
+        total_l3_cache *= (float)(maximum_logical / l3_cache_sharing);
+        total_l3_cache /= (1024.f * 1024.f);
+        printf("total l3 cache %6.1fmb\n\n", total_l3_cache);
+    }
 
-    printf("n_threads specified %d\n", n_threads);
-    printf("logical processors per core %d\n", logical_per_core);
-    printf("maximum logical processors %d\n", maximum_logical);
+        printf("n_threads specified %d\n", n_threads);
+        printf("logical processors per core %d\n", logical_per_core);
+        printf("maximum logical processors %d\n", maximum_logical);
 
     //
     // Check the logical processors per core.
     //
 
     if (logical_per_core == 1) {
-        printf("bypassing set process affinity - not SMT system\n");
+        if (verbose) {
+            printf("bypassing set process affinity - not SMT system\n");
+        }
         return;
     }
 
@@ -571,7 +583,9 @@ xb_set_process_affinity (
 
     const uint32_t maximum_smt_threads = maximum_logical / 2;
     if ((n_threads & 1) || (n_threads > maximum_smt_threads)) {
-        printf("bypassing set process affinity - number threads odd or gt maximum logical / 2\n");
+        if (verbose) {
+            printf("bypassing set process affinity - number threads odd or gt maximum logical / 2\n");
+        }
         return;
     }
 
@@ -624,14 +638,18 @@ xb_set_process_affinity (
 
     set_affinity:
     if (SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
-        printf("process group affinity set to 0x%016llx\n", affinity_mask);
+        if (verbose) {
+           printf("process group affinity set to 0x%016llx\n", affinity_mask);
+        }
 
         //
         // Compute the processor index of the master thread.
         //
 
         BitScanForward64(&master_index, affinity_mask);
-        printf("processor index of master thread %lu\n", master_index);
+        if (verbose) {
+            printf("processor index of master thread %lu\n", master_index);
+        }
 
 #if 0
         //
@@ -654,7 +672,7 @@ xb_set_process_affinity (
 }
 
 void
-xb_set_optimal_process_affinity(uint32_t n_threads) {
+xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
     //
     // This routine selects the most optimal affinity mask based
     // on the processor it recognizes. Otherwise it just calls
@@ -665,18 +683,24 @@ xb_set_optimal_process_affinity(uint32_t n_threads) {
     bool AMD_Ryzen_PRO_395 = false;        
     ggml_b612::CPUInfo cpuInfo;
 
-    std::cout << "CPU vendor = " << cpuInfo.vendor() << std::endl;
-    std::cout << "CPU Brand String = " << cpuInfo.model() << std::endl;
-    std::cout << "# of cores = " << cpuInfo.cores() << std::endl;
-    std::cout << "# of logical cores = " << cpuInfo.logicalCpus() << std::endl;
-    std::cout << "Is CPU Hyper threaded = " << cpuInfo.isHyperThreaded() << std::endl;
+    if (verbose) {
+        std::cout << "CPU vendor = " << cpuInfo.vendor() << std::endl;
+        std::cout << "CPU Brand String = " << cpuInfo.model() << std::endl;
+        std::cout << "# of cores = " << cpuInfo.cores() << std::endl;
+        std::cout << "# of logical cores = " << cpuInfo.logicalCpus() << std::endl;
+        std::cout << "Is CPU Hyper threaded = " << cpuInfo.isHyperThreaded() << std::endl;
+    }
 
     if (cpuInfo.vendor().find("AMD") != std::string::npos) {
         if (cpuInfo.model().find("AMD Ryzen AI 9 HX 370") != std::string::npos) {
-            printf("%s: Detected AMD Ryzen HX 370\n", __func__);
+            if (verbose) {
+                printf("%s: Detected AMD Ryzen HX 370\n", __func__);
+            }
             AMD_Ryzen_HX_370 = true;
         } else if (cpuInfo.model().find("AMD RYZEN AI MAX+ PRO 395") != std::string::npos) {
-            printf("%s: Detected AMD Ryzen PRO 395\n", __func__);
+            if (verbose) {
+                printf("%s: Detected AMD Ryzen PRO 395\n", __func__);
+            }
             AMD_Ryzen_PRO_395 = true;
         }
     }
@@ -753,7 +777,7 @@ xb_set_optimal_process_affinity(uint32_t n_threads) {
             break;
     }
 
-    xb_set_process_affinity(n_threads, affinity_mask);
+    xb_set_process_affinity(n_threads, affinity_mask, verbose);
 }
 
 #else
