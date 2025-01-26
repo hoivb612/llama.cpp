@@ -445,6 +445,17 @@ int main(int argc, char** argv) {
     } else {
         // xbapp logging mode
         llama_log_set(xbapp_log_callback, &(xbparams.verbose_level));
+        // map xbapp verbose level to current version of GGML definitions
+        ggml_log_level log_level = GGML_LOG_LEVEL_INFO;
+        switch (xbparams.verbose_level) {
+            case 0: break; // already 0 by default
+            case 1: log_level = GGML_LOG_LEVEL_INFO;  break; // info
+            case 2: log_level = GGML_LOG_LEVEL_WARN;  break; // warn
+            case 3: log_level = GGML_LOG_LEVEL_ERROR; break; // error
+            case 4: log_level = GGML_LOG_LEVEL_DEBUG; break; // debug
+            default: break; // no match then default to no logging (0)
+        }
+        llama_log_set(xbapp_log_callback, &log_level);
     } 
 
     print_system_info(xbparams);

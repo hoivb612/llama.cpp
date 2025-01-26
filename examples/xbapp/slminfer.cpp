@@ -10,7 +10,7 @@ llama_model_params model_params;
 static int total_tokens_generated = 0;
 bool save_slm_state = false;
 std::vector<llama_token> session_tokens;
-static int64_t t_token_generation = 0;
+static int64_t t_token_generation_ms = 0;
 std::vector<llama_token> tokens_shared;
 
 std::vector<llama_token> llama_tokenize(
@@ -442,10 +442,10 @@ int slm_inference(xbapp_params& xbparams) {
     printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
         t_ms,
         n_tokens_generated, 
-        n_tokens_generated / (t_ms / 1000.0f),
+        (t_ms == 0) ? 0.0 : n_tokens_generated / (t_ms / 1000.0f),
         (t_ms / n_tokens_generated));
 
-    t_token_generation += (t_end_generation - t_start_generation);
+    t_token_generation_ms += t_ms;
     return 0;
 }
 
@@ -454,8 +454,8 @@ void slm_terminate() {
 
     printf("%s: generated %d tokens in %.2f s, speed: %.2f t/s\n",
             __func__, 
-            total_tokens_generated, (t_token_generation / 1000000.0f), 
-            total_tokens_generated / (t_token_generation / 1000000.0f));
+            total_tokens_generated, (t_token_generation_ms / 1000.0f), 
+            (t_token_generation_ms == 0) ? 0.0: total_tokens_generated / (t_token_generation_ms / 1000.0f));
 
     llama_perf_context_print(ctx);
 

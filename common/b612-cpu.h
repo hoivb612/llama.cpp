@@ -228,12 +228,12 @@ CPUInfo::CPUInfo() {
 }
 
 uint64_t l1d_cache_size = 48ull * 1024ull;
-const int32_t l1d_cache_sharing = 0;
+const int32_t l1d_cache_sharing = 1;
 uint64_t l1i_cache_size = 32ull * 1024ull;
 uint64_t l2_cache_size = 1024ull * 1024ull;
-const int32_t l2_cache_sharing = 0;
+const int32_t l2_cache_sharing = 1;
 uint64_t l3_cache_size = 1024ull * 1024ull;
-const int32_t l3_cache_sharing = 0;
+const int32_t l3_cache_sharing = 1;
 
 typedef struct {
     uint64_t mask;
