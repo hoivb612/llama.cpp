@@ -8,6 +8,19 @@
 #include <string>
 #include <vector>
 
+#if defined(GGML_B612)
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+    #include <iostream>
+    #include <intrin.h>
+    #include "b612-cpu.h"
+#endif
+#endif // GGML_B612
+
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s -m model.gguf -c 2048 -b 2048 -ub 512 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32 [-pps]\n", argv[0]);
@@ -56,6 +69,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
         return 1;
     }
+
+#if defined(GGML_B612)
+    // llama_log_set(retrieval_log_callback, &(params.verbosity));
+
+    if (params.proc_affinity) {
+        ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
+    }
+#endif
+    const int64_t t_main_start = ggml_time_us();
 
     const int32_t n_kv_max = llama_n_ctx(ctx);
 
@@ -187,6 +209,13 @@ int main(int argc, char ** argv) {
             }
         }
     }
+
+#ifdef GGML_B612
+    const auto t_main_end = ggml_time_us();
+    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
+
+    ggml_print_tensor_op_perf_data();
+#endif
 
     LOG("\n");
     llama_perf_context_print(ctx);

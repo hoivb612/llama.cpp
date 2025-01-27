@@ -397,12 +397,16 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
 #endif
 
+#ifdef GGML_B612
+    const auto t_main_end = ggml_time_us();
+    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
+
+    ggml_print_tensor_op_perf_data();
+#endif
+
     // clean up
     llama_batch_free(query_batch);
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
-
-    const auto t_main_end = ggml_time_us();
-    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
 }

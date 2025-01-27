@@ -4695,6 +4695,74 @@ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
     *s = idx;
 }
 
+#if defined(GGML_B612)
+
+int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
+int compute_op_counts[GGML_OP_COUNT] = {0};
+int64_t compute_op_time[GGML_OP_COUNT] = {0};
+
+void ggml_cpu_print_tensor_op_perf_data() {
+
+    int32_t total_count = 0;
+    int32_t total_op_count = 0;
+    double total_percent = 0.;
+    int64_t total_time = 0;
+    double percent;
+
+    printf("\n\n");
+    printf("          Total     Total  Tensor\n");
+    printf("   Count Time(sec)   %%   Time(ms) Tensor Op\n\n");
+
+    for (int64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
+        total_count += compute_op_counts[i];
+        total_time += compute_op_time[i];
+    }
+
+    total_op_count = total_count;
+    total_percent = 0.;
+    for (int64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
+        if (compute_op_counts[i]) {
+            percent = (double)compute_op_time[i] * 100.f / (double)total_time;
+            total_percent += percent;
+            printf("%8ld %8.2f  %5.2f %8.2f GGML_OP_%s\n",
+                   compute_op_counts[i],
+                   (double)(compute_op_time[i]) / (1000. * 1000.),
+                   percent,
+                   (double)(compute_op_time[i]) / (1000. * (double)compute_op_counts[i]),
+                   ggml_op_name(i));
+        }
+    }
+
+    printf("\n%8d %8.2f %4.2f\n\n",
+           total_count,
+           (double)(total_time) / (1000. * 1000.),
+           total_percent);
+
+    printf("vector dot matrix multiply type frequency\n\n");
+    printf("   Count     %%\n\n");
+
+    total_count = 0;
+    total_percent = 0.;
+    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_type_counts); i += 1) {
+        total_count += vec_dot_type_counts[i];
+    }
+
+    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_type_counts); i += 1) {
+        if (vec_dot_type_counts[i]) {
+            percent = (double)vec_dot_type_counts[i] * 100.f / (double)total_count;
+            total_percent += percent;
+            printf("%8d   %5.2f GGML_TYPE_%s\n",
+                   vec_dot_type_counts[i],
+                   percent,
+                   ggml_type_name(i));
+        }
+    }
+
+    printf("\n%8d  %5.2f\n\n", total_count, total_percent);
+}
+
+#endif // GGML_B612
+
 // Helpers for polling loops
 #if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
 static inline void ggml_thread_cpu_relax(void) {
@@ -9950,6 +10018,12 @@ static void ggml_compute_forward_mul_mat(
     if (src0->buffer && ggml_backend_cpu_buft_is_aarch64(src0->buffer->buft)) {
         type = (enum ggml_type)(intptr_t)src0->extra;
     }
+
+#ifdef GGML_B612
+    if (!ith) {
+        vec_dot_type_counts[type_traits_cpu[type].vec_dot_type] += 1;
+    }
+#endif // GGML_B612
 
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
     if (src0->buffer && ggml_backend_amx_buft_is_amx(src0->buffer->buft)) {
@@ -16058,12 +16132,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
+#ifdef GGML_B612
+        int64_t tensor_t0 = ggml_time_us();
+#endif // GGML_B612
+
         ggml_compute_forward(&params, node);
 
-        if (state->ith == 0 && cplan->abort_callback &&
+        if (!state->ith) {
+#ifdef GGML_B612
+            // update tensor op count
+            compute_op_counts[node->op] += 1;    
+            // update tensor op time
+            tensor_t0 = ggml_time_us() - tensor_t0;
+            compute_op_time[node->op] += tensor_t0;
+#endif // GGML_B612
+
+            if (cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
-            tp->abort = true;
-            tp->ec    = GGML_STATUS_ABORTED;
+                tp->abort = true;
+                tp->ec    = GGML_STATUS_ABORTED;
+            }
         }
 
         ggml_barrier(state->threadpool);

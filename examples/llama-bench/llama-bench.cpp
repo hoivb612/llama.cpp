@@ -1596,6 +1596,8 @@ int main(int argc, char ** argv) {
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
+    int64_t t_start = ggml_time_ms();
+
     int  params_idx   = 0;
     auto params_count = params_instances.size();
     for (const auto & inst : params_instances) {
@@ -1723,6 +1725,13 @@ int main(int argc, char ** argv) {
 
         ggml_threadpool_free_fn(threadpool);
     }
+
+#ifdef GGML_B612
+    int64_t t_elapsed = ggml_time_ms() - t_start;
+    printf("\n\n=== Elapsed time: %8.2fs\n", t_elapsed / 1000.0);
+
+    ggml_print_tensor_op_perf_data();
+#endif
 
     llama_free_model(lmodel);
 

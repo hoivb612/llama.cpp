@@ -2257,6 +2257,10 @@ extern "C" {
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
 
+#if defined(GGML_B612)
+    void ggml_print_tensor_op_perf_data();
+#endif // GGML_B612
+
 #ifdef  __cplusplus
 }
 #endif
