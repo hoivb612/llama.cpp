@@ -1577,6 +1577,9 @@ int main(int argc, char ** argv) {
 
     set_process_priority(params.prio);
 
+    printf("\n");
+    printf("\n\nsystem_info: %s\n\n", llama_print_system_info());
+
     // initialize printer
     std::unique_ptr<printer> p     = create_printer(params.output_format);
     std::unique_ptr<printer> p_err = create_printer(params.output_format_stderr);
