@@ -7961,10 +7961,3 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->strict_cpu     != p1->strict_cpu )    return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
-
-#if defined (GGML_B612)
-void ggml_print_tensor_op_perf_data() {
-    ggml_cpu_print_tensor_op_perf_data();
-}
-
-#endif // GGML_B612

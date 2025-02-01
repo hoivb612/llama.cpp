@@ -4849,7 +4849,7 @@ int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 
-void ggml_cpu_print_tensor_op_perf_data() {
+void ggml_backend_print_tensor_op_perf() {
 
     int32_t total_count = 0;
     int32_t total_op_count = 0;

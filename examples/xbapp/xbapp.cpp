@@ -518,7 +518,7 @@ int main(int argc, char** argv) {
     console::set_display(console::stats);
     t0 = ggml_time_us() - t0;
     printf("\n\n total elapsed time %7.2fsec\n", (double)t0 / (1000. * 1000.));
-    ggml_print_tensor_op_perf_data();
+    llama_print_tensor_op_perf();
 
     console::cleanup();
 

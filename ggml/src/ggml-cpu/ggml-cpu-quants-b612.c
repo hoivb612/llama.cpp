@@ -56,6 +56,14 @@ static inline float hsum_float_8(const __m256 x) {
     return _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
 }
 
+// horizontally add 16 floats
+static inline float hsum_float_16(const __m512 x) {
+    const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(x),
+                                     _mm512_extractf32x8_ps(x, 1));
+
+    return hsum_float_8(res);
+}
+
 // horizontally add 8 int32_t
 static inline int hsum_i32_8(const __m256i a) {
     const __m128i t0 = _mm_add_epi32(_mm256_castsi256_si128(a),
@@ -2726,7 +2734,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
 // #if defined(__AVX2__) || defined(__AVX512f__) // original check
-#pragma message("buiding AVX512F vec_dot_q4_0_q8_0 version")
+#pragma message("Building AVX512F vec_dot_q4_0_q8_0 version")
 
     __m256 acc = _mm256_setzero_ps();
     __m256i zero256 = _mm256_setzero_si256();
@@ -4355,7 +4363,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
 // #if defined(__AVX2__) || defined(__AVX512F__) // original code for both AVX2 and AVX512
-#pragma message("buiding AVX512F vec_dot_q8_0_q8_0 version")
+#pragma message("Building AVX512F vec_dot_q8_0_q8_0 version")
 
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -4406,7 +4414,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     return;
 
 #elif defined(__AVX2__)
-#pragma message("buiding ------ default ------ AVX2 vec_dot_q8_0_q8_0 version")
+#pragma message("Building ------ default ------ AVX2 vec_dot_q8_0_q8_0 version")
 
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -4426,7 +4434,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
     sumf = hsum_float_8(acc);
 #elif defined(__AVX__)
-#pragma message("buiding ------ default ------ AVX vec_dot_q8_0_q8_0 version")
+#pragma message("Building ------ default ------ AVX vec_dot_q8_0_q8_0 version")
 
     __m256 accum = _mm256_setzero_ps();
 
@@ -5112,7 +5120,7 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     *s = sum;
 
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
-#pragma message("buiding AVX512F vec_dot_q2_K_q8_K version")
+#pragma message("Building AVX512F vec_dot_q2_K_q8_K version")
 
     static __declspec(align(64)) const uint16_t perm0[32] = {
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -5225,10 +5233,7 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
         acc = _mm512_fmadd_ps(bd_ss, _mm512_cvtepi32_ps(p0), acc);
     }
 
-    __m256 res = _mm512_extractf32x8_ps(acc, 1);
-    res = _mm256_add_ps(res, _mm512_castps512_ps256(acc));
-//    __debugbreak();
-    *s = hsum_float_8(res);
+    *s = hsum_float_16(acc);
 
 #elif defined __AVX2__
 
@@ -5839,7 +5844,7 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     *s = sum;
 
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
-#pragma message("buiding AVX512F vec_dot_q3_K_q8_K version")
+#pragma message("Building AVX512F vec_dot_q3_K_q8_K version")
     static const uint16_t k_perm[8][16] = {
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
         2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -6740,7 +6745,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     *s = sumf;
 
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
-#pragma message("buiding AVX512F vec_dot_q4_K_q8_K version")
+#pragma message("Building AVX512F vec_dot_q4_K_q8_K version")
 
     static const uint16_t k_perm[4][32] = {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -6802,14 +6807,11 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
         acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
     }
 
-    const __m256 t0 = _mm256_add_ps(_mm512_castps512_ps256(acc),
-                                    _mm512_extractf32x8_ps(acc, 1));
-
-    *s = hsum_float_8(t0);
+    *s = hsum_float_16(acc);
     return;
 
 #elif defined __AVX2__DC
-#pragma message("buiding AVX2_DC vec_dot_q4_K_q8_K version")
+#pragma message("Building AVX2_DC vec_dot_q4_K_q8_K version")
 
     static const uint16_t k_perm[8][16] = {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -6884,7 +6886,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     return;
 
 #elif defined __AVX2__
-#pragma message("buiding AVX2_Default vec_dot_q4_K_q8_K version")
+#pragma message("Building AVX2_Default vec_dot_q4_K_q8_K version")
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
 
@@ -7595,7 +7597,6 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
         __m256 vd = _mm256_set1_ps(d);
         acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
-
     }
 
     *s = hsum_float_8(acc) + summs;
@@ -7695,7 +7696,6 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * restrict s, size_t bs, const void * r
         __m256 vd = _mm256_set1_ps(d);
         __m256i sumi = MM256_SET_M128I(sumi_1, sumi_0);
         acc = _mm256_add_ps(_mm256_mul_ps(vd, _mm256_cvtepi32_ps(sumi)), acc);
-
     }
 
     *s = hsum_float_8(acc) + summs;
@@ -8179,7 +8179,114 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     }
     *s = sum;
 
+    const uint64_t nb = n / QK_K;
+
+#elif defined(__AVX2__) && defined(GGML_B612)
+#pragma message("Building AVX2 B612 vec_dot_q6_K_q8_K")
+    static const uint16_t k_perm[8][16] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
+        6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
+        10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+        14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15
+    };
+
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m256i m2 = _mm256_set1_epi8(0x30);
+    const __m256i m32s = _mm256_set1_epi8(32);
+
+    __m256 acc = _mm256_setzero_ps();
+
+    for (uint64_t i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+
+        const uint8_t * restrict q4 = x[i].ql;
+        const uint8_t * restrict qh = x[i].qh;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
+        const __m256i scales_all = _mm256_cvtepi8_epi16(scales8);
+
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (uint64_t j = 0; j < QK_K / 128; ++j) {
+
+            //
+            // Load the low 4-bit values and the high 2-bit values.
+            //
+
+            const __m256i q4bits1 = _mm256_loadu_si256((const __m256i*)(q4 + (j * 64) + 0));
+            const __m256i q4bits2 = _mm256_loadu_si256((const __m256i*)(q4 + (j * 64) + 32));
+            const __m256i q4bitsH = _mm256_loadu_si256((const __m256i*)(qh + (j * 32)));
+
+            //
+            // Unpack the high (<5:4>) 2-bit values.
+            //
+
+            const __m256i q4h_0 = _mm256_and_si256(_mm256_rol_epi64(q4bitsH, 4), m2);
+            const __m256i q4h_1 = _mm256_and_si256(_mm256_rol_epi64(q4bitsH, 2), m2);
+            const __m256i q4h_2 = _mm256_and_si256(q4bitsH, m2);
+            const __m256i q4h_3 = _mm256_and_si256(_mm256_ror_epi64(q4bitsH, 2), m2);
+
+            //
+            // Unpack the low (<3:0>) 4-bit values and or in the high 2-bit values.
+            //
+
+            const __m256i q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0);
+            const __m256i q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1);
+            const __m256i q4_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2);
+            const __m256i q4_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
+
+            const __m256i q8_0 = _mm256_loadu_si256((const __m256i*)(q8 + (j * 128) + 0));
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)(q8 + (j * 128) + 32));
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)(q8 + (j * 128) + 64));
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)(q8 + (j * 128) + 96));
+
+            __m256i q8s_0 = _mm256_maddubs_epi16(m32s, q8_0);
+            __m256i q8s_1 = _mm256_maddubs_epi16(m32s, q8_1);
+            __m256i q8s_2 = _mm256_maddubs_epi16(m32s, q8_2);
+            __m256i q8s_3 = _mm256_maddubs_epi16(m32s, q8_3);
+
+            __m256i p16_0 = _mm256_maddubs_epi16(q4_0, q8_0);
+            __m256i p16_1 = _mm256_maddubs_epi16(q4_1, q8_1);
+            __m256i p16_2 = _mm256_maddubs_epi16(q4_2, q8_2);
+            __m256i p16_3 = _mm256_maddubs_epi16(q4_3, q8_3);
+
+            p16_0 = _mm256_sub_epi16(p16_0, q8s_0);
+            p16_1 = _mm256_sub_epi16(p16_1, q8s_1);
+            p16_2 = _mm256_sub_epi16(p16_2, q8s_2);
+            p16_3 = _mm256_sub_epi16(p16_3, q8s_3);
+
+            const __m256i idx0 = _mm256_loadu_si256((__m256i *)(&k_perm[(j * 4) + 0][0]));
+            const __m256i idx1 = _mm256_loadu_si256((__m256i *)(&k_perm[(j * 4) + 1][0]));
+            const __m256i idx2 = _mm256_loadu_si256((__m256i *)(&k_perm[(j * 4) + 2][0]));
+            const __m256i idx3 = _mm256_loadu_si256((__m256i *)(&k_perm[(j * 4) + 3][0]));
+
+            const __m256i v_scale0 = _mm256_permutexvar_epi16(idx0, scales_all);
+            const __m256i v_scale1 = _mm256_permutexvar_epi16(idx1, scales_all);
+            const __m256i v_scale2 = _mm256_permutexvar_epi16(idx2, scales_all);
+            const __m256i v_scale3 = _mm256_permutexvar_epi16(idx3, scales_all);
+
+            p16_0 = _mm256_madd_epi16(v_scale0, p16_0);
+            p16_1 = _mm256_madd_epi16(v_scale1, p16_1);
+            p16_2 = _mm256_madd_epi16(v_scale2, p16_2);
+            p16_3 = _mm256_madd_epi16(v_scale3, p16_3);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_2, p16_3));
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    *s = hsum_float_8(acc);
+
 #elif defined __AVX2__
+#pragma message("Building ---------- default AVX2 vec_dot_q6_K_q8_K")
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
     const __m256i m2 = _mm256_set1_epi8(3);

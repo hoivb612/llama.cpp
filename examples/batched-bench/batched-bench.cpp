@@ -214,7 +214,7 @@ int main(int argc, char ** argv) {
     const auto t_main_end = ggml_time_us();
     printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
 
-    ggml_print_tensor_op_perf_data();
+    llama_print_tensor_op_perf();
 #endif
 
     LOG("\n");

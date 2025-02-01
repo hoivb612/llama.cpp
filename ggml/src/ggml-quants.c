@@ -2612,22 +2612,22 @@ void dequantize_row_q6_K(const block_q6_K * restrict x, float * restrict y, int6
             const __m256i q2bitsH = _mm256_loadu_si256((const __m256i*)(qh + (j * 32)));
     
     	    //
-    	    // Unpack the high 2-bit values.
+    	    // Unpack the high (<5:4>) 2-bit values.
     	    //
     
-            __m256i q6_0 = _mm256_and_si256(_mm256_rol_epi64(q2bitsH, 4), m2);
-            __m256i q6_1 = _mm256_and_si256(_mm256_rol_epi64(q2bitsH, 2), m2);
-            __m256i q6_2 = _mm256_and_si256(q2bitsH, m2);
-            __m256i q6_3 = _mm256_and_si256(_mm256_ror_epi64(q2bitsH, 2), m2);
+            const __m256i q6h_0 = _mm256_and_si256(_mm256_rol_epi64(q2bitsH, 4), m2);
+            const __m256i q6h_1 = _mm256_and_si256(_mm256_rol_epi64(q2bitsH, 2), m2);
+            const __m256i q6h_2 = _mm256_and_si256(q2bitsH, m2);
+            const __m256i q6h_3 = _mm256_and_si256(_mm256_ror_epi64(q2bitsH, 2), m2);
     	
     	    //
-    	    // Unpack the low 4-bit values and combine with the high 2-bit values to form the 6-bit quant value.
+            // Unpack the low (<3:0>) 4-bit values and or in the high 2-bit values.
     	    //
     
-            q6_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q6_0);
-            q6_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q6_1);
-            q6_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q6_2);
-            q6_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q6_3);
+            __m256i q6_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q6h_0);
+            __m256i q6_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q6h_1);
+            __m256i q6_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q6h_2);
+            __m256i q6_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q6h_3);
     
     	    //
     	    // Subtract out the bias values from the quant values.
