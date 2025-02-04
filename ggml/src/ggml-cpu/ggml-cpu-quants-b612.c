@@ -8082,7 +8082,7 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     const block_q6_K * restrict x = vx;
     const block_q8_K * restrict y = vy;
 
-    const int nb = n / QK_K;
+    const uint64_t nb = n / QK_K;
 
 #ifdef __ARM_NEON
     float sum = 0;
@@ -8179,7 +8179,99 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     }
     *s = sum;
 
-    const uint64_t nb = n / QK_K;
+#elif defined(__AVX512F__) && defined(__GEN_AVX512__) && defined(GGML_B612)
+#pragma message("Building AVX512 B612 vec_dot_q6_K_q8_K")
+
+    static const uint16_t k_perm[4][32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15
+    };
+
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m256i m2 = _mm256_set1_epi8(0x30);
+    const __m512i m32s = _mm512_set1_epi8(32);
+
+    __m512 acc = _mm512_setzero_ps();
+
+    for (uint64_t i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+
+        const uint8_t * restrict q4 = x[i].ql;
+        const uint8_t * restrict qh = x[i].qh;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
+        const __m512i scales_all = _mm512_castsi256_si512(_mm256_cvtepi8_epi16(scales8));
+
+        __m512i sumi = _mm512_setzero_si512();
+
+        for (uint64_t j = 0; j < QK_K / 128; ++j) {
+
+            //
+            // Load the low 4-bit values and the high 2-bit values.
+            //
+
+            const __m256i q4bits1 = _mm256_loadu_si256((const __m256i*)(q4 + (j * 64) + 0));
+            const __m256i q4bits2 = _mm256_loadu_si256((const __m256i*)(q4 + (j * 64) + 32));
+            const __m256i q4bitsH = _mm256_loadu_si256((const __m256i*)(qh + (j * 32)));
+
+            //
+            // Unpack the high (<5:4>) 2-bit values.
+            //
+
+            const __m256i q4h_0 = _mm256_and_si256(_mm256_rol_epi64(q4bitsH, 4), m2);
+            const __m256i q4h_1 = _mm256_and_si256(_mm256_rol_epi64(q4bitsH, 2), m2);
+            const __m256i q4h_2 = _mm256_and_si256(q4bitsH, m2);
+            const __m256i q4h_3 = _mm256_and_si256(_mm256_ror_epi64(q4bitsH, 2), m2);
+
+            //
+            // Unpack the low (<3:0>) 4-bit values and or in the high 2-bit values.
+            //
+
+            const __m256i q4lh_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0);
+            const __m256i q4lh_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1);
+            const __m256i q4lh_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2);
+            const __m256i q4lh_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
+
+            __m512i q4_0 = _mm512_castsi256_si512(q4lh_0);
+            q4_0 = _mm512_inserti32x8(q4_0, q4lh_1, 1);
+
+            __m512i q4_1 = _mm512_castsi256_si512(q4lh_2);
+            q4_1 = _mm512_inserti32x8(q4_1, q4lh_3, 1);
+
+            const __m512i q8_0 = _mm512_loadu_si512(q8 + (j * 128) + 0);
+            const __m512i q8_1 = _mm512_loadu_si512(q8 + (j * 128) + 64);
+
+            const __m512i q8s_0 = _mm512_maddubs_epi16(m32s, q8_0);
+            const __m512i q8s_1 = _mm512_maddubs_epi16(m32s, q8_1);
+
+            __m512i p16_0 = _mm512_maddubs_epi16(q4_0, q8_0);
+            __m512i p16_1 = _mm512_maddubs_epi16(q4_1, q8_1);
+
+            p16_0 = _mm512_sub_epi16(p16_0, q8s_0);
+            p16_1 = _mm512_sub_epi16(p16_1, q8s_1);
+
+            const __m512i idx0 = _mm512_loadu_si512((__m512i *)(&k_perm[(j * 2) + 0][0]));
+            const __m512i idx1 = _mm512_loadu_si512((__m512i *)(&k_perm[(j * 2) + 1][0]));
+
+            const __m512i v_scale0 = _mm512_permutexvar_epi16(idx0, scales_all);
+            const __m512i v_scale1 = _mm512_permutexvar_epi16(idx1, scales_all);
+
+            p16_0 = _mm512_madd_epi16(v_scale0, p16_0);
+            p16_1 = _mm512_madd_epi16(v_scale1, p16_1);
+
+            sumi = _mm512_add_epi32(sumi, _mm512_add_epi32(p16_0, p16_1));
+        }
+
+        acc = _mm512_fmadd_ps(_mm512_broadcastss_ps(_mm_load_ss(&d)),
+                                                    _mm512_cvtepi32_ps(sumi),
+                                                    acc);
+    }
+
+    *s = hsum_float_16(acc);
 
 #elif defined(__AVX2__) && defined(GGML_B612)
 #pragma message("Building AVX2 B612 vec_dot_q6_K_q8_K")
