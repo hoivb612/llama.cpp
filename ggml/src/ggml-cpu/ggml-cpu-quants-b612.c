@@ -5845,6 +5845,156 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
 #pragma message("Building AVX512F vec_dot_q3_K_q8_K version")
+
+    static const uint16_t k_perm[4][32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15
+    };
+
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i m4 = _mm256_set1_epi8(4);
+    const __m128i m32 = _mm_set1_epi8(32);
+
+    __m512 acc = _mm512_setzero_ps();
+
+    for (uint64_t i = 0; i < nb; ++i) {
+
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+
+        const uint8_t * restrict q3 = x[i].qs;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        //
+        // Set up scales
+        //
+
+        uint32_t * aux = (uint32_t *)x[i].scales;
+        __m128i scales8 = _mm_set_epi32(
+                ((aux[1] >> 4) & kmask2) | (((aux[2] >> 6) & kmask1) << 4),
+                ((aux[0] >> 4) & kmask2) | (((aux[2] >> 4) & kmask1) << 4),
+                (aux[1] & kmask2) | (((aux[2] >> 2) & kmask1) << 4),
+                (aux[0] & kmask2) | (((aux[2] >> 0) & kmask1) << 4));
+
+        scales8 = _mm_sub_epi8(scales8, m32);
+        const __m512i scales_all = _mm512_castsi256_si512(_mm256_cvtepi8_epi16(scales8));
+
+        //
+        // high bits.
+        //
+
+        __m256i hbits = _mm256_loadu_si256((const __m256i*)x[i].hmask);
+
+        //
+        // integer accumulator
+        //
+
+        __m512i sumi = _mm512_setzero_si512();
+
+        for (uint64_t j = 0; j < QK_K/128; ++j) {
+
+            //
+            // load low 2 bits for 128 values (4 per byte).
+            //
+
+            const __m256i q3bits = _mm256_loadu_si256((const __m256i*)(q3 + (j * 32)));
+
+            //
+            // prepare low and high bits
+            //
+
+            const __m256i q3l_0 = _mm256_and_si256(q3bits, m3);
+            const __m256i q3h_0 = _mm256_andnot_si256(_mm256_rol_epi32(hbits, 2), m4);
+
+            const __m256i q3l_1 = _mm256_and_si256(_mm256_srli_epi16(q3bits, 2), m3);
+            const __m256i q3h_1 = _mm256_andnot_si256(_mm256_rol_epi32(hbits, 1), m4);
+
+            const __m256i q3l_2 = _mm256_and_si256(_mm256_srli_epi16(q3bits, 4), m3);
+            const __m256i q3h_2 = _mm256_andnot_si256(hbits, m4);
+
+            const __m256i q3l_3 = _mm256_and_si256(_mm256_srli_epi16(q3bits, 6), m3);
+            const __m256i q3h_3 = _mm256_andnot_si256(_mm256_ror_epi32(hbits, 1), m4);
+
+            hbits = _mm256_ror_epi32(hbits, 4);
+
+            //
+            // Combine low 2-bit values.
+            //
+
+            __m512i q3lc_0 = _mm512_castsi256_si512(q3l_0);
+            q3lc_0 = _mm512_inserti32x8(q3lc_0, q3l_1, 1);
+
+            __m512i q3lc_1 = _mm512_castsi256_si512(q3l_2);
+            q3lc_1 = _mm512_inserti32x8(q3lc_1, q3l_3, 1);
+
+            //
+            // Combine high 1-bit values.
+            //
+
+            __m512i q3hc_0 = _mm512_castsi256_si512(q3h_0);
+            q3hc_0 = _mm512_inserti32x8(q3hc_0, q3h_1, 1);
+
+            __m512i q3hc_1 = _mm512_castsi256_si512(q3h_2);
+            q3hc_1 = _mm512_inserti32x8(q3hc_1, q3h_3, 1);
+
+            //
+            // load Q8 quants
+            //
+
+            const __m512i q8_0 = _mm512_loadu_si512(q8 + (j * 128) + 0);
+            const __m512i q8_1 = _mm512_loadu_si512(q8 + (j * 128) + 64);
+
+            //
+            // Dot product: multiply the 2 low bits and 1 high bit part separately, so
+            // _mm256_maddubs_epi16 can be used, and then subtract. The high bit part has
+            // the 4 already subtracted (and so, it is zero if the high bit was not set,
+            // and 4 if the high bit was set)
+            //
+
+            __m512i q8s_0 = _mm512_maddubs_epi16(q3hc_0, q8_0);
+            __m512i q8s_1 = _mm512_maddubs_epi16(q3hc_1, q8_1);
+
+            __m512i p16_0 = _mm512_maddubs_epi16(q3lc_0, q8_0);
+            __m512i p16_1 = _mm512_maddubs_epi16(q3lc_1, q8_1);
+
+            p16_0 = _mm512_sub_epi16(p16_0, q8s_0);
+            p16_1 = _mm512_sub_epi16(p16_1, q8s_1);
+
+            //
+            // multiply with scales
+            //
+
+            __m512i idx0 = _mm512_loadu_si512((__m256i *)(&k_perm[(j * 2) + 0][0]));
+            __m512i idx1 = _mm512_loadu_si512((__m256i *)(&k_perm[(j * 2) + 1][0]));
+
+            __m512i v_scale0 = _mm512_permutexvar_epi16(idx0, scales_all);
+            __m512i v_scale1 = _mm512_permutexvar_epi16(idx1, scales_all);
+
+            p16_0 = _mm512_madd_epi16(v_scale0, p16_0);
+            p16_1 = _mm512_madd_epi16(v_scale1, p16_1);
+
+            //
+            // accumulate
+            //
+
+            sumi = _mm512_add_epi32(sumi, _mm512_add_epi32(p16_0, p16_1));
+        }
+
+        //
+        // multiply with block scale and accumulate
+        //
+
+        acc = _mm512_fmadd_ps(_mm512_broadcastss_ps(_mm_load_ss(&d)),
+                              _mm512_cvtepi32_ps(sumi),
+                              acc);
+    }
+
+    *s = hsum_float_16(acc);
+
+#elif defined(__AVX2__)
+#pragma message("Building B612 AVX2 vec_dot_q3_K_q8_K version")
+
     static const uint16_t k_perm[8][16] = {
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
         2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
@@ -5896,7 +6046,7 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
         __m256i sumi = _mm256_setzero_si256();
 
-        for (int j = 0; j < QK_K/128; ++j) {
+        for (uint64_t j = 0; j < QK_K/128; ++j) {
 
             //
             // load low 2 bits for 128 values (4 per byte).
@@ -5991,7 +6141,8 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     *s = hsum_float_8(acc);
     return;
 
-#elif defined __AVX2__
+#elif defined __AVX2__org
+#pragma message("Building ----------- default AVX2 vec_dot_q3_K_q8_K version")
 
     const __m256i m3 = _mm256_set1_epi8(3);
     const __m256i mone = _mm256_set1_epi8(1);
@@ -6096,6 +6247,7 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     *s = hsum_float_8(acc);
 
 #elif defined __AVX__
+#pragma message("Building --------- AVX vec_dot_q3_K_q8_K version")
 
     const __m128i m3 = _mm_set1_epi8(3);
     const __m128i mone = _mm_set1_epi8(1);
@@ -6673,7 +6825,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     const block_q4_K * restrict x = vx;
     const block_q8_K * restrict y = vy;
 
-    const int nb = n / QK_K;
+    const uint64_t nb = n / QK_K;
 
     static const uint32_t kmask1 = 0x3f3f3f3f;
     static const uint32_t kmask2 = 0x0f0f0f0f;
@@ -6690,7 +6842,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
     float sumf = 0;
 
-    for (int i = 0; i < nb; ++i) {
+    for (uint64_t i = 0; i < nb; ++i) {
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         const float dmin = y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -6719,7 +6871,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
         int32_t sumi1 = 0;
         int32_t sumi2 = 0;
 
-        for (int j = 0; j < QK_K/64; ++j) {
+        for (uint64_t j = 0; j < QK_K/64; ++j) {
             const ggml_uint8x16x2_t q4bits = ggml_vld1q_u8_x2(q4); q4 += 32;
 
             q8bytes = ggml_vld1q_s8_x2(q8); q8 += 32;
@@ -6760,7 +6912,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     const __m512i m4 = _mm512_set1_epi8(0xf);
     const __m512 zero512 = _mm512_setzero_ps();
 
-    for (int i = 0; i < nb; ++i) {
+    for (uint64_t i = 0; i < nb; ++i) {
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -6788,7 +6940,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
         __m512i sumi = _mm512_setzero_si512();
 
-        for (int j = 0; j < QK_K/64; ++j) {
+        for (uint64_t j = 0; j < QK_K/64; ++j) {
             const __m256i q4bits = _mm256_loadu_si256((const __m256i*)(q4 + (j * 32)));
             const __m512i q8v = _mm512_loadu_si512(q8 + (j * 64));
             const __m512i idx = _mm512_loadu_si512(&k_perm[j][0]);
@@ -6830,7 +6982,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     const __m256i m4 = _mm256_set1_epi8(0xF);
     const __m256 zero256 = _mm256_setzero_ps();
 
-   for (int i = 0; i < nb; ++i) {
+   for (uint64_t i = 0; i < nb; ++i) {
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -6857,7 +7009,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
         __m256i sumi = _mm256_setzero_si256();
 
-        for (int j = 0; j < QK_K/64; ++j) {
+        for (uint64_t j = 0; j < QK_K/64; ++j) {
             const __m256i idx0 = _mm256_loadu_si256((__m256i *)(&k_perm[(j * 2) + 0][0]));
             const __m256i idx1 = _mm256_loadu_si256((__m256i *)(&k_perm[(j * 2) + 1][0]));
 
@@ -6893,7 +7045,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     __m256 acc = _mm256_setzero_ps();
     __m128 acc_m = _mm_setzero_ps();
 
-   for (int i = 0; i < nb; ++i) {
+   for (uint64_t i = 0; i < nb; ++i) {
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -6920,7 +7072,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
         __m256i sumi = _mm256_setzero_si256();
 
-        for (int j = 0; j < QK_K/64; ++j) {
+        for (uint64_t j = 0; j < QK_K/64; ++j) {
 
             const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
             const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
@@ -6959,7 +7111,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     const __m256i m4 = _mm256_set1_epi8(0xF);
     const __m256 zero256 = _mm256_setzero_ps();
 
-   for (int i = 0; i < nb; ++i) {
+   for (uint64_t i = 0; i < nb; ++i) {
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -6988,7 +7140,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 
         __m256i sumi = _mm256_setzero_si256();
 
-        for (int j = 0; j < QK_K/64; ++j) {
+        for (uint64_t j = 0; j < QK_K/64; ++j) {
 
             const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
             const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
@@ -7021,7 +7173,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     __m256 acc = _mm256_setzero_ps();
     __m128 acc_m = _mm_setzero_ps();
 
-   for (int i = 0; i < nb; ++i) {
+   for (uint64_t i = 0; i < nb; ++i) {
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -7050,7 +7202,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
         __m128i sumi_1 = _mm_setzero_si128();
 
         __m128i shuffle = _mm_set1_epi16(0x0100);
-        for (int j = 0; j < QK_K/64; ++j) {
+        for (uint64_t j = 0; j < QK_K/64; ++j) {
 
             const __m128i scale_l = _mm_shuffle_epi8(scales, shuffle);
             shuffle = _mm_add_epi16(shuffle, m2);
