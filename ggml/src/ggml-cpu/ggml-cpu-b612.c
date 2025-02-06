@@ -4849,6 +4849,15 @@ int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 
+#define ROW_SIZE_BUCKETS 16385
+
+typedef struct {
+    int32_t total_count;
+    int32_t counts[ROW_SIZE_BUCKETS]; 
+} guant_type_info;
+
+DECLSPEC_CACHEALIGN guant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
+
 void ggml_backend_print_tensor_op_perf() {
 
     int32_t total_count = 0;
@@ -4907,6 +4916,39 @@ void ggml_backend_print_tensor_op_perf() {
     }
 
     printf("\n%8d  %5.2f\n\n", total_count, total_percent);
+
+    //
+    // Scan through all the quant types looking for types that have a non-zero
+    // total count.
+    //
+
+    for (int64_t i = 0; i < ARRAYSIZE(quant_type_row_size); i += 1) {
+        if (quant_type_row_size[i].total_count) {
+            printf("vector row size count histogram for quant type %s\n\n",
+                   ggml_type_name(i));
+
+            printf("  Size   Count    %%\n\n");
+
+            total_count = quant_type_row_size[i].total_count;
+            total_percent = 0;
+            int64_t weighted_rowsize = 0;
+
+            for (int64_t j = 0; j < ARRAYSIZE(quant_type_row_size[i].counts); j += 1) {
+                if (quant_type_row_size[i].counts[j]) {
+                    percent = (double)quant_type_row_size[i].counts[j] * 100.f / (double)total_count;
+                    total_percent += percent;
+                    weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
+                    printf("%6zd  %6d  %5.2f\n",
+                           j + 1,
+                           quant_type_row_size[i].counts[j],
+                           percent);
+                }
+            }
+        
+            printf("\n      %8d %5.2f\n\n", total_count, total_percent);
+            printf("Average row size %zd\n\n", weighted_rowsize / total_count);
+        }
+    }
 }
 
 #endif // GGML_B612
@@ -10316,6 +10358,21 @@ UseGgmlGemm2:;
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
+
+#if defined(GGML_B612)
+    if (!ith) {
+        const enum ggml_type src0_type = src0->type;
+        size_t src0_row_size = ggml_row_size(src0_type, ne00);
+        uint64_t bucket_index = src0_row_size;
+
+        if (bucket_index > ARRAYSIZE(quant_type_row_size[src0_type].counts)) {
+            bucket_index = ARRAYSIZE(quant_type_row_size[src0_type].counts);
+        }
+
+        quant_type_row_size[src0_type].total_count += 1;
+        quant_type_row_size[src0_type].counts[bucket_index - 1] += 1;
+    }
+#endif // GGML_B612
 
     // Now select a reasonable chunk size.
     int chunk_size = 16;
