@@ -1934,6 +1934,12 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+#if defined(GGML_B612)
+        /*.ntasks       =*/ 0,
+        /*.is_skipped   =*/ 0,
+        /*.reserved     =*/ 0,
+        /*.padding_b612 =*/ { 0 },
+#endif
         /*.padding      =*/ { 0 },
     };
 
@@ -3034,6 +3040,9 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+#if defined(GGML_B612)    
+    result->is_skipped = ggml_is_empty(result);
+#endif
 
     return result;
 }
@@ -3084,6 +3093,9 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+#if defined(GGML_B612)    
+    result->is_skipped = ggml_is_empty(result);
+#endif
 
     return result;
 }
@@ -3354,6 +3366,9 @@ struct ggml_tensor * ggml_reshape(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }
@@ -3371,6 +3386,9 @@ struct ggml_tensor * ggml_reshape_1d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }
@@ -3389,6 +3407,9 @@ struct ggml_tensor * ggml_reshape_2d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }
@@ -3408,6 +3429,9 @@ struct ggml_tensor * ggml_reshape_3d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }
@@ -3428,6 +3452,9 @@ struct ggml_tensor * ggml_reshape_4d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }
@@ -3445,6 +3472,9 @@ static struct ggml_tensor * ggml_view_impl(
 
     result->op     = GGML_OP_VIEW;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }
@@ -3576,6 +3606,9 @@ struct ggml_tensor * ggml_permute(
 
     result->op     = GGML_OP_PERMUTE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     int32_t params[] = { axis0, axis1, axis2, axis3 };
     ggml_set_op_params(result, params, sizeof(params));
@@ -3599,6 +3632,9 @@ struct ggml_tensor * ggml_transpose(
 
     result->op     = GGML_OP_TRANSPOSE;
     result->src[0] = a;
+#if defined(GGML_B612)    
+    result->is_skipped = true;
+#endif
 
     return result;
 }

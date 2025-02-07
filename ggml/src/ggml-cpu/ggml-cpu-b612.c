@@ -4849,6 +4849,9 @@ int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 
+#define GGML_TENSOR_NODE_COUNT 4096
+atomic_int graph_tensor_counts[GGML_TENSOR_NODE_COUNT] = {0};
+
 #define ROW_SIZE_BUCKETS 16385
 
 typedef struct {
@@ -4868,7 +4871,7 @@ void ggml_backend_print_tensor_op_perf() {
 
     printf("\n\n");
     printf("          Total     Total  Tensor\n");
-    printf("   Count Time(sec)   %%   Time(ms) Tensor Op\n\n");
+    printf("   Count Time(sec)   %%   Time(ms) Tensor Op\n");
 
     for (int64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
         total_count += compute_op_counts[i];
@@ -4890,13 +4893,34 @@ void ggml_backend_print_tensor_op_perf() {
         }
     }
 
+    // Number of total tensors processed and times
     printf("\n%8d %8.2f %4.2f\n\n",
            total_count,
            (double)(total_time) / (1000. * 1000.),
            total_percent);
 
-    printf("vector dot matrix multiply type frequency\n\n");
-    printf("   Count     %%\n\n");
+
+    total_count = 0;
+    int32_t total_tensors = 0;
+
+    printf("Graph Size  #_Nodes  #_Tensors\n");
+    for (int32_t i = 0; i < ARRAYSIZE(graph_tensor_counts); i += 1) {
+        if (graph_tensor_counts[i]) {
+            total_count += graph_tensor_counts[i];
+            total_tensors += graph_tensor_counts[i] * i;
+            printf("%5d       %5ld    %8ld\n",
+                   i,
+                   graph_tensor_counts[i],
+                   graph_tensor_counts[i] * i);
+        }
+    }
+
+    printf("\nTotal       %5d    %8d\n", total_count, total_tensors);
+    printf("Total OPs Tensors    %8d\n", total_op_count);
+    printf("Total NOP Tensors    %8d (skipped)\n\n", total_tensors - total_op_count);
+
+    printf("vector dot matrix multiply type frequency\n");
+    printf("   Count     %%\n");
 
     total_count = 0;
     total_percent = 0.;
@@ -4924,10 +4948,10 @@ void ggml_backend_print_tensor_op_perf() {
 
     for (int64_t i = 0; i < ARRAYSIZE(quant_type_row_size); i += 1) {
         if (quant_type_row_size[i].total_count) {
-            printf("vector row size count histogram for quant type %s\n\n",
+            printf("vector row size count histogram for quant type %s\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%\n\n");
+            printf("  Size   Count    %%\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -4945,8 +4969,9 @@ void ggml_backend_print_tensor_op_perf() {
                 }
             }
         
-            printf("\n      %8d %5.2f\n\n", total_count, total_percent);
-            printf("Average row size %zd\n\n", weighted_rowsize / total_count);
+            printf("\n      %8d %5.2f (avg row size %zd)\n\n", 
+                total_count, total_percent,
+                weighted_rowsize / total_count);
         }
     }
 }
@@ -16358,14 +16383,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
-#ifdef GGML_B612
+#if defined(GGML_B612)
+        if (node->is_skipped) {
+            continue;
+        }
+
         int64_t tensor_t0 = ggml_time_us();
 #endif // GGML_B612
 
         ggml_compute_forward(&params, node);
 
         if (!state->ith) {
-#ifdef GGML_B612
+#if defined(GGML_B612)
             // update tensor op count
             compute_op_counts[node->op] += 1;    
             // update tensor op time
@@ -16606,6 +16635,17 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
+
+#ifdef GGML_B612
+    int64_t tensor_index = cgraph->n_nodes;
+    if (tensor_index >= ARRAYSIZE(graph_tensor_counts)) {
+        printf("****** overflow nodes per graph %I64d\n", tensor_index);
+        printf("****** this graph entered in the 0th tensor size bucket\n");
+        tensor_index = 0;
+    }
+
+    atomic_fetch_add(&graph_tensor_counts[tensor_index], 1);
+#endif // GGML_B612
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);

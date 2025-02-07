@@ -618,6 +618,15 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
+#if defined(GGML_B612)
+        struct {
+            int n_tasks : 16;
+            int is_skipped : 8;
+            int reserved : 8;
+        };
+        char padding_b612[12];
+#endif
+
         char padding[8];
     };
 
