@@ -464,6 +464,7 @@ GGML_API float ggml_table_f32_f16[1 << 16];
 // so we define GGML_FP16_TO_FP32 and GGML_FP32_TO_FP16 elsewhere for NEON.
 // This is also true for POWER9.
 #if !defined(GGML_FP16_TO_FP32)
+#pragma message("=================== Define GGML_FP16_TO_FP32() as ggml_lookup_fp16_to_fp32")
 inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
     uint16_t s;
     memcpy(&s, &f, sizeof(uint16_t));

@@ -113,6 +113,9 @@ extern "C" {
                                        const void * GGML_RESTRICT y, int nr, int nc);
 
     struct ggml_type_traits_cpu {
+#if defined(GGML_B612)        
+        ggml_to_float_t          to_float;
+#endif        
         ggml_from_float_t        from_float;
         ggml_from_float_to_mat_t from_float_to_mat;
         ggml_vec_dot_t           vec_dot;

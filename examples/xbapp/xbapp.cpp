@@ -305,9 +305,6 @@ int64_t t0;
 int main(int argc, char** argv) {
     xbapp_params xbparams;
 
-    ggml_time_init();
-    t0 = ggml_time_us();
-
     // parse command line args
     {
         int i = 1;
@@ -459,6 +456,10 @@ int main(int argc, char** argv) {
     } 
 
     print_system_info(xbparams);
+
+    // print_system_info() initializes the time freq support so we can 
+    // just call ggml_time_us().
+    t0 = ggml_time_us();
 
     // initialize the model
     if (slm_init(xbparams) != 0) {

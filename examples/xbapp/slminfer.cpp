@@ -335,9 +335,12 @@ int slm_inference(xbapp_params& xbparams) {
     }
 
     int64_t t_start_generation = ggml_time_us();
-    printf("Prompt TTFT = %.2fms (size = %zu)\n", 
-        ((t_start_generation - t_start_decoding) / 1000.0f), 
-        embd.size());
+    float t_prompt_eval_ms = (t_start_generation - t_start_decoding) / 1000.0f;
+    printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n", 
+        t_prompt_eval_ms, 
+        embd.size(), 
+        (embd.size() * 1000.0f) / t_prompt_eval_ms, 
+        t_prompt_eval_ms / embd.size());
 
     if (xbparams.pfc_mode && save_slm_state) {
         session_tokens.insert(session_tokens.end(), embd_inp.begin(), embd_inp.end());
