@@ -4295,6 +4295,7 @@ inline static float32x4_t ggml_v_silu(float32x4_t x) {
 }
 
 #elif defined(__AVX512F__) && defined(__GEN_AVX512__) && defined(__AVX512DQ__)
+#pragma message("Building AVX512F expf and silu support")
 
 // adapted from arm limited optimized routine
 // the maximum error is 1.45358 plus 0.5 ulps
@@ -4486,7 +4487,7 @@ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
     uint64_t i = 0;
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__) && defined(__AVX512DQ__)
-#pragma message("Building AVX512 ggml_vec_silu_f32")
+#pragma message("Building AVX512F ggml_vec_silu_f32")
 
     const uint64_t xn = (nc & ~(GGML_F32_EPR16 - 1)); 
 
@@ -4601,7 +4602,7 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
     float sumf = 0;
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__) && defined(__AVX512DQ__)
-#pragma message("Building AVX512 ggml_vec_soft_max_f32")
+#pragma message("Building AVX512F ggml_vec_soft_max_f32")
 
     const uint64_t xn = (nc & ~(GGML_F32_EPR16 - 1)); 
 
@@ -11631,7 +11632,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
     else if (vec_dot_type != src1->type) {
         // override current default since we have direct f16-f32 vec_dot support
-        //vec_dot = (ggml_vec_dot_t)ggml_vec_dot_f16_f32;
+        // vec_dot = (ggml_vec_dot_t)ggml_vec_dot_f16_f32;
     }
 #endif
 
@@ -11801,8 +11802,9 @@ UseGgmlGemm1:;
 #if !defined(GGML_B612)
     const bool init_mat = (vec_dot_type != src1->type);
 #else
+    // for ggml_vec_dot_f16_f32() - currently not compatibile
     const bool init_mat = (vec_dot_type != src1->type);
-    //const bool init_mat = ((vec_dot_type != src1->type) && (vec_dot_type != GGML_TYPE_F16));
+    // const bool init_mat = ((vec_dot_type != src1->type) && (vec_dot_type != GGML_TYPE_F16));
 #endif // GGML_B612
     
     if (init_mat) {
@@ -18520,7 +18522,8 @@ void ggml_cpu_init(void) {
     ggml_critical_section_end();
 }
 
-#if defined(GGML_B612)
+#if defined(GGML_B612) && !defined(__GGML_B612_STATIC__)
+#pragma message("Building B612 proxies for ggml-cpu.dll")
 // for perfavx
 void ggml_init_tables(void) {
     ggml_cpu_init();
