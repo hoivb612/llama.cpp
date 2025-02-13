@@ -19,6 +19,10 @@
 #include <alloca.h>
 #endif
 
+#if defined(GGML_USE_RYZENAI)
+#include "ggml-ryzenai.h"
+#endif
+
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
@@ -11772,6 +11776,17 @@ static void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+#if defined(GGML_USE_RYZENAI)
+
+    if (ggml_ryzenai_can_mul_mat(src0, src1, dst)) {
+        if (params->ith == 0) {
+            ggml_ryzenai_mul_mat(src0, src1, dst, params->wdata, params->wsize);
+        }
+        return;
+    }
+
+#endif
+
 #if GGML_USE_LLAMAFILE
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -18499,6 +18514,10 @@ void ggml_cpu_init(void) {
 
 #if defined(__ARM_ARCH)
         ggml_init_arm_arch_features();
+#endif
+
+#if defined(GGML_USE_RYZENAI)
+        ggml_ryzenai_init();
 #endif
 
 #if defined(GGML_B612)

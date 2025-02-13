@@ -23,6 +23,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list (APPEND GGML_CPU_SOURCES
             ggml-cpu/ggml-cpu-b612.c
             ggml-cpu/ggml-cpu-quants-b612.c
+            ${GGML_SOURCES_RYZENAI}
+            ${GGML_HEADERS_RYZENAI}
         )
     else()
         list (APPEND GGML_CPU_SOURCES
@@ -66,6 +68,22 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list(APPEND GGML_CPU_SOURCES
                     ggml-cpu/llamafile/sgemm.cpp
                     ggml-cpu/llamafile/sgemm.h)
+    endif()
+
+    if (LLAMA_RYZENAI)
+        find_package(RyzenAI)
+        if (RyzenAI_FOUND)
+            message(STATUS "RyzenAI found")
+
+            set(GGML_HEADERS_RYZENAI ggml-ryzenai.h)
+            set(GGML_SOURCES_RYZENAI ggml-ryzenai.cpp)
+
+            add_compile_definitions(GGML_USE_RYZENAI)
+
+            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ryzenai::qlinear_2)
+        else()
+            message(WARNING "RyzenAI not found")
+        endif()
     endif()
 
     if (GGML_CPU_HBM)
