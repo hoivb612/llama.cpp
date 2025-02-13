@@ -7,9 +7,39 @@
 #include <fstream>
 #include <iostream> // TODO: remove me
 
-static void print_usage(int, char ** argv) {
+#define GGML_B612 1
+
+common_params params;
+
+#ifdef _WIN32
+#   define WIN32_LEAN_AND_MEAN
+#   ifndef NOMINMAX
+#       define NOMINMAX
+#   endif
+#   include <windows.h>
+#endif
+
+#if defined(GGML_B612)
+    #include <intrin.h>
+    #include "b612-cpu.h"
+
+void retrieval_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    GGML_UNUSED(text);
+
+    ggml_log_level retrieval_log_level = (ggml_log_level)0 /* GGML_LOG_LEVEL_NONE */;
+    if (user_data != nullptr) {
+        retrieval_log_level = *(ggml_log_level *)user_data;
+    }
+
+    if (level == retrieval_log_level) {
+        fputs(text, stdout);
+    }
+}
+#endif
+
+static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
-    LOG("\n    %s --model ./models/bge-base-en-v1.5-f16.gguf --top-k 3 --context-file README.md --context-file License --chunk-size 100 --chunk-separator .\n", argv[0]);
+    LOG("\n    %s --model ./models/bge-base-en-v1.5-f16.gguf --top-k 3 --context-file 1liners.txt [--context-file ...] --chunk-size 1 --chunk-separator .\n", argv[0]);
     LOG("\n");
 }
 
@@ -40,7 +70,7 @@ static std::vector<chunk> chunk_file(const std::string & filename, int chunk_siz
     chunk current_chunk;
     char buffer[1024];
     int64_t filepos = 0;
-    std::string current;
+    std::string current = "";
     while (f.read(buffer, 1024)) {
         current += std::string(buffer, f.gcount());
         size_t pos;
@@ -58,7 +88,6 @@ static std::vector<chunk> chunk_file(const std::string & filename, int chunk_siz
             }
             current = current.substr(pos + chunk_separator.size());
         }
-
     }
     // add leftover data to last chunk
     if (current_chunk.textdata.size() > 0) {
@@ -69,6 +98,13 @@ static std::vector<chunk> chunk_file(const std::string & filename, int chunk_siz
         } else {
             chunks.back().textdata += current_chunk.textdata;
         }
+    }
+    // if there is more data left then add it in as last chunk
+    if (current.size() > 0) {
+        current_chunk.filepos = filepos;
+        current_chunk.filename = filename;
+        current_chunk.textdata += current;
+        chunks.push_back(current_chunk);
     }
     f.close();
     return chunks;
@@ -86,7 +122,7 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
     llama_kv_cache_clear(ctx);
 
     // run model
-    LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
+    // LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
     if (llama_decode(ctx, batch) < 0) {
         LOG_ERR("%s : failed to decode\n", __func__);
     }
@@ -112,30 +148,36 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
 }
 
 int main(int argc, char ** argv) {
-    common_params params;
-
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_RETRIEVAL, print_usage)) {
         return 1;
     }
 
     common_init();
 
+#if defined(GGML_B612)
+    llama_log_set(retrieval_log_callback, &(params.verbosity));
+
+    ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
+#endif
+
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;
     params.embedding = true;
 
     if (params.chunk_size <= 0) {
-        LOG_ERR("chunk_size must be positive\n");
+        fprintf(stderr, "chunk_size must be positive\n");
         return 1;
     }
     if (params.context_files.empty()) {
-        LOG_ERR("context_files must be specified\n");
+        fprintf(stderr, "context_files must be specified\n");
         return 1;
     }
 
-    LOG_INF("processing files:\n");
+    int64_t t_main_start = ggml_time_us();
+
+    printf("processing files: ");
     for (auto & context_file : params.context_files) {
-        LOG_INF("%s\n", context_file.c_str());
+        printf("%s\n", context_file.c_str());
     }
 
     std::vector<chunk> chunks;
@@ -143,7 +185,7 @@ int main(int argc, char ** argv) {
         std::vector<chunk> file_chunk = chunk_file(context_file, params.chunk_size, params.chunk_separator);
         chunks.insert(chunks.end(), file_chunk.begin(), file_chunk.end());
     }
-    LOG_INF("Number of chunks: %ld\n", chunks.size());
+    printf("Number of chunks: %lld\n", chunks.size());
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -164,24 +206,27 @@ int main(int argc, char ** argv) {
 
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
     if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        LOG_ERR("%s: pooling type NONE not supported\n", __func__);
+        fprintf(stderr, "%s: pooling type NONE not supported\n", __func__);
         return 1;
     }
 
     if (n_ctx > n_ctx_train) {
-        LOG_WRN("%s: warning: model was trained on only %d context tokens (%d specified)\n",
+        printf("%s: warning: model was trained on only %d context tokens (%d specified)\n",
                 __func__, n_ctx_train, n_ctx);
     }
 
     // print system information
-    {
-        LOG_INF("\n");
-        LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+    if (params.verbosity) {
+        printf("\n");
+        printf("%s\n", common_params_get_system_info(params).c_str());
     }
 
     // max batch size
     const uint64_t n_batch = params.n_batch;
     GGML_ASSERT(params.n_batch >= params.n_ctx);
+
+    printf("%s: Tokenizing data...\n", __func__);
+    int64_t t_tokenization_start = ggml_time_us();
 
     // tokenize the prompts and trim
     for (auto & chunk : chunks) {
@@ -198,6 +243,8 @@ int main(int argc, char ** argv) {
         chunk.tokens = inp;
     }
 
+    int64_t t_tokenization_stop = ggml_time_us();
+
     // tokenization stats
     if (params.verbose_prompt) {
         for (int i = 0; i < (int) chunks.size(); i++) {
@@ -209,6 +256,9 @@ int main(int argc, char ** argv) {
             LOG_INF("\n\n");
         }
     }
+
+    printf("%s: Creating Embeddings...\n", __func__);
+    int64_t t_embeddings_start = ggml_time_us();
 
     // initialize batch
     const int n_chunks = chunks.size();
@@ -237,6 +287,10 @@ int main(int argc, char ** argv) {
             s = 0;
         }
 
+        if ((k % 50) == 0) {
+            printf("- Processing %d/%d items\r", k, n_chunks);
+        }
+
         // add to batch
         batch_add_seq(batch, inp, s);
         s += 1;
@@ -245,6 +299,8 @@ int main(int argc, char ** argv) {
     // final batch
     float * out = emb + p * n_embd;
     batch_decode(ctx, batch, out, s, n_embd);
+
+    int64_t t_embeddings_stop = ggml_time_us();
 
     // save embeddings to chunks
     for (int i = 0; i < n_chunks; i++) {
@@ -255,50 +311,98 @@ int main(int argc, char ** argv) {
 
     struct llama_batch query_batch = llama_batch_init(n_batch, 0, 1);
 
-    // start loop, receive query and return top k similar chunks based on cosine similarity
+    printf("%s: Querying loop starts...\n", __func__);
+
+    // start loop, read each query and return top-k or top similar chunk(s) 
+    // based on cosine similarity
+    int errors = 0;
+    int item_count = 0;
+    for (auto & context_file : params.context_files) {
+        std::ifstream cpfile(context_file);
+        if (!cpfile.is_open()) {
+            printf("[%s]: failed to open [%s]\n", __func__, context_file.c_str());
+            return false;
+        }
+
     std::string query;
-    while (true) {
-        LOG("Enter query: ");
-        std::getline(std::cin, query);
-        std::vector<int32_t> query_tokens = common_tokenize(ctx, query, true);
+        int64_t t_query_start = ggml_time_us();
 
-        batch_add_seq(query_batch, query_tokens, 0);
+        while (std::getline(cpfile, query)) {
+            std::vector<int32_t> query_tokens = common_tokenize(ctx, query, true);
 
-        std::vector<float> query_emb(n_embd, 0);
-        batch_decode(ctx, query_batch, query_emb.data(), 1, n_embd);
+           batch_add_seq(query_batch, query_tokens, 0);
 
-        common_batch_clear(query_batch);
+            std::vector<float> query_emb(n_embd, 0);
+            batch_decode(ctx, query_batch, query_emb.data(), 1, n_embd);
 
-        // compute cosine similarities
-        {
-            std::vector<std::pair<int, float>> similarities;
-            for (int i = 0; i < n_chunks; i++) {
-                float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd);
-                similarities.push_back(std::make_pair(i, sim));
-            }
+            common_batch_clear(query_batch);
 
-            // sort similarities
-            std::sort(similarities.begin(), similarities.end(), [](const std::pair<int, float> & a, const std::pair<int, float> & b) {
-                return a.second > b.second;
-            });
+            // compute cosine similarities
+            {
+                std::vector<std::pair<int, float>> similarities;
+                for (int i = 0; i < n_chunks; i++) {
+                    float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd);
+                    similarities.push_back(std::make_pair(i, sim));
+                }
 
-            LOG("Top %d similar chunks:\n", params.sampling.top_k);
-            for (int i = 0; i < std::min(params.sampling.top_k, (int) chunks.size()); i++) {
-                LOG("filename: %s\n", chunks[similarities[i].first].filename.c_str());
-                LOG("filepos: %lld\n", (long long int) chunks[similarities[i].first].filepos);
-                LOG("similarity: %f\n", similarities[i].second);
-                LOG("textdata:\n%s\n", chunks[similarities[i].first].textdata.c_str());
-                LOG("--------------------\n");
+                // sort similarities
+                std::sort(similarities.begin(), similarities.end(), [](const std::pair<int, float> & a, const std::pair<int, float> & b) {
+                    return a.second > b.second;
+                });
+
+#if 0
+                // print top candidate
+                printf("query: %s\n", query.c_str());
+                printf("filename: %s\n", chunks[similarities[0].first].filename.c_str());
+                printf("filepos: %lld\n", (long long int) chunks[similarities[0].first].filepos);
+                printf("similarity: %f\n", similarities[0].second);
+                printf("textdata:\n%s\n", chunks[similarities[0].first].textdata.c_str());            
+#endif
+                if ((chunks[similarities[0].first].textdata.find(query) == std::string::npos) &&
+                    (query.find(chunks[similarities[0].first].textdata) == std::string::npos)) {
+                    if (params.verbosity) {
+                        printf("ERROR encountered on the following item: \n"
+                            "s1 = [%s]\n"
+                            "s2 = [%s]\n", 
+                            query.c_str(),
+                            chunks[similarities[0].first].textdata.c_str());
+                    }
+                    errors++;
+                }
+
+                if ((++item_count % 50) == 0) {
+                    printf("- Processed %d items\r", item_count);
+                }
             }
         }
+
+        int64_t t_query_stop = ggml_time_us();
+        printf("Total items processed: %d\n", item_count);
+        printf("Query time             = %6.2fs (%5.2fms per item)\n", 
+            (t_query_stop - t_query_start) / (1000.0 * 1000.0), 
+            (t_query_stop - t_query_start) / (item_count * 1000.0));
     }
 
-    LOG("\n");
+#if defined(GGML_B612)
+    printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
+        (t_tokenization_stop - t_tokenization_start) / 1000.0, 
+        (t_tokenization_stop - t_tokenization_start) / (chunks.size() * 1000.0));
+    printf("Create Embeddings time = %6.2fs (%5.2fms per chunk)\n", 
+        (t_embeddings_stop - t_embeddings_start) / (1000.0 * 1000.0), 
+        (t_embeddings_stop - t_embeddings_start) / (chunks.size() * 1000.0));
+    printf("Errors                 = %3d\n", errors);
+
+    params.verbosity = GGML_LOG_LEVEL_INFO;
+    llama_log_set(retrieval_log_callback, &(params.verbosity));
     llama_perf_context_print(ctx);
+#endif
 
     // clean up
     llama_batch_free(query_batch);
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
+
+    const auto t_main_end = ggml_time_us();
+    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
 }
