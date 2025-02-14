@@ -599,7 +599,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_chunks = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
-    add_opt(common_arg(
+#ifdef GGML_B612
+   add_opt(common_arg(
+        {"-nq", "--no-query"},
+        "no query mode",
+        [](common_params & params) {
+            params.no_query = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_RETRIEVAL}));
+#endif // GGML_B612
+     add_opt(common_arg(
         {"-fa", "--flash-attn"},
         string_format("enable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled"),
         [](common_params & params) {

@@ -316,6 +316,13 @@ int main(int argc, char ** argv) {
     // start loop, read each query and return top-k or top similar chunk(s) 
     // based on cosine similarity
     int errors = 0;
+
+#ifdef GGML_B612
+    if (params.no_query) {
+        goto skip_query;
+    }
+#endif
+
     int item_count = 0;
     for (auto & context_file : params.context_files) {
         std::ifstream cpfile(context_file);
@@ -384,6 +391,7 @@ int main(int argc, char ** argv) {
     }
 
 #if defined(GGML_B612)
+skip_query:
     printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
         (t_tokenization_stop - t_tokenization_start) / 1000.0, 
         (t_tokenization_stop - t_tokenization_start) / (chunks.size() * 1000.0));

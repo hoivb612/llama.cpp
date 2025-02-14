@@ -353,6 +353,9 @@ struct common_params {
     std::vector<std::string> context_files; // context files to embed
 
     int32_t chunk_size = 64; // chunk size for context embedding
+#ifdef GGML_B612    
+    bool no_query      = false;
+#endif
 
     std::string chunk_separator = "\n"; // chunk separator for context embedding
 
