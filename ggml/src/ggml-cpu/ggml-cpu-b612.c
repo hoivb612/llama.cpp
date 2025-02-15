@@ -6336,7 +6336,7 @@ void ggml_backend_print_tensor_op_perf() {
 
     printf("\n\n");
     printf("          Total     Total  Tensor\n");
-    printf("   Count Time(sec)   %%   Time(ms) Tensor Op\n");
+    printf("   Count Time(sec)   %%   Time(us) Tensor Op\n");
 
     for (int64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
         total_count += compute_op_counts[i];
@@ -6353,7 +6353,7 @@ void ggml_backend_print_tensor_op_perf() {
                    compute_op_counts[i],
                    (double)(compute_op_time[i]) / (1000. * 1000.),
                    percent,
-                   (double)(compute_op_time[i]) / (1000. * (double)compute_op_counts[i]),
+                   (double)(compute_op_time[i]) / (double)compute_op_counts[i],
                    ggml_op_name(i));
         }
     }
