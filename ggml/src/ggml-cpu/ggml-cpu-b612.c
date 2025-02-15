@@ -6313,6 +6313,7 @@ void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, 
 int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
+int openMP_compute_runs = 0;
 
 #define GGML_TENSOR_NODE_COUNT 4096
 atomic_int graph_tensor_counts[GGML_TENSOR_NODE_COUNT] = {0};
@@ -6334,7 +6335,7 @@ void ggml_backend_print_tensor_op_perf() {
     int64_t total_time = 0;
     double percent;
 
-    printf("\n\n");
+    printf("\n\n OpenMP runs = %d\n\n", openMP_compute_runs);
     printf("          Total     Total  Tensor\n");
     printf("   Count Time(sec)   %%   Time(us) Tensor Op\n");
 
@@ -18194,6 +18195,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
+        #ifdef GGML_B612
+        openMP_compute_runs += 1;
+        #endif // GGML_B612
         #pragma omp parallel num_threads(n_threads)
         {
             #pragma omp single
