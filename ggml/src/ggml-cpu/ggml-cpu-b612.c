@@ -6325,9 +6325,15 @@ typedef struct {
     int32_t total_count;
     int32_t counts[ROW_SIZE_BUCKETS];
     int64_t times[ROW_SIZE_BUCKETS];
-} guant_type_info;
+    int64_t times_max[ROW_SIZE_BUCKETS];
+    int32_t max_ne00;
+    int32_t max_ne01;
+    int32_t max_ne10;
+    int32_t max_ne11;
+    int64_t max_time;
+} quant_type_info;
 
-DECLSPEC_CACHEALIGN guant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
+DECLSPEC_CACHEALIGN quant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
 
 void ggml_backend_print_tensor_op_perf() {
 
@@ -6423,7 +6429,7 @@ void ggml_backend_print_tensor_op_perf() {
             printf("vector row size count histogram for quant type %s\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%    Time(ms)\n");
+            printf("  Size   Count    %%    Time(ms)   Max(us)\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -6436,18 +6442,26 @@ void ggml_backend_print_tensor_op_perf() {
                     total_percent += percent;
                     weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
                     total_time += quant_type_row_size[i].times[j];
-                    printf("%6zd  %6d  %5.2f  %8.2f\n",
+                    printf("%6zd  %6d  %5.2f  %8.2f %9.2f\n",
                            j + 1,
                            quant_type_row_size[i].counts[j],
                            percent,
-                           quant_type_row_size[i].times[j] / 1000.0);
+                           quant_type_row_size[i].times[j] / 1000.0,
+                           (double) quant_type_row_size[i].times_max[j]);
                 }
             }
-        
+
             printf("\n      %8d %5.2f  %8.2f (avg row size %zd)\n\n", 
                 total_count, total_percent,
                 total_time / 1000.0,
                 weighted_rowsize / total_count);
+            printf("  Max entry: ne00 ne01 ne10 ne11  Time(us)\n");
+            printf("             %4d %4d %4d %4d %8.2f\n\n",
+                quant_type_row_size[i].max_ne00,
+                quant_type_row_size[i].max_ne01,
+                quant_type_row_size[i].max_ne10,
+                quant_type_row_size[i].max_ne01,
+                (double)quant_type_row_size[i].max_time);
         }
     }
 }
@@ -17931,15 +17945,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             // update tensor op time
             tensor_t0 = ggml_time_us() - tensor_t0;
             compute_op_time[node->op] += tensor_t0;
-            // update time per vec_dot_type and per src0_row_size
-            const struct ggml_tensor * src0 = node->src[0];
-            const enum ggml_type src0_type = src0->type;
-            vec_dot_type_times[type_traits_cpu[src0_type].vec_dot_type] += tensor_t0;
-            uint64_t bucket_index = ggml_row_size(src0_type, src0->ne[0]);
-            if (bucket_index > ARRAYSIZE(quant_type_row_size[src0_type].counts)) {
-                bucket_index = ARRAYSIZE(quant_type_row_size[src0_type].counts);
+            // update time per vec_dot_type and per src0_row_size for mul_mat
+            if (node->op == GGML_OP_MUL_MAT) {
+                const struct ggml_tensor * src0 = node->src[0];
+                const enum ggml_type src0_type = src0->type;
+                vec_dot_type_times[type_traits_cpu[src0_type].vec_dot_type] += tensor_t0;
+                quant_type_info *quant_type_info_data = &(quant_type_row_size[src0_type]);
+                uint64_t bucket_index = ggml_row_size(src0_type, src0->ne[0] /* ne00 */);
+                if (bucket_index > ARRAYSIZE(quant_type_info_data->counts)) {
+                    bucket_index = ARRAYSIZE(quant_type_info_data->counts);
+                }
+                quant_type_info_data->times[bucket_index - 1] += tensor_t0;
+                if (tensor_t0 > quant_type_info_data->times_max[bucket_index - 1]) {
+                    quant_type_info_data->times_max[bucket_index - 1] = tensor_t0;
+                }
+                if (tensor_t0 > quant_type_info_data->max_time) {
+                    quant_type_info_data->max_time = tensor_t0;
+                    quant_type_info_data->max_ne00 = (int32_t) src0->ne[0];
+                    quant_type_info_data->max_ne01 = (int32_t) src0->ne[1];
+                    const struct ggml_tensor * src1 = node->src[1];
+                    quant_type_info_data->max_ne10 = (int32_t) src1->ne[0];
+                    quant_type_info_data->max_ne11 = (int32_t) src1->ne[1];
+                }
             }
-            quant_type_row_size[src0_type].times[bucket_index - 1] += tensor_t0;
 #endif // GGML_B612
 
             if (cplan->abort_callback &&
