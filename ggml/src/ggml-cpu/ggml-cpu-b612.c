@@ -6312,6 +6312,7 @@ void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, 
 
 int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int64_t vec_dot_type_times[GGML_TYPE_COUNT] = {0};
+int64_t vec_dot_type_conversion_time[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 int openMP_compute_runs = 0;
@@ -6326,6 +6327,7 @@ typedef struct {
     int32_t counts[ROW_SIZE_BUCKETS];
     int64_t times[ROW_SIZE_BUCKETS];
     int64_t times_max[ROW_SIZE_BUCKETS];
+    int64_t conversion_from_float_times[ROW_SIZE_BUCKETS];
     int32_t max_ne00;
     int32_t max_ne01;
     int32_t max_ne10;
@@ -6394,7 +6396,7 @@ void ggml_backend_print_tensor_op_perf() {
     printf("Total NOP Tensors    %8d (skipped)\n\n", total_tensors - total_op_count);
 
     printf("vector dot matrix multiply type frequency\n");
-    printf("   Count     %%    Time(ms)      %%   vec_dot_type\n");
+    printf("   Count     %%    Time(ms)      %%   init_mat(ms) vec_dot_type\n");
 
     total_count = 0;
     total_percent = 0.;
@@ -6408,11 +6410,12 @@ void ggml_backend_print_tensor_op_perf() {
         if (vec_dot_type_counts[i]) {
             percent = (double)vec_dot_type_counts[i] * 100.f / (double)total_count;
             total_percent += percent;
-            printf("%8d   %5.2f  %8.2f %8.2f GGML_TYPE_%s\n",
+            printf("%8d   %5.2f  %8.2f %8.2f  %8.2f    GGML_TYPE_%s\n",
                    vec_dot_type_counts[i],
                    percent,
                    vec_dot_type_times[i] / 1000.0f,
                    (vec_dot_type_times[i] * 100.0) / total_time,
+                   vec_dot_type_conversion_time[i] / 1000.0f,
                    ggml_type_name(i));
         }
     }
@@ -6426,10 +6429,10 @@ void ggml_backend_print_tensor_op_perf() {
 
     for (int64_t i = 0; i < ARRAYSIZE(quant_type_row_size); i += 1) {
         if (quant_type_row_size[i].total_count) {
-            printf("vector row size count histogram for quant type %s\n",
+            printf("vector row size count histogram for quant type: %s\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%    Time(ms)   Max(us)\n");
+            printf("  Size   Count    %%    Time(ms)   Max(us) From_Float(ms)\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -6442,12 +6445,13 @@ void ggml_backend_print_tensor_op_perf() {
                     total_percent += percent;
                     weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
                     total_time += quant_type_row_size[i].times[j];
-                    printf("%6zd  %6d  %5.2f  %8.2f %9.2f\n",
+                    printf("%6zd  %6d  %5.2f  %8.2f %9.2f %8.2f\n",
                            j + 1,
                            quant_type_row_size[i].counts[j],
                            percent,
                            quant_type_row_size[i].times[j] / 1000.0,
-                           (double) quant_type_row_size[i].times_max[j]);
+                           (double) quant_type_row_size[i].times_max[j],
+                           quant_type_row_size[i].conversion_from_float_times[j] / 1000.0f);
                 }
             }
 
@@ -6456,7 +6460,7 @@ void ggml_backend_print_tensor_op_perf() {
                 total_time / 1000.0,
                 weighted_rowsize / total_count);
             printf("  Max entry: ne00 ne01 ne10 ne11  Time(us)\n");
-            printf("             %4d %4d %4d %4d %8.2f\n\n",
+            printf("             %4d %4d %4d %4d %9.2f\n\n",
                 quant_type_row_size[i].max_ne00,
                 quant_type_row_size[i].max_ne01,
                 quant_type_row_size[i].max_ne10,
@@ -11842,13 +11846,18 @@ UseGgmlGemm1:;
 #if !defined(GGML_B612)
     const bool init_mat = (vec_dot_type != src1->type);
 #else
-    // for ggml_vec_dot_f16_f32() - currently not compatibile
+    // for ggml_vec_dot_f16_f32() - currently not compatible
+    int64_t time_for_float_conversion = 0;
     const bool init_mat = (vec_dot_type != src1->type);
     // const bool init_mat = ((vec_dot_type != src1->type) && (vec_dot_type != GGML_TYPE_F16));
 #endif // GGML_B612
     
     if (init_mat) {
         char * wdata = params->wdata;
+
+#ifdef GGML_B612
+        time_for_float_conversion = ggml_time_us();
+#endif // GGML_B612
 
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
@@ -11875,6 +11884,11 @@ UseGgmlGemm1:;
                 }
             }
         }
+
+#ifdef GGML_B612
+        time_for_float_conversion = ggml_time_us() - time_for_float_conversion;
+        vec_dot_type_conversion_time[type_traits_cpu[type].vec_dot_type] += time_for_float_conversion;
+#endif // GGML_B612        
     }
 
     if (ith == 0) {
@@ -11915,18 +11929,19 @@ UseGgmlGemm2:;
     const int64_t nr1 = ne1 * ne2 * ne3;
 
 #if defined(GGML_B612)
+    uint64_t bucket_index = ggml_row_size(type, ne00);
     if (!ith) {
-        const enum ggml_type src0_type = src0->type;
-        size_t src0_row_size = ggml_row_size(src0_type, ne00);
-        uint64_t bucket_index = src0_row_size;
+        //const enum ggml_type src0_type = src0->type;
 
-        if (bucket_index > ARRAYSIZE(quant_type_row_size[src0_type].counts)) {
-            bucket_index = ARRAYSIZE(quant_type_row_size[src0_type].counts);
+        if (bucket_index > ARRAYSIZE(quant_type_row_size[type].counts)) {
+            bucket_index = ARRAYSIZE(quant_type_row_size[type].counts);
         }
 
-        quant_type_row_size[src0_type].total_count += 1;
-        quant_type_row_size[src0_type].counts[bucket_index - 1] += 1;
+        quant_type_row_size[type].total_count += 1;
+        quant_type_row_size[type].counts[bucket_index - 1] += 1;
     }
+
+    quant_type_row_size[type].conversion_from_float_times[bucket_index - 1] += time_for_float_conversion;
 #endif // GGML_B612
 
     // Now select a reasonable chunk size.
