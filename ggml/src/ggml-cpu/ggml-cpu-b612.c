@@ -6313,6 +6313,8 @@ void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, 
 int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int64_t vec_dot_type_times[GGML_TYPE_COUNT] = {0};
 int64_t vec_dot_type_conversion_time[GGML_TYPE_COUNT] = {0};
+int32_t vec_dot_src0_counts[GGML_TYPE_COUNT] = {0};
+int64_t vec_dot_src0_time[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 int openMP_compute_runs = 0;
@@ -6421,6 +6423,36 @@ void ggml_backend_print_tensor_op_perf() {
     }
 
     printf("\n%8d  %5.2f\n\n", total_count, total_percent);
+
+    printf("Vector Dot Matrix Multiply Src0 Type Frequency\n\n");
+    printf("          Total    Total  Tensor\n");
+    printf("   Count Time(sec)   %%   Time(ms) Tensor Op\n\n");
+
+    total_count = 0;
+    total_time = 0;
+    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_src0_counts); i += 1) {
+        total_count += vec_dot_src0_counts[i];
+        total_time += vec_dot_src0_time[i];
+    }
+
+    total_percent = 0.;
+    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_src0_counts); i += 1) {
+        if (vec_dot_src0_counts[i]) {
+            percent = (float)vec_dot_src0_time[i] * 100.f / (float)total_time;
+            total_percent += percent;
+            printf("%8ld %8.2f  %5.2f %8.2f GGML_TYPE_%s\n",
+                   vec_dot_src0_counts[i],
+                   (float)(vec_dot_src0_time[i]) / (1000. * 1000.),
+                   percent,
+                   (float)(vec_dot_src0_time[i]) / (1000. * (float)vec_dot_src0_counts[i]),
+                   ggml_type_name(i));
+        }
+    }
+
+    printf("\n%8d %8.2f %4.2f\n\n",
+           total_count,
+           (float)(total_time) / (1000. * 1000.),
+           total_percent);
 
     //
     // Scan through all the quant types looking for types that have a non-zero
@@ -11766,7 +11798,9 @@ static void ggml_compute_forward_mul_mat(
     }
 
 #ifdef GGML_B612
+    int64_t vec_dot_src0_t0 = 0;
     if (!ith) {
+        vec_dot_src0_t0 = ggml_time_us();
         vec_dot_type_counts[type_traits_cpu[type].vec_dot_type] += 1;
     }
 #endif // GGML_B612
@@ -11931,8 +11965,7 @@ UseGgmlGemm2:;
 #if defined(GGML_B612)
     uint64_t bucket_index = ggml_row_size(type, ne00);
     if (!ith) {
-        //const enum ggml_type src0_type = src0->type;
-
+        // type == src0->type
         if (bucket_index > ARRAYSIZE(quant_type_row_size[type].counts)) {
             bucket_index = ARRAYSIZE(quant_type_row_size[type].counts);
         }
@@ -12023,6 +12056,13 @@ UseGgmlGemm2:;
 
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+
+#ifdef GGML_B612
+    if (!ith) {
+        vec_dot_src0_counts[type] += 1;
+        vec_dot_src0_time[type] += ggml_time_us() - vec_dot_src0_t0;
+    }
+#endif // GGML_B612
 }
 
 // ggml_compute_forward_mul_mat_id
