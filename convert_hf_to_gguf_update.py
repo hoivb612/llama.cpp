@@ -126,6 +126,10 @@ def download_model(model):
 
     files = ["config.json", "tokenizer.json", "tokenizer_config.json"]
 
+    if name == "gpt-4o":
+        # Xenova/gpt-4o is tokenizer-only, it does not contain config.json
+        files = ["tokenizer.json", "tokenizer_config.json"]
+
     if tokt == TOKENIZER_TYPE.SPM:
         files.append("tokenizer.model")
 
