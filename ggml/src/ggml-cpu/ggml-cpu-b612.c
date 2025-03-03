@@ -11978,7 +11978,12 @@ UseGgmlGemm2:;
 #endif // GGML_B612
 
     // Now select a reasonable chunk size.
+#if !defined(GGML_B612)
     int chunk_size = 16;
+#else
+    // be a little brave and try something bolder
+    int chunk_size = min(128, nr0);
+#endif
 
     // We need to step up the size if it's small
     if (nr0 == 1 || nr1 == 1) {
@@ -12044,10 +12049,13 @@ UseGgmlGemm2:;
 
         // these checks are needed to avoid crossing dim1 boundaries
         // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
-        if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
-            num_rows_per_vec_dot = 1;
+        if (vec_dot_num_rows > 1) {
+            if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+                num_rows_per_vec_dot = 1;
+            }
         }
-
+        
+        // printf("%s: %d: ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", __func__, ith, ir0_start, ir0_end, ir1_start, ir1_end);
         ggml_compute_forward_mul_mat_one_chunk(params, dst, type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
@@ -18002,6 +18010,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             compute_op_time[node->op] += tensor_t0;
             // update time per vec_dot_type and per src0_row_size for mul_mat
             if (node->op == GGML_OP_MUL_MAT) {
+                // printf("=================================================\n");
                 const struct ggml_tensor * src0 = node->src[0];
                 const enum ggml_type src0_type = src0->type;
                 vec_dot_type_times[type_traits_cpu[src0_type].vec_dot_type] += tensor_t0;
