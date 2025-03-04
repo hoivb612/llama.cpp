@@ -1,7 +1,6 @@
 #pragma warning (disable:4267) //  conversion from 'size_t' to 'int' ...
 
 #include "xbapp.h"
-#include "b612-cpu.h"
 
 llama_context *ctx;
 llama_context_params ctx_params;
@@ -60,7 +59,7 @@ void llama_batch_add(struct llama_batch & batch, llama_token id, llama_pos pos, 
 }
 
 std::string pfx_file_path(std::string pfx) {
-#ifdef _WIN32    
+#ifdef _WIN32
 
     static std::hash<std::string> hasher;
     static std::string dir = "./llama_cache";
@@ -220,12 +219,6 @@ int slm_init(xbapp_params& xbparams) {
         // No pfc mode
         tokens_shared.clear();
     }
-
-#ifdef _WIN32
-	if (xbparams.process_affinity) {
-        ggml_b612::xb_set_optimal_process_affinity(xbparams.n_threads);
-    }
-#endif
 
     return 0;
 }

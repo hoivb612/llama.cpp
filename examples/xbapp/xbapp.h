@@ -64,6 +64,8 @@ struct xbapp_params {
     bool openmp                        = false; // true when openmp is present
     bool verbose_extra                 = false; // true for extra llama logging (i.e. debug messages)
     bool process_affinity              = false; // true if set process affinity is enabled
+    bool cpumask[32]                   = {false}; // for specifying custom CPU mask for process affinity
+    bool cpumask_present               = false; // default is false
 };
 
 

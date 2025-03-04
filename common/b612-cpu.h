@@ -2,7 +2,11 @@ namespace ggml_b612 {
 
 #if defined(_WIN32)
 
-#include <powrprof.h>
+//
+// This file contains common affinity, core parking, cache enumeration code. 
+//
+
+#include <powrprof.h> // UNDONE: powerprof.lib
 
 void xb_disable_core_parking(void)
 {
@@ -228,12 +232,9 @@ CPUInfo::CPUInfo() {
 }
 
 uint64_t l1d_cache_size = 48ull * 1024ull;
-const int32_t l1d_cache_sharing = 1;
 uint64_t l1i_cache_size = 32ull * 1024ull;
 uint64_t l2_cache_size = 1024ull * 1024ull;
-const int32_t l2_cache_sharing = 1;
 uint64_t l3_cache_size = 1024ull * 1024ull;
-const int32_t l3_cache_sharing = 1;
 
 typedef struct {
     uint64_t mask;
@@ -279,11 +280,11 @@ char * ggml_cache_type[4] = {
     "unified"
 };
 
-void
+uint64_t
 xb_set_process_affinity (
     uint32_t n_threads,
     uint64_t affinity_mask_requested,
-    bool verbose
+    bool verbose = false
     )
 {
 
@@ -347,7 +348,7 @@ xb_set_process_affinity (
         uint32_t edx;
     } cpu_info;
 
-    if (verbose) {        
+    if (verbose) {
         //
         // Get avx features for the current system.
         //
@@ -448,83 +449,72 @@ xb_set_process_affinity (
         }
 
         printf("\n");
+    }
 
-        //
-        // Get L1 instruction and data cache attributes.
-        //
-
-        __cpuid((int *)&cpu_info, 0x80000005);
-
-        //    printf("l1 d-cache line size %d\n", cpu_info.ecx & 0xff);
-        //    printf("l1 d-cache lines per tag %d\n", (cpu_info.ecx >> 8) & 0xff);
-        //    printf("l1 d-cache associativity %d\n", (cpu_info.ecx >> 16) & 0xff);
-
-        l1d_cache_size = ((cpu_info.ecx >> 24) & 0xff) * 1024ull;
-
-        //    printf("l1 i-cache line size %d\n", cpu_info.edx & 0xff);
-        //    printf("l1 i-cache lines per tag %d\n", (cpu_info.edx >> 8) & 0xff);
-        //    printf("l1 i-cache associativity %d\n", (cpu_info.edx >> 16) & 0xff);
-
-        l1i_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
-
-        __cpuidex((int *)&cpu_info, 0x8000001d, 0);
-
-        const int32_t l1d_cache_type = cpu_info.eax & 0x3;
-        const int32_t l1d_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
-        __cpuidex((int *)&cpu_info, 0x8000001d, 1);
-
-        const int32_t l1i_cache_type = cpu_info.eax & 0x3;
-        const int32_t l1i_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
+    //
+    // Get L1 instruction and data cache attributes.
+    //
+    __cpuid((int *)&cpu_info, 0x80000005);
+    if (verbose) {
+        printf("l1 d-cache line size %d\n", cpu_info.ecx & 0xff);
+        printf("l1 d-cache lines per tag %d\n", (cpu_info.ecx >> 8) & 0xff);
+        printf("l1 d-cache associativity %d\n", (cpu_info.ecx >> 16) & 0xff);
+    }
+    l1d_cache_size = ((cpu_info.ecx >> 24) & 0xff) * 1024ull;
+    if (verbose) {
+        printf("l1 i-cache line size %d\n", cpu_info.edx & 0xff);
+        printf("l1 i-cache lines per tag %d\n", (cpu_info.edx >> 8) & 0xff);
+        printf("l1 i-cache associativity %d\n", (cpu_info.edx >> 16) & 0xff);
+    }
+    l1i_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
+    __cpuidex((int *)&cpu_info, 0x8000001d, 0);
+    const int32_t l1d_cache_type = cpu_info.eax & 0x3;
+    const int32_t l1d_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+    __cpuidex((int *)&cpu_info, 0x8000001d, 1);
+    const int32_t l1i_cache_type = cpu_info.eax & 0x3;
+    const int32_t l1i_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+    if (verbose) {
         printf("l1 d-cache size %zdkb, type - %s, SMT sharing %d\n",
                l1d_cache_size / 1024,
                ggml_cache_type[l1d_cache_type],
                l1d_cache_sharing);
-
         printf("l1 i-cache size %zdkb, type - %s, SMT sharing %d\n",
                l1i_cache_size / 1024,
                ggml_cache_type[l1i_cache_type],
                l1i_cache_sharing);
-
-        //
-        // Get l2 cache information.
-        //
-
-        __cpuid((int *)&cpu_info, 0x80000006);
-
-        l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
-
-        __cpuidex((int *)&cpu_info, 0x8000001d, 2);
-
-        const int32_t l2_cache_type = cpu_info.eax & 0x3;
-        const int32_t l2_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
+    }
+    //
+    // Get l2 cache information.
+    //
+    __cpuid((int *)&cpu_info, 0x80000006);
+    l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
+    __cpuidex((int *)&cpu_info, 0x8000001d, 2);
+    const int32_t l2_cache_type = cpu_info.eax & 0x3;
+    const int32_t l2_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+    if (verbose) {
         printf("l2 cache size %zdkb, type - %s. SMT sharing %d\n",
                l2_cache_size / 1024,
                ggml_cache_type[l2_cache_type],
                l2_cache_sharing);
-    
-        //
-        // Get l3 cache information.
-        //
-
-        __cpuidex((int *)&cpu_info, 0x8000001d, 3);
-
-        uint32_t line_size = (cpu_info.ebx & 0xfff) + 1;
-        uint32_t partitions = ((cpu_info.ebx >> 12) & 0x3ff) + 1;
-        uint32_t associativity = ((cpu_info.ebx >> 22) & 0x3ff) + 1;
-        uint32_t sets = cpu_info.ecx + 1;
-
-        //    printf("l3 line size %d\n", line_size);
-        //    printf("l3 partitions %d\n", partitions);
-        //    printf("l3 associativity %d\n", associativity);
-        //    printf("l3 sets %d\n", sets);
-
-        l3_cache_size = line_size * partitions * associativity * sets;
-        const int32_t l3_cache_type = cpu_info.eax & 0x3;
-        const int32_t l3_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
-
+    }
+    //
+    // Get l3 cache information.
+    //
+    __cpuidex((int *)&cpu_info, 0x8000001d, 3);
+    uint32_t line_size = (cpu_info.ebx & 0xfff) + 1;
+    uint32_t partitions = ((cpu_info.ebx >> 12) & 0x3ff) + 1;
+    uint32_t associativity = ((cpu_info.ebx >> 22) & 0x3ff) + 1;
+    uint32_t sets = cpu_info.ecx + 1;
+    if (verbose) {
+        printf("l3 line size %d\n", line_size);
+        printf("l3 partitions %d\n", partitions);
+        printf("l3 associativity %d\n", associativity);
+        printf("l3 sets %d\n", sets);
+    }
+    l3_cache_size = line_size * partitions * associativity * sets;
+    const int32_t l3_cache_type = cpu_info.eax & 0x3;
+    const int32_t l3_cache_sharing = ((cpu_info.eax >> 14) & 0xfff) + 1;
+    if (verbose) {
         printf("l3 cache size %zdmb, type - %s, SMT sharing %d\n\n",
                l3_cache_size / (1024 * 1024),
                ggml_cache_type[l3_cache_type],
@@ -560,11 +550,11 @@ xb_set_process_affinity (
         total_l3_cache *= (float)(maximum_logical / l3_cache_sharing);
         total_l3_cache /= (1024.f * 1024.f);
         printf("total l3 cache %6.1fmb\n\n", total_l3_cache);
-    }
 
         printf("n_threads specified %d\n", n_threads);
         printf("logical processors per core %d\n", logical_per_core);
         printf("maximum logical processors %d\n", maximum_logical);
+    }
 
     //
     // Check the logical processors per core.
@@ -574,7 +564,7 @@ xb_set_process_affinity (
         if (verbose) {
             printf("bypassing set process affinity - not SMT system\n");
         }
-        return;
+        return 0;
     }
 
     //
@@ -586,7 +576,7 @@ xb_set_process_affinity (
         if (verbose) {
             printf("bypassing set process affinity - number threads odd or gt maximum logical / 2\n");
         }
-        return;
+        return 0;
     }
 
     //
@@ -601,12 +591,12 @@ xb_set_process_affinity (
         printf("GetProcessGroupAffinity succeeded with %d groups\n", group_count);
         if (group_count != 1) {
             printf("bypassing set affinity process because group count is greater than one\n");
-            return;
+            return 0;
         }
 
     } else {
         printf("GetProcessGroupAffinity failed\n");
-        return;
+        return 0;
     }
 #endif // #if 0
 
@@ -668,10 +658,10 @@ xb_set_process_affinity (
         printf("failed to set process affinity mask\n");
     }
 
-    return;
+    return affinity_mask;
 }
 
-void
+uint64_t
 xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
     //
     // This routine selects the most optimal affinity mask based
@@ -680,7 +670,9 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
     //
 
     bool AMD_Ryzen_HX_370 = false;
-    bool AMD_Ryzen_PRO_395 = false;        
+    bool AMD_Ryzen_PRO_395 = false;
+    bool AMD_Ryzen_7_350 = false;
+    bool AMD_Ryzen_9_9950X = false;
     ggml_b612::CPUInfo cpuInfo;
 
     if (verbose) {
@@ -692,18 +684,20 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
     }
 
     if (cpuInfo.vendor().find("AMD") != std::string::npos) {
+        if (verbose) {
+            printf("%s: Detected [%s]\n", __func__, cpuInfo.model().c_str());
+        }
         if (cpuInfo.model().find("AMD Ryzen AI 9 HX 370") != std::string::npos) {
-            if (verbose) {
-                printf("%s: Detected AMD Ryzen HX 370\n", __func__);
-            }
             AMD_Ryzen_HX_370 = true;
         } else if (cpuInfo.model().find("AMD RYZEN AI MAX+ PRO 395") != std::string::npos) {
-            if (verbose) {
-                printf("%s: Detected AMD Ryzen PRO 395\n", __func__);
-            }
             AMD_Ryzen_PRO_395 = true;
+        } else if (cpuInfo.model().find("AMD Ryzen AI 7 350") != std::string::npos) {
+            AMD_Ryzen_7_350 = true;
+        } else if (cpuInfo.model().find("AMD Ryzen 9 9950X") != std::string::npos) {
+            AMD_Ryzen_9_9950X = true;
         }
     }
+
     // setup affinity mask for all threads
     int64_t affinity_mask = 0;        
     // For uneven systems leverage the Classic cores 
@@ -711,37 +705,45 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
     // then use the cores crossing the two CCDs (yes!)
     switch (n_threads) {
         case 2:
-            if (AMD_Ryzen_HX_370) {
+            if (AMD_Ryzen_HX_370 ||
+                AMD_Ryzen_7_350) {
                 // use perf cores as available
                 affinity_mask = 0x00000Aul;
-            } else if (AMD_Ryzen_PRO_395) {
+            } else if (AMD_Ryzen_PRO_395 ||
+                       AMD_Ryzen_9_9950X) {
                 // use the middle cores spannning across the CPU
                 affinity_mask = 0x00018000uL;
             }
             break;
         case 4: 
-            if (AMD_Ryzen_HX_370) {
+            if (AMD_Ryzen_HX_370 ||
+                AMD_Ryzen_7_350) {
                 // use perf cores as available
                 affinity_mask = 0x0000AAul;
-            } else if (AMD_Ryzen_PRO_395) {
+            } else if (AMD_Ryzen_PRO_395 ||
+                       AMD_Ryzen_9_9950X) {
                 // use the middle cores spannning across the CPU
                 affinity_mask = 0x000AA000uL;
             }
             break;
         case 6: 
-            if (AMD_Ryzen_HX_370) {
+            if (AMD_Ryzen_HX_370 ||
+                AMD_Ryzen_7_350) {
                 // use perf cores as available
                 affinity_mask = 0x000AAAul;
-            } else if (AMD_Ryzen_PRO_395) {
+            } else if (AMD_Ryzen_PRO_395 ||
+                       AMD_Ryzen_9_9950X) {
                 // use the middle cores spannning across the CPU
                 affinity_mask = 0x004AA400uL;
             }
             break;
         case 8: 
-            if (AMD_Ryzen_HX_370) {
+            if (AMD_Ryzen_HX_370 ||
+                AMD_Ryzen_7_350) {
                 // use perf cores as available
                 affinity_mask = 0x00AAAAul;
-            } else if (AMD_Ryzen_PRO_395) {
+            } else if (AMD_Ryzen_PRO_395 ||
+                       AMD_Ryzen_9_9950X) {
                 // use the middle cores spannning across the CPU
                 affinity_mask = 0x00AAAA00uL;
             }
@@ -750,7 +752,8 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
             if (AMD_Ryzen_HX_370) {
                 // use perf cores as available
                 affinity_mask = 0x0AAAAAul;
-            } else if (AMD_Ryzen_PRO_395) {
+            } else if (AMD_Ryzen_PRO_395 ||
+                       AMD_Ryzen_9_9950X) {
                 // use the middle cores spannning across the CPU
                 affinity_mask = 0x02AAAA80uL;
             }
@@ -759,17 +762,15 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
             if (AMD_Ryzen_HX_370) {
                 // use perf cores as available
                 affinity_mask = 0xAAAAAAul;
-            } else if (AMD_Ryzen_PRO_395) {
+            } else if (AMD_Ryzen_PRO_395 ||
+                       AMD_Ryzen_9_9950X) {
                 // use the middle cores spannning across the CPU
                 affinity_mask = 0x0AAAAAA0uL;
             }
             break;
         case 16: 
-            if (AMD_Ryzen_HX_370) {
-                // use perf cores as available
-                affinity_mask = 0xAAAAAAul;
-            } else if (AMD_Ryzen_PRO_395) {
-                // use the middle cores spannning across the CPU
+            if (AMD_Ryzen_PRO_395 ||
+                AMD_Ryzen_9_9950X) {
                 affinity_mask = 0xAAAAAAAAuL;
             }
             break;
@@ -777,13 +778,15 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
             break;
     }
 
-    xb_set_process_affinity(n_threads, affinity_mask, verbose);
+    xb_set_process_affinity(n_threads, affinity_mask);
+    return(affinity_mask);
 }
 
 #else
 
-void
-xb_set_optimal_process_affinity(uint32_t n_threads) {
+uint64_t
+xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
+    return 0;
 }
 
 #endif // _WIN32

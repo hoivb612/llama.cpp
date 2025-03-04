@@ -171,10 +171,6 @@ struct cmd_params {
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
-#if defined(GGML_B612)
-    std::vector<int>                 n_threads_prompt;
-    std::vector<int>                 n_threads_gen;
-#endif
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
@@ -189,19 +185,24 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     ggml_numa_strategy               numa;
     int                              reps;
-#if defined(GGML_B612)
-    bool                             process_affinity;
-#endif
     ggml_sched_priority              prio;
     int                              delay;
     bool                             verbose;
     bool                             progress;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+#if defined(GGML_B612)
+    std::vector<int>                 n_threads_prompt;
+    std::vector<int>                 n_threads_gen;
+    bool                             process_affinity;
+    bool warmup_run;
+    bool cpumask[GGML_MAX_N_THREADS];
+    bool cpumask_present;
+#endif // GGML_B612
 };
 
 static const cmd_params cmd_params_defaults = {
-    /* model                */ { "models/7B/ggml-model-q4_0.gguf" },
+    /* model                */ {"models/Phi-3.bin"},
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -210,14 +211,10 @@ static const cmd_params cmd_params_defaults = {
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { cpu_get_num_math() },
-#if defined(GGML_B612)
-    /* n_threads_prompt     */ {0},
-    /* n_threads_gen        */ {0},
-#endif
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
-    /* n_gpu_layers         */ { 99 },
+    /* n_gpu_layers         */ { 0 },
     /* rpc_servers          */ { "" },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
@@ -228,15 +225,20 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
-#if defined(GGML_B612)
-    /* process_affinity     */ false,
-#endif
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
     /* delay                */ 0,
     /* verbose              */ false,
     /* progress             */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+#if defined(GGML_B612)
+    /* n_threads_prompt     */ {0},
+    /* n_threads_gen        */ {0},
+    /* process_affinity     */ false,
+    /* warmup_run           */ false,
+    /* cpumask              */ {false},
+    /* cpumask_present      */ false,
+#endif // GGML_B612
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -293,7 +295,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -oe, --output-err <csv|json|jsonl|md|sql> (default: %s)\n",
            output_format_str(cmd_params_defaults.output_format_stderr));
 #if defined(GGML_B612)
-    printf("  -affin, --process_affinity                (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
+    printf("  -paffin, --process_affinity               (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
+    printf("  -warm, --warmup_run                       (default: %s)\n", cmd_params_defaults.warmup_run ? "1" : "0");
 #endif
     printf("  -v, --verbose                             (default: %s)\n", cmd_params_defaults.verbose ? "1" : "0");
     printf("  --progress                                (default: %s)\n", cmd_params_defaults.progress ? "1" : "0");
@@ -343,13 +346,16 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
-#if defined(GGML_B612)
-    params.process_affinity     = cmd_params_defaults.process_affinity;
-#endif // GGML_B612
     params.numa                 = cmd_params_defaults.numa;
     params.prio                 = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
+#if defined(GGML_B612)
+    params.process_affinity     = cmd_params_defaults.process_affinity;
+    params.warmup_run           = cmd_params_defaults.warmup_run;
+    params.cpumask_present      = cmd_params_defaults.cpumask_present;
+    memset(&params.cpumask, 0, sizeof(params.cpumask));
+#endif // GGML_B612
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -411,7 +417,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
-            auto                   p = string_split<std::string>(argv[i], split_delim);
+            auto p = string_split<std::string>(argv[i], split_delim);
             std::vector<ggml_type> types;
             for (const auto & t : p) {
                 ggml_type gt = ggml_type_from_name(t);
@@ -430,7 +436,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
-            auto                   p = string_split<std::string>(argv[i], split_delim);
+            auto p = string_split<std::string>(argv[i], split_delim);
             std::vector<ggml_type> types;
             for (const auto & t : p) {
                 ggml_type gt = ggml_type_from_name(t);
@@ -451,23 +457,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             }
             auto p = string_split<int>(argv[i], split_delim);
             params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
-#if defined(GGML_B612)
-        } else if (arg == "-tp" || arg == "--threads-prompt") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            auto p = string_split<int>(argv[i], split_delim);
-            params.n_threads_prompt.insert(params.n_threads_prompt.end(), p.begin(), p.end());
-        } else if (arg == "-tg" || arg == "--threads-gen") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            auto p = string_split<int>(argv[i], split_delim);
-            params.n_threads_gen.insert(params.n_threads_gen.end(), p.begin(), p.end());
-#endif // GGML_B612
-        } else if (arg == "-C" || arg == "--cpu-mask") {
+        } else if (arg == "-Cm" || arg == "--cpu-mask") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
@@ -634,7 +624,35 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 #if defined(GGML_B612)
         } else if (arg == "-paffin" || arg == "--process-affinity") {
             params.process_affinity = true;
-#endif
+        } else if (arg == "-tp" || arg == "--threads-prompt") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.n_threads_prompt.insert(params.n_threads_prompt.end(), p.begin(), p.end());
+        } else if (arg == "-tg" || arg == "--threads-gen") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.n_threads_gen.insert(params.n_threads_gen.end(), p.begin(), p.end());
+        } else if (arg == "-warm" || arg == "--warmup_run") {
+            params.warmup_run = true;
+        } else if (arg == "-C" || arg == "--cpu-mask") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            if (!parse_cpu_mask(argv[i], params.cpumask)) {
+                fprintf(stderr, "error: failed to parse CPU mask: '%s'\n", argv[i]);
+                invalid_param = true;
+                break;
+            } else {
+                params.cpumask_present = true;
+            }
+#endif // GGML_B612
         } else if (arg == "--progress") {
             params.progress = true;
         } else {
@@ -734,7 +752,7 @@ struct cmd_params_instance {
 #if defined(GGML_B612)
     int                n_threads_prompt;
     int                n_threads_gen;
-#endif    
+#endif
     std::string        cpu_mask;
     bool               cpu_strict;
     int                poll;
@@ -1596,6 +1614,18 @@ int main(int argc, char ** argv) {
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
+    int64_t cpu_affinity_mask = 0;
+    int32_t cpu_core_count_from_cpumask = 0;
+    if (params.cpumask_present) {
+        for (int i = 0; i < 32; i++) {
+            if (params.cpumask[i]) {
+                cpu_core_count_from_cpumask++;
+                cpu_affinity_mask |= 1ull << i;
+            }
+        }
+        printf("CPU affinity mask = [%016llX] - core count = [%d]\n", cpu_affinity_mask, cpu_core_count_from_cpumask);
+    }
+
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
@@ -1655,21 +1685,56 @@ int main(int argc, char ** argv) {
 
         llama_attach_threadpool(ctx, threadpool, NULL);
 
+        // setup for warmup run if asked to do so (params.warmup_run == true)
+        bool warmup_already = params.warmup_run ? false : true;
+        // if either process_affinity or cpumask_present are true then enable warmup run
+        if (params.process_affinity || params.cpumask_present) {
+            warmup_already = false;
+        }
+
         // warmup run
         if (t.n_prompt > 0) {
-            if (params.progress) {
-                fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup prompt run\n", params_idx, params_count);
+            if (!warmup_already) {
+                if (params.progress) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup prompt run\n", params_idx, params_count);
+                }
+
+                if (params.cpumask_present && (cpu_core_count_from_cpumask >= t.n_threads_prompt)) {
+                    cpu_affinity_mask = ggml_b612::xb_set_process_affinity(t.n_threads_prompt, cpu_affinity_mask);
+                    printf("Set process affinity w/ cpuMask %016llX\n", cpu_affinity_mask);
+                } else if (params.process_affinity) {
+                    cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(t.n_threads_prompt);
+                    printf("Set process affinity w/ n_threads %016llX\n", cpu_affinity_mask);
+                }
+                warmup_already = true;
             }
+
+            // for printer.print_test() to print the correct thread count
+            t.n_threads = t.n_threads_prompt;
 
             //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-            test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+            test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads_prompt);
         }
         if (t.n_gen > 0) {
-            if (params.progress) {
-                fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup generation run\n", params_idx, params_count);
+            if (!warmup_already) {
+                if (params.progress) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup generation run\n", params_idx, params_count);
+                }
+
+                if (params.cpumask_present && (cpu_core_count_from_cpumask >= t.n_threads_gen)) {
+                    cpu_affinity_mask = ggml_b612::xb_set_process_affinity(t.n_threads_gen, cpu_affinity_mask);
+                    printf("Set process affinity w/ cpuMask %016llX\n", cpu_affinity_mask);
+                } else if (params.process_affinity) {
+                    cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(t.n_threads_gen);
+                    printf("Set process affinity w/ n_threads %016llX\n", cpu_affinity_mask);
+                }
+                warmup_already = true;
             }
 
-            test_gen(ctx, 1, t.n_threads);
+            // for printer.print_test() to print the correct thread count
+            t.n_threads = t.n_threads_gen;
+
+            test_gen(ctx, 1, t.n_threads_gen);
         }
 
         for (int i = 0; i < params.reps; i++) {
@@ -1682,14 +1747,6 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%ld: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-#if defined(GGML_B612)
-                if (params.process_affinity) {
-                    ggml_b612::xb_set_optimal_process_affinity(t.n_threads_prompt);
-                }
-
-                // for printer.print_test() to print the correct thread count
-                t.n_threads = t.n_threads_prompt;
-#endif
                 test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
             }
             if (t.n_gen > 0) {
@@ -1697,14 +1754,6 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%ld: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-#if defined(GGML_B612)
-                if (params.process_affinity) {
-                    ggml_b612::xb_set_optimal_process_affinity(t.n_threads_gen);
-                }
-
-                // for printer.print_test() to print the correct thread count
-                t.n_threads = t.n_threads_gen;
-#endif
                 test_gen(ctx, t.n_gen, t.n_threads);
             }
 
