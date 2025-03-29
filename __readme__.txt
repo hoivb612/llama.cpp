@@ -1,3 +1,20 @@
+===== Branch hv/b612_dc_120624 =====
+
+commit ba816402f1d6c160ffa6fe883d89aa66aa3c7705
+Merge: c1cdf909 c5ede384
+Author: Hoi Vo <hoiv@microsoft.com>
+Date:   Fri Dec 6 17:10:48 2024 -0800
+
+    Merge remote-tracking branch 'origin/master' into hv/b612
+
+commit c5ede3849fc021174862f9c0bf8273808d8f0d39 (master)
+Author: Georgi Gerganov <ggerganov@gmail.com>
+Date:   Fri Dec 6 21:33:15 2024 +0200
+
+    convert : add custom attention mapping
+
+=================================================================
+
 Offspring for hoivb612
 https://github.com/hoivb612/llama.cpp
 
