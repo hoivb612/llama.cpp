@@ -1,7 +1,7 @@
 #include "common.hpp"
 #include "element_wise.hpp"
 
-void acc_f32(const float * x, const float * y, float * dst, const int ne,
+static void acc_f32(const float * x, const float * y, float * dst, const int ne,
     const int ne10, const int ne11, const int ne12,
     const int nb1, const int nb2, int offset, const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
@@ -20,7 +20,7 @@ void acc_f32(const float * x, const float * y, float * dst, const int ne,
     }
 }
 
-void gelu_f32(const float * x, float * dst, const int k,
+static void gelu_f32(const float * x, float * dst, const int k,
                      const sycl::nd_item<3> &item_ct1) {
     const float GELU_COEF_A    = 0.044715f;
     const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
@@ -37,7 +37,7 @@ void gelu_f32(const float * x, float * dst, const int k,
               sycl::tanh(SQRT_2_OVER_PI * xi * (1.0f + GELU_COEF_A * xi * xi)));
 }
 
-void silu_f32(const float * x, float * dst, const int k,
+static void silu_f32(const float * x, float * dst, const int k,
                      const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -48,7 +48,7 @@ void silu_f32(const float * x, float * dst, const int k,
     dst[i] = x[i] / (1.0f + sycl::native::exp(-x[i]));
 }
 
-void gelu_quick_f32(const float *x, float *dst, int k,
+static void gelu_quick_f32(const float *x, float *dst, int k,
                            const sycl::nd_item<3> &item_ct1) {
     const float GELU_QUICK_COEF = -1.702f;
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
@@ -59,7 +59,7 @@ void gelu_quick_f32(const float *x, float *dst, int k,
     dst[i] = x[i] * (1.0f / (1.0f + sycl::native::exp(GELU_QUICK_COEF * x[i])));
 }
 
-void tanh_f32(const float *x, float *dst, int k,
+static void tanh_f32(const float *x, float *dst, int k,
                      const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -69,7 +69,7 @@ void tanh_f32(const float *x, float *dst, int k,
     dst[i] = sycl::tanh((float)(x[i]));
 }
 
-void relu_f32(const float * x, float * dst, const int k,
+static void relu_f32(const float * x, float * dst, const int k,
                      const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -80,7 +80,7 @@ void relu_f32(const float * x, float * dst, const int k,
     dst[i] = sycl::fmax((float)(x[i]), (float)0);
 }
 
-void sigmoid_f32(const float * x, float * dst, const int k,
+static void sigmoid_f32(const float * x, float * dst, const int k,
                             const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -91,7 +91,7 @@ void sigmoid_f32(const float * x, float * dst, const int k,
     dst[i] = 1.0f / (1.0f + sycl::native::exp(-x[i]));
 }
 
-void sqrt_f32(const float * x, float * dst, const int k,
+static void sqrt_f32(const float * x, float * dst, const int k,
                             const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -102,7 +102,7 @@ void sqrt_f32(const float * x, float * dst, const int k,
     dst[i] = sycl::sqrt(x[i]);
 }
 
-void sin_f32(const float * x, float * dst, const int k,
+static void sin_f32(const float * x, float * dst, const int k,
                             const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -113,7 +113,7 @@ void sin_f32(const float * x, float * dst, const int k,
     dst[i] = sycl::sin(x[i]);
 }
 
-void cos_f32(const float * x, float * dst, const int k,
+static void cos_f32(const float * x, float * dst, const int k,
                             const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -124,7 +124,7 @@ void cos_f32(const float * x, float * dst, const int k,
     dst[i] = sycl::cos(x[i]);
 }
 
-void hardsigmoid_f32(const float * x, float * dst, const int k,
+static void hardsigmoid_f32(const float * x, float * dst, const int k,
                             const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -135,7 +135,7 @@ void hardsigmoid_f32(const float * x, float * dst, const int k,
     dst[i] = sycl::fmin(1.0f, sycl::fmax(0.0f, (x[i] + 3.0f) / 6.0f));
 }
 
-void hardswish_f32(const float * x, float * dst, const int k,
+static void hardswish_f32(const float * x, float * dst, const int k,
                           const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -146,7 +146,7 @@ void hardswish_f32(const float * x, float * dst, const int k,
     dst[i] = x[i] * sycl::fmin(1.0f, sycl::fmax(0.0f, (x[i] + 3.0f) / 6.0f));
 }
 
-void exp_f32(const float * x, float * dst, const int k,
+static void exp_f32(const float * x, float * dst, const int k,
                           const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -157,7 +157,7 @@ void exp_f32(const float * x, float * dst, const int k,
     dst[i] = sycl::exp(x[i]);
 }
 
-void log_f32(const float * x, float * dst, const int k,
+static void log_f32(const float * x, float * dst, const int k,
                           const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -173,7 +173,7 @@ void log_f32(const float * x, float * dst, const int k,
     }
 }
 
-void neg_f32(const float * x, float * dst, const int k,
+static void neg_f32(const float * x, float * dst, const int k,
                           const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -184,7 +184,7 @@ void neg_f32(const float * x, float * dst, const int k,
     dst[i] = -x[i];
 }
 
-void step_f32(const float * x, float * dst, const int k,
+static void step_f32(const float * x, float * dst, const int k,
                           const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -195,7 +195,7 @@ void step_f32(const float * x, float * dst, const int k,
     dst[i] = x[i] > 0.0f;
 }
 
-void leaky_relu_f32(const float *x, float *dst, const int k, const float negative_slope,
+static void leaky_relu_f32(const float *x, float *dst, const int k, const float negative_slope,
                            const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -206,7 +206,7 @@ void leaky_relu_f32(const float *x, float *dst, const int k, const float negativ
              sycl::fmin((float)(x[i]), 0.0f) * negative_slope;
 }
 
-void sqr_f32(const float * x, float * dst, const int k,
+static void sqr_f32(const float * x, float * dst, const int k,
                     const sycl::nd_item<3> &item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
                   item_ct1.get_local_id(2);
@@ -217,7 +217,7 @@ void sqr_f32(const float * x, float * dst, const int k,
     dst[i] = x[i] * x[i];
 }
 
-void upscale_f32(const float  *x, float *dst, const int nb00, const int nb01,
+static void upscale_f32(const float  *x, float *dst, const int nb00, const int nb01,
                         const int nb02, const int nb03, const int ne10, const int ne11,
                         const int ne12, const int ne13, const float sf0, const float sf1,
                         const float sf2, const float sf3, const sycl::nd_item<1> &item_ct1) {
@@ -237,10 +237,10 @@ void upscale_f32(const float  *x, float *dst, const int nb00, const int nb01,
     int i02 = i12 / sf2;
     int i03 = i13 / sf3;
 
-    dst[index] = *(float *)((char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00);
+    dst[index] = *(const float *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00);
 }
 
-void pad_f32(const float  *x, float *dst, const int ne0, const int ne00, const int ne01, const int ne02,
+static void pad_f32(const float  *x, float *dst, const int ne0, const int ne00, const int ne01, const int ne02,
                     const sycl::nd_item<3> &item_ct1) {
     int nidx = item_ct1.get_local_id(2) +
                item_ct1.get_group(2) * item_ct1.get_local_range(2);
@@ -251,8 +251,7 @@ void pad_f32(const float  *x, float *dst, const int ne0, const int ne00, const i
     // operation
     int offset_dst = nidx + item_ct1.get_group(1) * ne0 +
                      item_ct1.get_group(0) * ne0 * item_ct1.get_group_range(1);
-    if (nidx < ne00 && item_ct1.get_group(1) < ne01 &&
-        item_ct1.get_group(0) < ne02) {
+    if (nidx < ne00 && item_ct1.get_group(1) < (size_t) ne01 && item_ct1.get_group(0) < (size_t) ne02) {
         int offset_src = nidx + item_ct1.get_group(1) * ne00 +
                          item_ct1.get_group(0) * ne00 * ne01;
             dst[offset_dst] = x[offset_src];
@@ -263,7 +262,7 @@ void pad_f32(const float  *x, float *dst, const int ne0, const int ne00, const i
 
 
 
-void acc_f32_sycl(const float *x, const float *y, float *dst,
+static void acc_f32_sycl(const float *x, const float *y, float *dst,
                          const int n_elements, const int ne10, const int ne11,
                          const int ne12, const int nb1, const int nb2,
                          const int offset, queue_ptr stream) {
@@ -278,7 +277,7 @@ void acc_f32_sycl(const float *x, const float *y, float *dst,
         });
 }
 
-void gelu_f32_sycl(const float *x, float *dst, const int k,
+static void gelu_f32_sycl(const float *x, float *dst, const int k,
                           queue_ptr stream) {
     const int num_blocks = (k + SYCL_GELU_BLOCK_SIZE - 1) / SYCL_GELU_BLOCK_SIZE;
     stream->parallel_for(
@@ -290,7 +289,7 @@ void gelu_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void silu_f32_sycl(const float *x, float *dst, const int k,
+static void silu_f32_sycl(const float *x, float *dst, const int k,
                           queue_ptr stream) {
     const int num_blocks = (k + SYCL_SILU_BLOCK_SIZE - 1) / SYCL_SILU_BLOCK_SIZE;
     stream->parallel_for(
@@ -302,7 +301,7 @@ void silu_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void gelu_quick_f32_sycl(const float *x, float *dst, const int k,
+static void gelu_quick_f32_sycl(const float *x, float *dst, const int k,
                                 queue_ptr stream) {
     const int num_blocks = (k + SYCL_GELU_BLOCK_SIZE - 1) / SYCL_GELU_BLOCK_SIZE;
     stream->parallel_for(
@@ -314,7 +313,7 @@ void gelu_quick_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void tanh_f32_sycl(const float *x, float *dst, const int k,
+static void tanh_f32_sycl(const float *x, float *dst, const int k,
                           queue_ptr stream) {
     const int num_blocks = (k + SYCL_TANH_BLOCK_SIZE - 1) / SYCL_TANH_BLOCK_SIZE;
     stream->parallel_for(
@@ -326,7 +325,7 @@ void tanh_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void relu_f32_sycl(const float *x, float *dst, const int k,
+static void relu_f32_sycl(const float *x, float *dst, const int k,
                           queue_ptr stream) {
     const int num_blocks = (k + SYCL_RELU_BLOCK_SIZE - 1) / SYCL_RELU_BLOCK_SIZE;
     stream->parallel_for(
@@ -338,7 +337,7 @@ void relu_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void hardsigmoid_f32_sycl(const float *x, float *dst, const int k,
+static void hardsigmoid_f32_sycl(const float *x, float *dst, const int k,
                                  queue_ptr stream) {
     const int num_blocks = (k + SYCL_HARDSIGMOID_BLOCK_SIZE - 1) / SYCL_HARDSIGMOID_BLOCK_SIZE;
     stream->parallel_for(
@@ -350,7 +349,7 @@ void hardsigmoid_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void hardswish_f32_sycl(const float *x, float *dst, const int k,
+static void hardswish_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_HARDSWISH_BLOCK_SIZE - 1) / SYCL_HARDSWISH_BLOCK_SIZE;
     stream->parallel_for(
@@ -362,7 +361,7 @@ void hardswish_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void exp_f32_sycl(const float *x, float *dst, const int k,
+static void exp_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_EXP_BLOCK_SIZE - 1) / SYCL_EXP_BLOCK_SIZE;
     stream->parallel_for(
@@ -374,7 +373,7 @@ void exp_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void log_f32_sycl(const float *x, float *dst, const int k,
+static void log_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_EXP_BLOCK_SIZE - 1) / SYCL_EXP_BLOCK_SIZE;
     stream->parallel_for(
@@ -386,7 +385,7 @@ void log_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void neg_f32_sycl(const float *x, float *dst, const int k,
+static void neg_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_NEG_BLOCK_SIZE - 1) / SYCL_NEG_BLOCK_SIZE;
     stream->parallel_for(
@@ -398,7 +397,7 @@ void neg_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void step_f32_sycl(const float *x, float *dst, const int k,
+static void step_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_NEG_BLOCK_SIZE - 1) / SYCL_NEG_BLOCK_SIZE;
     stream->parallel_for(
@@ -410,7 +409,7 @@ void step_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void sigmoid_f32_sycl(const float *x, float *dst, const int k,
+static void sigmoid_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_SIGMOID_BLOCK_SIZE - 1) / SYCL_SIGMOID_BLOCK_SIZE;
     stream->parallel_for(
@@ -422,7 +421,7 @@ void sigmoid_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void sqrt_f32_sycl(const float *x, float *dst, const int k,
+static void sqrt_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_SQRT_BLOCK_SIZE - 1) / SYCL_SQRT_BLOCK_SIZE;
     stream->parallel_for(
@@ -434,7 +433,7 @@ void sqrt_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void sin_f32_sycl(const float *x, float *dst, const int k,
+static void sin_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_SIN_BLOCK_SIZE - 1) / SYCL_SIN_BLOCK_SIZE;
     stream->parallel_for(
@@ -446,7 +445,7 @@ void sin_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void cos_f32_sycl(const float *x, float *dst, const int k,
+static void cos_f32_sycl(const float *x, float *dst, const int k,
                                queue_ptr stream) {
     const int num_blocks = (k + SYCL_SIN_BLOCK_SIZE - 1) / SYCL_SIN_BLOCK_SIZE;
     stream->parallel_for(
@@ -458,7 +457,7 @@ void cos_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void leaky_relu_f32_sycl(const float *x, float *dst, const int k,
+static void leaky_relu_f32_sycl(const float *x, float *dst, const int k,
                                 const float negative_slope,
                                 queue_ptr stream) {
     const int num_blocks = (k + SYCL_RELU_BLOCK_SIZE - 1) / SYCL_RELU_BLOCK_SIZE;
@@ -471,7 +470,7 @@ void leaky_relu_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void sqr_f32_sycl(const float *x, float *dst, const int k,
+static void sqr_f32_sycl(const float *x, float *dst, const int k,
                          queue_ptr stream) {
     const int num_blocks = (k + SYCL_SQR_BLOCK_SIZE - 1) / SYCL_SQR_BLOCK_SIZE;
     stream->parallel_for(
@@ -483,7 +482,7 @@ void sqr_f32_sycl(const float *x, float *dst, const int k,
         });
 }
 
-void upscale_f32_sycl(const float *x, float *dst, const int nb00, const int nb01,
+static void upscale_f32_sycl(const float *x, float *dst, const int nb00, const int nb01,
                              const int nb02, const int nb03, const int ne10, const int ne11,
                              const int ne12, const int ne13, const float sf0, const float sf1,
                              const float sf2, const float sf3, queue_ptr stream) {
@@ -497,7 +496,7 @@ void upscale_f32_sycl(const float *x, float *dst, const int nb00, const int nb01
         });
 }
 
-void pad_f32_sycl(const float *x, float *dst, const int ne00,
+static void pad_f32_sycl(const float *x, float *dst, const int ne00,
                          const int ne01, const int ne02, const int ne0,
                          const int ne1, const int ne2, queue_ptr stream) {
     int num_blocks = (ne0 + SYCL_PAD_BLOCK_SIZE - 1) / SYCL_PAD_BLOCK_SIZE;
@@ -520,9 +519,10 @@ inline void ggml_sycl_op_silu(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     silu_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_gelu(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -535,9 +535,10 @@ inline void ggml_sycl_op_gelu(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     gelu_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 inline void ggml_sycl_op_gelu_quick(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                     const ggml_tensor *src1, ggml_tensor *dst,
@@ -550,9 +551,10 @@ inline void ggml_sycl_op_gelu_quick(ggml_backend_sycl_context & ctx, const ggml_
 
     gelu_quick_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_tanh(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -564,9 +566,10 @@ inline void ggml_sycl_op_tanh(ggml_backend_sycl_context & ctx, const ggml_tensor
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     tanh_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_relu(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -579,9 +582,10 @@ inline void ggml_sycl_op_relu(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     relu_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_hardsigmoid(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -595,9 +599,10 @@ inline void ggml_sycl_op_hardsigmoid(ggml_backend_sycl_context & ctx, const ggml
 
     hardsigmoid_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_hardswish(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -610,9 +615,10 @@ inline void ggml_sycl_op_hardswish(ggml_backend_sycl_context & ctx, const ggml_t
 
     hardswish_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_exp(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -625,9 +631,10 @@ inline void ggml_sycl_op_exp(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     exp_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_log(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -640,9 +647,10 @@ inline void ggml_sycl_op_log(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     log_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_sigmoid(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -655,9 +663,10 @@ inline void ggml_sycl_op_sigmoid(ggml_backend_sycl_context & ctx, const ggml_ten
 
     sigmoid_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_sqrt(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -670,9 +679,10 @@ inline void ggml_sycl_op_sqrt(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     sqrt_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_sin(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -685,9 +695,10 @@ inline void ggml_sycl_op_sin(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     sin_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_cos(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -700,9 +711,10 @@ inline void ggml_sycl_op_cos(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     cos_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_step(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -715,9 +727,10 @@ inline void ggml_sycl_op_step(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     step_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_neg(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -730,9 +743,10 @@ inline void ggml_sycl_op_neg(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     neg_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_leaky_relu(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -749,9 +763,10 @@ inline void ggml_sycl_op_leaky_relu(ggml_backend_sycl_context & ctx, const ggml_
 
     leaky_relu_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), negative_slope, main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_sqr(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -764,9 +779,10 @@ inline void ggml_sycl_op_sqr(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     sqr_f32_sycl(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_upscale(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -787,9 +803,10 @@ inline void ggml_sycl_op_upscale(ggml_backend_sycl_context & ctx, const ggml_ten
                      dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3,
                      main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_pad(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -805,9 +822,10 @@ inline void ggml_sycl_op_pad(ggml_backend_sycl_context & ctx, const ggml_tensor 
         src0->ne[0], src0->ne[1], src0->ne[2],
         dst->ne[0], dst->ne[1], dst->ne[2], main_stream);
 
-    (void) src1;
-    (void) dst;
-    (void) src1_dd;
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src1_dd);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_acc(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -827,7 +845,8 @@ inline void ggml_sycl_op_acc(ggml_backend_sycl_context & ctx, const ggml_tensor 
 
     acc_f32_sycl(src0_dd, src1_dd, dst_dd, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], nb1, nb2, offset, main_stream);
 
-    (void) dst;
+    GGML_UNUSED(dst);
+    GGML_UNUSED(ctx);
 }
 
 inline void ggml_sycl_op_add(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
@@ -863,149 +882,149 @@ inline void ggml_sycl_op_div(ggml_backend_sycl_context & ctx, const ggml_tensor 
 }
 
 
-void ggml_sycl_sqrt(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_sqrt(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_sqrt);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_sqrt);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_sin(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_sin(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_sin);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_sin);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_cos(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_cos(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_cos);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_cos);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_acc(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_acc(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_acc);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_acc);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_gelu(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_gelu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_gelu);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_gelu);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_silu(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_silu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_silu);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_silu);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_gelu_quick(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_gelu_quick(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_gelu_quick);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_gelu_quick);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_tanh(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_tanh(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_tanh);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_tanh);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_relu(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_relu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_relu);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_relu);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_sigmoid(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_sigmoid(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_sigmoid);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_sigmoid);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_hardsigmoid(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_hardsigmoid(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_hardsigmoid);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_hardsigmoid);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_hardswish(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_hardswish(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_hardswish);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-
-void ggml_sycl_exp(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_exp);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_log(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_log);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_neg(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_neg);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_step(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_step);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_leaky_relu(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_leaky_relu);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_sqr(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_sqr);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_upscale(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_upscale);
-    GGML_SYCL_DEBUG("call %s done\n", __func__);
-}
-
-void ggml_sycl_pad(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_pad);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_hardswish);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
 
-
-void ggml_sycl_add(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_exp(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_add);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_exp);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_sub(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_log(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_sub);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_log);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_mul(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_neg(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_mul);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_neg);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }
 
-void ggml_sycl_div(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_sycl_step(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_SYCL_DEBUG("call %s\n", __func__);
-    ggml_sycl_op_flatten(ctx, src0, src1, dst, ggml_sycl_op_div);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_step);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_leaky_relu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_leaky_relu);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_sqr(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_sqr);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_upscale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_upscale);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_pad(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_pad);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+
+
+void ggml_sycl_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_add);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_sub(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_sub);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_mul);
+    GGML_SYCL_DEBUG("call %s done\n", __func__);
+}
+
+void ggml_sycl_div(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("call %s\n", __func__);
+    ggml_sycl_op_flatten(ctx, dst->src[0], dst->src[1], dst, ggml_sycl_op_div);
     GGML_SYCL_DEBUG("call %s done\n", __func__);
 }

@@ -1,5 +1,5 @@
 ifndef LLAMA_MAKEFILE
-$(error The Makefile build is deprecated. Use the CMake build instead. For more details, see https://github.com/ggerganov/llama.cpp/blob/master/docs/build.md)
+$(error The Makefile build is deprecated. Use the CMake build instead. For more details, see https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
 endif
 
 # Define the default target now so that it is always the first target
@@ -22,6 +22,7 @@ BUILD_TARGETS = \
 	llama-infill \
 	llama-llava-cli \
 	llama-minicpmv-cli\
+	llama-qwen2vl-cli\
 	llama-lookahead \
 	llama-lookup \
 	llama-lookup-create \
@@ -51,6 +52,7 @@ TEST_TARGETS = \
 	tests/test-arg-parser \
 	tests/test-autorelease \
 	tests/test-backend-ops \
+	tests/test-chat \
 	tests/test-chat-template \
 	tests/test-double-float \
 	tests/test-grammar-integration \
@@ -445,6 +447,10 @@ ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686 amd64))
 	MK_CFLAGS     += -march=native -mtune=native
 	HOST_CXXFLAGS += -march=native -mtune=native
 
+	# Usage AMX build test
+	#MK_CFLAGS     += -march=graniterapids -mtune=graniterapids
+	#HOST_CXXFLAGS += -march=graniterapids -mtune=graniterapids
+
 	# Usage AVX-only
 	#MK_CFLAGS   += -mfma -mf16c -mavx
 	#MK_CXXFLAGS += -mfma -mf16c -mavx
@@ -457,7 +463,7 @@ endif
 ifneq '' '$(findstring mingw,$(shell $(CC) -dumpmachine))'
 	# The stack is only 16-byte aligned on Windows, so don't let gcc emit aligned moves.
 	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=54412
-	# https://github.com/ggerganov/llama.cpp/issues/2922
+	# https://github.com/ggml-org/llama.cpp/issues/2922
 	MK_CFLAGS   += -Xassembler -muse-unaligned-vector-move
 	MK_CXXFLAGS += -Xassembler -muse-unaligned-vector-move
 
@@ -590,7 +596,7 @@ ifdef GGML_RPC
 	OBJ_GGML_EXT += ggml/src/ggml-rpc.o
 endif # GGML_RPC
 
-OBJ_CUDA_TMPL      = $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/fattn-wmma*.cu))
+OBJ_CUDA_TMPL      = $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/fattn-mma*.cu))
 OBJ_CUDA_TMPL     += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/mmq*.cu))
 
 ifdef GGML_CUDA_FA_ALL_QUANTS
@@ -673,6 +679,10 @@ endif # GGML_CUDA_NO_PEER_COPY
 ifdef GGML_CUDA_CCBIN
 	MK_NVCCFLAGS += -ccbin $(GGML_CUDA_CCBIN)
 endif # GGML_CUDA_CCBIN
+
+ifdef GGML_CUDA_NO_FA
+	MK_NVCCFLAGS += -DGGML_CUDA_NO_FA
+endif # GGML_CUDA_NO_FA
 
 ifdef GGML_CUDA_FA_ALL_QUANTS
 	MK_NVCCFLAGS += -DGGML_CUDA_FA_ALL_QUANTS
@@ -794,6 +804,10 @@ ifdef GGML_CUDA_NO_PEER_COPY
 	HIPFLAGS += -DGGML_CUDA_NO_PEER_COPY
 endif # GGML_CUDA_NO_PEER_COPY
 
+ifdef GGML_CUDA_NO_FA
+	HIPFLAGS += -DGGML_CUDA_NO_FA
+endif # GGML_CUDA_NO_FA
+
 	OBJ_GGML_EXT += ggml/src/ggml-cuda/ggml-cuda.o
 	OBJ_GGML_EXT += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/*.cu))
 	OBJ_GGML_EXT += $(OBJ_CUDA_TMPL)
@@ -822,7 +836,7 @@ ifdef GGML_MUSA
 	else
 		MUSA_PATH ?= /opt/musa
 	endif
-	MUSA_ARCHITECTURES ?= 21;22
+	MUSA_ARCHITECTURES ?= 21;22;31
 
 	MK_CPPFLAGS += -DGGML_USE_MUSA -DGGML_USE_CUDA
 	MK_LDFLAGS += -L$(MUSA_PATH)/lib -Wl,-rpath=$(MUSA_PATH)/lib
@@ -841,7 +855,7 @@ ifdef GGML_MUSA
 	CXX := $(MUSA_PATH)/bin/clang++
 	MCC := $(CCACHE) $(MUSA_PATH)/bin/mcc
 
-	MUSAFLAGS  = -x musa -mtgpu
+	MUSAFLAGS  = -fsigned-char -x musa -mtgpu
 	MUSAFLAGS += $(foreach arch,$(subst ;, ,$(MUSA_ARCHITECTURES)),--cuda-gpu-arch=mp_$(arch))
 
 ifdef GGML_CUDA_FORCE_MMQ
@@ -869,6 +883,10 @@ endif # GGML_CUDA_PEER_MAX_BATCH_SIZE
 ifdef GGML_CUDA_NO_PEER_COPY
 	MUSAFLAGS += -DGGML_CUDA_NO_PEER_COPY
 endif # GGML_CUDA_NO_PEER_COPY
+
+ifdef GGML_CUDA_NO_FA
+	MUSAFLAGS += -DGGML_CUDA_NO_FA
+endif # GGML_CUDA_NO_FA
 
 ifdef GGML_CUDA_FA_ALL_QUANTS
 	MUSAFLAGS += -DGGML_CUDA_FA_ALL_QUANTS
@@ -948,7 +966,6 @@ DIR_COMMON = common
 
 OBJ_GGML = \
 	$(DIR_GGML)/src/ggml.o \
-	$(DIR_GGML)/src/ggml-aarch64.o \
 	$(DIR_GGML)/src/ggml-alloc.o \
 	$(DIR_GGML)/src/ggml-backend.o \
 	$(DIR_GGML)/src/ggml-backend-reg.o \
@@ -956,9 +973,11 @@ OBJ_GGML = \
 	$(DIR_GGML)/src/ggml-quants.o \
 	$(DIR_GGML)/src/ggml-threading.o \
 	$(DIR_GGML)/src/ggml-cpu/ggml-cpu.o \
-	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-cpp.o \
+	$(DIR_GGML)/src/ggml-cpu/ggml-cpu_cpp.o \
 	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-aarch64.o \
+	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-hbm.o \
 	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-quants.o \
+	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-traits.o \
 	$(OBJ_GGML_EXT)
 
 OBJ_LLAMA = \
@@ -977,6 +996,7 @@ OBJ_COMMON = \
 	$(DIR_COMMON)/ngram-cache.o \
 	$(DIR_COMMON)/sampling.o \
 	$(DIR_COMMON)/speculative.o \
+	$(DIR_COMMON)/chat.o \
 	$(DIR_COMMON)/build-info.o \
 	$(DIR_COMMON)/json-schema-to-grammar.o
 
@@ -1070,8 +1090,8 @@ endif
 ifdef REMOVE_WARNING
 $(info !!! REMOVAL WARNING !!!)
 $(info The following LLAMA_ options have been removed and are no longer supported)
-$(info   - LLAMA_DISABLE_LOGS   (https://github.com/ggerganov/llama.cpp/pull/9418))
-$(info   - LLAMA_SERVER_VERBOSE (https://github.com/ggerganov/llama.cpp/pull/9418))
+$(info   - LLAMA_DISABLE_LOGS   (https://github.com/ggml-org/llama.cpp/pull/9418))
+$(info   - LLAMA_SERVER_VERBOSE (https://github.com/ggml-org/llama.cpp/pull/9418))
 $(info )
 endif
 
@@ -1098,17 +1118,10 @@ DEP_FILES = $(OBJ_GGML:.o=.d) $(OBJ_LLAMA:.o=.d) $(OBJ_COMMON:.o=.d)
 # Default target
 all: $(BUILD_TARGETS)
 
+# force c++ build for source file that have same name as c file
 # Note: need this exception because `ggml-cpu.c` and `ggml-cpu.cpp` both produce the same obj/dep files
-#       g++ -M -I ./ggml/include/ -I ./ggml/src ggml/src/ggml-cpu/ggml-cpu.cpp | grep ggml
-$(DIR_GGML)/src/ggml-cpu/ggml-cpu-cpp.o: \
-	ggml/src/ggml-cpu/ggml-cpu.cpp \
-	ggml/include/ggml-backend.h \
-	ggml/include/ggml.h \
-	ggml/include/ggml-alloc.h \
-	ggml/src/ggml-backend-impl.h \
-	ggml/include/ggml-cpu.h \
-	ggml/src/ggml-impl.h
-	$(CXX) $(CXXFLAGS)   -c $< -o $@
+$(DIR_GGML)/%_cpp.o: $(DIR_GGML)/%.cpp
+	$(CXX) $(CXXFLAGS) -MMD -c $< -o $@
 
 # Rules for building object files
 $(DIR_GGML)/%.o: $(DIR_GGML)/%.c
@@ -1362,7 +1375,11 @@ llama-server: \
 	examples/server/httplib.h \
 	examples/server/index.html.hpp \
 	examples/server/loading.html.hpp \
+	common/chat.cpp \
+	common/chat.h \
+	common/chat-template.hpp \
 	common/json.hpp \
+	common/minja.hpp \
 	$(OBJ_ALL)
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h %.hpp $<,$^) -Iexamples/server $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS) $(LWINSOCK2)
@@ -1399,6 +1416,14 @@ llama-llava-cli: examples/llava/llava-cli.cpp \
 	$(CXX) $(CXXFLAGS) $< $(filter-out %.h $<,$^) -o $@ $(LDFLAGS) -Wno-cast-qual
 
 llama-minicpmv-cli: examples/llava/minicpmv-cli.cpp \
+	examples/llava/llava.cpp \
+	examples/llava/llava.h \
+	examples/llava/clip.cpp \
+	examples/llava/clip.h \
+	$(OBJ_ALL)
+	$(CXX) $(CXXFLAGS) $< $(filter-out %.h $<,$^) -o $@ $(LDFLAGS) -Wno-cast-qual
+
+llama-qwen2vl-cli: examples/llava/qwen2vl-cli.cpp \
 	examples/llava/llava.cpp \
 	examples/llava/llava.h \
 	examples/llava/clip.cpp \
@@ -1458,6 +1483,11 @@ tests/test-double-float: tests/test-double-float.cpp
 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
 
 tests/test-json-schema-to-grammar: tests/test-json-schema-to-grammar.cpp \
+	$(OBJ_ALL)
+	$(CXX) $(CXXFLAGS) -Iexamples/server -c $< -o $(call GET_OBJ_FILE, $<)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+
+tests/test-chat: tests/test-chat.cpp \
 	$(OBJ_ALL)
 	$(CXX) $(CXXFLAGS) -Iexamples/server -c $< -o $(call GET_OBJ_FILE, $<)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
