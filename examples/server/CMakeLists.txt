@@ -5,7 +5,7 @@ option(LLAMA_SERVER_SSL "Build SSL support for the server" OFF)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
 if (MINGW)
-    # fix: https://github.com/ggerganov/llama.cpp/actions/runs/9651004652/job/26617901362?pr=8006
+    # fix: https://github.com/ggml-org/llama.cpp/actions/runs/9651004652/job/26617901362?pr=8006
     add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER})
 endif()
 
@@ -15,7 +15,7 @@ set(TARGET_SRCS
     httplib.h
 )
 set(PUBLIC_ASSETS
-    index.html
+    index.html.gz
     loading.html
 )
 
@@ -34,14 +34,7 @@ endforeach()
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
 
-# clean up generated files in pre-build step
-foreach(asset ${PUBLIC_ASSETS})
-    set(output "${CMAKE_CURRENT_BINARY_DIR}/${asset}.hpp")
-    add_custom_command(TARGET ${TARGET} PRE_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E remove -f "${output}"
-    )
-endforeach()
-
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE common ${CMAKE_THREAD_LIBS_INIT})
 
 if (LLAMA_SERVER_SSL)

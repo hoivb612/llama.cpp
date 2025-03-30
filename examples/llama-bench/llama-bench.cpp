@@ -757,7 +757,7 @@ struct cmd_params_instance {
     bool               cpu_strict;
     int                poll;
     int                n_gpu_layers;
-    std::string        rpc_servers;
+    std::string        rpc_servers_str;
     llama_split_mode   split_mode;
     int                main_gpu;
     bool               no_kv_offload;
@@ -770,8 +770,37 @@ struct cmd_params_instance {
         llama_model_params mparams = llama_model_default_params();
 
         mparams.n_gpu_layers = n_gpu_layers;
-        if (!rpc_servers.empty()) {
-            mparams.rpc_servers = rpc_servers.c_str();
+        if (!rpc_servers_str.empty()) {
+            auto rpc_servers = string_split<std::string>(rpc_servers_str, ',');
+
+            // add RPC devices
+            if (!rpc_servers.empty()) {
+                ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+                if (!rpc_reg) {
+                    fprintf(stderr, "%s: failed to find RPC backend\n", __func__);
+                    exit(1);
+                }
+
+                typedef ggml_backend_dev_t (*ggml_backend_rpc_add_device_t)(const char * endpoint);
+                ggml_backend_rpc_add_device_t ggml_backend_rpc_add_device_fn = (ggml_backend_rpc_add_device_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_device");
+                if (!ggml_backend_rpc_add_device_fn) {
+                    fprintf(stderr, "%s: failed to find RPC device add function\n", __func__);
+                    exit(1);
+                }
+                static std::vector<ggml_backend_dev_t> devices;
+                devices.clear();
+                for (const std::string & server : rpc_servers) {
+                    ggml_backend_dev_t dev = ggml_backend_rpc_add_device_fn(server.c_str());
+                    if (dev) {
+                        devices.push_back(dev);
+                    } else {
+                        fprintf(stderr, "%s: failed to add RPC device for server '%s'\n", __func__, server.c_str());
+                        exit(1);
+                    }
+                }
+                devices.push_back(nullptr);
+                mparams.devices = devices.data();
+            }
         }
         mparams.split_mode   = split_mode;
         mparams.main_gpu     = main_gpu;
@@ -782,7 +811,7 @@ struct cmd_params_instance {
     }
 
     bool equal_mparams(const cmd_params_instance & other) const {
-        return model == other.model && n_gpu_layers == other.n_gpu_layers && rpc_servers == other.rpc_servers &&
+        return model == other.model && n_gpu_layers == other.n_gpu_layers && rpc_servers_str == other.rpc_servers_str &&
                split_mode == other.split_mode && main_gpu == other.main_gpu && use_mmap == other.use_mmap &&
                tensor_split == other.tensor_split;
     }
@@ -937,8 +966,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
 struct test {
     static const std::string build_commit;
     static const int         build_number;
-    static const std::string cpu_info;
-    static const std::string gpu_info;
+    const std::string        cpu_info;
+    const std::string        gpu_info;
     std::string              model_filename;
     std::string              model_type;
     uint64_t                 model_size;
@@ -968,7 +997,10 @@ struct test {
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
-    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) {
+    test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
+        cpu_info(get_cpu_info()),
+        gpu_info(get_gpu_info()) {
+
         model_filename = inst.model;
         char buf[128];
         llama_model_desc(lmodel, buf, sizeof(buf));
@@ -1127,8 +1159,6 @@ struct test {
 
 const std::string test::build_commit = LLAMA_COMMIT;
 const int         test::build_number = LLAMA_BUILD_NUMBER;
-const std::string test::cpu_info     = get_cpu_info();
-const std::string test::gpu_info     = get_gpu_info();
 
 struct printer {
     virtual ~printer() {}
@@ -1499,7 +1529,8 @@ static void test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
-    const int32_t       n_vocab = llama_n_vocab(model);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<llama_token> tokens(n_batch);
 
@@ -1507,7 +1538,7 @@ static void test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
-        tokens[0]    = n_processed == 0 && llama_add_bos_token(model) ? llama_token_bos(model) : std::rand() % n_vocab;
+        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
@@ -1522,9 +1553,10 @@ static void test_gen(llama_context * ctx, int n_gen, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
-    const int32_t       n_vocab = llama_n_vocab(model);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
-    llama_token token = llama_add_bos_token(model) ? llama_token_bos(model) : std::rand() % n_vocab;
+    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
     for (int i = 0; i < n_gen; i++) {
         llama_decode(ctx, llama_batch_get_one(&token, 1));
@@ -1616,6 +1648,7 @@ int main(int argc, char ** argv) {
 
     int64_t cpu_affinity_mask = 0;
     int32_t cpu_core_count_from_cpumask = 0;
+#ifdef GGML_B612
     if (params.cpumask_present) {
         for (int i = 0; i < 32; i++) {
             if (params.cpumask[i]) {
@@ -1625,6 +1658,7 @@ int main(int argc, char ** argv) {
         }
         printf("CPU affinity mask = [%016llX] - core count = [%d]\n", cpu_affinity_mask, cpu_core_count_from_cpumask);
     }
+#endif // GGML_B612
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
@@ -1636,15 +1670,15 @@ int main(int argc, char ** argv) {
     for (const auto & inst : params_instances) {
         params_idx++;
         if (params.progress) {
-            fprintf(stderr, "llama-bench: benchmark %d/%ld: starting\n", params_idx, params_count);
+            fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
         }
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {
-                llama_free_model(lmodel);
+                llama_model_free(lmodel);
             }
 
-            lmodel = llama_load_model_from_file(inst.model.c_str(), inst.to_llama_mparams());
+            lmodel = llama_model_load_from_file(inst.model.c_str(), inst.to_llama_mparams());
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
@@ -1652,16 +1686,16 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_new_context_with_model(lmodel, inst.to_llama_cparams());
+        llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
-            llama_free_model(lmodel);
+            llama_model_free(lmodel);
             return 1;
         }
 
         test t(inst, lmodel, ctx);
 
-        llama_kv_cache_clear(ctx);
+        llama_kv_self_clear(ctx);
 
         // cool off before the test
         if (params.delay) {
@@ -1686,19 +1720,23 @@ int main(int argc, char ** argv) {
         llama_attach_threadpool(ctx, threadpool, NULL);
 
         // setup for warmup run if asked to do so (params.warmup_run == true)
-        bool warmup_already = params.warmup_run ? false : true;
+        bool warmup_already = true; 
+#ifdef GGML_B612
+        warmup_already = params.warmup_run ? false : true;
         // if either process_affinity or cpumask_present are true then enable warmup run
         if (params.process_affinity || params.cpumask_present) {
             warmup_already = false;
         }
+#endif // GGML_B612
 
         // warmup run
         if (t.n_prompt > 0) {
             if (!warmup_already) {
                 if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup prompt run\n", params_idx, params_count);
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
 
+#ifdef GGML_B612
                 if (params.cpumask_present && (cpu_core_count_from_cpumask >= t.n_threads_prompt)) {
                     cpu_affinity_mask = ggml_b612::xb_set_process_affinity(t.n_threads_prompt, cpu_affinity_mask);
                     printf("Set process affinity w/ cpuMask %016llX\n", cpu_affinity_mask);
@@ -1706,21 +1744,26 @@ int main(int argc, char ** argv) {
                     cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(t.n_threads_prompt);
                     printf("Set process affinity w/ n_threads %016llX\n", cpu_affinity_mask);
                 }
+#endif // GGML_B612
+
                 warmup_already = true;
             }
 
+#ifdef GGML_B612
             // for printer.print_test() to print the correct thread count
             t.n_threads = t.n_threads_prompt;
+#endif // GGML_B612
 
             //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-            test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads_prompt);
+            test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
         }
         if (t.n_gen > 0) {
             if (!warmup_already) {
                 if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup generation run\n", params_idx, params_count);
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
 
+#ifdef GGML_B612
                 if (params.cpumask_present && (cpu_core_count_from_cpumask >= t.n_threads_gen)) {
                     cpu_affinity_mask = ggml_b612::xb_set_process_affinity(t.n_threads_gen, cpu_affinity_mask);
                     printf("Set process affinity w/ cpuMask %016llX\n", cpu_affinity_mask);
@@ -1728,30 +1771,34 @@ int main(int argc, char ** argv) {
                     cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(t.n_threads_gen);
                     printf("Set process affinity w/ n_threads %016llX\n", cpu_affinity_mask);
                 }
+#endif // GGML_B612
+
                 warmup_already = true;
             }
 
+#ifdef GGML_B612
             // for printer.print_test() to print the correct thread count
             t.n_threads = t.n_threads_gen;
+#endif //GGML_B612
 
-            test_gen(ctx, 1, t.n_threads_gen);
+            test_gen(ctx, 1, t.n_threads);
         }
 
         for (int i = 0; i < params.reps; i++) {
-            llama_kv_cache_clear(ctx);
+            llama_kv_self_clear(ctx);
 
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
                 if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%ld: prompt run %d/%d\n", params_idx, params_count,
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
                 test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
             }
             if (t.n_gen > 0) {
                 if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%ld: generation run %d/%d\n", params_idx, params_count,
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
                 test_gen(ctx, t.n_gen, t.n_threads);
@@ -1785,7 +1832,7 @@ int main(int argc, char ** argv) {
     llama_print_tensor_op_perf();
 #endif
 
-    llama_free_model(lmodel);
+    llama_model_free(lmodel);
 
     if (p) {
         p->print_footer();
