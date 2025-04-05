@@ -7,8 +7,6 @@
 #include <fstream>
 #include <iostream> // TODO: remove me
 
-#define GGML_B612 1
-
 common_params params;
 
 #ifdef _WIN32
@@ -17,11 +15,8 @@ common_params params;
 #       define NOMINMAX
 #   endif
 #   include <windows.h>
-#endif
 
-#if defined(GGML_B612)
-    #include <intrin.h>
-    #include "b612-cpu.h"
+#endif // _WIN32
 
 void retrieval_log_callback(ggml_log_level level, const char * text, void * user_data) {
     GGML_UNUSED(text);
@@ -35,7 +30,6 @@ void retrieval_log_callback(ggml_log_level level, const char * text, void * user
         fputs(text, stdout);
     }
 }
-#endif
 
 static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
@@ -154,11 +148,7 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-#if defined(GGML_B612)
     llama_log_set(retrieval_log_callback, &(params.verbosity));
-
-    ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
-#endif
 
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;
@@ -385,7 +375,6 @@ int main(int argc, char ** argv) {
             (t_query_stop - t_query_start) / (item_count * 1000.0));
     }
 
-#if defined(GGML_B612)
     printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
         (t_tokenization_stop - t_tokenization_start) / 1000.0, 
         (t_tokenization_stop - t_tokenization_start) / (chunks.size() * 1000.0));
@@ -397,7 +386,6 @@ int main(int argc, char ** argv) {
     params.verbosity = GGML_LOG_LEVEL_INFO;
     llama_log_set(retrieval_log_callback, &(params.verbosity));
     llama_perf_context_print(ctx);
-#endif
 
     // clean up
     llama_batch_free(query_batch);
