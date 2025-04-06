@@ -3,6 +3,11 @@ https://github.com/hoivb612/llama.cpp
 
 ===========================================
 
+MSYS2 ucrt support: 
+pacman -S --needed base-devel mingw-w64-ucrt-x86_64-toolchain
+
+===========================================
+
 For ARM64: 
 cmake --preset arm64-windows-llvm-release -D GGML_LLAMAFILE=OFF -D GGML_OPENMP=OFF -B build.arm
 cd build.arm
