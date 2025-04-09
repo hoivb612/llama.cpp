@@ -19,11 +19,6 @@ common_params params;
 #       define NOMINMAX
 #   endif
 #   include <windows.h>
-
-#if defined(GGML_B612)
-    #include <intrin.h>
-    #include "b612-cpu.h"
-#endif // GGML_B612
 #endif // _WIN32
 
 void retrieval_log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -157,12 +152,6 @@ int main(int argc, char ** argv) {
     common_init();
 
     llama_log_set(retrieval_log_callback, &(params.verbosity));
-
-#if defined(_WIN32) && defined(GGML_B612)
-    if (params.proc_affinity) {
-        ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
-    }
-#endif
 
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;
@@ -412,8 +401,6 @@ skip_query:
 #ifdef GGML_B612
     const auto t_main_end = ggml_time_us();
     printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
-
-    // llama_print_tensor_op_perf();
 #endif
 
     // clean up
