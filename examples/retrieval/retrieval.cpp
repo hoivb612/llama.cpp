@@ -7,7 +7,9 @@
 #include <fstream>
 #include <iostream> // TODO: remove me
 
+#ifndef GGML_B612
 #define GGML_B612 1
+#endif
 
 common_params params;
 
@@ -17,11 +19,12 @@ common_params params;
 #       define NOMINMAX
 #   endif
 #   include <windows.h>
-#endif
 
 #if defined(GGML_B612)
     #include <intrin.h>
     #include "b612-cpu.h"
+#endif // GGML_B612
+#endif // _WIN32
 
 void retrieval_log_callback(ggml_log_level level, const char * text, void * user_data) {
     GGML_UNUSED(text);
@@ -35,7 +38,6 @@ void retrieval_log_callback(ggml_log_level level, const char * text, void * user
         fputs(text, stdout);
     }
 }
-#endif
 
 static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
@@ -154,10 +156,12 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-#if defined(GGML_B612)
     llama_log_set(retrieval_log_callback, &(params.verbosity));
 
-    ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
+#if defined(_WIN32) && defined(GGML_B612)
+    if (params.proc_affinity) {
+        ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
+    }
 #endif
 
     // For BERT models, batch size must be equal to ubatch size
@@ -317,6 +321,13 @@ int main(int argc, char ** argv) {
     // based on cosine similarity
     int errors = 0;
     int item_count = 0;
+
+#ifdef GGML_B612
+    //if (params.no_query) {
+    //    goto skip_query;
+    //}
+#endif
+
     for (auto & context_file : params.context_files) {
         std::ifstream cpfile(context_file);
         if (!cpfile.is_open()) {
@@ -384,6 +395,7 @@ int main(int argc, char ** argv) {
     }
 
 #if defined(GGML_B612)
+skip_query:
     printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
         (t_tokenization_stop - t_tokenization_start) / 1000.0, 
         (t_tokenization_stop - t_tokenization_start) / (chunks.size() * 1000.0));
@@ -397,12 +409,16 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
 #endif
 
+#ifdef GGML_B612
+    const auto t_main_end = ggml_time_us();
+    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
+
+    // llama_print_tensor_op_perf();
+#endif
+
     // clean up
     llama_batch_free(query_batch);
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
-
-    const auto t_main_end = ggml_time_us();
-    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
 }
