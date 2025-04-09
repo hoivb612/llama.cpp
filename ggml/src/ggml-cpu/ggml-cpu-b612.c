@@ -124,14 +124,6 @@ struct ggml_arm_arch_features_type {
 
 #if defined(_WIN32)
 
-#ifndef __AVX512BF16__
-#define __AVX512BF16__
-#define GGML_BF16_STEP32 128
-#define GGML_BF16_EPR32 32
-#define GGML_BF16_STEP16 64
-#define GGML_BF16_EPR16 16
-#endif // __AVX512BF16__
-
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
     #define NOMINMAX
@@ -233,6 +225,21 @@ typedef void * thread_ret_t;
 #include <unistd.h>
 
 #endif
+
+#ifndef __AVX512BF16__
+#define __AVX512BF16__
+#define GGML_BF16_STEP32 128
+#define GGML_BF16_EPR32 32
+#define GGML_BF16_STEP16 64
+#define GGML_BF16_EPR16 16
+#endif // __AVX512BF16__
+
+#if defined(__gnu_linux__)
+#define GGML_BF16_STEP32 128
+#define GGML_BF16_EPR32 32
+#define GGML_BF16_STEP16 64
+#define GGML_BF16_EPR16 16
+#endif // __gnu_linux__
 
 typedef pthread_t ggml_thread_t;
 
@@ -2730,7 +2737,7 @@ void ggml_vec_sumsq_bf16(const uint64_t n, float * s, ggml_bf16_t * x) {
     uint64_t i = 0;
     float sumf = 0.0f;
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__)
+#if defined(__AVX512F__) && defined(__GEN_AVX512__) && !defined(__gnu_linux__)
 
     const uint64_t xn = (n & ~(GGML_BF16_EPR32 - 1));
 
@@ -2772,7 +2779,7 @@ void ggml_vec_sumsq_bf16(const uint64_t n, float * s, ggml_bf16_t * x) {
         } while (i < n);
     }
 
-#elif defined(__AVX2__)
+#elif defined(__AVX2__) && !defined(__gnu_linux__)
 
     const uint64_t xn = (n & ~(GGML_BF16_EPR16 - 1));
 
@@ -3009,7 +3016,7 @@ void ggml_vec_dot_f32(const int n, float * restrict s, size_t bs, const float * 
 
 #endif // GGML_B612
 
-#if !defined(GGML_B612)
+#if !defined(GGML_B612) || defined(__gnu_linux__)
 
 void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t * restrict x, size_t bx, ggml_bf16_t * restrict y, size_t by, int nrc) {
     assert(nrc == 1);
@@ -5085,7 +5092,7 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
     const uint64_t nc = n;
     uint64_t i = 0;
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__)
+#if defined(__AVX512F__) && defined(__GEN_AVX512__) && !defined(__gnu_linux__)
 #pragma message("Building AVX512F ggml_fp32_to_bf16_row_cpu")
 
     __m512 ax[GGML_F32_ARR];
@@ -5118,7 +5125,7 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
         } while (i < nc);
     }
 
-#elif defined(__AVX2__)
+#elif defined(__AVX2__) && !defined(__gnu_linux__)
 
     __m256 ax[GGML_F32_ARR];
     __m128bh ay[GGML_F32_ARR];
@@ -6438,7 +6445,14 @@ typedef struct {
     int64_t max_time;
 } quant_type_info;
 
-DECLSPEC_CACHEALIGN quant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
+#if defined(__gnu_linux__)
+#define DECLSPEC__CACHEALIGN
+#define ARRAYSIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#else
+#define DECLSPEC__CACHEALIGN DECLSPEC_CACHEALIGN 
+#endif // __gnu_linux
+
+DECLSPEC__CACHEALIGN quant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
 
 void ggml_backend_print_tensor_op_perf() {
 
@@ -8794,7 +8808,7 @@ static void ggml_compute_forward_add_q_f32(
     ggml_to_float_t dequantize_row_q = ggml_get_type_traits(type)->to_float;
 #if defined(GGML_B612)
     if (ggml_get_type_traits_cpu(type)->to_float) {
-        (ggml_to_float_t) dequantize_row_q = ggml_get_type_traits_cpu(type)->to_float;
+        dequantize_row_q = ggml_get_type_traits_cpu(type)->to_float;
     }
 #endif
     ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dtype)->from_float;
@@ -12083,7 +12097,7 @@ UseGgmlGemm2:;
     int chunk_size = 16;
 #else
     // be a little brave and try something bolder
-    int chunk_size = min(128, nr0);
+    int chunk_size = MIN(128, nr0);
 #endif
 
     // We need to step up the size if it's small

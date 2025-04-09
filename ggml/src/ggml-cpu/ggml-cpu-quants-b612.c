@@ -2012,13 +2012,15 @@ void quantize_row_q3_K(const float * restrict x, void * restrict vy, int64_t k) 
 void quantize_row_q4_K(const float * restrict x, void * restrict vy, int64_t k) {
     assert(k % QK_K == 0);
     block_q4_K * restrict y = vy;
+
     quantize_row_q4_K_ref(x, y, k);
 }
 
 #else // GGML_B612
 
-void quantize_row_q4_K(const float * restrict x, block_q4_K * restrict y, int64_t k) {
+void quantize_row_q4_K(const float * restrict x, void * restrict vy, int64_t k) {
     const uint64_t qk = QK_K;
+    block_q4_K * restrict y = vy;
 
     assert(k % qk == 0);
 
@@ -2164,8 +2166,9 @@ inline int hsum_i32_16(__m512i x) {
 
 #endif
 
-void quantize_row_q8_K(const float * restrict x, block_q8_K * restrict y, int64_t k) {
+void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) {
     const uint64_t qk = QK_K;
+    block_q8_K * restrict y = vy;
 
     assert(k % qk == 0);
 
@@ -5122,14 +5125,20 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 #elif defined(GGML_B612) && (defined(__AVX512F__) && defined(__GEN_AVX512__))
 #pragma message("Building AVX512F vec_dot_q2_K_q8_K version")
 
-    static __declspec(align(64)) const uint16_t perm0[32] = {
+#if defined(__gnu_linux__)
+#define DECL_ALIGNED_64 __attribute__ ((aligned (64)))
+#else
+#define DECL_ALIGNED_64 __declspec(align(64))
+#endif // __gnu_linux__
+
+    static DECL_ALIGNED_64 const uint16_t perm0[32] = {
         0, 0, 0, 0, 0, 0, 0, 0,
         1, 1, 1, 1, 1, 1, 1, 1,
         8, 8, 8, 8, 8, 8, 8, 8,
         9, 9, 9, 9, 9, 9, 9, 9
     };
 
-    static __declspec(align(64)) const uint16_t perm1[32] = {
+    static DECL_ALIGNED_64 const uint16_t perm1[32] = {
         2, 2, 2, 2, 2, 2, 2, 2,
         3, 3, 3, 3, 3, 3, 3, 3,
         10, 10, 10, 10, 10, 10, 10, 10,
@@ -5137,14 +5146,14 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     };
 
 
-    static __declspec(align(64)) const uint16_t perm2[32] = {
+    static DECL_ALIGNED_64 const uint16_t perm2[32] = {
         4, 4, 4, 4, 4, 4, 4, 4,
         5, 5, 5, 5, 5, 5, 5, 5,
         12, 12, 12, 12, 12, 12, 12, 12,
         13, 13, 13, 13, 13, 13, 13, 13
     };
 
-    static __declspec(align(64)) const uint16_t perm3[32] = {
+    static DECL_ALIGNED_64 const uint16_t perm3[32] = {
         6, 6, 6, 6, 6, 6, 6, 6,
         7, 7, 7, 7, 7, 7, 7, 7,
         14, 14, 14, 14, 14, 14, 14, 14,
