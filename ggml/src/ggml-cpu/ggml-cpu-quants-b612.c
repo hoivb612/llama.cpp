@@ -904,6 +904,7 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
         __m256i i3 = _mm256_cvtps_epi32( v3 );
 
 #if defined(__AVX2__)
+#pragma message("Building --------------- default -------------- AVX2 quantize_row_q8_0")
         // Convert int32 to int16
         i0 = _mm256_packs_epi32( i0, i1 );	// 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
         i2 = _mm256_packs_epi32( i2, i3 );	// 16, 17, 18, 19,  24, 25, 26, 27,  20, 21, 22, 23, 28, 29, 30, 31
@@ -918,6 +919,7 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
 
         _mm256_storeu_si256((__m256i *)y[i].qs, i0);
 #else
+#pragma message("Building --------------- default -------------- AVX quantize_row_q8_0")
         // Since we don't have in AVX some necessary functions,
         // we split the registers in half and call AVX2 analogs from SSE
         __m128i ni0 = _mm256_castsi256_si128( i0 );
@@ -1086,7 +1088,7 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
     block_q8_0 * restrict y = vy;
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
-
+#pragma message("Building AVX512 quantize_row_q8_0")
     const __m512 signBit = _mm512_set1_ps(-0.0f);
     const __m512i perm = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13,
                                            2, 6, 10, 14, 3, 7, 11, 15);
@@ -1166,6 +1168,7 @@ void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) 
     }
 
 #elif defined(__AVX2__)
+#pragma message("Building AVX2 quantize_row_q8_0")
 
     for (uint64_t i = 0; i < nb; i++) {
         // Load elements into 4 AVX vectors

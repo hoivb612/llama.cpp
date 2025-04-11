@@ -30,6 +30,12 @@
 #   include <windows.h>
 #endif
 
+#if defined(__gnu_linux__)
+    #ifdef GGML_B612
+    #undef GGML_B612 // Does not work for Linux
+    #endif // GGML_B612
+#endif // __gnu_linux__
+
 #if defined(GGML_B612)
     #include <iostream>
     #include <intrin.h>
@@ -730,12 +736,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.poll.empty()) {
         params.poll = cmd_params_defaults.poll;
     }
+#ifdef GGML_B612    
     if (params.n_threads_prompt.empty()) {
         params.n_threads_prompt = params.n_threads;
     }
     if (params.n_threads_gen.empty()) {
         params.n_threads_gen = params.n_threads;
     }
+#endif // GGML_B612
 
     return params;
 }
@@ -1614,6 +1622,7 @@ int main(int argc, char ** argv) {
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
+#ifdef GGML_B612
     int64_t cpu_affinity_mask = 0;
     int32_t cpu_core_count_from_cpumask = 0;
     if (params.cpumask_present) {
@@ -1625,6 +1634,7 @@ int main(int argc, char ** argv) {
         }
         printf("CPU affinity mask = [%016llX] - core count = [%d]\n", cpu_affinity_mask, cpu_core_count_from_cpumask);
     }
+#endif // GGML_B612
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
@@ -1685,12 +1695,15 @@ int main(int argc, char ** argv) {
 
         llama_attach_threadpool(ctx, threadpool, NULL);
 
+        bool warmup_already = true;
+#ifdef GGML_B612
         // setup for warmup run if asked to do so (params.warmup_run == true)
-        bool warmup_already = params.warmup_run ? false : true;
+        warmup_already = params.warmup_run ? false : true;
         // if either process_affinity or cpumask_present are true then enable warmup run
         if (params.process_affinity || params.cpumask_present) {
             warmup_already = false;
         }
+#endif // GGML_B612
 
         // warmup run
         if (t.n_prompt > 0) {
@@ -1699,6 +1712,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup prompt run\n", params_idx, params_count);
                 }
 
+#ifdef GGML_B612
                 if (params.cpumask_present && (cpu_core_count_from_cpumask >= t.n_threads_prompt)) {
                     cpu_affinity_mask = ggml_b612::xb_set_process_affinity(t.n_threads_prompt, cpu_affinity_mask);
                     printf("Set process affinity w/ cpuMask %016llX\n", cpu_affinity_mask);
@@ -1707,13 +1721,16 @@ int main(int argc, char ** argv) {
                     printf("Set process affinity w/ n_threads %016llX\n", cpu_affinity_mask);
                 }
                 warmup_already = true;
+#endif // GGML_B612
             }
 
+#ifdef GGML_B612
             // for printer.print_test() to print the correct thread count
             t.n_threads = t.n_threads_prompt;
+#endif // GGML_B612
 
             //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-            test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads_prompt);
+            test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
         }
         if (t.n_gen > 0) {
             if (!warmup_already) {
@@ -1721,6 +1738,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%ld: warmup generation run\n", params_idx, params_count);
                 }
 
+#ifdef GGML_B612
                 if (params.cpumask_present && (cpu_core_count_from_cpumask >= t.n_threads_gen)) {
                     cpu_affinity_mask = ggml_b612::xb_set_process_affinity(t.n_threads_gen, cpu_affinity_mask);
                     printf("Set process affinity w/ cpuMask %016llX\n", cpu_affinity_mask);
@@ -1729,12 +1747,15 @@ int main(int argc, char ** argv) {
                     printf("Set process affinity w/ n_threads %016llX\n", cpu_affinity_mask);
                 }
                 warmup_already = true;
+#endif // GGML_B612
             }
 
+#ifdef GGML_B612
             // for printer.print_test() to print the correct thread count
             t.n_threads = t.n_threads_gen;
+#endif // GGML_B612
 
-            test_gen(ctx, 1, t.n_threads_gen);
+            test_gen(ctx, 1, t.n_threads);
         }
 
         for (int i = 0; i < params.reps; i++) {
