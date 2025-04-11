@@ -25,7 +25,9 @@ void common_log_set_verbosity_thold(int verbosity) {
 #define LOG_COL_WHITE   "\033[37m"
 
 static int64_t t_us() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    // B612 - Update for VS2022 Community 14.43.34808
+    //return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // colors
