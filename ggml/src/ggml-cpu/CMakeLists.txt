@@ -182,6 +182,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 include(ggml-cpu/cmake/FindSIMD.cmake)
             endif ()
             if (GGML_AVX512)
+                if (GGML_B612_PERF)
+                    add_compile_definitions(GGML_B612_PERF)
+                endif()
                 list(APPEND ARCH_FLAGS /arch:AVX512)
                 # /arch:AVX512 includes: __AVX512F__, __AVX512CD__, __AVX512BW__, __AVX512DQ__, and __AVX512VL__
                 # MSVC has no compile-time flags enabling specific

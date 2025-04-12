@@ -1,3 +1,7 @@
+#ifndef GGML_B612_PERF
+#define GGML_B612_PERF
+#endif
+
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -6,10 +10,6 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream> // TODO: remove me
-
-#ifndef GGML_B612
-#define GGML_B612 1
-#endif
 
 common_params params;
 
@@ -311,7 +311,7 @@ int main(int argc, char ** argv) {
     int errors = 0;
     int item_count = 0;
 
-#ifdef GGML_B612
+#ifdef GGML_B612_PERF
     //if (params.no_query) {
     //    goto skip_query;
     //}
@@ -383,7 +383,7 @@ int main(int argc, char ** argv) {
             (t_query_stop - t_query_start) / (item_count * 1000.0));
     }
 
-#if defined(GGML_B612)
+#if defined(GGML_B612_PERF)
 skip_query:
     printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
         (t_tokenization_stop - t_tokenization_start) / 1000.0, 
@@ -398,9 +398,11 @@ skip_query:
     llama_perf_context_print(ctx);
 #endif
 
-#ifdef GGML_B612
+#ifdef GGML_B612_PERF
     const auto t_main_end = ggml_time_us();
     printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
+
+    llama_print_tensor_op_perf();
 #endif
 
     // clean up

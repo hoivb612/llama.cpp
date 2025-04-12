@@ -695,6 +695,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_threadpool;
     }
 
+#if defined(GGML_B612_PERF)
+    if (strcmp(name, "ggml_backend_print_tensor_op_perf") == 0) {
+        return (void *)ggml_backend_print_tensor_op_perf;
+    }
+#endif // GGML_B612_PERF
+
     return NULL;
 
     GGML_UNUSED(reg);

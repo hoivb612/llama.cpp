@@ -147,6 +147,10 @@ extern "C" {
     GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cpu_aarch64_buffer_type(void);
     GGML_BACKEND_API bool ggml_backend_cpu_buft_is_aarch64(ggml_backend_buffer_type_t buft);
 
+#ifdef GGML_B612_PERF
+    GGML_BACKEND_API void ggml_backend_print_tensor_op_perf();
+#endif
+
 #ifdef __cplusplus
 }
 #endif

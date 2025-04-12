@@ -22391,3 +22391,17 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
     fputs(text, stderr);
     fflush(stderr);
 }
+
+#if defined(GGML_B612_PERF)
+
+void llama_print_tensor_op_perf() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        auto * reg = ggml_backend_reg_get(i);
+        auto * ggml_print_tensor_op_perf_fn = (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_print_tensor_op_perf");
+        if (ggml_print_tensor_op_perf_fn != nullptr) {
+            ggml_print_tensor_op_perf_fn();
+        }
+    }
+}
+
+#endif // GGML_B612

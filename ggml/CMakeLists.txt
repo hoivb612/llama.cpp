@@ -115,7 +115,7 @@ option(GGML_LSX              "ggml: enable lsx"              ON)
 option(GGML_RVV              "ggml: enable rvv"              ON)
 option(GGML_SVE              "ggml: enable SVE"              OFF)
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
-
+option(GGML_B612_PERF        "ggml: build B612 PERF variant" ON)
 
 if (WIN32)
     set(GGML_WIN_VER "0x602" CACHE STRING   "ggml: Windows version")
