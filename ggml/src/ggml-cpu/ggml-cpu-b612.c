@@ -95,6 +95,7 @@
 #if !defined(GGML_B612)
 typedef double ggml_float;
 #else
+// codegen with float only is better without causing any perturbations to the results
 typedef float ggml_float;
 #endif // GGML_B612
 
