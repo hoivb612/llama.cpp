@@ -92,7 +92,11 @@
 #endif
 
 // floating point type used to accumulate sums
+#if !defined(GGML_B612)
 typedef double ggml_float;
+#else
+typedef float ggml_float;
+#endif // GGML_B612
 
 #define GGML_GELU_FP16
 #define GGML_GELU_QUICK_FP16
@@ -2162,7 +2166,7 @@ void ggml_vec_neg_f32(const uint64_t n, float * y, const float * x)
     uint64_t i = 0;
     const uint32_t xor_pat = 0x80000000;
 
-    __m512 vx = _mm512_set1_ps(*(float *)&xor_pat);
+    __m512 vx = _mm512_set1_ps(*(const float *)&xor_pat);
     __m512 ax[GGML_F32_ARR];
 
     const uint64_t np = (n & ~(GGML_F32_STEP16 - 1));
@@ -3438,7 +3442,7 @@ void ggml_vec_dot_bf16_f32(const int n, float * restrict s, size_t bs, const ggm
         if (np) {
             do {
                 for (uint64_t j = 0; j < GGML_F32_ARR; j++) {
-                    au[j] = _mm256_loadu_si256((__m256i *)(x + i + j * GGML_F16_EPR16));
+                    au[j] = _mm256_loadu_si256((const __m256i *)(x + i + j * GGML_F16_EPR16));
                     ay[j] = _mm512_loadu_ps(y + i + j * GGML_F32_EPR16);
                     av[j] = _mm512_cvtepu16_epi32(au[j]);
                     av[j] = _mm512_slli_epi32(av[j], 16);
@@ -3452,7 +3456,7 @@ void ggml_vec_dot_bf16_f32(const int n, float * restrict s, size_t bs, const ggm
 
         if (xn > np) {
             do {
-                au[0] = _mm256_loadu_si256((__m256i *)(x + i));
+                au[0] = _mm256_loadu_si256((const __m256i *)(x + i));
                 ay[0] = _mm512_loadu_ps(y + i);
                 av[0] = _mm512_cvtepu16_epi32(au[0]);
                 av[0] = _mm512_slli_epi32(av[0], 16);
@@ -3577,7 +3581,7 @@ void ggml_vec_dot_f16_f32(const int64_t n, float * restrict s, size_t bs, const 
         if (np) {
             do {
                 for (uint64_t j = 0; j < GGML_F32_ARR; j++) {
-                    ax[j] = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i *)(x + i + j * GGML_F32_EPR16)));
+                    ax[j] = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i + j * GGML_F32_EPR16)));
                     ay[j] = _mm512_loadu_ps(y + i + j * GGML_F32_EPR16);
                     sum[j] = _mm512_fmadd_ps(ax[j], ay[j], sum[j]);
                 }
@@ -3588,7 +3592,7 @@ void ggml_vec_dot_f16_f32(const int64_t n, float * restrict s, size_t bs, const 
 
         if (xn > np) {
             do {
-                ax[0] = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i *)(x + i)));
+                ax[0] = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i)));
                 ay[0] = _mm512_loadu_ps(y + i);
                 sum[0] = _mm512_fmadd_ps(ax[0], ay[0], sum[0]);
                 i += GGML_F32_EPR16;
@@ -4100,7 +4104,7 @@ void ggml_vec_scale_f32(const int64_t n, float * y, const float   v) {
         do {
             y[i] *= v;
             i += 1;
-        } while (i < n);
+        } while (i < (uint64_t) n);
     }
 
 #elif defined(__AVX2__)
@@ -5021,7 +5025,7 @@ void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
 
     for (; i < np; i += GGML_F16_STEP16) {
         for (uint64_t j = 0; j < GGML_F16_ARR; j++) {
-            ax[j] = _mm256_loadu_si256((__m256i *)(x + i + j * GGML_F16_EPR16));
+            ax[j] = _mm256_loadu_si256((const __m256i *)(x + i + j * GGML_F16_EPR16));
             ay[j] = _mm512_cvtepu16_epi32(ax[j]);
             ay[j] = _mm512_slli_epi32(ay[j], 16);
             _mm512_storeu_si512((y + i + j * GGML_F16_EPR16), ay[j]); 
@@ -5031,7 +5035,7 @@ void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
     const uint64_t xn = (nc & ~(GGML_F16_EPR16 - 1));
 
     for (; i < xn; i += GGML_F16_EPR16) {
-        ax[0] = _mm256_loadu_si256((__m256i *)(x + i));
+        ax[0] = _mm256_loadu_si256((const __m256i *)(x + i));
         ay[0] = _mm512_cvtepu16_epi32(ax[0]);
         ay[0] = _mm512_slli_epi32(ay[0], 16);
         _mm512_storeu_si512((y + i), ay[0]); 
@@ -5187,7 +5191,7 @@ void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
 
     for (; i < np; i += GGML_F16_STEP16) {
         for (uint64_t j = 0; j < GGML_F16_ARR; j++) {
-            ax[j] = _mm256_loadu_si256((__m256i *)(x + i + j * GGML_F16_EPR16));
+            ax[j] = _mm256_loadu_si256((const __m256i *)(x + i + j * GGML_F16_EPR16));
             ay[j] = _mm512_cvtph_ps(ax[j]);
             _mm512_storeu_ps((y + i + j * GGML_F16_EPR16), ay[j]); 
         }
@@ -5196,7 +5200,7 @@ void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
     const uint64_t xn = (nc & ~(GGML_F16_EPR16 - 1));
 
     for (; i < xn; i += GGML_F16_EPR16) {
-        ax[0] = _mm256_loadu_si256((__m256i *)(x + i));
+        ax[0] = _mm256_loadu_si256((const __m256i *)(x + i));
         ay[0] = _mm512_cvtph_ps(ax[0]);
         _mm512_storeu_ps((y + i), ay[0]); 
     }
@@ -5520,10 +5524,10 @@ void dequantize_row_q3_K_cpu(const block_q3_K * restrict x, float * restrict y, 
         // Complement the upper bits and preshift into place.
         //
 
-        for (uint64_t i = 0; i < 2; i++) {
-            hm[i] = _mm_cvtsi64_si128(~hmk[i * 2 + 0]);
-            hm[i] = _mm_insert_epi64(hm[i], ~hmk[i * 2 + 1], 1);
-            hm[i] = _mm_rol_epi32(hm[i], 2);
+        for (uint64_t ii = 0; ii < 2; ii++) {
+            hm[ii] = _mm_cvtsi64_si128(~hmk[ii * 2 + 0]);
+            hm[ii] = _mm_insert_epi64(hm[ii], ~hmk[ii * 2 + 1], 1);
+            hm[ii] = _mm_rol_epi32(hm[ii], 2);
         }
 
         //
@@ -5849,7 +5853,7 @@ void dequantize_row_q4_0_cpu(const block_q4_0 * restrict x, float * restrict y, 
         // Load all the q4_0 quant nibble values.
         //
 
-        __m128i nibbles = _mm_loadu_si128((__m128i *)x[i].qs);
+        __m128i nibbles = _mm_loadu_si128((const __m128i *)x[i].qs);
 
         for (uint64_t j = 0; j < (qk / 16); j += 1) {
 
@@ -5947,7 +5951,7 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
         // The scale values are the first 8 bytes and the min values are the second 8 bytes.
         //
 
-        const uint32_t * vscales = (uint32_t *)x[i].scales;
+        const uint32_t * vscales = (const uint32_t *)x[i].scales;
         sm.utmp[3] = ((vscales[2] >> 4) & kmask2) | ((vscales[1] & kmask4) >> 2);
         sm.utmp[2] = vscales[1] & kmask1;
         sm.utmp[1] = (vscales[2] & kmask2) | ((vscales[0] & kmask4) >> 2);
@@ -5957,7 +5961,7 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
         // Initialize pointer to q array.
         //
 
-        const uint64_t * q = (uint64_t *)x[i].qs;
+        const uint64_t * q = (const uint64_t *)x[i].qs;
 
         for (int64_t j = 0; j < QK_K / 32; j += 2) {
 
@@ -5977,13 +5981,13 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
             // Dequantize first 32 quant values from the low quant nibble.
             //
 
-            for (int64_t k = 0; k < 2; ++k) {
-                const __m128i q1iq = _mm_loadu_epi8(q + (k * 2));
+            for (int64_t kk = 0; kk < 2; ++kk) {
+                const __m128i q1iq = _mm_loadu_epi8(q + (kk * 2));
                 const __m128i q1i = _mm_and_si128(q1iq, kmaskq);
                 const __m512i q1vi = _mm512_cvtepi8_epi32(q1i);
                 const __m512 q1v = _mm512_cvtepi32_ps(q1vi);
                 const __m512 y1 = _mm512_fmsub_ps(d1v, q1v, m1v);
-                _mm512_storeu_ps(y + (k * 16), y1);
+                _mm512_storeu_ps(y + (kk * 16), y1);
             }
 
 #else
@@ -5995,12 +5999,12 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
             // Dequantize first 32 quant values from the low quant nibble.
             //
 
-            for (int64_t k = 0; k < 4; ++k) {
-                const __m128i q1i = _mm_insert_epi64(qiz, q[k] & kmaskq, 0);
+            for (int64_t kk = 0; kk < 4; ++kk) {
+                const __m128i q1i = _mm_insert_epi64(qiz, q[kk] & kmaskq, 0);
                 const __m256i q1vi = _mm256_cvtepi8_epi32(q1i);
                 const __m256 q1v = _mm256_cvtepi32_ps(q1vi);
                 const __m256 y1 = _mm256_fmsub_ps(d1v, q1v, m1v);
-                _mm256_storeu_ps(y + (k * 8), y1);
+                _mm256_storeu_ps(y + (kk * 8), y1);
             }
 
 #endif // defined(__AVX512F__) && defined(__GEN_AVX512__)
@@ -6023,14 +6027,14 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
             // Dequantize first 32 quant values from the high quant nibble.
             //
 
-            for (int64_t k = 0; k < 2; ++k) {
-                const __m128i q2iq = _mm_loadu_epi8(q + (k * 2));
+            for (int64_t kk = 0; kk < 2; ++kk) {
+                const __m128i q2iq = _mm_loadu_epi8(q + (kk * 2));
                 const __m128i q2is = _mm_srli_epi16(q2iq, 4);
                 const __m128i q2i = _mm_and_si128(q2is, kmaskq);
                 const __m512i q2vi = _mm512_cvtepi8_epi32(q2i);
                 const __m512 q2v = _mm512_cvtepi32_ps(q2vi);
                 const __m512 y2 = _mm512_fmsub_ps(d2v, q2v, m2v);
-                _mm512_storeu_ps(y + (k * 16), y2);
+                _mm512_storeu_ps(y + (kk * 16), y2);
             }
 
 #else
@@ -6042,12 +6046,12 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
             // Dequantize second 32 quant values from the high quant nibble.
             //
 
-            for (int64_t k = 0; k < 4; ++k) {
-                const __m128i q2i = _mm_insert_epi64(qiz, (q[k] >> 4) & kmaskq, 0);
+            for (int64_t kk = 0; kk < 4; ++kk) {
+                const __m128i q2i = _mm_insert_epi64(qiz, (q[kk] >> 4) & kmaskq, 0);
                 const __m256i q2vi = _mm256_cvtepi8_epi32(q2i);
                 const __m256 q2v = _mm256_cvtepi32_ps(q2vi);
                 const __m256 y2 = _mm256_fmsub_ps(d2v, q2v, m2v);
-                _mm256_storeu_ps(y + (k * 8), y2);
+                _mm256_storeu_ps(y + (kk * 8), y2);
             }
 
 #endif // defined(__AVX512F__) && defined(__GEN_AVX512__)
@@ -6088,14 +6092,14 @@ void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, 
 #pragma message("Building AVX512F dequantize_row_q6_K_cpu")
 
     static const uint16_t k_perm[8][32] = {
-         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
-         2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-         4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-         6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-         8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-        10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,
-        12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,
-        14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15
+       { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+       { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 },
+       { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 },
+       { 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
+       { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 },
+       {10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11 },
+       {12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13 },
+       {14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15 }
     };
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
@@ -6173,10 +6177,10 @@ void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, 
     	    // Load the scale selection index values.
     	    //
     
-    	    const __m512i idx0 = _mm512_loadu_si512((__m512i *)&k_perm[(j * 4) + 0][0]);
-    	    const __m512i idx1 = _mm512_loadu_si512((__m512i *)&k_perm[(j * 4) + 1][0]);
-    	    const __m512i idx2 = _mm512_loadu_si512((__m512i *)&k_perm[(j * 4) + 2][0]);
-    	    const __m512i idx3 = _mm512_loadu_si512((__m512i *)&k_perm[(j * 4) + 3][0]);
+    	    const __m512i idx0 = _mm512_loadu_si512((const __m512i *)&k_perm[(j * 4) + 0][0]);
+    	    const __m512i idx1 = _mm512_loadu_si512((const __m512i *)&k_perm[(j * 4) + 1][0]);
+    	    const __m512i idx2 = _mm512_loadu_si512((const __m512i *)&k_perm[(j * 4) + 2][0]);
+    	    const __m512i idx3 = _mm512_loadu_si512((const __m512i *)&k_perm[(j * 4) + 3][0]);
     
     	    //
     	    // Select the scale values.
@@ -6315,12 +6319,12 @@ void dequantize_row_q8_0_cpu(const block_q8_0 * restrict x, float * restrict y, 
         __m128i qs;
         __m512 qp;
 
-         qs = _mm_loadu_si128((__m128i *)&x[i].qs[0]);
+         qs = _mm_loadu_si128((const __m128i *)&x[i].qs[0]);
          qp = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(qs));
          qp = _mm512_mul_ps(qp, d);
          _mm512_storeu_ps(y, qp);
 
-         qs = _mm_loadu_si128((__m128i *)&x[i].qs[16]);
+         qs = _mm_loadu_si128((const __m128i *)&x[i].qs[16]);
          qp = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(qs));
          qp = _mm512_mul_ps(qp, d);
          _mm512_storeu_ps(y + 16, qp);
@@ -6376,7 +6380,7 @@ void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, 
 
         for (uint64_t l = 0; l < qk / 64; l += 1) {
             for (uint64_t j = 0; j < 4; j++) {
-                qs[j] = _mm_loadu_si128((__m128i *)&x[i].qs[j * 16 + l * 64]);
+                qs[j] = _mm_loadu_si128((const __m128i *)&x[i].qs[j * 16 + l * 64]);
                 qp[j] = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(qs[j]));
                 qp[j] = _mm512_mul_ps(qp[j], d);
                 _mm512_storeu_ps(y + j * 16 + l * 64, qp[j]);
@@ -6471,18 +6475,18 @@ void ggml_backend_print_tensor_op_perf() {
     printf("          Total     Total  Tensor\n");
     printf("   Count Time(sec)   %%     Time(us) Tensor Op\n");
 
-    for (int64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
         total_count += compute_op_counts[i];
         total_time += compute_op_time[i];
     }
 
     total_op_count = total_count;
     total_percent = 0.;
-    for (int64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
         if (compute_op_counts[i]) {
-            percent = (double)compute_op_time[i] * 100.f / (double)total_time;
+            percent = (double)compute_op_time[i] * 100.0 / (double)total_time;
             total_percent += percent;
-            printf("%8ld %8.2f  %5.2f   %8.2f GGML_OP_%s\n",
+            printf("%8d %8.2f  %5.2f   %8.2f GGML_OP_%s\n",
                    compute_op_counts[i],
                    (double)(compute_op_time[i]) / (1000. * 1000.),
                    percent,
@@ -6502,11 +6506,11 @@ void ggml_backend_print_tensor_op_perf() {
     int32_t total_tensors = 0;
 
     printf("Graph Size  #_Nodes  #_Tensors\n");
-    for (int32_t i = 0; i < ARRAYSIZE(graph_tensor_counts); i += 1) {
+    for (uint32_t i = 0; i < ARRAYSIZE(graph_tensor_counts); i += 1) {
         if (graph_tensor_counts[i]) {
             total_count += graph_tensor_counts[i];
             total_tensors += graph_tensor_counts[i] * i;
-            printf("%5d       %5ld    %8ld\n",
+            printf("%5d       %5d    %8d\n",
                    i,
                    graph_tensor_counts[i],
                    graph_tensor_counts[i] * i);
@@ -6518,26 +6522,26 @@ void ggml_backend_print_tensor_op_perf() {
     printf("Total NOP Tensors    %8d (skipped)\n\n", total_tensors - total_op_count);
 
     printf("vector dot matrix multiply type frequency\n");
-    printf("   Count     %%    Time(ms)      %%   init_mat(ms) vec_dot_type\n");
+    printf("   Count     %%    Time(ms)       %%   init_mat(ms) vec_dot_type\n");
 
     total_count = 0;
     total_percent = 0.;
     total_time = 0;
-    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_type_counts); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(vec_dot_type_counts); i += 1) {
         total_count += vec_dot_type_counts[i];
         total_time += vec_dot_type_times[i];
     }
 
-    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_type_counts); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(vec_dot_type_counts); i += 1) {
         if (vec_dot_type_counts[i]) {
-            percent = (double)vec_dot_type_counts[i] * 100.f / (double)total_count;
+            percent = (double)vec_dot_type_counts[i] * 100.0 / (double)total_count;
             total_percent += percent;
-            printf("%8d   %5.2f  %8.2f %8.2f  %8.2f    GGML_TYPE_%s\n",
+            printf("%8d   %5.2f  %9.2f %8.2f  %8.2f    GGML_TYPE_%s\n",
                    vec_dot_type_counts[i],
                    percent,
-                   vec_dot_type_times[i] / 1000.0f,
+                   (double)(vec_dot_type_times[i]) / 1000.0,
                    (vec_dot_type_times[i] * 100.0) / total_time,
-                   vec_dot_type_conversion_time[i] / 1000.0f,
+                   (double)(vec_dot_type_conversion_time[i]) / 1000.0,
                    ggml_type_name(i));
         }
     }
@@ -6550,28 +6554,28 @@ void ggml_backend_print_tensor_op_perf() {
 
     total_count = 0;
     total_time = 0;
-    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_src0_counts); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(vec_dot_src0_counts); i += 1) {
         total_count += vec_dot_src0_counts[i];
         total_time += vec_dot_src0_time[i];
     }
 
     total_percent = 0.;
-    for (int64_t i = 0; i < ARRAYSIZE(vec_dot_src0_counts); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(vec_dot_src0_counts); i += 1) {
         if (vec_dot_src0_counts[i]) {
             percent = (float)vec_dot_src0_time[i] * 100.f / (float)total_time;
             total_percent += percent;
-            printf("%8ld %8.2f  %5.2f %8.2f GGML_TYPE_%s\n",
+            printf("%8d %8.2f  %5.2f %8.2f GGML_TYPE_%s\n",
                    vec_dot_src0_counts[i],
-                   (float)(vec_dot_src0_time[i]) / (1000. * 1000.),
+                   (double)(vec_dot_src0_time[i]) / (1000.0 * 1000.0),
                    percent,
-                   (float)(vec_dot_src0_time[i]) / (1000. * (float)vec_dot_src0_counts[i]),
+                   (double)(vec_dot_src0_time[i]) / (1000.0 * vec_dot_src0_counts[i]),
                    ggml_type_name(i));
         }
     }
 
     printf("\n%8d %8.2f %4.2f\n\n",
            total_count,
-           (float)(total_time) / (1000. * 1000.),
+           (double)(total_time) / (1000.0 * 1000.0),
            total_percent);
 
     //
@@ -6579,21 +6583,21 @@ void ggml_backend_print_tensor_op_perf() {
     // total count.
     //
 
-    for (int64_t i = 0; i < ARRAYSIZE(quant_type_row_size); i += 1) {
+    for (uint64_t i = 0; i < ARRAYSIZE(quant_type_row_size); i += 1) {
         if (quant_type_row_size[i].total_count) {
-            printf("vector row size count histogram for quant type: %s\n",
+            printf("vector row size count histogram for quant type: %s\n\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%    Time(ms)   Max(us) From_Float(ms)\n");
+            printf("  Size   Count    %%    Time(ms)   Max(ms)  From_Float(ms)\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
             total_time = 0;
             int64_t weighted_rowsize = 0;
 
-            for (int64_t j = 0; j < ARRAYSIZE(quant_type_row_size[i].counts); j += 1) {
+            for (uint64_t j = 0; j < ARRAYSIZE(quant_type_row_size[i].counts); j += 1) {
                 if (quant_type_row_size[i].counts[j]) {
-                    percent = (double)quant_type_row_size[i].counts[j] * 100.f / (double)total_count;
+                    percent = (double)quant_type_row_size[i].counts[j] * 100.0 / (double)total_count;
                     total_percent += percent;
                     weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
                     total_time += quant_type_row_size[i].times[j];
@@ -6602,8 +6606,8 @@ void ggml_backend_print_tensor_op_perf() {
                            quant_type_row_size[i].counts[j],
                            percent,
                            quant_type_row_size[i].times[j] / 1000.0,
-                           (double) quant_type_row_size[i].times_max[j],
-                           quant_type_row_size[i].conversion_from_float_times[j] / 1000.0f);
+                           (double) quant_type_row_size[i].times_max[j] / 1000.0,
+                           quant_type_row_size[i].conversion_from_float_times[j] / 1000.0);
                 }
             }
 
@@ -6611,13 +6615,13 @@ void ggml_backend_print_tensor_op_perf() {
                 total_count, total_percent,
                 total_time / 1000.0,
                 weighted_rowsize / total_count);
-            printf("  Max entry: ne00 ne01 ne10 ne11  Time(us)\n");
+            printf("  Max entry: ne00 ne01 ne10 ne11  Time(ms)\n");
             printf("             %4d %4d %4d %4d %9.2f\n\n",
                 quant_type_row_size[i].max_ne00,
                 quant_type_row_size[i].max_ne01,
                 quant_type_row_size[i].max_ne10,
                 quant_type_row_size[i].max_ne01,
-                (double)quant_type_row_size[i].max_time);
+                (double)quant_type_row_size[i].max_time / 1000.0);
         }
     }
 }
@@ -12109,6 +12113,7 @@ UseGgmlGemm2:;
 #else
     // be a little brave and try something bolder
     int chunk_size = MIN(128, nr0);
+    // int chunk_size = 16;
 #endif
 
     // We need to step up the size if it's small
@@ -13575,7 +13580,7 @@ static void ggml_compute_forward_soft_max_f32(
         ggml_float sum = ggml_vec_soft_max_f32(nc, dp, wp, max);
         assert(sum > 0.0);
 
-        sum = 1.0/sum;
+        sum = 1.0f/sum;
         ggml_vec_scale_f32(nc, dp, sum);
 
 #ifndef NDEBUG
@@ -15685,7 +15690,7 @@ static void ggml_compute_forward_flash_attn_back_f32(
 
                     assert(sum > 0.0);
 
-                    sum = 1.0/sum;
+                    sum = 1.0f/sum;
                     ggml_vec_scale_f32(masked_begin, SM, sum);
 
                 }
@@ -16868,7 +16873,7 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         ggml_vec_max_f32(nc, &max, s0);
         ggml_float sum = ggml_vec_soft_max_f32(nc, ds0, s0, max);
         assert(sum > 0.0);
-        ggml_vec_scale_f32(nc, ds0, 1.0/sum);
+        ggml_vec_scale_f32(nc, ds0, 1.0f/sum);
 
         // grad(src0) = (softmax(src0) - src1) * grad(cross_entropy_loss(src0, src1)) / nr
         ggml_vec_sub_f32(nc, ds0, ds0, s1);
@@ -18397,9 +18402,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     ggml_cpu_init();
 
 #ifdef GGML_B612_PERF
-    int64_t tensor_index = cgraph->n_nodes;
+    uint32_t tensor_index = cgraph->n_nodes;
     if (tensor_index >= ARRAYSIZE(graph_tensor_counts)) {
-        printf("****** overflow nodes per graph %I64d\n", tensor_index);
+        printf("****** overflow nodes per graph %d\n", tensor_index);
         printf("****** this graph entered in the 0th tensor size bucket\n");
         tensor_index = 0;
     }
