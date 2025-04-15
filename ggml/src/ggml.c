@@ -1610,10 +1610,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
 #if defined(GGML_B612)
-        /*.ntasks       =*/ 0,
-        /*.is_skipped   =*/ 0,
-        /*.reserved     =*/ 0,
-        /*.padding_b612 =*/ { 0 },
+        /*.ntasks       =*/ { 0,
+        /*.is_skipped   =*/   0,
+        /*.reserved     =*/   0 },
 #endif
         /*.padding      =*/ { 0 },
     };
@@ -2715,7 +2714,7 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = ggml_is_empty(result);
 #endif
 
@@ -2768,7 +2767,7 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = ggml_is_empty(result);
 #endif
 
@@ -3041,7 +3040,7 @@ struct ggml_tensor * ggml_reshape(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3061,7 +3060,7 @@ struct ggml_tensor * ggml_reshape_1d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3082,7 +3081,7 @@ struct ggml_tensor * ggml_reshape_2d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3104,7 +3103,7 @@ struct ggml_tensor * ggml_reshape_3d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3127,7 +3126,7 @@ struct ggml_tensor * ggml_reshape_4d(
 
     result->op     = GGML_OP_RESHAPE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3147,7 +3146,7 @@ static struct ggml_tensor * ggml_view_impl(
 
     result->op     = GGML_OP_VIEW;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3281,7 +3280,7 @@ struct ggml_tensor * ggml_permute(
 
     result->op     = GGML_OP_PERMUTE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 
@@ -3307,7 +3306,7 @@ struct ggml_tensor * ggml_transpose(
 
     result->op     = GGML_OP_TRANSPOSE;
     result->src[0] = a;
-#if defined(GGML_B612)    
+#if defined(GGML_B612)
     result->is_skipped = true;
 #endif
 

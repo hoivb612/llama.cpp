@@ -3251,6 +3251,7 @@ void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restri
     ggml_float sumf = 0.0;
 
 #if defined(GGML_SIMD)
+#pragma message("Building ----- default ----- SIMD version of ggml_vec_dot_f16")
     const int np = (n & ~(GGML_F16_STEP - 1));
 
     GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
@@ -3346,6 +3347,7 @@ void ggml_vec_dot_f16(const int n, float * restrict s, size_t bs, ggml_fp16_t * 
     }
 
 #elif defined(__AVX2__)
+#pragma message("buiding AVX2 ggml_vec_dot_f16 version")
 
     const int64_t xn = (n & ~(GGML_F16_EPR - 1));
 
@@ -6589,7 +6591,7 @@ void ggml_backend_print_tensor_op_perf() {
             printf("vector row size count histogram for quant type: %s\n\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%    Time(ms)   Max(ms)  From_Float(ms)\n");
+            printf("  Size   Count    %%    Time(ms)    Max(ms)  From_Float(ms)\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -6602,7 +6604,7 @@ void ggml_backend_print_tensor_op_perf() {
                     total_percent += percent;
                     weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
                     total_time += quant_type_row_size[i].times[j];
-                    printf("%6zd  %6d  %5.2f  %8.2f %9.2f %8.2f\n",
+                    printf("%6zd  %6d  %5.2f  %9.2f %9.2f %9.2f\n",
                            j + 1,
                            quant_type_row_size[i].counts[j],
                            percent,
