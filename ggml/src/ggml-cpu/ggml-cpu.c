@@ -224,10 +224,6 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
-#ifndef GGML_B612_PERF
-#define GGML_B612_PERF 1
-#endif // GGML_B612
-
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
 #endif
@@ -631,6 +627,23 @@ do {                                                                  \
     }                                                                 \
     res = (ggml_float) _mm512_reduce_add_ps(x[0]);                    \
 } while (0)
+
+#ifdef GGML_B612_PERF // MYST
+#define GGML_F32_STEP16 64
+#define GGML_F32_EPR16 16
+#define GGML_F32_VEC_REDUCE512(res, x)                            \
+do {                                                              \
+    x[0] = _mm512_add_ps(x[0], x[1]);                             \
+    x[2] = _mm512_add_ps(x[2], x[3]);                             \
+    x[0] = _mm512_add_ps(x[0], x[2]);                             \
+    const __m256 t0 = _mm256_add_ps(_mm512_castps512_ps256(x[0]), \
+                                    _mm512_extractf32x8_ps(x[0], 1)); \
+    const __m128 t1 = _mm_add_ps(_mm256_castps256_ps128(t0),      \
+                                 _mm256_extractf128_ps(t0, 1));   \
+    const __m128 t2 = _mm_hadd_ps(t1, t1);                        \
+    res = _mm_cvtss_f32(_mm_hadd_ps(t2, t2));                     \
+} while (0)
+#endif // GGML_B612_PERF
 
 // TODO: is this optimal ?
 
@@ -1402,7 +1415,60 @@ static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float *
    UNUSED(by);
    UNUSED(bs);
 
-#if defined(GGML_SIMD)
+#if defined(__AVX512F__) && defined(GGML_B612_PERF) // MYST
+#pragma message("buiding AVX512F ggml_vec_dot_f32 version")
+    float sumf = 0.0f;
+    int64_t i = 0;
+
+    const int64_t xn = (n & ~(GGML_F32_EPR16 - 1));
+
+    if (xn) {
+        __m512 sum[GGML_F32_ARR];
+        __m512 ax[GGML_F32_ARR];
+        __m512 ay[GGML_F32_ARR];
+
+        const int64_t np = (n & ~(GGML_F32_STEP16 - 1));
+
+        sum[0] = _mm512_setzero_ps();
+        sum[1] = _mm512_setzero_ps();
+        sum[2] = _mm512_setzero_ps();
+        sum[3] = _mm512_setzero_ps();
+
+        if (np) {
+            do {
+              for (int64_t j = 0; j < GGML_F32_ARR; j++) {
+                  ax[j] = _mm512_loadu_ps(x + i + j * GGML_F32_EPR16);
+                  ay[j] = _mm512_loadu_ps(y + i + j * GGML_F32_EPR16);
+                  sum[j] = _mm512_fmadd_ps(ax[j], ay[j], sum[j]); 
+              }
+
+              i += GGML_F32_STEP16;
+            } while (i < np);
+        }
+
+        if (xn > np) {
+            do {
+                ax[0] = _mm512_loadu_ps(x + i);
+                ay[0] = _mm512_loadu_ps(y + i);
+                sum[0] = _mm512_fmadd_ps(ax[0], ay[0], sum[0]);
+                i += GGML_F32_EPR16;
+            } while (i < xn);
+        }
+
+        // reduce sum0..sum3 to sumf
+        GGML_F32_VEC_REDUCE512(sumf, sum);
+    }
+
+    // leftovers
+    if (n & (GGML_F32_EPR16 - 1)) {
+        do {
+            sumf += x[i] * y[i];
+            i += 1;
+        } while (i < n);
+    }
+
+#elif defined(GGML_SIMD)
+#pragma message("buiding ----------------- default ---------------- SIMD ggml_vec_dot_f32 version")
     float sumf = 0.0f;
     const int np = (n & ~(GGML_F32_STEP - 1));
 
@@ -1515,7 +1581,62 @@ static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t *
 
     ggml_float sumf = 0.0;
 
-#if defined(GGML_SIMD)
+#if defined(__AVX512F__) && defined(GGML_B612_PERF) // MYST
+#pragma message("buiding AVX512F ggml_vec_dot_f16 version")
+#define GGML_F16_STEP16 64
+#define GGML_F16_EPR16 16
+#define GGML_F16_VEC_REDUCE512(res, x) GGML_F32_VEC_REDUCE512(res, x)
+
+    int64_t i = 0;
+    const int64_t xn = (n & ~(GGML_F16_EPR16 - 1));
+
+    if (xn) {
+        __m512 sum[GGML_F16_ARR];
+        __m512 ax[GGML_F16_ARR];
+        __m512 ay[GGML_F16_ARR];
+
+        sum[0] = _mm512_setzero_ps();
+        sum[1] = _mm512_setzero_ps();
+        sum[2] = _mm512_setzero_ps();
+        sum[3] = _mm512_setzero_ps();
+
+        const int64_t np = (n & ~(GGML_F16_STEP16 - 1));
+
+        if (np) {
+            do {
+                for (int64_t j = 0; j < GGML_F16_ARR; j++) {
+                    ax[j] = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(x + i + j * GGML_F16_EPR16)));
+                    ay[j] = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(y + i + j * GGML_F16_EPR16)));
+                    sum[j] = _mm512_fmadd_ps(ax[j], ay[j], sum[j]);
+                }
+    
+                i += GGML_F16_STEP16;
+            } while (i < np);
+        }
+
+        if (xn > np) {
+            do {
+                ax[0] = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(x + i)));
+                ay[0] = _mm512_cvtph_ps(_mm256_loadu_si256((__m256i const *)(y + i)));
+                sum[0] = _mm512_fmadd_ps(ax[0], ay[0], sum[0]);
+                i += GGML_F16_EPR16;
+            } while (i < xn);
+        }
+
+        // reduce sum0..sum3 to sumf
+        GGML_F16_VEC_REDUCE512(sumf, sum);
+    }
+
+    // leftovers
+    if (n & (GGML_F16_EPR16 - 1)) {
+        do {
+            sumf += GGML_FP16_TO_FP32(x[i]) * GGML_FP16_TO_FP32(y[i]);
+            i += 1;
+        } while (i < n);
+    }
+
+#elif defined(GGML_SIMD)
+#pragma message("buiding ----------------- default ---------------- SIMD ggml_vec_dot_f16 version")
     const int np = (n & ~(GGML_F16_STEP - 1));
 
     GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
@@ -2327,7 +2448,7 @@ void ggml_backend_print_tensor_op_perf() {
     printf("Total NOP Tensors    %8d (skipped)\n\n", total_tensors - total_op_count);
 
     printf("vector dot matrix multiply type frequency\n");
-    printf("   Count     %%    Time(ms)      %%   init_mat(ms) vec_dot_type\n");
+    printf("   Count     %%    Time(ms)       %%   init_mat(ms) vec_dot_type\n");
 
     total_count = 0;
     total_percent = 0.;
@@ -2341,7 +2462,7 @@ void ggml_backend_print_tensor_op_perf() {
         if (vec_dot_type_counts[i]) {
             percent = (double)vec_dot_type_counts[i] * 100.0 / (double)total_count;
             total_percent += percent;
-            printf("%8d   %5.2f  %8.2f %8.2f  %8.2f    GGML_TYPE_%s\n",
+            printf("%8d   %5.2f  %9.2f %8.2f  %8.2f    GGML_TYPE_%s\n",
                    vec_dot_type_counts[i],
                    percent,
                    (double)(vec_dot_type_times[i]) / 1000.0,
@@ -2373,7 +2494,7 @@ void ggml_backend_print_tensor_op_perf() {
                    vec_dot_src0_counts[i],
                    (double)(vec_dot_src0_time[i]) / (1000.0 * 1000.0),
                    percent,
-                   (double)(vec_dot_src0_time[i]) / (1000.0 * (double)vec_dot_src0_counts[i]),
+                   (double)(vec_dot_src0_time[i]) / (1000.0 * vec_dot_src0_counts[i]),
                    ggml_type_name(i));
         }
     }
@@ -2393,7 +2514,7 @@ void ggml_backend_print_tensor_op_perf() {
             printf("vector row size count histogram for quant type: %s\n\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%    Time(ms)   Max(ms)  From_Float(ms)\n");
+            printf("  Size   Count    %%    Time(ms)    Max(ms)  From_Float(ms)\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -2406,7 +2527,7 @@ void ggml_backend_print_tensor_op_perf() {
                     total_percent += percent;
                     weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
                     total_time += quant_type_row_size[i].times[j];
-                    printf("%6zd  %6d  %5.2f  %8.2f %9.2f %8.2f\n",
+                    printf("%6zd  %6d  %5.2f  %9.2f %9.2f %9.2f\n",
                            j + 1,
                            quant_type_row_size[i].counts[j],
                            percent,
@@ -7568,15 +7689,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-#if defined(GGML_B612_PERF)
-    if ((vec_dot_type != src1->type) && (vec_dot_type != GGML_TYPE_F16)) {
-    }
-    else if (vec_dot_type != src1->type) {
-        // override current default since we have direct f16-f32 vec_dot support
-        // vec_dot = (ggml_vec_dot_t)ggml_vec_dot_f16_f32;
-    }
-#endif // GGML_B612_PERF
-
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -7600,11 +7712,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
-#if !defined(GGML_B612_PERF)
     // attempt to reduce false-sharing (does not seem to make a difference)
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
-#endif
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -7637,7 +7747,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                 //}
 
-#if !defined(GGML_B612_PERF)
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
@@ -7645,11 +7754,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                     memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
-#else
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &dst_col[ir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
-                }
-#endif // GGML_B612_PERF
             }
         }
     }
@@ -7742,16 +7846,11 @@ static void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
-#if !defined(GGML_B612_PERF)
-    const bool init_mat = (vec_dot_type != src1->type);
-#else
-    // for ggml_vec_dot_f16_f32() - currently not compatible
+#ifdef GGML_B612_PERF
     int64_t time_for_float_conversion = 0;
-    const bool init_mat = (vec_dot_type != src1->type);
-    // const bool init_mat = ((vec_dot_type != src1->type) && (vec_dot_type != GGML_TYPE_F16));
 #endif // GGML_B612_PERF
-    
-    if (init_mat) {
+
+    if (vec_dot_type != src1->type) {
         char * wdata = params->wdata;
 
 #ifdef GGML_B612_PERF
@@ -7843,13 +7942,7 @@ UseGgmlGemm2:;
 #endif // GGML_B612_PERF
 
     // Now select a reasonable chunk size.
-#if !defined(GGML_B612_PERF)
     int chunk_size = 16;
-#else
-    // be a little brave and try something bolder
-    int chunk_size = MIN(128, nr0);
-    // int chunk_size = 16;
-#endif
 
     // We need to step up the size if it's small
     if (nr0 == 1 || nr1 == 1) {

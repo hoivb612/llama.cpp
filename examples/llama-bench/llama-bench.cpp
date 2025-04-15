@@ -1,3 +1,8 @@
+#ifndef GGML_B612_PERF
+#pragma message("Enable GGML_B612_PERF")
+#define GGML_B612_PERF 1
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -1625,6 +1630,10 @@ int main(int argc, char ** argv) {
 
         ggml_threadpool_free_fn(threadpool);
     }
+
+#ifdef GGML_B612_PERF
+    llama_print_tensor_op_perf();
+#endif
 
     llama_free_model(lmodel);
 

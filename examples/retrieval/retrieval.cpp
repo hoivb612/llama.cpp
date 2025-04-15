@@ -1,5 +1,6 @@
 #ifndef GGML_B612_PERF
-#define GGML_B612_PERF
+#pragma message("Enable GGML_B612_PERF")
+#define GGML_B612_PERF 1
 #endif
 
 #include "arg.h"
