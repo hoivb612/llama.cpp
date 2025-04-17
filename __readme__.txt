@@ -1,5 +1,10 @@
+
 Offspring for hoivb612
 https://github.com/hoivb612/llama.cpp
+
+===========================================
+
+Saved checkpoint for branch 032825 before taking the next plunge 04/16
 
 ===========================================
 
