@@ -1,51 +1,51 @@
-ifndef LLAMA_MAKEFILE
-$(error The Makefile build is deprecated. Use the CMake build instead. For more details, see https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
-endif
+#ifndef LLAMA_MAKEFILE
+#$(error The Makefile build is deprecated. Use the CMake build instead. For more details, see https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+#endif
 
 # Define the default target now so that it is always the first target
 BUILD_TARGETS = \
-	libllava.a \
-	llama-batched \
-	llama-batched-bench \
+	#libllava.a \
+	#llama-batched \
+	#llama-batched-bench \
 	llama-bench \
-	llama-cli \
-	llama-convert-llama2c-to-ggml \
-	llama-embedding \
-	llama-eval-callback \
-	llama-export-lora \
-	llama-gbnf-validator \
-	llama-gguf \
-	llama-gguf-hash \
-	llama-gguf-split \
-	llama-gritlm \
-	llama-imatrix \
-	llama-infill \
-	llama-llava-cli \
-	llama-minicpmv-cli\
-	llama-qwen2vl-cli\
-	llama-lookahead \
-	llama-lookup \
-	llama-lookup-create \
-	llama-lookup-merge \
-	llama-lookup-stats \
-	llama-parallel \
-	llama-passkey \
-	llama-perplexity \
-	llama-q8dot \
-	llama-quantize \
-	llama-quantize-stats \
+	#llama-cli \
+	#llama-convert-llama2c-to-ggml \
+	#llama-embedding \
+	#llama-eval-callback \
+	#llama-export-lora \
+	#llama-gbnf-validator \
+	#llama-gguf \
+	#llama-gguf-hash \
+	#llama-gguf-split \
+	#llama-gritlm \
+	#llama-imatrix \
+	#llama-infill \
+	#llama-llava-cli \
+	#llama-minicpmv-cli\
+	#llama-qwen2vl-cli\
+	#llama-lookahead \
+	#llama-lookup \
+	#llama-lookup-create \
+	#llama-lookup-merge \
+	#llama-lookup-stats \
+	#llama-parallel \
+	#llama-passkey \
+	#llama-perplexity \
+	#llama-q8dot \
+	#llama-quantize \
+	#llama-quantize-stats \
 	llama-retrieval \
-	llama-save-load-state \
-	llama-server \
-	llama-simple \
-	llama-simple-chat \
-	llama-run \
-	llama-speculative \
-	llama-tokenize \
-	llama-vdot \
-	llama-cvector-generator \
-	llama-gen-docs \
-	tests/test-c.o
+	#llama-save-load-state \
+	#llama-server \
+	#llama-simple \
+	#llama-simple-chat \
+	#llama-run \
+	#llama-speculative \
+	#llama-tokenize \
+	#llama-vdot \
+	#llama-cvector-generator \
+	#llama-gen-docs \
+	#tests/test-c.o
 
 # Binaries only useful for tests
 TEST_TARGETS = \
@@ -246,7 +246,8 @@ test: $(TEST_TARGETS)
 	fi
 	@echo 'All tests passed.'
 
-all: $(BUILD_TARGETS) $(TEST_TARGETS) $(LEGACY_TARGETS_BUILD)
+#all: $(BUILD_TARGETS) $(TEST_TARGETS) $(LEGACY_TARGETS_BUILD)
+all: $(BUILD_TARGETS)
 
 ifdef RISCV_CROSS_COMPILE
 CC	:= riscv64-unknown-linux-gnu-gcc
@@ -780,10 +781,6 @@ ifdef GGML_HIP
 
 	MK_CPPFLAGS += -DGGML_USE_HIP -DGGML_USE_CUDA
 
-ifdef GGML_HIP_UMA
-	MK_CPPFLAGS += -DGGML_HIP_UMA
-endif # GGML_HIP_UMA
-
 	MK_LDFLAGS += -L$(ROCM_PATH)/lib -Wl,-rpath=$(ROCM_PATH)/lib
 	MK_LDFLAGS += -L$(ROCM_PATH)/lib64 -Wl,-rpath=$(ROCM_PATH)/lib64
 	MK_LDFLAGS += -lhipblas -lamdhip64 -lrocblas
@@ -978,15 +975,33 @@ OBJ_GGML = \
 	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-hbm.o \
 	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-quants.o \
 	$(DIR_GGML)/src/ggml-cpu/ggml-cpu-traits.o \
+	$(DIR_GGML)/src/gguf.o \
 	$(OBJ_GGML_EXT)
 
 OBJ_LLAMA = \
 	$(DIR_LLAMA)/llama.o \
-	$(DIR_LLAMA)/llama-vocab.o \
+	$(DIR_LLAMA)/llama-adapter.o \
+	$(DIR_LLAMA)/llama-arch.o \
+	$(DIR_LLAMA)/llama-batch.o \
+	$(DIR_LLAMA)/llama-chat.o \
+	$(DIR_LLAMA)/llama-context.o \
+	$(DIR_LLAMA)/llama-cparams.o \
 	$(DIR_LLAMA)/llama-grammar.o \
+	$(DIR_LLAMA)/llama-graph.o \
+	$(DIR_LLAMA)/llama-hparams.o \
+	$(DIR_LLAMA)/llama-impl.o \
+	$(DIR_LLAMA)/llama-io.o \
+	$(DIR_LLAMA)/llama-kv-cache.o \
+	$(DIR_LLAMA)/llama-memory.o \
+	$(DIR_LLAMA)/llama-mmap.o \
+	$(DIR_LLAMA)/llama-model-loader.o \
+	$(DIR_LLAMA)/llama-model.o \
+	$(DIR_LLAMA)/llama-quant.o \
 	$(DIR_LLAMA)/llama-sampling.o \
+	$(DIR_LLAMA)/llama-vocab.o \
 	$(DIR_LLAMA)/unicode.o \
 	$(DIR_LLAMA)/unicode-data.o
+
 
 OBJ_COMMON = \
 	$(DIR_COMMON)/common.o \
@@ -997,6 +1012,7 @@ OBJ_COMMON = \
 	$(DIR_COMMON)/sampling.o \
 	$(DIR_COMMON)/speculative.o \
 	$(DIR_COMMON)/chat.o \
+	$(DIR_COMMON)/llguidance.o \
 	$(DIR_COMMON)/build-info.o \
 	$(DIR_COMMON)/json-schema-to-grammar.o
 

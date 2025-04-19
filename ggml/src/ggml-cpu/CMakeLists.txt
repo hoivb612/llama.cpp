@@ -21,12 +21,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/amx/mmq.cpp
         ggml-cpu/amx/mmq.h
         ggml-cpu/ggml-cpu-impl.h
+        ggml-cpu/common.h
         )
 
     if (GGML_B612)
         list (APPEND GGML_CPU_SOURCES
-            ggml-cpu/ggml-cpu-b612.c
-            ggml-cpu/ggml-cpu-quants-b612.c
+            ggml-cpu/b612/ggml-cpu-b612.c
+            ggml-cpu/b612/ggml-cpu-quants-b612.c
+            ggml-cpu/b612/ops-b612.cpp
+            ggml-cpu/b612/simd-mappings-b612.h
+            ggml-cpu/b612/vec-b612.h
+            ggml-cpu/b612/vec-b612.cpp
             ${GGML_SOURCES_RYZENAI}
             ${GGML_HEADERS_RYZENAI}
         )
@@ -34,7 +39,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list (APPEND GGML_CPU_SOURCES
             ggml-cpu/ggml-cpu.c
             ggml-cpu/ggml-cpu-quants.c
-        )
+            ggml-cpu/binary-ops.cpp
+            ggml-cpu/binary-ops.h
+            ggml-cpu/unary-ops.cpp
+            ggml-cpu/unary-ops.h
+            ggml-cpu/ops.cpp
+            ggml-cpu/simd-mappings.h
+            ggml-cpu/vec.h
+            ggml-cpu/vec.cpp
+                )
     endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)

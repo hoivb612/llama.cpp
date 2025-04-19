@@ -15,11 +15,13 @@ common_params params;
 #       define NOMINMAX
 #   endif
 #   include <windows.h>
-#endif
 
 #if defined(GGML_B612)
     #include <intrin.h>
     #include "b612-cpu.h"
+#endif // GGML_B612
+
+#endif // _WIN32
 
 void retrieval_log_callback(ggml_log_level level, const char * text, void * user_data) {
     GGML_UNUSED(text);
@@ -33,7 +35,6 @@ void retrieval_log_callback(ggml_log_level level, const char * text, void * user
         fputs(text, stdout);
     }
 }
-#endif
 
 static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
@@ -152,13 +153,13 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-#if defined(GGML_B612)
     llama_log_set(retrieval_log_callback, &(params.verbosity));
 
+#ifdef GGML_B612
     if (params.proc_affinity) {
         ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
     }
-#endif
+#endif // GGML_B612
 
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;
@@ -333,7 +334,7 @@ int main(int argc, char ** argv) {
             return false;
         }
 
-    std::string query;
+        std::string query;
         int64_t t_query_start = ggml_time_us();
 
         while (std::getline(cpfile, query)) {
@@ -392,8 +393,10 @@ int main(int argc, char ** argv) {
             (t_query_stop - t_query_start) / (item_count * 1000.0));
     }
 
-#if defined(GGML_B612)
-skip_query:
+    #ifdef GGML_B612
+    skip_query:
+    #endif
+    
     printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
         (t_tokenization_stop - t_tokenization_start) / 1000.0, 
         (t_tokenization_stop - t_tokenization_start) / (chunks.size() * 1000.0));
@@ -406,11 +409,12 @@ skip_query:
     llama_log_set(retrieval_log_callback, &(params.verbosity));
     llama_perf_context_print(ctx);
 
+#ifdef GGML_B612
     const auto t_main_end = ggml_time_us();
     printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
 
     llama_print_tensor_op_perf();
-#endif
+#endif // GGML_B612
 
     // clean up
     llama_batch_free(query_batch);
