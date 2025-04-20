@@ -183,7 +183,7 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     uint64_t i = 0;
     float sumf = 0;
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__)
+#if defined(__AVX512F__) && defined(__GEN_AVX512__) && !defined(__gnu_linux__)
 
     const uint64_t xn = (nc & ~(GGML_BF16_EPR32 - 1));
 
@@ -234,7 +234,7 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
         } while (i < nc);
     }
 
-#elif defined(__AVX2__)
+#elif defined(__AVX2__) && !defined(__gnu_linux__)
 
     const uint64_t xn = (nc & ~(GGML_BF16_EPR16 - 1));
 
@@ -1151,7 +1151,7 @@ void ggml_vec_sumsq_bf16(const uint64_t n, float * s, const ggml_bf16_t * x) {
     uint64_t i = 0;
     float sumf = 0.0f;
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__) /* && !defined(__gnu_linux__) */
+#if defined(__AVX512F__) && defined(__GEN_AVX512__) && !defined(__gnu_linux__)
 
     const uint64_t xn = (n & ~(GGML_BF16_EPR32 - 1));
 
@@ -1193,7 +1193,7 @@ void ggml_vec_sumsq_bf16(const uint64_t n, float * s, const ggml_bf16_t * x) {
         } while (i < n);
     }
 
-#elif defined(__AVX2__) /* && !defined(__gnu_linux__) */
+#elif defined(__AVX2__) && !defined(__gnu_linux__)
 
     const uint64_t xn = (n & ~(GGML_BF16_EPR16 - 1));
 

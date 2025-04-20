@@ -607,10 +607,10 @@ extern "C" {
             int is_skipped : 8;
             int reserved : 8;
         };
-        char padding_b612[12];
-#endif
-
+        char padding[4];
+#else
         char padding[8];
+#endif // GGML_B612
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

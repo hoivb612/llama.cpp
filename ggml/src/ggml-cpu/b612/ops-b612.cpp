@@ -3888,7 +3888,7 @@ static void ggml_compute_forward_abs_f16(
     }
 }
 
-static void ggml_compute_forward_abs(
+void ggml_compute_forward_abs(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -3960,7 +3960,7 @@ static void ggml_compute_forward_sgn_f16(
     }
 }
 
-static void ggml_compute_forward_sgn(
+void ggml_compute_forward_sgn(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4032,7 +4032,7 @@ static void ggml_compute_forward_neg_f16(
     }
 }
 
-static void ggml_compute_forward_neg(
+void ggml_compute_forward_neg(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4104,7 +4104,7 @@ static void ggml_compute_forward_step_f16(
     }
 }
 
-static void ggml_compute_forward_step(
+void ggml_compute_forward_step(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4176,7 +4176,7 @@ static void ggml_compute_forward_tanh_f16(
     }
 }
 
-static void ggml_compute_forward_tanh(
+void ggml_compute_forward_tanh(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4248,7 +4248,7 @@ static void ggml_compute_forward_elu_f16(
     }
 }
 
-static void ggml_compute_forward_elu(
+void ggml_compute_forward_elu(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4320,7 +4320,7 @@ static void ggml_compute_forward_relu_f16(
     }
 }
 
-static void ggml_compute_forward_relu(
+void ggml_compute_forward_relu(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4392,7 +4392,7 @@ static void ggml_compute_forward_sigmoid_f16(
     }
 }
 
-static void ggml_compute_forward_sigmoid(
+void ggml_compute_forward_sigmoid(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -4495,7 +4495,7 @@ static void ggml_compute_forward_gelu_f16(
     }
 }
 
-static void ggml_compute_forward_gelu(
+void ggml_compute_forward_gelu(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
@@ -4967,7 +4967,7 @@ static void ggml_compute_forward_hardswish_f16(
     }
 }
 
-static void ggml_compute_forward_hardswish(
+void ggml_compute_forward_hardswish(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -5039,7 +5039,7 @@ static void ggml_compute_forward_hardsigmoid_f16(
     }
 }
 
-static void ggml_compute_forward_hardsigmoid(
+void ggml_compute_forward_hardsigmoid(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
@@ -5111,7 +5111,7 @@ static void ggml_compute_forward_exp_f16(
     }
 }
 
-static void ggml_compute_forward_exp(
+void ggml_compute_forward_exp(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 

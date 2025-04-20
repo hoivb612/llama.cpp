@@ -776,7 +776,6 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
 #elif defined(__gnu_linux__)
 #pragma message("Building Linux ggml_fp32_to_bf16_row_cpu")
 
-    int i = 0;
 #if defined(__AVX512BF16__)
     // subnormals are flushed to zero on this platform
     for (; i + 32 <= n; i += 32) {
