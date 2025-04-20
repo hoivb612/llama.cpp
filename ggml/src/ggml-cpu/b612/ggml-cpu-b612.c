@@ -784,12 +784,11 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
             (__m512i *)(y + i),
             m512i(_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + i + 16),
                                 _mm512_loadu_ps(x + i))));
-  }
+    }
 #endif
     for (; i < n; i++) {
         y[i] = GGML_FP32_TO_BF16(x[i]);
     }
-}
 
 #else
 
