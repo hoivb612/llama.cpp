@@ -707,7 +707,7 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
     const uint64_t nc = n;
     uint64_t i = 0;
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__) /* && !defined(__gnu_linux__) */
+#if defined(__AVX512F__) && defined(__GEN_AVX512__) && !defined(__gnu_linux__)
 #pragma message("Building AVX512F ggml_fp32_to_bf16_row_cpu")
 
     __m512 ax[GGML_F32_ARR];
@@ -740,7 +740,8 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
         } while (i < nc);
     }
 
-#elif defined(__AVX2__) /* && !defined(__gnu_linux__) */
+#elif defined(__AVX2__) && !defined(__gnu_linux__)
+#pragma message("Building AVX2 ggml_fp32_to_bf16_row_cpu")
 
     __m256 ax[GGML_F32_ARR];
     __m128bh ay[GGML_F32_ARR];
@@ -771,6 +772,24 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
             i += 1;
         } while (i < nc);
     }
+
+#elif defined(__gnu_linux__)
+#pragma message("Building Linux ggml_fp32_to_bf16_row_cpu")
+
+    int i = 0;
+#if defined(__AVX512BF16__)
+    // subnormals are flushed to zero on this platform
+    for (; i + 32 <= n; i += 32) {
+        _mm512_storeu_si512(
+            (__m512i *)(y + i),
+            m512i(_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + i + 16),
+                                _mm512_loadu_ps(x + i))));
+  }
+#endif
+    for (; i < n; i++) {
+        y[i] = GGML_FP32_TO_BF16(x[i]);
+    }
+}
 
 #else
 
@@ -5130,7 +5149,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #ifdef GGML_XBOX_PERF
     uint32_t tensor_index = cgraph->n_nodes;
     if (tensor_index >= ARRAYSIZE(graph_tensor_counts)) {
-        printf("****** overflow nodes per graph %I64d\n", tensor_index);
+        printf("****** overflow nodes per graph %d\n", tensor_index);
         printf("****** this graph entered in the 0th tensor size bucket\n");
         tensor_index = 0;
     }
