@@ -10,17 +10,16 @@
 common_params params;
 
 #ifdef _WIN32
-#   define WIN32_LEAN_AND_MEAN
-#   ifndef NOMINMAX
-#       define NOMINMAX
-#   endif
-#   include <windows.h>
+    #define WIN32_LEAN_AND_MEAN
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
 
-#if defined(GGML_B612)
-    #include <intrin.h>
-    #include "b612-cpu.h"
-#endif // GGML_B612
-
+    #if defined(GGML_B612)
+        #include <intrin.h>
+        #include "b612-cpu.h"
+    #endif // GGML_B612
 #endif // _WIN32
 
 void retrieval_log_callback(ggml_log_level level, const char * text, void * user_data) {
@@ -155,7 +154,7 @@ int main(int argc, char ** argv) {
 
     llama_log_set(retrieval_log_callback, &(params.verbosity));
 
-#ifdef GGML_B612
+#if defined(_WIN32) && defined(GGML_B612)
     if (params.proc_affinity) {
         ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
     }
@@ -319,6 +318,7 @@ int main(int argc, char ** argv) {
     // start loop, read each query and return top-k or top similar chunk(s) 
     // based on cosine similarity
     int errors = 0;
+    int item_count = 0;
 
 #ifdef GGML_B612
     if (params.no_query) {
@@ -326,7 +326,6 @@ int main(int argc, char ** argv) {
     }
 #endif
 
-    int item_count = 0;
     for (auto & context_file : params.context_files) {
         std::ifstream cpfile(context_file);
         if (!cpfile.is_open()) {

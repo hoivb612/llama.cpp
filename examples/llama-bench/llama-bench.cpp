@@ -22,19 +22,25 @@
 #include "ggml.h"
 #include "llama.h"
 
-#ifdef _WIN32
-#   define WIN32_LEAN_AND_MEAN
-#   ifndef NOMINMAX
-#       define NOMINMAX
-#   endif
-#   include <windows.h>
-#endif
+#if defined(__gnu_linux__)
+    #ifdef GGML_B612
+    #undef GGML_B612 // Does not work for Linux
+    #endif // GGML_B612
+#endif // __gnu_linux__
 
-#if defined(GGML_B612)
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
     #include <iostream>
-    #include <intrin.h>
-    #include "b612-cpu.h"
-#endif
+
+    #if defined(GGML_B612)
+        #include <intrin.h>
+        #include "b612-cpu.h"
+    #endif // GGML_B612
+#endif // _WIN32
 
 // utils
 static uint64_t get_time_ns() {
@@ -730,12 +736,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.poll.empty()) {
         params.poll = cmd_params_defaults.poll;
     }
+#ifdef GGML_B612
     if (params.n_threads_prompt.empty()) {
         params.n_threads_prompt = params.n_threads;
     }
     if (params.n_threads_gen.empty()) {
         params.n_threads_gen = params.n_threads;
     }
+#endif // GGML_B612
 
     return params;
 }
@@ -1646,9 +1654,9 @@ int main(int argc, char ** argv) {
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
+#ifdef GGML_B612
     int64_t cpu_affinity_mask = 0;
     int32_t cpu_core_count_from_cpumask = 0;
-#ifdef GGML_B612
     if (params.cpumask_present) {
         for (int i = 0; i < 32; i++) {
             if (params.cpumask[i]) {

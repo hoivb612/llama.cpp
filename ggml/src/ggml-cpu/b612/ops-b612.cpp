@@ -1614,7 +1614,7 @@ static void ggml_compute_forward_add_q_f32(
     ggml_to_float_t dequantize_row_q = ggml_get_type_traits(type)->to_float;
 #if defined(GGML_B612)
     if (ggml_get_type_traits_cpu(type)->to_float) {
-        (ggml_to_float_t) dequantize_row_q = ggml_get_type_traits_cpu(type)->to_float;
+        dequantize_row_q = ggml_get_type_traits_cpu(type)->to_float;
     }
 #endif
     ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dtype)->from_float;
@@ -6758,7 +6758,7 @@ static void ggml_compute_forward_soft_max_f32(
         ggml_float sum = ggml_vec_soft_max_f32(nc, dp, wp, max);
         assert(sum > 0.0);
 
-        sum = 1.0/sum;
+        sum = 1.0f/sum;
         ggml_vec_scale_f32(nc, dp, sum);
 
 #ifndef NDEBUG
@@ -9140,7 +9140,7 @@ static void ggml_compute_forward_flash_attn_back_f32(
 
                     assert(sum > 0.0);
 
-                    sum = 1.0/sum;
+                    sum = 1.0f/sum;
                     ggml_vec_scale_f32(masked_begin, SM, sum);
 
                 }
@@ -10558,7 +10558,7 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         ggml_vec_max_f32(nc, &max, s0);
         const ggml_float sum = ggml_vec_soft_max_f32(nc, ds0, s0, max);
         assert(sum > 0.0);
-        ggml_vec_scale_f32(nc, ds0, 1.0/sum);
+        ggml_vec_scale_f32(nc, ds0, 1.0f/sum);
 
         // grad(src0f) = (softmax(src0f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
         ggml_vec_sub_f32(nc, ds0, ds0, s1);

@@ -1616,9 +1616,10 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.ntasks       =*/ 0,
         /*.is_skipped   =*/ 0,
         /*.reserved     =*/ 0,
-        /*.padding_b612 =*/ { 0 },
-#endif
         /*.padding      =*/ { 0 },
+#else
+        /*.padding      =*/ { 0 },
+#endif // GGML_B612
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
