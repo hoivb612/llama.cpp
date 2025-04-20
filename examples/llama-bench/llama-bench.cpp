@@ -1833,12 +1833,10 @@ int main(int argc, char ** argv) {
         ggml_threadpool_free_fn(threadpool);
     }
 
-#ifdef GGML_B612
     int64_t t_elapsed = ggml_time_ms() - t_start;
     printf("\n\n=== Elapsed time: %8.2fs\n", t_elapsed / 1000.0);
 
     llama_print_tensor_op_perf();
-#endif
 
     llama_model_free(lmodel);
 

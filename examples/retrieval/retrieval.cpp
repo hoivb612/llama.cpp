@@ -408,12 +408,10 @@ int main(int argc, char ** argv) {
     llama_log_set(retrieval_log_callback, &(params.verbosity));
     llama_perf_context_print(ctx);
 
-#ifdef GGML_B612
     const auto t_main_end = ggml_time_us();
     printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_main_end - t_main_start) / (1000. * 1000.)); 
 
     llama_print_tensor_op_perf();
-#endif // GGML_B612
 
     // clean up
     llama_batch_free(query_batch);
