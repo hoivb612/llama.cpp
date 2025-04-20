@@ -159,10 +159,6 @@ static void atomic_thread_fence(memory_order mo) {
 #include <stdatomic.h>
 #endif
 
-#ifdef GGML_B612
-#define GGML_XBOX_PERF 1
-#endif // GGML_B612
-
 typedef HANDLE pthread_t;
 
 typedef DWORD thread_ret_t;
@@ -204,7 +200,12 @@ typedef void * thread_ret_t;
 #include <sys/stat.h>
 #include <unistd.h>
 
-#endif
+#endif // _WIN32
+
+#ifdef GGML_B612
+#pragma message("Enable Xbox perf counters")
+#define GGML_XBOX_PERF 1
+#endif // GGML_B612
 
 typedef pthread_t ggml_thread_t;
 
@@ -2209,7 +2210,7 @@ void ggml_backend_print_tensor_op_perf() {
             printf("vector row size count histogram for quant type: %s\n\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%    Time(ms)    Max(ms) From_Float(ms)\n");
+            printf("  Size   Count    %%     Time(ms)    Max(ms) From_Float(ms)\n");
 
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -2250,7 +2251,7 @@ void ggml_backend_print_tensor_op_perf() {
 #else
 
 void ggml_backend_print_tensor_op_perf() {
-    // No perf data collected
+    printf("%s: No perf data collected for processing...\n", __func__);
 }
 
 #endif // GGML_XBOX_PERF
@@ -3124,7 +3125,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &dst_col[ir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
-#endif
+#endif // GGML_XBOX_PERF
             }
         }
     }
