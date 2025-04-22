@@ -991,6 +991,7 @@ void ggml_vec_sum_f32(const uint64_t n, float * s, const float * x) {
     }
 
 #elif defined(__AVX2__)
+#pragma message("Building AVX2 ggml_vec_sum_f32 version")
 
     uint64_t i = 0;
     const uint64_t xn = (n & ~(GGML_F32_EPR - 1));

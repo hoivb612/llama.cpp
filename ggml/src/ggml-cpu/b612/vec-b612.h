@@ -625,17 +625,7 @@ inline static void ggml_vec_silu_backward_f16(const int n, ggml_fp16_t * dx, con
     }
 }
 
-inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
-    ggml_float sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sum += (ggml_float)x[i];
-    }
-    *s = (float)sum;
-#else
-    vDSP_sve(x, 1, s, n);
-#endif
-}
+void ggml_vec_sum_f32(const uint64_t n, float * s, const float * x);
 
 inline static void ggml_vec_sum_f32_ggf(const int n, ggml_float * s, const float * x) {
     ggml_float sum = 0.0;
