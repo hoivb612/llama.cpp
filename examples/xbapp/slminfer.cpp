@@ -12,39 +12,43 @@ std::vector<llama_token> session_tokens;
 static int64_t t_token_generation_ms = 0;
 std::vector<llama_token> tokens_shared;
 
-std::vector<llama_token> llama_tokenize(
-    const struct llama_model * model,
+std::vector<llama_token> slm_tokenize(
+  const struct llama_context * ctx,
            const std::string & text,
                         bool   add_special,
-                        bool   parse_special = false) {
+                        bool   parse_special) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
     // upper limit for the number of tokens
     int n_tokens = text.length() + 2 * add_special;
     std::vector<llama_token> result(n_tokens);
-    n_tokens = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
-        GGML_UNUSED(check);
+        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
         GGML_ASSERT(check == -n_tokens);
-    }
-    else {
+    } else {
         result.resize(n_tokens);
     }
     return result;
 }
 
-std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token, bool special = true) {
-    std::vector<char> result(8, 0);
-    const int n_tokens = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size(), 0, special);
-    if (n_tokens < 0) {
-        result.resize(-n_tokens);
-        int check = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size(), 0, special);
-        GGML_ASSERT(check == -n_tokens);
-    } else {
-        result.resize(n_tokens);
+std::string slm_token_to_piece(const struct llama_context * ctx, llama_token token, bool special = false) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::string piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    }
+    else {
+        piece.resize(n_chars);
     }
 
-    return std::string(result.data(), result.size());
+    return piece;
 }
 
 void llama_batch_add(struct llama_batch & batch, llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool logits) {
@@ -145,7 +149,7 @@ int slm_init(xbapp_params& xbparams) {
             // build the shared prompt
             xbparams.pfx_shared = ::trim(template_prompt.substr(0, pos));
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            tokens_shared = llama_tokenize(model, xbparams.pfx_shared, false, true);
+            tokens_shared = slm_tokenize(ctx, xbparams.pfx_shared, false, true);
 
 #if 1 // use llama_state_load_file()
             // build the cache file directory
@@ -245,7 +249,7 @@ int slm_inference(xbapp_params& xbparams) {
     }
 
     // tokenize the remaining prompt or full prompt if pfc_mode is off
-    std::vector<llama_token> tokens_input = llama_tokenize(model, xbparams.prompt, false, true);
+    std::vector<llama_token> tokens_input = slm_tokenize(ctx, xbparams.prompt, false, true);
 
     // append the variant part of the prompt or the full prompt for non pfc mode
     embd_inp.insert(embd_inp.end(), tokens_input.begin(), tokens_input.end());
@@ -351,7 +355,7 @@ int slm_inference(xbapp_params& xbparams) {
             // build the shared prompt
             xbparams.pfx_shared = ::trim(template_prompt.substr(0, pos));
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            tokens_shared = llama_tokenize(model, xbparams.pfx_shared, false, true);
+            tokens_shared = slm_tokenize(ctx, xbparams.pfx_shared, false, true);
         }
 
 #else // use llama_set_state_data()
@@ -375,6 +379,9 @@ int slm_inference(xbapp_params& xbparams) {
     bool valid_reply = false;
     int n_tokens_generated = 0;
 
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
     while (n_past <= max_len) {
 
         // sample the last token just received
@@ -382,11 +389,11 @@ int slm_inference(xbapp_params& xbparams) {
 
         {
             // is it an end of generation - are we done?
-            if (llama_token_is_eog(model, new_token_id)) {
+            if (llama_token_is_eog(vocab, new_token_id)) {
                 break;
             }
 
-            const std::string token_str = llama_token_to_piece(ctx, new_token_id);
+            const std::string token_str = slm_token_to_piece(ctx, new_token_id);
 
             if (token_str.find('{') != std::string::npos) {
                 // accepted answers have '{' characters

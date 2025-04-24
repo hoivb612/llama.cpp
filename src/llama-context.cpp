@@ -1299,8 +1299,8 @@ int llama_context::decode(llama_batch & inp_batch) {
             n_outputs = n_outputs_new;
         }
 
-        // find KV slot
-        {
+        // Pooling does not use the KV cache
+        if (!embd_pooled) {
             if (!kv_self->find_slot(ubatch)) {
                 LLAMA_LOG_WARN("%s: failed to find KV cache slot for ubatch of size %d\n", __func__, ubatch.n_tokens);
 

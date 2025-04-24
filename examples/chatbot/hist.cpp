@@ -81,21 +81,22 @@ int tokens_used(void) {
 }
 
 std::string describe_token(llama_token token) {
-    if (token == llama_token_bos(g_model))
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    if (token == llama_token_bos(vocab))
         return "§";
-    if (token == llama_token_eos(g_model))
+    if (token == llama_token_eos(vocab))
         return "∎";
-    if (token == llama_token_cls(g_model))
+    if (token == llama_token_cls(vocab))
         return "⌘";
-    if (token == llama_token_sep(g_model))
+    if (token == llama_token_sep(vocab))
         return "⋯";
-    if (token == llama_token_pad(g_model))
+    if (token == llama_token_pad(vocab))
         return "␣";
-    if (token == llama_token_nl(g_model))
+    if (token == llama_token_nl(vocab))
         return "↵";
-    if (llama_token_is_eog(g_model, token))
+    if (llama_token_is_eog(vocab, token))
         return "⌟";
-    if (llama_token_is_control(g_model, token))
+    if (llama_token_is_control(vocab, token))
         return "∷";
     std::string s = token_to_piece(g_ctx, token, DONT_RENDER_SPECIAL_TOKENS);
     if (s.empty())
