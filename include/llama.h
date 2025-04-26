@@ -1427,6 +1427,7 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     LLAMA_API void                           llama_print_tensor_op_perf();
+    LLAMA_API void                           llama_set_tensor_repacking(bool);
 
 #ifdef __cplusplus
 }

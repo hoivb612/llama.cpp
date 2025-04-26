@@ -516,7 +516,7 @@ typedef struct {
 
 DECLSPEC__CACHEALIGN quant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
 
-void ggml_backend_print_tensor_op_perf() {
+void ggml_cpu_print_tensor_op_perf() {
 
     int32_t total_count = 0;
     int32_t total_op_count = 0;
@@ -687,6 +687,7 @@ bool ggml_cpu_allow_tensor_repacking() {
 }
 
 void ggml_cpu_set_tensor_repacking_flag(bool allow_repacking) {
+    printf("%s: set tensor repacking to %s\n", __func__, allow_repacking ? "true" : "false");
     allow_tensor_repacking = allow_repacking;
 }
 

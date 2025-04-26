@@ -631,8 +631,8 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
 
 #if defined(GGML_XBOX_PERF)
-    if (strcmp(name, "ggml_cpu_backend_print_tensor_op_perf") == 0) {
-        return (void *)ggml_cpu_backend_print_tensor_op_perf;
+    if (strcmp(name, "ggml_cpu_print_tensor_op_perf") == 0) {
+        return (void *)ggml_cpu_print_tensor_op_perf;
     }
 
     if (strcmp(name, "ggml_cpu_allow_tensor_repacking") == 0) {

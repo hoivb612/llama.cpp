@@ -1626,6 +1626,10 @@ int main(int argc, char ** argv) {
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
 
+#ifdef GGML_B612
+    // llama_set_tensor_repacking(false);
+#endif // GGML_B612
+
     // initialize llama.cpp
     if (!params.verbose) {
         llama_log_set(llama_null_log_callback, NULL);
