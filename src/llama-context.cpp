@@ -2839,8 +2839,6 @@ void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
 }
 
-#if defined(GGML_B612)
-
 void llama_print_tensor_op_perf() {
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         auto * reg = ggml_backend_reg_get(i);
@@ -2850,5 +2848,3 @@ void llama_print_tensor_op_perf() {
         }
     }
 }
-
-#endif // GGML_B612

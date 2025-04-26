@@ -142,9 +142,11 @@ extern "C" {
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
-#ifdef GGML_B612
-    GGML_BACKEND_API void ggml_backend_print_tensor_op_perf();
-#endif
+#ifdef GGML_XBOX_PERF
+    GGML_BACKEND_API void ggml_cpu_backend_print_tensor_op_perf();
+    GGML_BACKEND_API bool ggml_cpu_allow_tensor_repacking();
+    GGML_BACKEND_API void ggml_cpu_set_tensor_repacking_flag();
+#endif // GGML_XBOX_PERF
 
 #ifdef __cplusplus
 }

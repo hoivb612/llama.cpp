@@ -630,9 +630,17 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_threadpool;
     }
 
-#if defined(GGML_B612)
-    if (strcmp(name, "ggml_backend_print_tensor_op_perf") == 0) {
-        return (void *)ggml_backend_print_tensor_op_perf;
+#if defined(GGML_XBOX_PERF)
+    if (strcmp(name, "ggml_cpu_backend_print_tensor_op_perf") == 0) {
+        return (void *)ggml_cpu_backend_print_tensor_op_perf;
+    }
+
+    if (strcmp(name, "ggml_cpu_allow_tensor_repacking") == 0) {
+        return (void *)ggml_cpu_allow_tensor_repacking;
+    }
+
+    if (strcmp(name, "ggml_cpu_set_tensor_repacking_flag") == 0) {
+        return (void *)ggml_cpu_set_tensor_repacking_flag;
     }
 #endif
 

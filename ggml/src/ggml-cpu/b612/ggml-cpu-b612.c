@@ -202,11 +202,6 @@ typedef void * thread_ret_t;
 
 #endif // _WIN32
 
-#ifdef GGML_B612
-#pragma message("Enable Xbox perf counters")
-#define GGML_XBOX_PERF 1
-#endif // GGML_B612
-
 typedef pthread_t ggml_thread_t;
 
 #if defined(__APPLE__)
@@ -2085,7 +2080,7 @@ typedef struct {
 
 DECLSPEC__CACHEALIGN quant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
 
-void ggml_backend_print_tensor_op_perf() {
+void ggml_cpu_backend_print_tensor_op_perf() {
 
     int32_t total_count = 0;
     int32_t total_op_count = 0;
@@ -2248,10 +2243,15 @@ void ggml_backend_print_tensor_op_perf() {
     }
 }
 
-#else
+// default behavior
+bool allow_tensor_repacking = true;
 
-void ggml_backend_print_tensor_op_perf() {
-    printf("%s: No perf data collected for processing...\n", __func__);
+bool ggml_cpu_allow_tensor_repacking() {
+    return(allow_tensor_repacking);
+}
+
+void ggml_cpu_set_tensor_repacking_flag(bool allow_repacking) {
+    allow_tensor_repacking = allow_repacking;
 }
 
 #endif // GGML_XBOX_PERF

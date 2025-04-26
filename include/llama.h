@@ -1426,9 +1426,7 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
-#if defined(GGML_B612)
     LLAMA_API void                           llama_print_tensor_op_perf();
-#endif // GGML_B612
 
 #ifdef __cplusplus
 }

@@ -679,10 +679,15 @@ void ggml_backend_print_tensor_op_perf() {
     }
 }
 
-#else
+// default behavior
+bool allow_tensor_repacking = true;
 
-void ggml_backend_print_tensor_op_perf() {
-    printf("%s: No perf data collected for processing...\n", __func__);
+bool ggml_cpu_allow_tensor_repacking() {
+    return(allow_tensor_repacking);
+}
+
+void ggml_cpu_set_tensor_repacking_flag(bool allow_repacking) {
+    allow_tensor_repacking = allow_repacking;
 }
 
 #endif // GGML_XBOX_PERF
