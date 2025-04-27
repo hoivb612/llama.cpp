@@ -2838,23 +2838,3 @@ void llama_perf_context_print(const llama_context * ctx) {
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
 }
-
-void llama_print_tensor_op_perf() {
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        auto * reg = ggml_backend_reg_get(i);
-        auto * ggml_print_tensor_op_perf_fn = (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_print_tensor_op_perf");
-        if (ggml_print_tensor_op_perf_fn != nullptr) {
-            ggml_print_tensor_op_perf_fn();
-        }
-    }
-}
-
-void llama_set_tensor_repacking(bool repack_tensor) {
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        auto * reg = ggml_backend_reg_get(i);
-        auto * ggml_set_tensor_repacking_fn = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_tensor_repacking_flag");
-        if (ggml_set_tensor_repacking_fn != nullptr) {
-            ggml_set_tensor_repacking_fn(repack_tensor);
-        }
-    }
-}

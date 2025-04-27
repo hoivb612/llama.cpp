@@ -158,6 +158,12 @@ int main(int argc, char ** argv) {
     if (params.proc_affinity) {
         ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
     }
+    if (params.use_openmp) {
+        llama_select_OpenMP();
+    }
+    if (params.no_tensor_repack) {
+        llama_set_tensor_repacking(false);
+    }
 #endif // GGML_B612
 
     // For BERT models, batch size must be equal to ubatch size

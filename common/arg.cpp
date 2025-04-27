@@ -3047,6 +3047,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"-omp", "--openmp"},
+        "use OpenMP runtime support",
+        [](common_params & params) {
+            params.use_openmp = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"-norepack", "--no-tensor-repack"},
+        "turn off automatic tensor repacking (ex. Q4_0 -> Q4_0_8_8)",
+        [](common_params & params) {
+            params.no_tensor_repack = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-pfc", "--prefix-cache"},
         "use prefix cache support",
         [](common_params & params) {

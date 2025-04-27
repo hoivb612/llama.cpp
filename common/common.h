@@ -343,7 +343,8 @@ struct common_params {
 #if defined(GGML_B612)
     bool custom_prompts_on = false; // custom prompts are available
     bool prefix_cache_on   = false; // use prefix cache if it exists or create one if not present
-    bool use_omp           = false; // use open MP threading (NOP currently - dictated by GGML_USE_OPENMP)
+    bool use_openmp        = false; // use open MP threading (NOP currently - regulated by GGML_USE_OPENMP)
+    bool no_tensor_repack  = false; // disable tensor repacking (ex. Q4_0 -> Q4_0_8_8) - currently being done automatically
     bool proc_affinity     = false; // use process affinity
 #endif
 

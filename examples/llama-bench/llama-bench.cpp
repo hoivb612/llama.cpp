@@ -201,6 +201,8 @@ struct cmd_params {
     std::vector<int>                 n_threads_prompt;
     std::vector<int>                 n_threads_gen;
     bool                             process_affinity;
+    bool                             no_tensor_repack;
+    bool                             use_openmp;
     bool warmup_run;
     bool cpumask[GGML_MAX_N_THREADS];
     bool cpumask_present;
@@ -241,6 +243,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_threads_prompt     */ {0},
     /* n_threads_gen        */ {0},
     /* process_affinity     */ false,
+    /* no_tensor_repack     */ false,
+    /* use_openmp           */ false,
     /* warmup_run           */ false,
     /* cpumask              */ {false},
     /* cpumask_present      */ false,
@@ -301,8 +305,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -oe, --output-err <csv|json|jsonl|md|sql> (default: %s)\n",
            output_format_str(cmd_params_defaults.output_format_stderr));
 #if defined(GGML_B612)
-    printf("  -paffin, --process_affinity               (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
-    printf("  -warm, --warmup_run                       (default: %s)\n", cmd_params_defaults.warmup_run ? "1" : "0");
+    printf("  -paffin, --process-affinity               (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
+    printf("  -norepack, --no-tensor-repack             (default: %s)\n", cmd_params_defaults.no_tensor_repack ? "1" : "0");
+    printf("  -omp, --openmp                            (default: %s)\n", cmd_params_defaults.use_openmp ? "1" : "0");
+    printf("  -warm, --warmup-run                       (default: %s)\n", cmd_params_defaults.warmup_run ? "1" : "0");
 #endif
     printf("  -v, --verbose                             (default: %s)\n", cmd_params_defaults.verbose ? "1" : "0");
     printf("  --progress                                (default: %s)\n", cmd_params_defaults.progress ? "1" : "0");
@@ -358,6 +364,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
 #if defined(GGML_B612)
     params.process_affinity     = cmd_params_defaults.process_affinity;
+    params.no_tensor_repack     = cmd_params_defaults.no_tensor_repack;
+    params.use_openmp           = cmd_params_defaults.use_openmp;
     params.warmup_run           = cmd_params_defaults.warmup_run;
     params.cpumask_present      = cmd_params_defaults.cpumask_present;
     memset(&params.cpumask, 0, sizeof(params.cpumask));
@@ -630,6 +638,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 #if defined(GGML_B612)
         } else if (arg == "-paffin" || arg == "--process-affinity") {
             params.process_affinity = true;
+        } else if (arg == "-norepack" || arg == "--no-tensor-repacking") {
+            params.no_tensor_repack = true;
+        } else if (arg == "-omp" || arg == "--openmp") {
+            params.use_openmp = true;
         } else if (arg == "-tp" || arg == "--threads-prompt") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -1626,10 +1638,6 @@ int main(int argc, char ** argv) {
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
 
-#ifdef GGML_B612
-    // llama_set_tensor_repacking(false);
-#endif // GGML_B612
-
     // initialize llama.cpp
     if (!params.verbose) {
         llama_log_set(llama_null_log_callback, NULL);
@@ -1638,6 +1646,16 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     set_process_priority(params.prio);
+
+#ifdef GGML_B612
+    if (params.no_tensor_repack) {
+        llama_set_tensor_repacking(false);
+    }
+
+    if (params.use_openmp) {
+        llama_select_OpenMP();
+    }
+#endif // GGML_B612
 
     printf("\n");
     printf("\n\nsystem_info: %s\n\n", llama_print_system_info());

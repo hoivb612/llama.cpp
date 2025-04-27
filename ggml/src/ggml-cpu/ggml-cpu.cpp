@@ -644,6 +644,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
 #endif
 
+#if defined(GGML_B612)
+    if (strcmp(name, "ggml_cpu_select_OpenMP") == 0) {
+        return (void *)ggml_cpu_select_OpenMP;
+    }
+#endif // GGML_B612
+
     return NULL;
 
     GGML_UNUSED(reg);

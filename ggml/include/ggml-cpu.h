@@ -148,6 +148,10 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_set_tensor_repacking_flag();
 #endif // GGML_XBOX_PERF
 
+#ifdef GGML_B612
+    GGML_BACKEND_API void ggml_cpu_select_OpenMP();
+#endif // GGML_B612
+
 #ifdef __cplusplus
 }
 #endif

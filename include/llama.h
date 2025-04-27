@@ -1428,6 +1428,7 @@ extern "C" {
 
     LLAMA_API void                           llama_print_tensor_op_perf();
     LLAMA_API void                           llama_set_tensor_repacking(bool);
+    LLAMA_API void                           llama_select_OpenMP();
 
 #ifdef __cplusplus
 }
