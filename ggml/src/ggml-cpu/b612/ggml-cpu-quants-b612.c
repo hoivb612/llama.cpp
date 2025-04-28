@@ -2125,6 +2125,148 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 #if (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
 #pragma message("Building AVX512F vec_dot_q4_0_q8_0 version")
 
+    __m512 acc = _mm512_setzero_ps();
+    const __m512i zero512 = _mm512_setzero_si512();
+
+    const __m256i offset = _mm256_set1_epi8(8);
+    const __m256i m4 = _mm256_set1_epi8(0xf);
+
+    //
+    // Process odd quant first if there is one.
+    //
+
+    uint64_t i = 0;
+
+    if (nb & 1) {
+
+        //
+        // Compute combined scale for the block.
+        //
+
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[0].d) * GGML_FP16_TO_FP32(y[0].d));
+
+        //
+        // Get the q4_0 quant vector with nibbles in the [0..15] interval, and convert to
+        // bytes in the [-8..+7] interval.
+        //
+
+        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[0].qs);
+        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
+        __m256i qx = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
+        qx = _mm256_and_si256(m4, qx);
+        qx = _mm256_sub_epi8(qx, offset);
+
+        //
+        // Get the q8_0 quant vector.
+        //
+
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[0].qs);
+
+        //
+        // Get the absolute value of qx.
+        //
+
+        const __m256i ax = _mm256_sign_epi8(qx, qx);
+
+        //
+        // Get the signed value of qy. 
+        //
+
+        const __m256i sy = _mm256_sign_epi8(qy, qx);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32.
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m256i zero256 = _mm256_setzero_si256();
+        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
+        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and insert in overall accumulation which is zero
+        // at this point.
+        //
+
+        __m256 partial_acc = _mm256_mul_ps(d, q);
+        acc = _mm512_insertf32x8(acc, partial_acc, 0);
+
+        i = 1;
+    }
+
+    //
+    // Process remaining quant pairs.
+    //
+
+    for (; i < nb; i += 2) {
+
+        //
+        // Compute combined scale for two quant blocks.
+        //
+
+        const __m256 d0 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+        const __m256 d1 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i + 1].d) * GGML_FP16_TO_FP32(y[i + 1].d));
+        __m512 d = _mm512_castps256_ps512(d0);
+        d = _mm512_insertf32x8(d, d1, 1);
+
+        //
+        // Compute the dot product of two quant blocks and accumulate.
+        //
+        // Get the q4_0 quant vectors with nibbles in the [0..15] interval, and convert to
+        // bytes in the [-8..+7] interval.
+        //
+
+        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[i].qs);
+        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
+        __m256i qxl = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
+        qxl = _mm256_and_si256(m4, qxl);
+        qxl = _mm256_sub_epi8(qxl, offset);
+        const __m256i axl = _mm256_sign_epi8(qxl, qxl);
+
+        tmp1 = _mm_loadu_si128((const __m128i *)x[i + 1].qs);
+        tmp2 = _mm_srli_epi16(tmp1, 4);
+        __m256i qxh = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
+        qxh = _mm256_and_si256(m4, qxh);
+        qxh = _mm256_sub_epi8(qxh, offset);
+        const __m256i axh = _mm256_sign_epi8(qxh, qxh);
+
+        __m512i ax = _mm512_castsi256_si512(axl);
+        ax = _mm512_inserti32x8(ax, axh, 1);
+
+        //
+        // Get the q8_0 quant vectors.
+        //
+
+        const __m256i qyl = _mm256_loadu_si256((const __m256i *)y[i].qs);
+        const __m256i qyh = _mm256_loadu_si256((const __m256i *)y[i + 1].qs);
+        const __m256i syl = _mm256_sign_epi8(qyl, qxl);
+        const __m256i syh = _mm256_sign_epi8(qyh, qxh);
+        __m512i sy = _mm512_castsi256_si512(syl);
+        sy = _mm512_inserti32x8(sy, syh, 1);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m512i summed_pairs = _mm512_dpbusd_epi32(zero512, ax, sy);
+        const __m512 q = _mm512_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and accumulate.
+        //
+
+        acc = _mm512_fmadd_ps(d, q, acc);
+    }
+
+    *s = hsum_float_16(acc);
+    return; // We are done here there is no common join at the end
+
+#elif defined(__AVX2__) // Could have a problem for __clang__ (not validated yet)
+#pragma message("Building AVX512F vec_dot_q4_0_q8_0 version")
+
     __m256 acc = _mm256_setzero_ps();
     __m256i zero256 = _mm256_setzero_si256();
 
@@ -2185,9 +2327,9 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     *s = hsum_float_8(acc);
-    return;
+    return; // We are done here there is no common join at the end
 
-#elif defined(__AVX2__)
+#elif defined(__AVX2_ORG__)
 
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -2314,6 +2456,8 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     sumf = hsum_float_4x4(acc_0, acc_1, acc_2, acc_3);
 
 #endif // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
+
+    // common scalar portion for __AVX2_ORG__, __AVX__ and __SSSE3__
 
     for (; ib < nb; ++ib) {
         int sumi0 = 0;
@@ -2643,11 +2787,119 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 // #if defined(__AVX2__) || defined(__AVX512F__) // original code for both AVX2 and AVX512
 #pragma message("Building AVX512F vec_dot_q8_0_q8_0 version")
 
-    // Initialize accumulator with zeros
+    __m512 acc = _mm512_setzero_ps();
+    const __m512i zero512 = _mm512_setzero_si512();
+
+    //
+    // Process odd quant first if there is one.
+    //
+
+    uint64_t i = 0;
+
+    if (nb & 1) {
+
+        //
+        // Compute combined scale for quant block.
+        //
+
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[0].d) * GGML_FP16_TO_FP32(y[0].d));
+
+        //
+        // Compute the dot product of quant block and accumulate.
+        //
+
+        __m256i qx = _mm256_loadu_si256((const __m256i *)x[0].qs);
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[0].qs);
+
+        //
+        // Get the absolute values of qx.
+        //
+
+        const __m256i ax = _mm256_sign_epi8(qx, qx);
+
+        //
+        // Get the signed values of qy.
+        //
+
+        const __m256i sy = _mm256_sign_epi8(qy, qx);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m256i zero256 = _mm256_setzero_si256();
+        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
+        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and insert in overall accumulation.
+        //
+
+        __m256 partial_acc = _mm256_mul_ps(d, q);
+        acc = _mm512_insertf32x8(acc, partial_acc, 0);
+
+        i = 1;
+    }
+
+    //
+    // Process remaing quant pairs.
+    //
+
+    for (; i < nb; i += 2) {
+
+        //
+        // Compute combined scale for two quant blocks.
+        //
+
+        const __m256 d0 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+        const __m256 d1 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i + 1].d) * GGML_FP16_TO_FP32(y[i + 1].d));
+        __m512 d = _mm512_castps256_ps512(d0);
+        d = _mm512_insertf32x8(d, d1, 1);
+
+        //
+        // Compute the dot product of two quant blocks and accumulate.
+        //
+
+        const __m256i qxl = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        const __m256i qxh = _mm256_loadu_si256((const __m256i *)x[i + 1].qs);
+        const __m256i axl = _mm256_sign_epi8(qxl, qxl);
+        const __m256i axh = _mm256_sign_epi8(qxh, qxh);
+        __m512i ax = _mm512_castsi256_si512(axl);
+        ax = _mm512_inserti32x8(ax, axh, 1);
+
+        const __m256i qyl = _mm256_loadu_si256((const __m256i *)y[i].qs);
+        const __m256i qyh = _mm256_loadu_si256((const __m256i *)y[i + 1].qs);
+        const __m256i syl = _mm256_sign_epi8(qyl, qxl);
+        const __m256i syh = _mm256_sign_epi8(qyh, qxh);
+        __m512i sy = _mm512_castsi256_si512(syl);
+        sy = _mm512_inserti32x8(sy, syh, 1);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m512i summed_pairs = _mm512_dpbusd_epi32(zero512, ax, sy);
+        const __m512 q = _mm512_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and accumulate.
+        //
+
+        acc = _mm512_fmadd_ps(d, q, acc);
+    }
+
+    *s = hsum_float_16(acc);
+
+#elif defined(__AVX2__)
+#pragma message("Building AVX2 vec_dot_q8_0_q8_0 version")
+
     __m256 acc = _mm256_setzero_ps();
     __m256i zero256 = _mm256_setzero_si256();
 
-    // Main loop
     for (uint64_t i = 0; i < nb; ++i) {
 
         //
@@ -2661,13 +2913,13 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
 
         //
-        // Get the absolute values of qx
+        // Get the absolute values of qx.
         //
 
         const __m256i ax = _mm256_sign_epi8(qx, qx);
 
         //
-        // Get the signed values of qy
+        // Get the signed values of qy.
         //
 
         const __m256i sy = _mm256_sign_epi8(qy, qx);
@@ -2682,16 +2934,15 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
 
         //
-        // Multiply q with scale and accumulate
+        // Multiply q with scale and accumulate.
         //
 
         acc = _mm256_fmadd_ps(d, q, acc);
     }
 
     *s = hsum_float_8(acc);
-    return;
 
-#elif defined(__AVX2__)
+#elif defined(__AVX2_ORG__)
 #pragma message("Building ------ default ------ AVX2 vec_dot_q8_0_q8_0 version")
 
     // Initialize accumulator with zeros
@@ -2736,6 +2987,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
 #endif // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
 
+    // common code to join in only for __AVX2_ORG__ and __AVX__
     for (; ib < nb; ++ib) {
         int sumi = 0;
 

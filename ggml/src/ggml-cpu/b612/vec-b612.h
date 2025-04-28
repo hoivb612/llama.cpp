@@ -204,7 +204,7 @@ inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int 
 #endif
 }
 
-void ggml_vec_scale_f32(const int64_t n, float * y, const float   v);
+void ggml_vec_scale_f32(const uint64_t n, float * y, const float   v);
 
 void ggml_vec_scale_f16(const uint64_t n, ggml_fp16_t * y, const float v);
 
@@ -217,10 +217,9 @@ inline static void ggml_vec_sqr_f16 (const int n, ggml_fp16_t * y, const ggml_fp
         y[i] = GGML_FP32_TO_FP16(v*v);
     }
 }
-inline static void ggml_vec_sqrt_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = sqrtf(x[i]); }
-/* Consider
-{ ggml_vec_mul_f32(n, y, x, x); }
-*/
+
+void ggml_vec_sqrt_f32(const uint64_t n, float* y, const float* x);
+
 inline static void ggml_vec_sqrt_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_FP32_TO_FP16(sqrtf(GGML_FP16_TO_FP32(x[i])));
@@ -244,7 +243,9 @@ inline static void ggml_vec_cos_f16 (const int n, ggml_fp16_t * y, const ggml_fp
         y[i] = GGML_FP32_TO_FP16(cosf(GGML_FP16_TO_FP32(x[i])));
     }
 }
-inline static void ggml_vec_abs_f32  (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = fabsf(x[i]); }
+
+void ggml_vec_abs_f32(const uint64_t n, float* y, const float* x);
+
 inline static void ggml_vec_abs_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_FP32_TO_FP16(fabsf(GGML_FP16_TO_FP32(x[i])));

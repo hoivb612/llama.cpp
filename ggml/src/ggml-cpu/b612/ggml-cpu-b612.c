@@ -703,28 +703,34 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
     const uint64_t nc = n;
     uint64_t i = 0;
 
-#if defined(__AVX512F__) && defined(__GEN_AVX512__) && !defined(__gnu_linux__)
+#if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_fp32_to_bf16_row_cpu")
 
-    __m512 ax[GGML_F32_ARR];
-    __m256bh ay[GGML_F32_ARR];
+    __m512 ax;
+    __m512 bx;
+    __m512bh ay;
+    __m256bh by;
 
     const uint64_t np = (nc & ~(GGML_F32_STEP16 - 1));
 
     for (; i < np; i += GGML_F32_STEP16) {
-        for (uint64_t j = 0; j < GGML_F32_ARR; j++) {
-            ax[j] = _mm512_loadu_ps(x + i + j * GGML_F32_EPR16);
-            ay[j] = _mm512_cvtneps_pbh(ax[j]);
-            _mm256_storeu_si256((__m256i *)(y + i + j * GGML_F32_EPR16), ay[j]); 
-        }
+        ax = _mm512_loadu_ps(x + i + 16);
+        bx = _mm512_loadu_ps(x + i + 0);
+        ay = _mm512_cvtne2ps_pbh(ax, bx);
+        _mm512_storeu_si512((__m512i *)(y + i + 0), ay);
+
+        ax = _mm512_loadu_ps(x + i + 48);
+        bx = _mm512_loadu_ps(x + i + 32);
+        ay = _mm512_cvtne2ps_pbh(ax, bx);
+        _mm512_storeu_si512((__m512i *)(y + i + 32), ay); 
     }
 
     const uint64_t xn = (nc & ~(GGML_F32_EPR16 - 1));
 
     for (; i < xn; i += GGML_F32_EPR16) {
-        ax[0] = _mm512_loadu_ps(x + i);
-        ay[0] = _mm512_cvtneps_pbh(ax[0]);
-        _mm256_storeu_si256((__m256i *)(y + i), ay[0]); 
+        ax = _mm512_loadu_ps(x + i);
+        by = _mm512_cvtneps_pbh(ax);
+        _mm256_storeu_si256((__m256i *)(y + i), by); 
     }
 
     // leftovers
@@ -2167,7 +2173,7 @@ void ggml_cpu_print_tensor_op_perf() {
 
     printf("Vector Dot Matrix Multiply Src0 Type Frequency\n\n");
     printf("          Total    Total  Tensor\n");
-    printf("   Count Time(sec)   %%   Time(ms) Tensor Op\n\n");
+    printf("   Count Time(sec)   %%   Time(ms) Src0 Type\n\n");
 
     total_count = 0;
     total_time = 0;
@@ -2181,7 +2187,7 @@ void ggml_cpu_print_tensor_op_perf() {
         if (vec_dot_src0_counts[i]) {
             percent = (float)vec_dot_src0_time[i] * 100.f / (float)total_time;
             total_percent += percent;
-            printf("%8d %8.2f  %5.2f %8.2f GGML_TYPE_%s\n",
+            printf("%8d %8.2f  %5.2f %8.2f ggml_type_%s\n",
                    vec_dot_src0_counts[i],
                    (double)(vec_dot_src0_time[i]) / (1000. * 1000.),
                    percent,
