@@ -2893,6 +2893,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     *s = hsum_float_16(acc);
+    return; // do not fall through to common code below
 
 #elif defined(__AVX2__)
 #pragma message("Building AVX2 vec_dot_q8_0_q8_0 version")
@@ -2962,6 +2963,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     sumf = hsum_float_8(acc);
+    return; // do not fall through to common code below
 
 #elif defined(__AVX__)
 #pragma message("Building ------ default ------ AVX vec_dot_q8_0_q8_0 version")
