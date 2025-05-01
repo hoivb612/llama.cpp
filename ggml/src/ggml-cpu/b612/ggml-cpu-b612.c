@@ -4891,7 +4891,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        int64_t tensor_t0 = ggml_time_us();
+        int64_t tensor_t0 = 0;
+        if (!state->ith) {
+            tensor_t0 = ggml_time_us();
+        }
 #endif // GGML_XBOX_PERF
 
         ggml_compute_forward(&params, node);
@@ -4932,7 +4935,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
                 atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
-                tp->ec    = GGML_STATUS_ABORTED;
+                tp->ec = GGML_STATUS_ABORTED;
             }
         }
         
@@ -5182,7 +5185,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
-    int n_threads                               = cplan->n_threads;
+    int n_threads = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     bool disposable_threadpool = false;

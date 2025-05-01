@@ -3109,7 +3109,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
 #if defined(GGML_XBOX_PERF)
-        int64_t tensor_t0 = ggml_time_us();
+        int64_t tensor_t0 = 0;
+        if (!state-ith) {
+            tensor_t0 = ggml_time_us();
+        }
 #endif // GGML_XBOX_PERF
 
         ggml_compute_forward(&params, node);
