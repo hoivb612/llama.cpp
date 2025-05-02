@@ -252,7 +252,12 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q4_0_org(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#else
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
+
     static const int qk = QK4_0;
 
     assert(k % qk == 0);
@@ -348,7 +353,7 @@ void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRI
 
 #ifdef GGML_B612
 void dequantize_row_q8_0_org(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    #else
+#else
 void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 #endif // GGML_B612
 

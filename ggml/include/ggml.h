@@ -334,10 +334,11 @@ extern "C" {
     GGML_API ggml_fp16_t ggml_fp32_to_fp16(float);
 #ifdef GGML_B612
     GGML_API void        ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t *, float *, int64_t);
+    GGML_API void        ggml_fp32_to_fp16_row_cpu(const float *, ggml_fp16_t *, int64_t);
 #else
     GGML_API void        ggml_fp16_to_fp32_row(const ggml_fp16_t *, float *, int64_t);
-#endif // GGML_B612
     GGML_API void        ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
+#endif // GGML_B612
 
     // google brain half-precision bfloat16
     typedef struct { uint16_t bits; } ggml_bf16_t;
@@ -345,11 +346,12 @@ extern "C" {
     GGML_API float       ggml_bf16_to_fp32(ggml_bf16_t);  // consider just doing << 16
 #ifdef GGML_B612
     GGML_API void        ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t *, float *, int64_t);
+    GGML_API void        ggml_fp32_to_bf16_row_cpu(const float *, ggml_bf16_t *, int64_t);
 #else
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
+    GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 #endif // GGML_B612
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
-    GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
     struct ggml_object;
     struct ggml_context;

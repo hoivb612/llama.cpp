@@ -5511,42 +5511,6 @@ int ggml_cpu_has_sme(void) {
 #endif
 }
 
-#if defined(GGML_B612) && defined(NOT_NOW)
-// static functions to forward to ggml-base.dll for perfavx
-typedef void (*PFN_ggml_bf16_to_fp32_row)(const ggml_bf16_t *, float *, const int64_t);
-static PFN_ggml_bf16_to_fp32_row pfn_ggml_bf16_to_fp32_row;
-
-typedef void (*PFN_ggml_fp32_to_bf16_row)(const float *, ggml_bf16_t *, const int64_t);
-static PFN_ggml_fp32_to_bf16_row pfn_ggml_fp32_to_bf16_row;
-
-typedef void (*PFN_ggml_fp16_to_fp32_row)(const ggml_fp16_t *, float *, const int64_t);
-static PFN_ggml_fp16_to_fp32_row pfn_ggml_fp16_to_fp32_row;
-
-typedef void (*PFN_ggml_fp32_to_fp16_row)(const float *, ggml_fp16_t *, const int64_t);
-static PFN_ggml_fp32_to_fp16_row pfn_ggml_fp32_to_fp16_row;
-
-typedef void (*PFN_dequantize_row_q2_K)(const block_q2_K *, float *, int64_t);
-static PFN_dequantize_row_q2_K pfn_dequantize_row_q2_K;
-
-typedef void (*PFN_dequantize_row_q3_K)(const block_q3_K *, float *, int64_t);
-static PFN_dequantize_row_q3_K pfn_dequantize_row_q3_K;
-
-typedef void (*PFN_dequantize_row_q4_K)(const block_q4_K *, float *, int64_t);
-static PFN_dequantize_row_q4_K pfn_dequantize_row_q4_K;
-
-typedef void (*PFN_dequantize_row_q4_0)(const block_q4_0 *, float *, int64_t);
-static PFN_dequantize_row_q4_0 pfn_dequantize_row_q4_0;
-
-typedef void (*PFN_dequantize_row_q6_K)(const block_q6_K *, float *, int64_t);
-static PFN_dequantize_row_q6_K pfn_dequantize_row_q6_K;
-
-typedef void (*PFN_dequantize_row_q8_K)(const block_q8_K *, float *, int64_t);
-static PFN_dequantize_row_q8_K pfn_dequantize_row_q8_K;
-
-typedef void (*PFN_dequantize_row_q8_0)(const block_q8_0 *, float *, int64_t);
-static PFN_dequantize_row_q8_0 pfn_dequantize_row_q8_0;
-#endif // GGML_B612
-
 void ggml_cpu_init(void) {
     static bool is_first_call = true;
 
@@ -5590,83 +5554,8 @@ void ggml_cpu_init(void) {
         ggml_init_arm_arch_features();
 #endif
 
-#if defined(GGML_B612) && defined(NOT_NOW)
-        pfn_ggml_bf16_to_fp32_row = (PFN_ggml_bf16_to_fp32_row)ggml_bf16_to_fp32_row_cpu;
-        pfn_ggml_fp32_to_bf16_row = (PFN_ggml_fp32_to_bf16_row)ggml_fp32_to_bf16_row_cpu;
-        pfn_ggml_fp16_to_fp32_row = (PFN_ggml_fp16_to_fp32_row)ggml_fp16_to_fp32_row_cpu;
-        pfn_ggml_fp32_to_fp16_row = (PFN_ggml_fp32_to_fp16_row)ggml_fp32_to_fp16_row_cpu;
-
-        pfn_dequantize_row_q2_K = (PFN_dequantize_row_q2_K)dequantize_row_q2_K_cpu;
-        pfn_dequantize_row_q3_K = (PFN_dequantize_row_q3_K)dequantize_row_q3_K_cpu;
-        pfn_dequantize_row_q4_K = (PFN_dequantize_row_q4_K)dequantize_row_q4_K_cpu;
-        pfn_dequantize_row_q4_0 = (PFN_dequantize_row_q4_0)dequantize_row_q4_0_cpu;
-        pfn_dequantize_row_q6_K = (PFN_dequantize_row_q6_K)dequantize_row_q6_K_cpu;
-        pfn_dequantize_row_q8_K = (PFN_dequantize_row_q8_K)dequantize_row_q8_K_cpu;
-        pfn_dequantize_row_q8_0 = (PFN_dequantize_row_q8_0)dequantize_row_q8_0_cpu;
-#endif // GGML_B612
-
         is_first_call = false;
     }
 
     ggml_critical_section_end();
 }
-
-#if defined(GGML_B612) && !defined(__GGML_B612_STATIC__) && defined(NOT_NOW)
-#pragma message("Building B612 proxies for ggml-cpu.dll")
-// for perfavx
-void ggml_init_tables(void) {
-    ggml_cpu_init();
-}
-
-void ggml_time_init(void) {
-    // this is just for show and satisfies perfavx. The real call is 
-    // done via ggml_cpu_init() -> ggml_init() -> ggml_time_init().
-}
-
-// the following are just proxies for the real funcs in ggml-base.dll
-
-void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
-    pfn_ggml_bf16_to_fp32_row(x, y, n);
-}
-
-void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
-    pfn_ggml_fp32_to_bf16_row(x, y, n);
-}
-
-void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int64_t n) {
-    pfn_ggml_fp16_to_fp32_row(x, y, n);
-}
-
-void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n) {
-    pfn_ggml_fp32_to_fp16_row(x, y, n);
-}
-
-void dequantize_row_q2_K(const block_q2_K * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q2_K(x, y, k);
-}
-
-void dequantize_row_q3_K(const block_q3_K * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q3_K(x, y, k);
-}
-
-void dequantize_row_q4_K(const block_q4_K * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q4_K(x, y, k);
-}
-
-void dequantize_row_q4_0(const block_q4_0 * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q4_0(x, y, k);
-}
-
-void dequantize_row_q6_K(const block_q6_K * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q6_K(x, y, k);
-}
-
-void dequantize_row_q8_K(const block_q8_K * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q8_K(x, y, k);
-}
-
-void dequantize_row_q8_0(const block_q8_0 * restrict x, float * restrict y, int64_t k) {
-    pfn_dequantize_row_q8_0(x, y, k);
-}
-
-#endif //GGML_B612
