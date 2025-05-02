@@ -6256,9 +6256,15 @@ static void ggml_compute_forward_get_rows_f16(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+#ifdef GGML_B612
+        ggml_fp16_to_fp32_row_cpu(
+                (const ggml_fp16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+#else
         ggml_fp16_to_fp32_row(
                 (const ggml_fp16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+#endif // GGML_B612
     }
 }
 
@@ -6297,9 +6303,15 @@ static void ggml_compute_forward_get_rows_bf16(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+#ifdef GGML_B612
+        ggml_bf16_to_fp32_row_cpu(
+                (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+#else
         ggml_bf16_to_fp32_row(
                 (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+#endif // GGML_B612
     }
 }
 

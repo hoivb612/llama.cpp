@@ -614,6 +614,9 @@ struct ggml_compute_state {
 // ggml_vec_argmax_f32                      -> vec.h
 
 void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
+#ifdef GGML_B612_
+#pragma comment(linker, "/EXPORT:ggml_bf16_to_fp32_row=" __FUNCTION__)
+#endif // GGML_B612
 
     const uint64_t nc = n;
     uint64_t i = 0;
@@ -699,6 +702,9 @@ void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
 }
 
 void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:ggml_fp32_to_bf16_row=" __FUNCTION__)
+#endif // GGML_B612
 
     const uint64_t nc = n;
     uint64_t i = 0;
@@ -802,6 +808,9 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
 }
 
 void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:ggml_fp16_to_fp32_row=" __FUNCTION__)
+#endif // GGML_B612
 
     const uint64_t nc = n;
     uint64_t i = 0;
@@ -882,6 +891,9 @@ void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
 }
 
 void ggml_fp32_to_fp16_row_cpu(const float * x, ggml_fp16_t * y, int64_t n) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:ggml_fp32_to_fp16_row=" __FUNCTION__)
+#endif // GGML_B612
 
     const uint64_t nc = n;
     uint64_t i = 0;
@@ -964,6 +976,10 @@ void ggml_fp32_to_fp16_row_cpu(const float * x, ggml_fp16_t * y, int64_t n) {
 // New versions replacing the C versions in ggml/src/ggml-quants.c
 
 void dequantize_row_q2_K_cpu(const block_q2_K * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q2_K=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK_K;
     assert(k % qk == 0);
 
@@ -1114,6 +1130,10 @@ void dequantize_row_q2_K_cpu(const block_q2_K * restrict x, float * restrict y, 
 }
 
 void dequantize_row_q3_K_cpu(const block_q3_K * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q3_K=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK_K;
 
     assert(k % qk == 0);
@@ -1458,6 +1478,10 @@ void dequantize_row_q3_K_cpu(const block_q3_K * restrict x, float * restrict y, 
 }
 
 void dequantize_row_q4_0_cpu(const block_q4_0 * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q4_0=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK4_0;
 
     assert(k % qk == 0);
@@ -1533,6 +1557,10 @@ void dequantize_row_q4_0_cpu(const block_q4_0 * restrict x, float * restrict y, 
 }
 
 void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q4_K=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK_K;
 
     assert(k % qk == 0);
@@ -1707,6 +1735,10 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
 }
 
 void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q6_K=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK_K;
 
     assert(k % qk == 0);
@@ -1930,6 +1962,10 @@ void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, 
 }
 
 void dequantize_row_q8_0_cpu(const block_q8_0 * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q8_0=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK8_0;
 
     assert(k % qk == 0);
@@ -1989,6 +2025,10 @@ void dequantize_row_q8_0_cpu(const block_q8_0 * restrict x, float * restrict y, 
 }
 
 void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, int64_t k) {
+#ifdef GGML_B612
+#pragma comment(linker, "/EXPORT:dequantize_row_q8_K=" __FUNCTION__)
+#endif // GGML_B612
+
     const uint64_t qk = QK_K;
 
     assert(k % qk == 0);
@@ -2016,7 +2056,7 @@ void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, 
     }
 
 #elif defined(__AVX2__)
-#pragma message("Building AVX2 dequantize_row_q8_K")
+#pragma message("Building AVX2 dequantize_row_q8_K_cpu")
 
     for (uint64_t i = 0; i < nb; i++) {
         const __m256 d = _mm256_set1_ps(x[i].d);
@@ -2036,7 +2076,7 @@ void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, 
     }
 
 #else
-#pragma message("Building Scalar dequantize_row_q8_K")
+#pragma message("Building Scalar dequantize_row_q8_K_cpu")
 
     for (uint64_t i = 0; i < nb; i++) {
         for (int j = 0; j < QK_K; ++j) {

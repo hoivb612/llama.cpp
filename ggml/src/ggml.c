@@ -376,7 +376,11 @@ ggml_bf16_t ggml_fp32_to_bf16(float x) {
     return GGML_FP32_TO_BF16(x);
 }
 
+#ifdef GGML_B612
+void ggml_fp16_to_fp32_row_org(const ggml_fp16_t * x, float * y, int64_t n) {
+#else
 void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int64_t n) {
+#endif // GGML_B612
     for (int64_t i = 0; i < n; i++) {
         y[i] = GGML_FP16_TO_FP32(x[i]);
     }
@@ -384,7 +388,11 @@ void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int64_t n) {
 
 // FIXME: these functions must detect the instruction set at runtime, since they are part of the core ggml library
 //        currently, the ggml_cpu_has_* functions are entirely compile-time
+#ifdef GGML_B612
+void ggml_fp32_to_fp16_row_org(const float * x, ggml_fp16_t * y, int64_t n) {
+#else
 void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n) {
+#endif // GGML_B612
     int64_t i = 0;
 #if defined(__F16C__)
     //if (ggml_cpu_has_f16c()) {
@@ -405,9 +413,19 @@ void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n) {
     }
 }
 
+#ifdef GGML_B612
+void ggml_bf16_to_fp32_row_org(const ggml_bf16_t * x, float * y, int64_t n) {
+#else
 void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
+#endif // GGML_B612
     int64_t i = 0;
 #if defined(__AVX512F__)
+#ifdef GGML_B612
+// This flag (__AVX512F__) is not defined for ggml.c compilation so this code
+// should never be compiled.
+#pragma message("Building ------------- default AVX512F version of " __FUNCION__ "!!!!")
+#endif // GGML_B612
+
     //if (ggml_cpu_has_avx512()) {
         for (; i + 16 <= n; i += 16) {
             _mm512_storeu_ps(y + i,
@@ -438,16 +456,25 @@ void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
     }
 }
 
+#ifdef GGML_B612
+void ggml_fp32_to_bf16_row_org(const float * x, ggml_bf16_t * y, int64_t n) {
+    #else
 void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
-  int i = 0;
+#endif
+    int i = 0;
 #if defined(__AVX512BF16__)
-  // subnormals are flushed to zero on this platform
-  for (; i + 32 <= n; i += 32) {
+#ifdef GGML_B612
+// This flag (__AVX512BF16__) is not defined for ggml.c compilation so this code
+// should never be compiled.
+#pragma message("Building ------------- default AVX512BF16 version of " __FUNCION__ "!!!!")
+#endif // GGML_B612
+    // subnormals are flushed to zero on this platform
+    for (; i + 32 <= n; i += 32) {
         _mm512_storeu_si512(
             (__m512i *)(y + i),
             m512i(_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + i + 16),
                                 _mm512_loadu_ps(x + i))));
-  }
+    }
 #endif
     for (; i < n; i++) {
         y[i] = GGML_FP32_TO_BF16(x[i]);
@@ -611,8 +638,13 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 1,
         .type_size                = sizeof(ggml_fp16_t),
         .is_quantized             = false,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row_org,
+        .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row_org,
+#else
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
+#endif // GGML_B612
     },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
@@ -663,7 +695,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK8_0,
         .type_size                = sizeof(block_q8_0),
         .is_quantized             = true,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_org,
+#else
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
+#endif // GGML_B612
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
     [GGML_TYPE_Q8_1] = {
@@ -678,7 +714,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q2_K),
         .is_quantized             = true,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) dequantize_row_q2_K_org,
+#else
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
+#endif // GGML_B612
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
     },
     [GGML_TYPE_Q3_K] = {
@@ -686,7 +726,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q3_K),
         .is_quantized             = true,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) dequantize_row_q3_K_org,
+#else
         .to_float                 = (ggml_to_float_t) dequantize_row_q3_K,
+#endif // GGML_B612
         .from_float_ref           = (ggml_from_float_t) quantize_row_q3_K_ref,
     },
     [GGML_TYPE_Q4_K] = {
@@ -694,7 +738,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q4_K),
         .is_quantized             = true,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_K_org,
+#else
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
+#endif // GGML_B612
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
     },
     [GGML_TYPE_Q5_K] = {
@@ -710,7 +758,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q6_K),
         .is_quantized             = true,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) dequantize_row_q6_K_org,
+#else
         .to_float                 = (ggml_to_float_t) dequantize_row_q6_K,
+#endif // GGML_B612
         .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
     },
     [GGML_TYPE_IQ2_XXS] = {
@@ -796,7 +848,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 1,
         .type_size                = sizeof(ggml_bf16_t),
         .is_quantized             = false,
+#ifdef GGML_B612
+        .to_float                 = (ggml_to_float_t) ggml_bf16_to_fp32_row_org,
+#else
         .to_float                 = (ggml_to_float_t) ggml_bf16_to_fp32_row,
+#endif // GGML_B612        
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_bf16_row_ref,
     },
     [31] = { // GGML_TYPE_Q4_0_4_4
@@ -6469,7 +6525,11 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);
+#ifdef GGML_B612
+                ggml_fp32_to_fp16_row_org(src + start, (ggml_fp16_t *)dst + start, n);
+#else
                 ggml_fp32_to_fp16_row(src + start, (ggml_fp16_t *)dst + start, n);
+#endif // GGML_B612
                 result = n * elemsize;
             } break;
         case GGML_TYPE_BF16:

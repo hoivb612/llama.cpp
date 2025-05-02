@@ -346,7 +346,12 @@ void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q8_0_org(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    #else
 void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
+
     static const int qk = QK8_0;
 
     assert(k % qk == 0);
@@ -709,7 +714,11 @@ void quantize_row_q2_K_ref(const float * GGML_RESTRICT x, block_q2_K * GGML_REST
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q2_K_org(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#else
 void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
     assert(k % QK_K == 0);
     const int nb = k / QK_K;
 
@@ -1053,7 +1062,12 @@ void quantize_row_q3_K_ref(const float * GGML_RESTRICT x, block_q3_K * GGML_REST
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q3_K_org(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#else
 void dequantize_row_q3_K(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
+
     assert(k % QK_K == 0);
     const int nb = k / QK_K;
 
@@ -1277,7 +1291,12 @@ void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_REST
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q4_K_org(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#else
 void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
+
     assert(k % QK_K == 0);
     const int nb = k / QK_K;
 
@@ -1687,7 +1706,12 @@ void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_REST
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q6_K_org(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#else
 void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
+
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
 
@@ -2515,7 +2539,12 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
     }
 }
 
+#ifdef GGML_B612
+void dequantize_row_q8_K_org(const block_q8_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#else
 void dequantize_row_q8_K(const block_q8_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#endif // GGML_B612
+
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
 
