@@ -871,11 +871,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    [33] = { // GGML_TYPE_Q4_0_8_8
-        .type_name                = "TYPE_Q4_0_8_8 REMOVED, use Q4_0 with runtime repacking",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
+    [33] = { // refreshed for GGML_TYPE_Q4_x_8_8 (Q4_0_8_8 + Q4_K_8_8) data collection
+        .type_name                = "TYPE_Q4_X_8_8 REPLACED_by_runtime_repacking",
+        .blck_size                = QK4_0,
+        .type_size                = sizeof(block_q4_0),
+        .is_quantized             = true,
     },
     [GGML_TYPE_TQ1_0] = {
         .type_name                = "tq1_0",

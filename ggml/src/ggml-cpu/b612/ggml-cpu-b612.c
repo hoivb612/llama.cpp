@@ -2274,7 +2274,7 @@ void ggml_cpu_print_tensor_op_perf() {
                 }
             }
 
-            printf("\n      %8d %5.2f  %8.2f (avg row size %zd)\n\n", 
+            printf("\n      %8d %5.2f   %8.2f (avg row size %zd)\n\n", 
                 total_count, total_percent,
                 total_time / 1000.0,
                 weighted_rowsize / total_count);
@@ -3806,7 +3806,52 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
     // extra_buffer op?
+#ifdef GGML_XBOX_PERF
+        int64_t vec_dot_t0 = ggml_time_us();
+#endif
+
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+
+#ifdef GGML_XBOX_PERF
+        // if successful then it is one of the repacked computation
+        if ((tensor->op == GGML_OP_MUL_MAT) && !params->ith) {
+            // note: the collected time includes both the conversion and vec_dot time
+            // and Q4_0_8_8 is used as a bucket for these repacked types: Q4_0_8_8 and
+            // Q4_K_8_8
+            const int64_t vec_dot_time = ggml_time_us() - vec_dot_t0;
+            vec_dot_src0_time[GGML_TYPE_Q4_0_8_8] += vec_dot_time;
+            vec_dot_src0_counts[GGML_TYPE_Q4_0_8_8] += 1;
+            const struct ggml_tensor * src0 = tensor->src[0];
+            if (src0->type == GGML_TYPE_Q4_0) {
+                vec_dot_type_counts[GGML_TYPE_Q8_0] += 1;
+            } else if (src0->type == GGML_TYPE_Q4_K) {
+                vec_dot_type_counts[GGML_TYPE_Q8_K] += 1;
+            }
+
+            uint64_t bucket_index = ggml_row_size(GGML_TYPE_Q4_0_8_8, src0->ne[0]);
+            quant_type_info *quant_type_info_data = &(quant_type_row_size[GGML_TYPE_Q4_0_8_8]);
+            if (bucket_index > ARRAYSIZE(quant_type_info_data->counts)) {
+                bucket_index = ARRAYSIZE(quant_type_info_data->counts);
+            }
+            quant_type_info_data->total_count += 1;
+            quant_type_info_data->counts[bucket_index - 1] += 1;
+            quant_type_info_data->times[bucket_index - 1] += vec_dot_time;
+            if (vec_dot_time > quant_type_info_data->times_max[bucket_index - 1]) {
+                // save the new max time for this bucket
+                quant_type_info_data->times_max[bucket_index - 1] = vec_dot_time;
+            }
+            if (vec_dot_time > quant_type_info_data->max_time) {
+                // save the new max time for this dimension size
+                quant_type_info_data->max_time = vec_dot_time;
+                quant_type_info_data->max_ne00 = (int32_t) src0->ne[0];
+                quant_type_info_data->max_ne01 = (int32_t) src0->ne[1];
+                const struct ggml_tensor * src1 = tensor->src[1];
+                quant_type_info_data->max_ne10 = (int32_t) src1->ne[0];
+                quant_type_info_data->max_ne11 = (int32_t) src1->ne[1];
+            }
+        }
+#endif // GGML_XBOX_PERF
+
         return;
     }
 
@@ -4913,10 +4958,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
-    set_numa_thread_affinity(state->ith);
+    const int ith = state->ith;
+    set_numa_thread_affinity(ith);
 
     struct ggml_compute_params params = {
-        /*.ith       =*/ state->ith,
+        /*.ith       =*/ ith,
         /*.nth       =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
         /*.wsize     =*/ cplan->work_size,
         /*.wdata     =*/ cplan->work_data,
@@ -4932,24 +4978,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         int64_t tensor_t0 = 0;
-        if (!state->ith) {
+        if (!ith) {
             tensor_t0 = ggml_time_us();
         }
 #endif // GGML_XBOX_PERF
 
         ggml_compute_forward(&params, node);
 
-        if (!state->ith) {
+        if (!ith) {
 #if defined(GGML_XBOX_PERF)
-            // update tensor op count
-            compute_op_counts[node->op] += 1;    
             // update tensor op time
             tensor_t0 = ggml_time_us() - tensor_t0;
             compute_op_time[node->op] += tensor_t0;
+            // update tensor op count
+            compute_op_counts[node->op] += 1;
             // update time per vec_dot_type and per src0_row_size for mul_mat
             if (node->op == GGML_OP_MUL_MAT) {
-                // printf("=================================================\n");
                 const struct ggml_tensor * src0 = node->src[0];
+
+                // the following data collection is duplicate and not valid
+                // when there is tensor repacking happening for Q4_0/Q4_K. All
+                // stats below is contributing to Q4_0 which is also correct
+                // but will not show up in the final print out because the count is
+                // always 0 since it is already taken care in ggml_compute_forward()
                 const enum ggml_type src0_type = src0->type;
                 vec_dot_type_times[type_traits_cpu[src0_type].vec_dot_type] += tensor_t0;
                 quant_type_info *quant_type_info_data = &(quant_type_row_size[src0_type]);
@@ -4959,9 +5010,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 }
                 quant_type_info_data->times[bucket_index - 1] += tensor_t0;
                 if (tensor_t0 > quant_type_info_data->times_max[bucket_index - 1]) {
+                    // save the new max time for this bucket
                     quant_type_info_data->times_max[bucket_index - 1] = tensor_t0;
                 }
                 if (tensor_t0 > quant_type_info_data->max_time) {
+                    // save the new max time for this dimension size
                     quant_type_info_data->max_time = tensor_t0;
                     quant_type_info_data->max_ne00 = (int32_t) src0->ne[0];
                     quant_type_info_data->max_ne01 = (int32_t) src0->ne[1];

@@ -123,17 +123,17 @@ void clear_ephemeral(void) {
 
 int chatbot_token_eot(llama_model *model) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    llama_token eot = llama_token_eot(vocab);
+    llama_token eot = llama_vocab_eot(vocab);
     if (eot != -1)
         return eot;
-    return llama_token_eos(vocab);
+    return llama_vocab_eos(vocab);
 }
 
 bool out_of_context(int extra) {
     err("error: ran out of context window at %d tokens\n"
         "consider passing `-c %d` at startup for the maximum\n"
         "you can free up more space using /forget or /clear",
-        tokens_used() + extra, llama_n_ctx_train(g_model));
+        tokens_used() + extra, llama_model_n_ctx_train(g_model));
     return false;
 }
 
@@ -299,7 +299,7 @@ void on_quit(const std::vector<std::string> &args) {
     clear_ephemeral();
 
     print_ephemeral("freeing model...");
-    llama_free_model(g_model);
+    llama_model_free(g_model);
     clear_ephemeral();
 
     print_ephemeral("freeing backend...");
@@ -313,9 +313,9 @@ void chat_loop() {
     const llama_vocab * vocab = llama_model_get_vocab(g_model);
 
     // setup conversation
-    if (llama_add_bos_token(vocab)) {
+    if (llama_vocab_get_add_bos(vocab)) {
         print_ephemeral("loading bos token...");
-        eval_token(llama_token_bos(vocab));
+        eval_token(llama_vocab_bos(vocab));
     }
     record_undo();
 
@@ -411,7 +411,7 @@ void chat_loop() {
             if (!eval_token(id))
                 break;
             const llama_vocab * vocab = llama_model_get_vocab(g_model);
-            if (llama_token_is_eog(vocab, id))
+            if (llama_vocab_is_eog(vocab, id))
                 break;
             std::string s = token_to_piece(g_ctx, id, g_params.special);
             print(s);
@@ -462,14 +462,14 @@ int main(int argc, char **argv) {
 
     print_ephemeral("loading model...");
     llama_model_params model_params = common_model_params_to_llama(g_params);
-    g_model = llama_load_model_from_file(g_params.model.path.c_str(), model_params);
+    g_model = llama_model_load_from_file(g_params.model.path.c_str(), model_params);
     clear_ephemeral();
     if (g_model == NULL) {
         fprintf(stderr, "... failed to load model '%s'\n", g_params.model.path.c_str());
         exit(2);
     }
-    if (g_params.n_ctx <= 0 || g_params.n_ctx > llama_n_ctx_train(g_model))
-        g_params.n_ctx = llama_n_ctx_train(g_model);
+    if (g_params.n_ctx <= 0 || g_params.n_ctx > llama_model_n_ctx_train(g_model))
+        g_params.n_ctx = llama_model_n_ctx_train(g_model);
     if (g_params.n_ctx < g_params.n_batch)
         g_params.n_batch = g_params.n_ctx;
 
@@ -482,7 +482,7 @@ int main(int argc, char **argv) {
 
     print_ephemeral("initializing context...");
     llama_context_params ctx_params = common_context_params_to_llama(g_params);
-    g_ctx = llama_new_context_with_model(g_model, ctx_params);
+    g_ctx = llama_init_from_model(g_model, ctx_params);
     clear_ephemeral();
     if (!g_ctx) {
         fprintf(stderr, "error: failed to initialize context\n");
@@ -496,7 +496,7 @@ int main(int argc, char **argv) {
     clear_ephemeral();
 
     print_ephemeral("freeing model...");
-    llama_free_model(g_model);
+    llama_model_free(g_model);
     clear_ephemeral();
 
     print_ephemeral("freeing backend...");

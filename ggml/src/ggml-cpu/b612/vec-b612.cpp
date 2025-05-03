@@ -8,20 +8,14 @@
 #pragma warning(disable: 4244 4267)
 #endif
 
-#if defined(_WIN32)
-    #ifndef __AVX512BF16__
-        #define __AVX512BF16__
-        #define GGML_BF16_STEP32 128
-        #define GGML_BF16_EPR32 32
-        #define GGML_BF16_STEP16 64
-        #define GGML_BF16_EPR16 16
-    #endif // __AVX512BF16__
-#else
-    #define GGML_BF16_STEP32 128
-    #define GGML_BF16_EPR32 32
-    #define GGML_BF16_STEP16 64
-    #define GGML_BF16_EPR16 16
-#endif // _WIN32
+// For AVX512_BF16 full time
+#ifndef __AVX512BF16__
+    #define __AVX512BF16__
+#endif // __AVX512BF16__
+#define GGML_BF16_STEP32 128
+#define GGML_BF16_EPR32 32
+#define GGML_BF16_STEP16 64
+#define GGML_BF16_EPR16 16
 
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];

@@ -108,7 +108,7 @@ int slm_init(xbapp_params& xbparams) {
     model_params = llama_model_default_params();
     model_params.n_gpu_layers = xbparams.n_ngl;
 
-    model = llama_load_model_from_file(xbparams.model_path.c_str(), model_params);
+    model = llama_model_load_from_file(xbparams.model_path.c_str(), model_params);
     if (model == NULL) {
         printf("%s: error: unable to load model\n" , __func__);
         return 1;
@@ -130,7 +130,7 @@ int slm_init(xbapp_params& xbparams) {
     // enable perf counters
     ctx_params.no_perf = false;
 
-    ctx = llama_new_context_with_model(model, ctx_params);
+    ctx = llama_init_from_model(model, ctx_params);
     if (ctx == NULL) {
         printf("%s: error: failed to create the llama_context\n" , __func__);
         return 1;
@@ -141,7 +141,7 @@ int slm_init(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // start from a known point
-        llama_kv_cache_clear(ctx);
+        llama_kv_self_clear(ctx);
 
         std::string template_prompt = xbparams.custom_template_prompt;
         size_t pos = template_prompt.find("{message}");
@@ -190,7 +190,7 @@ int slm_init(xbapp_params& xbparams) {
                 //printf("%s: token_shared=%zd - %s\n", __func__, tokens_shared.size(), LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_shared).c_str());
 
                 // remove any "future" tokens that we might have inherited from the previous session
-                llama_kv_cache_seq_rm(ctx, -1, tokens_shared.size(), -1);
+                llama_kv_self_seq_rm(ctx, -1, tokens_shared.size(), -1);
             }
 
 #else // use llama_set_state_data()
@@ -234,7 +234,7 @@ int slm_inference(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_seq_rm(ctx, -1, tokens_shared.size(), -1);
+        llama_kv_self_seq_rm(ctx, -1, tokens_shared.size(), -1);
         embd_inp.insert(embd_inp.end(), tokens_shared.begin(), tokens_shared.end());
         n_past = tokens_shared.size();
         n_kv_pfx = tokens_shared.size();
@@ -243,7 +243,7 @@ int slm_inference(xbapp_params& xbparams) {
         xbparams.prompt.append("\"\n<|end|>\n<|Assistant|>\nYou:");
     } else {
         // start from a known point for each new user prompt
-        llama_kv_cache_clear(ctx);
+        llama_kv_self_clear(ctx);
         n_past = 0;
         n_kv_pfx = 0;
     }
@@ -389,7 +389,7 @@ int slm_inference(xbapp_params& xbparams) {
 
         {
             // is it an end of generation - are we done?
-            if (llama_token_is_eog(vocab, new_token_id)) {
+            if (llama_vocab_is_eog(vocab, new_token_id)) {
                 break;
             }
 
@@ -463,7 +463,7 @@ void slm_terminate() {
     llama_perf_context_print(ctx);
 
     llama_free(ctx);
-    llama_free_model(model);
+    llama_model_free(model);
 
     llama_backend_free();
 }
