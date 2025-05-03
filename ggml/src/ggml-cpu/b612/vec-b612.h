@@ -43,7 +43,13 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_bf16_f32(const int n, float * GGML_RESTRICT s, size_t bs, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_f16_f32(const int64_t n, float * GGML_RESTRICT s, size_t bs, const ggml_fp16_t * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc);
- 
+
+// Cosine similarity
+//
+float ggml_cosine_similarity_f32(int n, float *x, float *y);
+float ggml_cosine_similarity_bf16(int n, ggml_bf16_t *x, ggml_bf16_t *y);
+//
+
 void ggml_vec_silu_f32(const int n, float * y, const float * x);
 ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
 ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
@@ -81,6 +87,7 @@ inline static void ggml_vec_neg_f16 (const int n, ggml_fp16_t * y, const ggml_fp
 }
 
 void ggml_vec_mul_f32(const uint32_t n, float * z, const float * x, const float * y);
+void ggml_vec_mul1_f32(const uint64_t n, float * z, const float * x, const float v);
 inline static void ggml_vec_mul_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(x[i]) * GGML_FP16_TO_FP32(y[i]));

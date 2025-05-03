@@ -700,6 +700,8 @@ static inline __m128i packNibbles( __m256i bytes ) {
 #endif  //__loongarch_asx
 
 void quantize_row_q4_0(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q4_0=" __FUNCTION__)
+
     const uint64_t qk = QK4_0;
 
     assert(qk == 32);
@@ -754,6 +756,8 @@ void quantize_row_q5_1(const float * restrict x, void * restrict y, int64_t k) {
 }
 
 void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q8_0=" __FUNCTION__)
+
     uint64_t qk = QK8_0;
 
     assert(qk == 32);
@@ -1592,6 +1596,8 @@ static inline void get_scale_min_k4(int j, const uint8_t * restrict q, uint8_t *
 //========================- 2-bit (de)-quantization
 
 void quantize_row_q2_K(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q2_K=" __FUNCTION__)
+
     const uint64_t qk = QK_K;
 
     assert(k % qk == 0);
@@ -1668,12 +1674,16 @@ void quantize_row_q2_K(const float * restrict x, void * restrict vy, int64_t k) 
 //========================= 3-bit (de)-quantization
 
 void quantize_row_q3_K(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q3_K=" __FUNCTION__)
+
     quantize_row_q3_K_ref(x, vy, k);
 }
 
 // ====================== 4-bit (de)-quantization
 
 void quantize_row_q4_K(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q4_K=" __FUNCTION__)
+
     const uint64_t qk = QK_K;
     block_q4_K * restrict y = vy;
 
@@ -1760,6 +1770,8 @@ void quantize_row_q5_K(const float * restrict x, void * restrict vy, int64_t k) 
 // ====================== 6-bit (de)-quantization
 
 void quantize_row_q6_K(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q6_K=" __FUNCTION__)
+
     assert(k % QK_K == 0);
     block_q6_K * restrict y = vy;
     quantize_row_q6_K_ref(x, y, k);
@@ -1812,6 +1824,8 @@ inline int hsum_i32_16(__m512i x) {
 #endif
 
 void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) {
+#pragma comment(linker, "/EXPORT:quantize_row_q8_K=" __FUNCTION__)
+
     const uint64_t qk = QK_K;
     block_q8_K * restrict y = vy;
 
@@ -2105,6 +2119,8 @@ static inline __m128i get_scale_shuffle(int i) {
 #endif
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#pragma comment(linker, "/EXPORT:ggml_vec_dot_q4_0_q8_0=" __FUNCTION__)
+
     const uint64_t qk = QK8_0;
     const uint64_t nb = n / qk;
 
@@ -2132,74 +2148,13 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     const __m256i m4 = _mm256_set1_epi8(0xf);
 
     //
-    // Process odd quant first if there is one.
+    // Process quant pairs if there are any.
     //
 
     uint64_t i = 0;
+    uint64_t np = nb & ~1;
 
-    if (nb & 1) {
-
-        //
-        // Compute combined scale for the block.
-        //
-
-        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[0].d) * GGML_FP16_TO_FP32(y[0].d));
-
-        //
-        // Get the q4_0 quant vector with nibbles in the [0..15] interval, and convert to
-        // bytes in the [-8..+7] interval.
-        //
-
-        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[0].qs);
-        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
-        __m256i qx = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
-        qx = _mm256_and_si256(m4, qx);
-        qx = _mm256_sub_epi8(qx, offset);
-
-        //
-        // Get the q8_0 quant vector.
-        //
-
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[0].qs);
-
-        //
-        // Get the absolute value of qx.
-        //
-
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
-
-        //
-        // Get the signed value of qy. 
-        //
-
-        const __m256i sy = _mm256_sign_epi8(qy, qx);
-
-        //
-        // mul (ax * sy) + 0 directly to epi32.
-        //
-        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
-        //
-
-        const __m256i zero256 = _mm256_setzero_si256();
-        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
-        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
-
-        //
-        // Multiply q with scale and insert in overall accumulation which is zero
-        // at this point.
-        //
-
-        __m256 partial_acc = _mm256_mul_ps(d, q);
-        acc = _mm512_insertf32x8(acc, partial_acc, 0);
-
-        i = 1;
-    }
-
-    //
-    // Process remaining quant pairs.
-    //
-
-    for (; i < nb; i += 2) {
+    for (; i < np; i += 2) {
 
         //
         // Compute combined scale for two quant blocks.
@@ -2217,16 +2172,17 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         // bytes in the [-8..+7] interval.
         //
 
-        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[i].qs);
-        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
+        const __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[i].qs);
+        const __m128i tmp3 = _mm_loadu_si128((const __m128i *)x[i + 1].qs);
+
+        const __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
         __m256i qxl = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
         qxl = _mm256_and_si256(m4, qxl);
         qxl = _mm256_sub_epi8(qxl, offset);
         const __m256i axl = _mm256_sign_epi8(qxl, qxl);
 
-        tmp1 = _mm_loadu_si128((const __m128i *)x[i + 1].qs);
-        tmp2 = _mm_srli_epi16(tmp1, 4);
-        __m256i qxh = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
+        __m128i tmp4 = _mm_srli_epi16(tmp3, 4);
+        __m256i qxh = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp3), tmp4, 1);
         qxh = _mm256_and_si256(m4, qxh);
         qxh = _mm256_sub_epi8(qxh, offset);
         const __m256i axh = _mm256_sign_epi8(qxh, qxh);
@@ -2261,7 +2217,68 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         acc = _mm512_fmadd_ps(d, q, acc);
     }
 
+    //
+    // Process a trailing quant if there is one.
+    //
+
+    if (nb & 1) {
+
+        //
+        // Compute combined scale for the block.
+        //
+
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+
+        //
+        // Get the q4_0 quant vector with nibbles in the [0..15] interval, and convert to
+        // bytes in the [-8..+7] interval.
+        //
+
+        __m128i tmp1 = _mm_loadu_si128((const __m128i *)x[i].qs);
+        __m128i tmp2 = _mm_srli_epi16(tmp1, 4);
+        __m256i qx = _mm256_insertf128_si256(_mm256_castsi128_si256(tmp1), tmp2, 1);
+        qx = _mm256_and_si256(m4, qx);
+        qx = _mm256_sub_epi8(qx, offset);
+
+        //
+        // Get the q8_0 quant vector.
+        //
+
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
+
+        //
+        // Get the absolute value of qx.
+        //
+
+        const __m256i ax = _mm256_sign_epi8(qx, qx);
+
+        //
+        // Get the signed value of qy. 
+        //
+
+        const __m256i sy = _mm256_sign_epi8(qy, qx);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32.
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m256i zero256 = _mm256_setzero_si256();
+        const __m256i summed_pairs = _mm256_dpbusd_epi32(zero256, ax, sy);
+        const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and add to the overall accumulation.
+        //
+
+        const __m512 zero512d = _mm512_setzero_ps();
+        const __m256 partial_acc = _mm256_mul_ps(d, q);
+        acc = _mm512_add_ps(acc, _mm512_insertf32x8(zero512d, partial_acc, 0));
+    }
+
     *s = hsum_float_16(acc);
+
     return; // We are done here there is no common join at the end
 
 #elif defined(__AVX2__) // Could have a problem for __clang__ (not validated yet)
@@ -2765,6 +2782,8 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#pragma comment(linker, "/EXPORT:ggml_vec_dot_q8_0_q8_0=" __FUNCTION__)
+
     const uint64_t qk = QK8_0;
     const uint64_t nb = n / qk;
 
@@ -2791,10 +2810,62 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     const __m512i zero512 = _mm512_setzero_si512();
 
     //
-    // Process odd quant first if there is one.
+    // Process quant pairs if there are any.
     //
 
     uint64_t i = 0;
+    uint64_t np = nb & ~1;
+
+    for (; i < np; i += 2) {
+
+        //
+        // Compute combined scale for two quant blocks.
+        //
+
+        const __m256 d0 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
+        const __m256 d1 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i + 1].d) * GGML_FP16_TO_FP32(y[i + 1].d));
+        __m512 d = _mm512_castps256_ps512(d0);
+        d = _mm512_insertf32x8(d, d1, 1);
+
+        //
+        // Compute the dot product of two quant blocks and accumulate.
+        //
+
+        const __m256i qxl = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        const __m256i qxh = _mm256_loadu_si256((const __m256i *)x[i + 1].qs);
+
+        const __m256i qyl = _mm256_loadu_si256((const __m256i *)y[i].qs);
+        const __m256i qyh = _mm256_loadu_si256((const __m256i *)y[i + 1].qs);
+
+        const __m256i axl = _mm256_sign_epi8(qxl, qxl);
+        const __m256i axh = _mm256_sign_epi8(qxh, qxh);
+        __m512i ax = _mm512_castsi256_si512(axl);
+        ax = _mm512_inserti32x8(ax, axh, 1);
+
+        const __m256i syl = _mm256_sign_epi8(qyl, qxl);
+        const __m256i syh = _mm256_sign_epi8(qyh, qxh);
+        __m512i sy = _mm512_castsi256_si512(syl);
+        sy = _mm512_inserti32x8(sy, syh, 1);
+
+        //
+        // mul (ax * sy) + 0 directly to epi32
+        //
+        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
+        //
+
+        const __m512i summed_pairs = _mm512_dpbusd_epi32(zero512, ax, sy);
+        const __m512 q = _mm512_cvtepi32_ps(summed_pairs);
+
+        //
+        // Multiply q with scale and accumulate.
+        //
+
+        acc = _mm512_fmadd_ps(d, q, acc);
+    }
+
+    //
+    // Process a trailing quant if there is one.
+    //
 
     if (nb & 1) {
 
@@ -2802,14 +2873,14 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         // Compute combined scale for quant block.
         //
 
-        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[0].d) * GGML_FP16_TO_FP32(y[0].d));
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
 
         //
         // Compute the dot product of quant block and accumulate.
         //
 
-        __m256i qx = _mm256_loadu_si256((const __m256i *)x[0].qs);
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[0].qs);
+        __m256i qx = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[i].qs);
 
         //
         // Get the absolute values of qx.
@@ -2834,62 +2905,12 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         const __m256 q = _mm256_cvtepi32_ps(summed_pairs);
 
         //
-        // Multiply q with scale and insert in overall accumulation.
+        // Multiply q with scale and add to the overall accumulation.
         //
 
-        __m256 partial_acc = _mm256_mul_ps(d, q);
-        acc = _mm512_insertf32x8(acc, partial_acc, 0);
-
-        i = 1;
-    }
-
-    //
-    // Process remaing quant pairs.
-    //
-
-    for (; i < nb; i += 2) {
-
-        //
-        // Compute combined scale for two quant blocks.
-        //
-
-        const __m256 d0 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
-        const __m256 d1 = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i + 1].d) * GGML_FP16_TO_FP32(y[i + 1].d));
-        __m512 d = _mm512_castps256_ps512(d0);
-        d = _mm512_insertf32x8(d, d1, 1);
-
-        //
-        // Compute the dot product of two quant blocks and accumulate.
-        //
-
-        const __m256i qxl = _mm256_loadu_si256((const __m256i *)x[i].qs);
-        const __m256i qxh = _mm256_loadu_si256((const __m256i *)x[i + 1].qs);
-        const __m256i axl = _mm256_sign_epi8(qxl, qxl);
-        const __m256i axh = _mm256_sign_epi8(qxh, qxh);
-        __m512i ax = _mm512_castsi256_si512(axl);
-        ax = _mm512_inserti32x8(ax, axh, 1);
-
-        const __m256i qyl = _mm256_loadu_si256((const __m256i *)y[i].qs);
-        const __m256i qyh = _mm256_loadu_si256((const __m256i *)y[i + 1].qs);
-        const __m256i syl = _mm256_sign_epi8(qyl, qxl);
-        const __m256i syh = _mm256_sign_epi8(qyh, qxh);
-        __m512i sy = _mm512_castsi256_si512(syl);
-        sy = _mm512_inserti32x8(sy, syh, 1);
-
-        //
-        // mul (ax * sy) + 0 directly to epi32
-        //
-        // N.B. __AVX512VNNI__ and __AVX512VL__ are always defined.
-        //
-
-        const __m512i summed_pairs = _mm512_dpbusd_epi32(zero512, ax, sy);
-        const __m512 q = _mm512_cvtepi32_ps(summed_pairs);
-
-        //
-        // Multiply q with scale and accumulate.
-        //
-
-        acc = _mm512_fmadd_ps(d, q, acc);
+        const __m512 zero512d = _mm512_setzero_ps();
+        const __m256 partial_acc = _mm256_mul_ps(d, q);
+        acc = _mm512_add_ps(acc, _mm512_insertf32x8(zero512d, partial_acc, 0));
     }
 
     *s = hsum_float_16(acc);
@@ -3257,6 +3278,8 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * restrict s, size_t bs, const void * 
 }
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#pragma comment(linker, "/EXPORT:ggml_vec_dot_q2_K_q8_K=" __FUNCTION__)
+
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -3607,6 +3630,8 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#pragma comment(linker, "/EXPORT:ggml_vec_dot_q3_K_q8_K=" __FUNCTION__)
+
     assert(n % QK_K == 0);
     assert(nrc == 1);
     UNUSED(nrc);
@@ -4237,6 +4262,8 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#pragma comment(linker, "/EXPORT:ggml_vec_dot_q4_K_q8_K=" __FUNCTION__)
+
     assert(n % QK_K == 0);
     assert(nrc == 1);
     UNUSED(nrc);
@@ -4929,6 +4956,8 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q6_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#pragma comment(linker, "/EXPORT:ggml_vec_dot_q6_K_q8_K=" __FUNCTION__)
+
     assert(n % QK_K == 0);
     assert(nrc == 1);
     UNUSED(nrc);

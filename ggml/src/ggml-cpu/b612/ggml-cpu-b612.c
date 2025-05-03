@@ -614,7 +614,7 @@ struct ggml_compute_state {
 // ggml_vec_argmax_f32                      -> vec.h
 
 void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
-#ifdef GGML_B612_
+#ifdef GGML_B612
 #pragma comment(linker, "/EXPORT:ggml_bf16_to_fp32_row=" __FUNCTION__)
 #endif // GGML_B612
 
@@ -5514,9 +5514,12 @@ int ggml_cpu_has_sme(void) {
 void ggml_cpu_init(void) {
     static bool is_first_call = true;
 
+    if (!is_first_call) {
+        return;
+    }
+
 #if defined(GGML_B612)
     if (is_first_call)
-    // avoid being called repeatedly from here (ggml_cpu_init() is popular)
 #endif
     // needed to initialize f16 tables
     {
@@ -5558,4 +5561,10 @@ void ggml_cpu_init(void) {
     }
 
     ggml_critical_section_end();
+}
+
+void ggml_init_tables() {
+#pragma comment(linker, "/EXPORT:ggml_init_tables=" __FUNCTION__)
+    // for perfafx
+    ggml_cpu_init();
 }

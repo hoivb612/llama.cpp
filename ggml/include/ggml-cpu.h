@@ -104,12 +104,6 @@ extern "C" {
     GGML_BACKEND_API int ggml_cpu_has_wasm_simd  (void);
     GGML_BACKEND_API int ggml_cpu_has_llamafile  (void);
 
-    // Cosine similarity
-    //
-    GGML_BACKEND_API float ggml_cosine_similarity_f32(int n, float *x, float *y);
-    GGML_BACKEND_API float ggml_cosine_similarity_bf16(int n, ggml_bf16_t *x, ggml_bf16_t *y);
-    //
-
     // Internal types and functions exposed for tests and benchmarks
 
     typedef void (*ggml_vec_dot_t)  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx,
