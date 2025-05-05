@@ -778,7 +778,7 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
             break;
     }
 
-    xb_set_process_affinity(n_threads, affinity_mask);
+    affinity_mask = xb_set_process_affinity(n_threads, affinity_mask);
     return(affinity_mask);
 }
 
