@@ -5,7 +5,19 @@
 
 #include <algorithm>
 #include <fstream>
-#include <iostream> // TODO: remove me
+#include <iostream>
+
+#include "hnswlib/hnswlib.h"
+#include "json.hpp"
+using json = nlohmann::json;
+
+#if !defined WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+#endif // WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 common_params params;
 
@@ -42,6 +54,8 @@ static void print_usage(int argc, char ** argv) {
 }
 
 struct chunk {
+    // chunk index
+    int32_t id;
     // filename
     std::string filename;
     // original file position
@@ -145,6 +159,387 @@ static void batch_decode(llama_context * ctx, llama_batch & batch, float * outpu
     }
 }
 
+bool create_vector_database(common_params & params) {
+    if (params.vector_db_file.empty()) {
+        return false;
+    }
+
+    for (auto & context_file : params.context_files) {
+        printf("%s\n", context_file.c_str());
+    }
+
+    std::vector<chunk> chunks;
+    for (auto & context_file : params.context_files) {
+        std::vector<chunk> file_chunk = chunk_file(context_file, params.chunk_size, params.chunk_separator);
+        chunks.insert(chunks.end(), file_chunk.begin(), file_chunk.end());
+    }
+    printf("Number of chunks: %zu\n", chunks.size());
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    // load the model
+    common_init_result llama_init = common_init_from_params(params);
+
+    llama_model * model = llama_init.model.get();
+    llama_context * ctx = llama_init.context.get();
+
+    if (model == NULL) {
+        LOG_ERR("%s: unable to load model\n", __func__);
+        return false;
+    }
+
+    int64_t t_start = ggml_time_us();
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const int n_ctx_train = llama_model_n_ctx_train(model);
+    const int n_ctx = llama_n_ctx(ctx);
+
+    const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
+    if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        fprintf(stderr, "%s: model pooling type NONE not supported\n", __func__);
+        return false;
+    }
+
+    if (n_ctx > n_ctx_train) {
+        printf("%s: warning: model was trained on only %d context tokens (%d specified)\n",
+                __func__, n_ctx_train, n_ctx);
+    }
+
+    // print system information
+    if (params.verbosity) {
+        printf("\n");
+        printf("%s\n", common_params_get_system_info(params).c_str());
+    }
+
+    // max batch size
+    const uint64_t n_batch = params.n_batch;
+    GGML_ASSERT(params.n_batch >= params.n_ctx);
+
+    printf("%s: Tokenizing data...\n", __func__);
+    int64_t t_tokenization_start = ggml_time_us();
+
+    // tokenize the prompts and trim
+    for (auto & chunk : chunks) {
+        auto inp = common_tokenize(ctx, chunk.textdata, true, false);
+        if (inp.size() > n_batch) {
+            LOG_ERR("%s: chunk size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
+                    __func__, (long long int) inp.size(), (long long int) n_batch);
+            return false;
+        }
+        // add eos if not present
+        if (llama_vocab_eos(vocab) >= 0 && (inp.empty() || inp.back() != llama_vocab_eos(vocab))) {
+            inp.push_back(llama_vocab_eos(vocab));
+        }
+        chunk.tokens = inp;
+    }
+
+    int64_t t_tokenization_stop = ggml_time_us();
+
+    // tokenization stats
+    if (params.verbose_prompt) {
+        for (int i = 0; i < (int) chunks.size(); i++) {
+            LOG_INF("%s: prompt %d: '%s'\n", __func__, i, chunks[i].textdata.c_str());
+            LOG_INF("%s: number of tokens in prompt = %zu\n", __func__, chunks[i].tokens.size());
+            for (int j = 0; j < (int) chunks[i].tokens.size(); j++) {
+                LOG_INF("%6d -> '%s'\n", chunks[i].tokens[j], common_token_to_piece(ctx, chunks[i].tokens[j]).c_str());
+            }
+            LOG_INF("\n\n");
+        }
+    }
+
+    printf("%s: Creating Embeddings...\n", __func__);
+    int64_t t_embeddings_start = ggml_time_us();
+
+    // initialize batch
+    const int n_chunks = chunks.size();
+    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+    // allocate output
+    const int n_embd = llama_model_n_embd(model);
+    std::vector<float> embeddings(n_chunks * n_embd, 0);
+    float * emb = embeddings.data();
+
+    // break into batches
+    int p = 0; // number of prompts processed already
+    int s = 0; // number of prompts in current batch
+    for (int k = 0; k < n_chunks; k++) {
+        // clamp to n_batch tokens
+        auto & inp = chunks[k].tokens;
+
+        const uint64_t n_toks = inp.size();
+
+        // encode if at capacity
+        if (batch.n_tokens + n_toks > n_batch) {
+            float * out = emb + p * n_embd;
+            batch_decode(ctx, batch, out, s, n_embd);
+            common_batch_clear(batch);
+            p += s;
+            s = 0;
+        }
+
+        if ((k % 50) == 0) {
+            printf("- Processing %d/%d items\r", k, n_chunks);
+        }
+
+        // add to batch
+        batch_add_seq(batch, inp, s);
+        s += 1;
+    }
+
+    // final batch
+    float * out = emb + p * n_embd;
+    batch_decode(ctx, batch, out, s, n_embd);
+
+    int64_t t_embeddings_stop = ggml_time_us();
+
+    // save embeddings to chunks
+    for (int i = 0; i < n_chunks; i++) {
+        chunks[i].embedding = std::vector<float>(emb + (i * n_embd), emb + ((i + 1) * n_embd));
+        // clear tokens as they are no longer needed
+    }
+
+    // Maximum number of elements, should be known beforehand
+    int max_elements = chunks.size() + 1024;
+
+    // if dataset is big and memory is a concern then NHSW need to be chosen. 
+    // As well as in NMSLIB, we chose the M parameter. The 4 <= M <= 64 is 
+    // the number of links per vector, higher is more accurate but uses more RAM. 
+    // The memory usage is (d * 4 + M * 2 * 4) bytes per vector.
+    
+    int M = 16;                 // Tightly connected with internal dimensionality of the data
+                                // strongly affects the memory consumption
+    int ef_construction = 200;  // Controls index search speed/build speed tradeoff
+    int ef_search = 100;
+
+    // Initializing index
+    const int32_t n_dimension = llama_model_n_embd(model);
+    hnswlib::L2Space vec_space(n_dimension);
+    hnswlib::HierarchicalNSW<float>* vec_hnsw = new hnswlib::HierarchicalNSW<float>(&vec_space, max_elements, M, ef_construction);
+    vec_hnsw->setEf(ef_search);
+
+    // Create the root JSON array
+    json chunks_json_root = json::array();
+
+    // save embeddings to chunks
+    for (int i = 0; i < n_chunks; i++) {
+        json chunks_json_obj;
+        chunks_json_obj["id"] = i;
+        chunks_json_obj["text"] = chunks[i].textdata;
+        chunks_json_obj["tokens"] = chunks[i].tokens.size();
+        // Add the objects to the root array
+        chunks_json_root.push_back(chunks_json_obj);
+
+        vec_hnsw->addPoint(chunks[i].embedding.data(), i);
+    }
+
+    printf("[%s]: persist vector DB '%s' dimension: %d\n", __func__, params.vector_db_file.c_str(), n_dimension);
+    printf("[%s]: vector DB max_elements-[%zd] / cur_elements-[%zd]\n", __func__,
+        vec_hnsw->getMaxElements(), vec_hnsw->getCurrentElementCount());
+
+    // Persist the database
+    vec_hnsw->saveIndex(params.vector_db_file.c_str());
+    printf("[%s]: vector DB %s saved\n", __func__, params.vector_db_file.c_str());
+    delete vec_hnsw;
+
+    // Persist the chunks metadata to disk
+    std::string chunks_json_path = params.vector_db_file + ".json";
+    std::ofstream chunks_json_file(chunks_json_path.c_str());
+    if (!chunks_json_file.is_open()) {
+        std::cerr << "Failed to open file for writing." << std::endl;
+    } else {
+        chunks_json_file << chunks_json_root.dump(2); // Pretty print with 4 spaces indentation
+        chunks_json_file.close();
+    }
+
+    params.verbosity = GGML_LOG_LEVEL_INFO;
+    llama_log_set(retrieval_log_callback, &(params.verbosity));
+    llama_perf_context_print(ctx);
+
+    const auto t_end = ggml_time_us();
+    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_end - t_start) / (1000. * 1000.)); 
+
+    llama_print_tensor_op_perf();
+
+    // clean up
+    llama_backend_free();
+
+    return true;
+}
+
+bool query_database(common_params & params) {
+    if (params.vector_db_file.empty()) {
+        fprintf(stderr, "vector_db_file (-db <file>) must be specified\n");
+        return false;
+    }
+
+    // load the model
+    common_init_result llama_init = common_init_from_params(params);
+
+    llama_model * model = llama_init.model.get();
+    llama_context * ctx = llama_init.context.get();
+
+    if (model == NULL) {
+        LOG_ERR("%s: unable to load model\n", __func__);
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const int n_ctx_train = llama_model_n_ctx_train(model);
+    const int n_ctx = llama_n_ctx(ctx);
+
+    const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
+    if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        fprintf(stderr, "%s: model pooling type NONE not supported\n", __func__);
+        return false;
+    }
+
+    if (n_ctx > n_ctx_train) {
+        printf("%s: warning: model was trained on only %d context tokens (%d specified)\n",
+                __func__, n_ctx_train, n_ctx);
+    }
+
+    // print system information
+    if (params.verbosity) {
+        printf("\n");
+        printf("%s\n", common_params_get_system_info(params).c_str());
+    }
+
+    const int32_t n_dimension = llama_model_n_embd(model);
+    hnswlib::L2Space vecspace(n_dimension);
+    hnswlib::HierarchicalNSW<float> *vec_db = new hnswlib::HierarchicalNSW<float>(&vecspace, params.vector_db_file.c_str());
+    size_t max_elements = vec_db->getMaxElements();
+    size_t cur_elementCount = vec_db->getCurrentElementCount();
+
+    printf("[%s]: load vector DB '%s' - max_elms(%zd)/cur_elms(%zd)\n", __func__, params.vector_db_file.c_str(),
+        max_elements, cur_elementCount);
+
+    std::ifstream chunks_json_file(params.vector_db_file + ".json");
+    json chunks_json;
+    try {
+        chunks_json = json::parse(chunks_json_file);
+    } catch (const std::exception& e) {
+        std::cerr << "Error reading chunk: " << e.what() << std::endl;
+        return false;
+    }
+
+    std::vector<chunk> chunks_vector;
+    for (const auto& item : chunks_json) {
+        int32_t id = item["id"];
+        std::string text = item["text"];
+        chunk entry = {id, "", 0, text, {}, {}};
+        chunks_vector.push_back(entry);
+    }
+
+    int64_t t_start = ggml_time_us();
+
+    struct llama_batch query_batch = llama_batch_init(params.n_batch, 0, 1);
+    printf("%s: Querying loop starts...\n", __func__);
+
+    // start loop, read each query and return top-k or top similar chunk(s) 
+    // based on cosine similarity
+    int errors = 0;
+    int item_count = 0;
+
+    for (auto & context_file : params.context_files) {
+        std::ifstream cpfile(context_file);
+        if (!cpfile.is_open()) {
+            printf("[%s]: failed to open [%s]\n", __func__, context_file.c_str());
+            return false;
+        }
+
+        std::string query;
+        int64_t t_query_start = ggml_time_us();
+
+        while (std::getline(cpfile, query)) {
+            std::vector<int32_t> query_tokens = common_tokenize(ctx, query, true);
+
+           batch_add_seq(query_batch, query_tokens, 0);
+
+            std::vector<float> query_emb(n_dimension, 0);
+            batch_decode(ctx, query_batch, query_emb.data(), 1, n_dimension);
+
+            common_batch_clear(query_batch);
+
+            // Search for nearest chunks
+            try {
+                std::vector<std::pair<float, hnswlib::labeltype>> results = vec_db->searchKnnCloserFirst(query_emb.data(), 3);
+                bool continue_search = false;
+                for (auto item: results) {
+                    int idx = /* chunk index/label */ item.second;
+
+                    // locate the chunk with the specified idx
+                    auto it = std::find_if(chunks_vector.begin(), chunks_vector.end(), [idx](const chunk& c) {
+                        return c.id == idx;
+                    });
+
+                    if (it != chunks_vector.end()) {
+                        #if 0                        
+                        // verify the string from the chunk with the matching idx
+                        if ((it->textdata.find(query) == std::string::npos) &&
+                            (query.find(it->textdata) == std::string::npos)) {
+                            // the chunk does not have matching text with the query string
+                            errors++;
+                            printf("=======>>>> ERROR     [%4d]. Distance: %5.2f - [%d]-<%.50s>\n", idx, item.first, 
+                                it->id, it->textdata.c_str());
+                        }
+    
+                        printf("     [%4d]. Distance: %5.2f - [%d]-<%.50s>\n", idx, item.first, 
+                            it->id, it->textdata.c_str());
+                        #endif // 0
+
+                        if (item_count != it->id) {
+                            continue_search = true;
+                            printf("===== Found [%4d]. Distance: %5.2f <%.50s>\n", 
+                                idx, item.first, it->textdata.c_str());
+                        }
+                        if (!continue_search) {
+                            break; // break after first match
+                        }
+                    } else {
+                        // the chunk could not be found
+                        fprintf(stderr, "Chunk with id == %d not found\n", idx);
+                    }
+                }
+                if (continue_search) {
+                    // continue_search is true only when we hit an error during retrieval
+                    printf("===== ERROR @chunk id = %4d-<%.50s\n", item_count, query.c_str());
+                    errors++;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Search failed: " << e.what() << std::endl;
+            }
+
+            if ((++item_count % 50) == 0) {
+                printf("- Processed %d items\r", item_count);
+            }
+        }
+
+        int64_t t_end = ggml_time_us();
+        printf("Total items processed: %d\n", item_count);
+        printf("Query time             = %6.2fs (%5.2fms per item)\n", 
+            (t_end - t_start) / (1000.0 * 1000.0), 
+            (t_end - t_start) / (item_count * 1000.0));
+    }
+    
+    printf("Errors                 = %3d\n", errors);
+
+    params.verbosity = GGML_LOG_LEVEL_INFO;
+    llama_log_set(retrieval_log_callback, &(params.verbosity));
+    llama_perf_context_print(ctx);
+
+    printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(ggml_time_us() - t_start) / (1000. * 1000.)); 
+
+    llama_print_tensor_op_perf();
+
+    // clean up
+    llama_batch_free(query_batch);
+    llama_backend_free();
+    return true;
+}
+
 int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_RETRIEVAL, print_usage)) {
         return 1;
@@ -158,6 +553,9 @@ int main(int argc, char ** argv) {
     if (params.proc_affinity) {
         ggml_b612::xb_set_optimal_process_affinity(params.cpuparams.n_threads);
     }
+#endif // _WIN32 && GGML_B612
+
+#if defined(GGML_B612)
     if (params.use_openmp) {
         llama_select_OpenMP();
     }
@@ -178,6 +576,24 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "context_files must be specified\n");
         return 1;
     }
+
+#if defined(GGML_B612)
+    if (!params.vector_db_file.empty()) {
+        if (params.query_mode == false) {
+            if (!create_vector_database(params)) {
+                fprintf(stderr, "failed to create vector db\n");
+                return 1;
+            }
+            return 0;
+        } else {
+            if (!query_database(params)) {
+                fprintf(stderr, "failed to query vector db\n");
+                return 1;
+            }
+            return 0;
+        }
+    }
+#endif // GGML_B612
 
     int64_t t_main_start = ggml_time_us();
 
@@ -312,7 +728,7 @@ int main(int argc, char ** argv) {
 
     // save embeddings to chunks
     for (int i = 0; i < n_chunks; i++) {
-        chunks[i].embedding = std::vector<float>(emb + i * n_embd, emb + (i + 1) * n_embd);
+        chunks[i].embedding = std::vector<float>(emb + (i * n_embd), emb + ((i + 1) * n_embd));
         // clear tokens as they are no longer needed
         chunks[i].tokens.clear();
     }
@@ -325,12 +741,6 @@ int main(int argc, char ** argv) {
     // based on cosine similarity
     int errors = 0;
     int item_count = 0;
-
-#ifdef GGML_B612
-    if (params.no_query) {
-        goto skip_query;
-    }
-#endif
 
     for (auto & context_file : params.context_files) {
         std::ifstream cpfile(context_file);
@@ -397,10 +807,6 @@ int main(int argc, char ** argv) {
             (t_query_stop - t_query_start) / (1000.0 * 1000.0), 
             (t_query_stop - t_query_start) / (item_count * 1000.0));
     }
-
-    #ifdef GGML_B612
-    skip_query:
-    #endif
     
     printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
         (t_tokenization_stop - t_tokenization_start) / 1000.0, 

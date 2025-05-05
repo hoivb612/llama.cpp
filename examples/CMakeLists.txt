@@ -58,6 +58,7 @@ else()
     add_subdirectory(gen-docs)
     add_subdirectory(xbapp)
     add_subdirectory(chatbot)
+    add_subdirectory(llm-infer)
     if (NOT GGML_BACKEND_DL)
         # these examples use the backends directly and cannot be built with dynamic loading
         add_subdirectory(convert-llama2c-to-ggml)

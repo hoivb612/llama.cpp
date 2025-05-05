@@ -282,6 +282,7 @@ struct common_params {
     std::string rpc_servers          = ""; // comma separated list of RPC servers                           // NOLINT
 #if defined(GGML_B612)
     std::string custom_p_file        = "";  // custom prompts input file                                    // NOLINT
+    std::string vector_db_file       = "";  // vector database file for retrieval                           // NOLINT
 #endif
 
     std::vector<std::string> in_files;   // all input files
@@ -346,6 +347,7 @@ struct common_params {
     bool use_openmp        = false; // use open MP threading (NOP currently - regulated by GGML_USE_OPENMP)
     bool no_tensor_repack  = false; // disable tensor repacking (ex. Q4_0 -> Q4_0_8_8) - currently being done automatically
     bool proc_affinity     = false; // use process affinity
+    bool query_mode        = false; // use query mode (for retrieval)
 #endif
 
     bool single_turn       = false; // single turn chat conversation
@@ -408,9 +410,6 @@ struct common_params {
     std::vector<std::string> context_files; // context files to embed
 
     int32_t chunk_size = 64; // chunk size for context embedding
-#ifdef GGML_B612    
-    bool no_query      = false;
-#endif
 
     std::string chunk_separator = "\n"; // chunk separator for context embedding
 

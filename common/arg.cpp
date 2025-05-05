@@ -1347,10 +1347,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
 #ifdef GGML_B612
    add_opt(common_arg(
-        {"-nq", "--no-query"},
-        "no query mode",
+        {"-q", "--query"},
+        "query vector DB mode",
         [](common_params & params) {
-            params.no_query = true;
+            params.query_mode = true;
         }
     ).set_examples({LLAMA_EXAMPLE_RETRIEVAL}));
 #endif // GGML_B612
@@ -3075,6 +3075,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.custom_prompts_on = true;
         }
     ).set_examples({LLAMA_EXAMPLE_XBAPP}));
+    add_opt(common_arg(
+        {"-db", "--vector-db"}, "FNAME",
+        "vector database file generation (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.vector_db_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_RETRIEVAL}));
 #endif // GGML_B612
     add_opt(common_arg(
         {"-md", "--model-draft"}, "FNAME",
