@@ -541,7 +541,7 @@ int main(int argc, char *argv[]) {
                 auto start = std::chrono::high_resolution_clock::now();
                 std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
                 if (!file.is_open()) {
-                    printf("Failed to open file: %s\n", entry.path().c_str());
+                    printf("Failed to open file: %s\n", entry.path().string().c_str());
                 }
 
                 // Get file size and reset position to beginning
@@ -551,7 +551,7 @@ int main(int argc, char *argv[]) {
                 // Read entire file into buffer
                 std::string buffer(fileSize, '\0');
                 if (!file.read(buffer.data(), fileSize)) {
-                    printf("Error reading file: %s\n", entry.path().c_str());
+                    printf("Error reading file: %s\n", entry.path().string().c_str());
                 }
 
                 std::string texts = ConvertToUtf8(buffer);

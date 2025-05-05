@@ -63,6 +63,45 @@ std::string pfx_file_path(
     return full_file_path;
 }
 
+std::vector<llama_token> slm_tokenize(
+  const struct llama_context * ctx,
+           const std::string & text,
+                        bool   add_special,
+                        bool   parse_special) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    // upper limit for the number of tokens
+    int n_tokens = text.length() + 2 * add_special;
+    std::vector<llama_token> result(n_tokens);
+    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+    if (n_tokens < 0) {
+        result.resize(-n_tokens);
+        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+        GGML_ASSERT(check == -n_tokens);
+    } else {
+        result.resize(n_tokens);
+    }
+    return result;
+}
+
+std::string slm_token_to_piece(const struct llama_context * ctx, llama_token token, bool special = false) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::string piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    }
+    else {
+        piece.resize(n_chars);
+    }
+
+    return piece;
+}
+
 LLM_INFER_API
 bool llm_initialize(
     model_params & params) {
@@ -88,7 +127,7 @@ bool llm_initialize(
     }
 #endif // GGML_USE_CUDA
 
-    llm_model = llama_load_model_from_file(params.model_name.c_str(), common_model_params);
+    llm_model = llama_model_load_from_file(params.model_name.c_str(), common_model_params);
     if (llm_model == NULL) {
         printf("%s: error: unable to load model\n" , __func__);
         return false;
@@ -98,13 +137,12 @@ bool llm_initialize(
     llama_context_params llm_ctx_params = llama_context_default_params();
 
     // Grab values from defaults or command line args 
-    llm_ctx_params.seed  = params.seed;
     llm_ctx_params.n_ctx = params.n_ctx;
     llm_ctx_params.n_batch = params.n_batch;
     llm_ctx_params.n_threads = params.n_threads;
     llm_ctx_params.n_threads_batch = params.n_threads;
 
-    llm_ctx = llama_new_context_with_model(llm_model, llm_ctx_params);
+    llm_ctx = llama_init_from_model(llm_model, llm_ctx_params);
 
     if (llm_ctx == NULL) {
         printf("%s: error: failed to create the llama_context\n" , __func__);
@@ -117,7 +155,7 @@ bool llm_initialize(
     std::vector<llama_token> llm_tokens_shared;
     if (params.pfc_mode) {
         // start from a known point
-        llama_kv_cache_clear(llm_ctx);
+        llama_kv_self_clear(llm_ctx);
 
         std::string template_prompt = params.custom_template_prompt;
         size_t pos = template_prompt.find("{message}");
@@ -125,7 +163,7 @@ bool llm_initialize(
             // build the shared prompt
             params.pfx_shared = template_prompt.substr(0, pos);
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            llm_tokens_shared = llama_tokenize(llm_model, params.pfx_shared, false, false);
+            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, false, false);
             // build the cache file directory
             params.pfx_file = pfx_file_path(params.pfx_shared);
             // load the cache and create one if it does not exist
@@ -148,7 +186,6 @@ bool llm_initialize(
             else {
                 printf("%s: Loading saved state from '%s'...\n", __func__, params.pfx_file.c_str());
                 llm_session_tokens.resize(n_token_count_out);
-                llama_set_rng_seed(llm_ctx, params.seed);
                 // printf("%s: n_token_count_out=%zd: %s\n", __func__, n_token_count_out, LOG_TOKENS_TOSTR_PRETTY(ctx, session_tokens).c_str());
 
                 // sanity check
@@ -164,7 +201,7 @@ bool llm_initialize(
                 //printf("%s: token_shared=%zd\n", __func__, llm_tokens_shared.size());
 
                 // remove any "future" tokens that we might have inherited from the previous session
-                llama_kv_cache_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
+                llama_kv_self_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
             }
         }
         else {
@@ -193,14 +230,14 @@ bool llm_inference(
     std::vector<llama_token> llm_tokens_shared = llm_tokens_shared;
     if (params.pfc_mode) {
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
+        llama_kv_self_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
         embd_inp.insert(embd_inp.end(), llm_tokens_shared.begin(), llm_tokens_shared.end());
         n_consumed = llm_tokens_shared.size();
         n_past = llm_tokens_shared.size();
         n_kv_pfx = llm_tokens_shared.size();
     } else {
         // start from a known point
-        llama_kv_cache_clear(llm_ctx);
+        llama_kv_self_clear(llm_ctx);
 
         n_consumed = 0;
         n_past = 0;
@@ -208,7 +245,7 @@ bool llm_inference(
     }
 
     // tokenize the remaining prompt or full prompt if pfc_mode is off
-    std::vector<llama_token> tokens_input = llama_tokenize(llm_model, params.prompt, false, false);
+    std::vector<llama_token> tokens_input = slm_tokenize(llm_ctx, params.prompt, false, false);
 
     // append the variant part of the prompt or use the full prompt (for non pfc mode)
     embd_inp.insert(embd_inp.end(), tokens_input.begin(), tokens_input.end());
@@ -253,6 +290,22 @@ bool llm_inference(
         embd.push_back(embd_inp[i]);
     }
 
+    // initialize the sampler
+    auto sparams = llama_sampler_chain_default_params();
+    sparams.no_perf = false;
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
+
+    // sample the most likely token (greedy sampling algo)
+    const int   top_k = 40;
+    const float top_p = 0.9f;
+    const float min_keep = 1.0f;
+    const float temp = 0.1f;
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, min_keep));  
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp (temp));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(params.seed));
+    // llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
     int64_t t1_start = ggml_time_us();
     GGML_UNUSED(t1_start );
 
@@ -263,7 +316,7 @@ bool llm_inference(
             n_eval = params.n_batch;
         }
 
-        if (llama_decode(llm_ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
+        if (llama_decode(llm_ctx, llama_batch_get_one(&embd[i], n_eval))) {
             printf("%s : failed to eval\n", __func__);
             return false;
         }
@@ -273,8 +326,13 @@ bool llm_inference(
     }
 
     int64_t t2_start = ggml_time_us();
+    float t_prompt_eval_ms = (t2_start - t1_start) / 1000.0f;
     if (params.verbose != 0) {
-        printf("Prompt eval time = %.2fms\n", ((t2_start - t1_start) / 1000.0f));
+        printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n", 
+            t_prompt_eval_ms, 
+            embd.size(), 
+            (embd.size() * 1000.0f) / t_prompt_eval_ms, 
+            t_prompt_eval_ms / embd.size());
     }
 
     if (params.pfc_mode && params.save_llm_state) {
@@ -292,7 +350,7 @@ bool llm_inference(
             // build the shared prompt
             params.pfx_shared = template_prompt.substr(0, pos);
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            llm_tokens_shared = llama_tokenize(llm_model, params.pfx_shared, false, false);
+            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, false, false);
         }
     }
 
@@ -302,58 +360,39 @@ bool llm_inference(
     std::string slm_output;
     int n_tokens_generated = 0;
 
+    // sample the last token just received
+    const llama_vocab * vocab = llama_model_get_vocab(llm_model);
+
     while (n_past <= max_len) {
+
         // sample the last token just received
-        {
-            auto n_vocab = llama_n_vocab(llm_model);
-            auto *logits = llama_get_logits_ith(llm_ctx, 0);
+        llama_token new_token_id = llama_sampler_sample(smpl, llm_ctx, -1);
 
-            std::vector<llama_token_data> candidates;
-            candidates.reserve(n_vocab);
-
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                candidates.emplace_back(llama_token_data{ token_id, logits[token_id], 0.0f });
-            }
-
-            llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
-
-            // sample the most likely token (greedy sampling algo)
-            const int   top_k = 40;
-            const float top_p = 0.9f;
-            const float temp = 0.1f;
-
-            llama_sample_top_k(llm_ctx, &candidates_p, top_k, 1);
-            llama_sample_top_p(llm_ctx, &candidates_p, top_p, 1);
-            llama_sample_temp(llm_ctx, &candidates_p, temp);
-
-            const llama_token new_token_id = llama_sample_token_greedy(llm_ctx, &candidates_p);
-
-            // we reached the end of token generation
-            if (llama_token_is_eog(llm_model, new_token_id)) {
-                printf("\n");
-                break;
-            }
-
-            const std::string token_str = llama_token_to_piece(llm_ctx, new_token_id);
-            if (params.streaming_reply) {
-                printf("%s", token_str.c_str());
-            } else {
-                slm_output += token_str;
-            }
-
-            // save this new token for next evaluation
-            embd.clear();
-            embd.push_back(new_token_id);
-
-            n_tokens_generated += 1;
-            params.total_llm_tokens_generated += 1;
+        // check wither it is the end of text generation 
+        if (llama_vocab_is_eog(vocab, new_token_id)) {
+            printf("\n");
+            break;
         }
+
+        const std::string token_str = slm_token_to_piece(llm_ctx, new_token_id);
+        if (params.streaming_reply) {
+            printf("%s", token_str.c_str());
+        } else {
+            slm_output += token_str;
+        }
+
+        // save this new token for next evaluation
+        embd.clear();
+        embd.push_back(new_token_id);
+
+        n_tokens_generated += 1;
+        params.total_llm_tokens_generated += 1;
 
         // bump current generated token index
         n_past += 1;
 
         // decode the output for the new generated token
-        if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1, n_past, 0))) {
+        if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1))) {
             printf("%s : failed to eval, return code %d\n", __func__, 1);
             return false;
         }
@@ -382,10 +421,10 @@ void llm_terminate(const model_params& ) {
 
     int verbose = GGML_LOG_LEVEL_INFO;
     llama_log_set(default_log_callback, &verbose);
-    llama_print_timings(llm_ctx);
+    llama_perf_context_print(llm_ctx);
 
     llama_free(llm_ctx);
-    llama_free_model(llm_model);
+    llama_model_free(llm_model);
 
     llama_backend_free();
 }
@@ -398,7 +437,7 @@ static void batch_decode(
     int n_embd) {
 
     // clear previous kv_cache values (irrelevant for embeddings)
-    llama_kv_cache_clear(ctx);
+    llama_kv_self_clear(ctx);
 
     // run model
     // fprintf(stderr, "%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
@@ -422,7 +461,7 @@ static void batch_decode(
         }
 
         float * out = output + batch.seq_id[i][0] * n_embd;
-        llama_embd_normalize(embd, out, n_embd);
+        common_embd_normalize(embd, out, n_embd, 2);
     }
 }
 
@@ -449,7 +488,7 @@ bool embed_initialize(
     }
 #endif // GGML_USE_CUDA
 
-   embed_model = llama_load_model_from_file(params.model_name.c_str(), llama_model_params);
+   embed_model = llama_model_load_from_file(params.model_name.c_str(), llama_model_params);
    if (embed_model == NULL) {
        printf("%s: error: unable to load model\n" , __func__);
        return false;
@@ -459,7 +498,6 @@ bool embed_initialize(
    llama_context_params embed_ctx_params = llama_context_default_params();
 
    // Grab default params or values from command line args
-   embed_ctx_params.seed  = params.seed;
    embed_ctx_params.n_ctx = params.n_ctx;
    embed_ctx_params.n_batch = params.n_batch;
    embed_ctx_params.n_threads = params.n_threads;
@@ -469,7 +507,7 @@ bool embed_initialize(
    embed_ctx_params.n_ubatch = params.n_batch;
    embed_ctx_params.embeddings = true;
 
-   embed_ctx = llama_new_context_with_model(embed_model, embed_ctx_params);
+   embed_ctx = llama_init_from_model(embed_model, embed_ctx_params);
 
    if (embed_ctx == NULL) {
        printf("%s: error: failed to create the llama_context\n" , __func__);
@@ -477,9 +515,9 @@ bool embed_initialize(
    }
 
    // Save dimension from model hparams
-   params.n_dim = llama_n_embd(embed_model);
+   params.n_dim = llama_model_n_embd(embed_model);
 
-   const int n_ctx_train = llama_n_ctx_train(embed_model);
+   const int n_ctx_train = llama_model_n_ctx_train(embed_model);
     const int n_ctx = llama_n_ctx(embed_ctx);
 
     const enum llama_pooling_type pooling_type = llama_pooling_type(embed_ctx);
@@ -507,11 +545,12 @@ bool embed_encode_batch(
     struct llama_batch batch = llama_batch_init(params.n_batch, 0, 1);
 
     // Allocate output
-    int n_embd = llama_n_embd(embed_model);
+    int n_embd = llama_model_n_embd(embed_model);
+    const llama_vocab * vocab = llama_model_get_vocab(llm_model);
 
     // Tokenize the prompts and trim
     for (auto & chunk : chunks) {
-        auto inp = llama_tokenize(embed_ctx, chunk.textdata, true, false);
+        auto inp = slm_tokenize(embed_ctx, chunk.textdata, true, false);
         if (inp.size() > params.n_batch) {
             fprintf(stderr, "%s: error: chunk size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
                     __func__, (long long int) inp.size(), (long long int) params.n_batch);
@@ -519,8 +558,8 @@ bool embed_encode_batch(
         }
 
         // add eos if not present
-        if (llama_token_eos(embed_model) >= 0 && (inp.empty() || inp.back() != llama_token_eos(embed_model))) {
-            inp.push_back(llama_token_eos(embed_model));
+        if (llama_vocab_eos(vocab) >= 0 && (inp.empty() || inp.back() != llama_vocab_eos(vocab))) {
+            inp.push_back(llama_vocab_eos(vocab));
         }
 
         chunk.tokens = inp;
@@ -542,7 +581,7 @@ bool embed_encode_batch(
         if (batch.n_tokens + n_toks > params.n_batch) {
             float * out = emb + p * n_embd;
             batch_decode(embed_ctx, batch, out, s, n_embd);
-            llama_batch_clear(batch);
+            common_batch_clear(batch);
             p += s;
             s = 0;
         }
@@ -550,7 +589,7 @@ bool embed_encode_batch(
         // Add to batch
         size_t n_tokens = rag_tokens.size();
         for (size_t i = 0; i < n_tokens; i++) {
-            llama_batch_add(batch, rag_tokens[i], (llama_pos) i, { s }, true);
+            common_batch_add(batch, rag_tokens[i], (llama_pos) i, { s }, true);
         }
 
         s += 1;
@@ -580,12 +619,13 @@ bool embed_encode_batch_single(
     struct llama_batch batch = llama_batch_init(params.n_batch, 0, 1);
 
     // Allocate output
-    int n_embd = llama_n_embd(embed_model);
+    int n_embd = llama_model_n_embd(embed_model);
+    const llama_vocab * vocab = llama_model_get_vocab(llm_model);
     std::vector<float> chunk_embeddings(n_embd, 0);
 
     // Tokenize the prompts and trim
     for (auto & chunk : chunks) {
-        chunk.tokens = llama_tokenize(embed_ctx, chunk.textdata, true, false);
+        chunk.tokens = slm_tokenize(embed_ctx, chunk.textdata, true, false);
         size_t n_tokens = chunk.tokens.size();
         if (n_tokens > params.n_batch) {
             fprintf(stderr, "%s: error: chunk size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
@@ -594,20 +634,20 @@ bool embed_encode_batch_single(
         }
 
         // add eos if not present
-        if (llama_token_eos(embed_model) >= 0 && (chunk.tokens.empty() || chunk.tokens.back() != llama_token_eos(embed_model))) {
-            chunk.tokens.push_back(llama_token_eos(embed_model));
+        if (llama_vocab_eos(vocab) >= 0 && (chunk.tokens.empty() || chunk.tokens.back() != llama_vocab_eos(vocab))) {
+            chunk.tokens.push_back(llama_vocab_eos(vocab));
         }
 
 
         // Add to batch
         for (size_t i = 0; i < n_tokens; i++) {
-            llama_batch_add(batch, chunk.tokens[i], (llama_pos) i, { 0 }, true);
+            common_batch_add(batch, chunk.tokens[i], (llama_pos) i, { 0 }, true);
         }
 
         batch_decode(embed_ctx, batch, chunk_embeddings.data(), 1, n_embd);
         chunk.embeddings = chunk_embeddings;
 
-        llama_batch_clear(batch);
+        common_batch_clear(batch);
     }
 
     llama_batch_free(batch);
@@ -622,10 +662,11 @@ bool embed_encode_single(
     std::vector<float> & embeddings) {
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
 
-    const int n_embd = llama_n_embd(embed_model);
+    const int n_embd = llama_model_n_embd(embed_model);
+    const llama_vocab * vocab = llama_model_get_vocab(llm_model);
     std::vector<float> query_embeddings(n_embd, 0);
     
-    std::vector<int32_t> query_tokens = llama_tokenize(embed_ctx, query, true);
+    std::vector<int32_t> query_tokens = slm_tokenize(embed_ctx, query, true, false);
     size_t n_tokens = query_tokens.size();
     if (n_tokens > params.n_batch) {
         fprintf(stderr, "%s: error: query string size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
@@ -634,22 +675,22 @@ bool embed_encode_single(
     }
 
     // add eos if not present
-    if ((llama_token_eos(embed_model) >= 0) && 
-        (query_tokens.empty() || (query_tokens.back() != llama_token_eos(embed_model)))) {
-        query_tokens.push_back(llama_token_eos(embed_model));
+    if ((llama_vocab_eos(vocab) >= 0) && 
+        (query_tokens.empty() || (query_tokens.back() != llama_vocab_eos(vocab)))) {
+        query_tokens.push_back(llama_vocab_eos(vocab));
     }
 
     
     struct llama_batch embed_query_batch = llama_batch_init(params.n_batch, 0, 1);
     for (size_t i = 0; i < n_tokens; i++) {
-        llama_batch_add(embed_query_batch, query_tokens[i], (llama_pos) i, { 0 }, true);
+        common_batch_add(embed_query_batch, query_tokens[i], (llama_pos) i, { 0 }, true);
     }
 
     // query_embeddings contains the result from sentencepiece (all-MiniLM-L6-v2)
     batch_decode(embed_ctx, embed_query_batch, query_embeddings.data(), 1, n_embd);
     embeddings = query_embeddings;
 
-    llama_batch_clear(embed_query_batch);
+    common_batch_clear(embed_query_batch);
     llama_batch_free(embed_query_batch);
 
     return true;
@@ -660,7 +701,7 @@ void embed_terminate() {
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
 
     llama_free(embed_ctx);
-    llama_free_model(embed_model);
+    llama_model_free(embed_model);
 
     // This step is done via the llm_terminate() side
     // llama_backend_free();
