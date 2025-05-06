@@ -1,3 +1,7 @@
+git clone https://hoiv:...@github.com/XbGH-MS/Xllama .
+
+===========================================================
+
 git merge origin/hv/b612 // -> hv/b612_dc_merged
 
 origin/hv/b612 came from 03282025
