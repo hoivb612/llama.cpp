@@ -12,6 +12,17 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef GGML_B612
+    #if defined(_MSC_VER) /* && (defined(__AVX2__) || defined(__AVX512F__)) */
+        #ifndef __FMA__
+            #define __FMA__
+        #endif
+        #ifndef __F16C__
+            #define __F16C__
+        #endif
+    #endif
+#endif // GGML_B612
+
 #ifdef __ARM_FEATURE_SVE
 #include <arm_sve.h>
 #endif // __ARM_FEATURE_SVE
@@ -25,6 +36,7 @@
 #endif
 
 #if defined(__F16C__)
+#pragma message("GGML-IMPL.h: using AVX512 F16C intrinsics")
 #include <immintrin.h>
 #endif
 
@@ -346,6 +358,7 @@ GGML_API void ggml_aligned_free(void * ptr, size_t size);
 #elif defined(__F16C__)
 
     #ifdef _MSC_VER
+        #pragma message("GGML-IMPL.h: using AVX512 F16C for FP16 <-> FP32 conversion")
         #define GGML_COMPUTE_FP16_TO_FP32(x) _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x)))
         #define GGML_COMPUTE_FP32_TO_FP16(x) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(x), 0), 0)
     #else
@@ -416,6 +429,7 @@ GGML_API void ggml_aligned_free(void * ptr, size_t size);
     #define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
 
 #else
+#pragma message("GGML-IMPL.h: using c-style computation for FP16 <-> FP32 conversion")
 
     // FP16 <-> FP32
     // ref: https://github.com/Maratyszcza/FP16
@@ -511,6 +525,7 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #endif
 
 #if !defined(GGML_FP32_TO_FP16)
+#pragma message("=================== Define GGML_FP32_TO_FP16() as GGML_COMPUTE_FP32_to_FP16")
 #define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
 #endif
 
