@@ -76,13 +76,13 @@ static void llama_tensor_dequantize_impl(
     if (nthread < 2) {
         if (tensor->type == GGML_TYPE_F16) {
 #ifdef GGML_B612
-            ggml_fp16_to_fp32_row_cpu((ggml_fp16_t *)tensor->data, f32_output, nelements);
+            ggml_fp16_to_fp32_row_org((ggml_fp16_t *)tensor->data, f32_output, nelements);
 #else            
             ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
 #endif // GGML_B612
         } else if (tensor->type == GGML_TYPE_BF16) {
 #ifdef GGML_B612
-            ggml_bf16_to_fp32_row_cpu((ggml_bf16_t *)tensor->data, f32_output, nelements);
+            ggml_bf16_to_fp32_row_org((ggml_bf16_t *)tensor->data, f32_output, nelements);
 #else
             ggml_bf16_to_fp32_row((ggml_bf16_t *)tensor->data, f32_output, nelements);
 #endif // GGML_B612
@@ -120,13 +120,13 @@ static void llama_tensor_dequantize_impl(
         auto compute = [qtype] (ggml_type typ, uint8_t * inbuf, float * outbuf, int nels) {
             if (typ == GGML_TYPE_F16) {
 #ifdef GGML_B612
-                ggml_fp16_to_fp32_row_cpu((ggml_fp16_t *)inbuf, outbuf, nels);
+                ggml_fp16_to_fp32_row_org((ggml_fp16_t *)inbuf, outbuf, nels);
 #else
                 ggml_fp16_to_fp32_row((ggml_fp16_t *)inbuf, outbuf, nels);
 #endif // GGML_B612
             } else if (typ == GGML_TYPE_BF16) {
 #ifdef GGML_B612
-                ggml_bf16_to_fp32_row_cpu((ggml_bf16_t *)inbuf, outbuf, nels);
+                ggml_bf16_to_fp32_row_org((ggml_bf16_t *)inbuf, outbuf, nels);
 #else
                 ggml_bf16_to_fp32_row((ggml_bf16_t *)inbuf, outbuf, nels);
 #endif // GGML_B612

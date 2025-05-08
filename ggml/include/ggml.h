@@ -333,8 +333,10 @@ extern "C" {
     GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t);
     GGML_API ggml_fp16_t ggml_fp32_to_fp16(float);
 #ifdef GGML_B612
-    GGML_API void        ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t *, float *, int64_t);
-    GGML_API void        ggml_fp32_to_fp16_row_cpu(const float *, ggml_fp16_t *, int64_t);
+             void        ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t *, float *, int64_t);
+             void        ggml_fp32_to_fp16_row_cpu(const float *, ggml_fp16_t *, int64_t);
+    GGML_API void        ggml_fp16_to_fp32_row_org(const ggml_fp16_t *, float *, int64_t);
+    GGML_API void        ggml_fp32_to_fp16_row_org(const float *, ggml_fp16_t *, int64_t);
 #else
     GGML_API void        ggml_fp16_to_fp32_row(const ggml_fp16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
@@ -345,8 +347,10 @@ extern "C" {
     GGML_API ggml_bf16_t ggml_fp32_to_bf16(float);
     GGML_API float       ggml_bf16_to_fp32(ggml_bf16_t);  // consider just doing << 16
 #ifdef GGML_B612
-    GGML_API void        ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t *, float *, int64_t);
-    GGML_API void        ggml_fp32_to_bf16_row_cpu(const float *, ggml_bf16_t *, int64_t);
+             void        ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t *, float *, int64_t);
+             void        ggml_fp32_to_bf16_row_cpu(const float *, ggml_bf16_t *, int64_t);
+    GGML_API void        ggml_bf16_to_fp32_row_org(const ggml_bf16_t *, float *, int64_t);
+    GGML_API void        ggml_fp32_to_bf16_row_org(const float *, ggml_bf16_t *, int64_t);
 #else
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);

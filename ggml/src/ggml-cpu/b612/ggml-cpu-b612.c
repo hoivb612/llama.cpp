@@ -5621,3 +5621,11 @@ void ggml_init_tables() {
     // for perfafx
     ggml_cpu_init();
 }
+
+#pragma comment(linker, "/EXPORT:ggml_time_init=ggml-base.ggml_time_init")
+
+#pragma comment(linker, "/EXPORT:ggml_time_us=ggml-base.ggml_time_us")
+
+void ggml_disable_core_parking() {
+#pragma comment(linker, "/EXPORT:ggml_disable_core_parking=" __FUNCTION__)
+}

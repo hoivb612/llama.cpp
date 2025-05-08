@@ -11,7 +11,11 @@
 #endif
 
 // floating point type used to accumulate sums
+#ifdef GGML_B612
+typedef float ggml_float;
+#else
 typedef double ggml_float;
+#endif // GGML_B612
 
 #define GGML_GELU_FP16
 #define GGML_GELU_QUICK_FP16
