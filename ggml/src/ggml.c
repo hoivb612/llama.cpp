@@ -496,29 +496,224 @@ bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
 //
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
-static int64_t timer_freq, timer_start;
-void ggml_time_init(void) {
-    LARGE_INTEGER t;
-    QueryPerformanceFrequency(&t);
-    timer_freq = t.QuadPart;
+static int64_t timer_freq = 0, timer_start = 0;
 
-    // The multiplication by 1000 or 1000000 below can cause an overflow if timer_freq
-    // and the uptime is high enough.
-    // We subtract the program start time to reduce the likelihood of that happening.
-    QueryPerformanceCounter(&t);
-    timer_start = t.QuadPart;
+#if defined(__USE_TIME_RECIP__)
+#pragma message("Building with __USE_TIME_RECIP__ enabled")
+
+static uint64_t tsc_freq = 0;
+
+uint64_t dv1000_fraction;
+uint8_t dv1000_shift;
+
+uint64_t ms_fraction;
+uint8_t ms_shift;
+
+uint64_t us_fraction;
+uint8_t us_shift;
+
+uint64_t
+ggml_compute_fraction (
+    uint64_t Numerator,
+    uint64_t Divisor,
+    uint8_t * Shift
+    )
+
+/*++
+
+Routine Description:
+
+    This function computes an unsigned 64-bit scaled fraction from the
+    specified unsigned numerator and unsigned divisor values. The result
+    can be used to performance division via multiplication.
+
+Arguments:
+
+    Numerator - Supplies the 64-bit unsigned fraction numerator.
+
+    Divisor - Supplies the 64-bit unsigned fraction divisor.
+
+    Shift - Supplies a pointer to a variable that receives the computed
+        shift count.
+
+Return Value:
+
+    The unsigned 64-bit scaled fraction is returned as the function value.
+
+--*/
+
+{
+
+    int64_t fraction;
+    uint8_t numberBits;
+    uint64_t remainder;
+
+    //
+    // Compute the 64-bit fractional value.
+    //
+
+    numberBits = 0;
+    remainder = Numerator;
+    fraction = 0;
+    while (fraction >= 0) {
+        numberBits += 1;
+        fraction <<= 1;
+        remainder <<= 1;
+        if (remainder >= Divisor) {
+            remainder -= Divisor;
+            fraction |= 1;
+        }
+    }
+
+    if (remainder != 0) {
+        if (fraction == 0xffffffffffffffffI64) {
+            fraction = 0x8000000000000000I64;
+            numberBits -= 1;
+
+        } else {
+            fraction += 1;
+        }
+    }
+
+    //
+    // Compute the shift count value and return the reciprocal fraction.
+    //
+
+    *Shift = numberBits - 64;
+    return fraction;
+}
+
+void
+ggml_compute_tsc_frequency (
+    void
+    )
+
+{
+
+    uint64_t period = timer_freq / 8;
+    uint64_t start_qpc_cycles;
+    uint64_t total_qpc_cycles;
+    uint64_t start_tsc_cycles;
+    uint64_t total_tsc_cycles;
+
+    //
+    // Poll elapsed time until the computed period has elapsed.
+    //
+
+    start_qpc_cycles = ggml_cycles();
+    start_tsc_cycles = ReadTimeStampCounter();
+    do {
+        total_qpc_cycles = ggml_cycles() - start_qpc_cycles;
+        total_tsc_cycles = ReadTimeStampCounter() - start_tsc_cycles;
+    } while (total_qpc_cycles < period);
+
+    //
+    // Compute the number of seconds that have elapsed.
+    //
+
+    double qpc_seconds = (double)total_qpc_cycles / (double)timer_freq;
+
+    //
+    // Compute the number of tsc cycles per second.
+    //
+
+    double tsc_per_second = (double)total_tsc_cycles / qpc_seconds;
+    tsc_freq = (uint64_t)tsc_per_second;
+    printf("TSC frequency in counts per second %zd\n", tsc_freq);
+    return;
+}
+
+#endif // defined(__USE_TIME_RECIP__)
+
+void ggml_time_init(void) {
+    if (!timer_freq) {
+        LARGE_INTEGER t;
+        QueryPerformanceFrequency(&t);
+        timer_freq = t.QuadPart;
+
+#if defined(__USE_TIME_RECIP__)
+
+        dv1000_fraction = ggml_compute_fraction(1, 1000, &dv1000_shift);
+        ms_fraction = ggml_compute_fraction(1000, timer_freq, &ms_shift); 
+        us_fraction = ggml_compute_fraction(1000000, timer_freq, &us_shift);
+        // printf("dv1000 fraction multiplier is 0x%016I64x right shift %d\n", dv1000_fraction, dv1000_shift);  
+        // printf("ms fraction multiplier is 0x%016I64x right shift %d\n", ms_fraction, ms_shift);
+        // printf("us fraction multiplier is 0x%016I64x right shift %d\n", us_fraction, us_shift);
+
+#endif // (__USE_TIME_RECIP__)
+
+        // The multiplication by 1000 or 1000000 below can cause an overflow if timer_freq
+        // and the uptime is high enough.
+        // We subtract the program start time to reduce the likelihood of that happening.
+        QueryPerformanceCounter(&t);
+        timer_start = t.QuadPart;
+
+#if defined(__USE_TIME_RECIP__)
+
+        //
+        // Compute the approximate frequency of TSC.
+        //
+
+        ggml_compute_tsc_frequency();
+
+#endif // (__USE_TIME_RECIP__)
+
+    }
 }
 int64_t ggml_time_ms(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
+
+#if defined(__USE_TIME_RECIP__)
+
+    return UnsignedMultiplyHigh(t.QuadPart - timer_start, ms_fraction) >> ms_shift;
+
+#else
+
     return ((t.QuadPart-timer_start) * 1000) / timer_freq;
+
+#endif // defined(__USE_TIME_RECIP__)
+
 }
+
 int64_t ggml_time_us(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
-}
+
+#if defined(__USE_TIME_RECIP__)
+
+    return UnsignedMultiplyHigh(t.QuadPart - timer_start, us_fraction) >> us_shift;
+
 #else
+
+    return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
+
+#endif // defined(__USE_TIME_RECIP__)
+
+}
+
+int64_t ggml_cycles(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (t.QuadPart - timer_start);
+}
+
+int64_t ggml_cycles_per_ms(void) {
+
+#if defined(__USE_TIME_RECIP__)
+
+    return UnsignedMultiplyHigh(timer_freq, dv1000_fraction) >> dv1000_shift;
+
+#else
+
+    return timer_freq / 1000;
+
+#endif // defined(__USE_TIME_RECIP__)
+
+}
+
+#else
+
 void ggml_time_init(void) {}
 int64_t ggml_time_ms(void) {
     struct timespec ts;
@@ -531,7 +726,6 @@ int64_t ggml_time_us(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec*1000000 + (int64_t)ts.tv_nsec/1000;
 }
-#endif
 
 int64_t ggml_cycles(void) {
     return clock();
@@ -540,6 +734,8 @@ int64_t ggml_cycles(void) {
 int64_t ggml_cycles_per_ms(void) {
     return CLOCKS_PER_SEC/1000;
 }
+
+#endif // defined(_MSC_VER) || defined(__MINGW32__)
 
 //
 // cross-platform UTF-8 file paths
