@@ -132,6 +132,7 @@ option(GGML_VXE              "ggml: enable vxe"              ON)
 
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
 option(GGML_B612             "ggml: build B612 variant"      ON)
+option(GGML_B612_za          "ggml: build B612 za variant"   OFF)
 option(GGML_XBOX_PERF        "ggml: enable Xbox perf data"   ON)
 set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
