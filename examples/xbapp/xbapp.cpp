@@ -427,35 +427,31 @@ int main(int argc, char** argv) {
     }
 
     int prompt_index = 1;
-    std::string full_prompt = ::trim(xbparams.custom_template_prompt);
-    size_t message_index = full_prompt.find("{message}");
-    if (message_index == std::string::npos) {
-        printf("%s: template prompt is not correctly formed for cpf mode - "
-               "no \"{message}\" identifier located\n", __func__);
-    }
-
     while (custom_prompts_it != custom_prompts.end())
     {
-        // extract custom user prompt
-        std::string& custom_prompt = *custom_prompts_it;
+        // Create custom user prompt
+        std::string& custom_prompt = ::trim(*custom_prompts_it);
         custom_prompt.erase(
             std::remove(custom_prompt.begin(), custom_prompt.end(), '\"'),
             custom_prompt.end());
-        custom_prompt = ::trim(custom_prompt);
 
-        // build the full prompt
-        GGML_ASSERT(message_index != std::string::npos);
-        full_prompt.replace(message_index, 
-            std::string("{message}").length(), custom_prompt);
+        std::string full_prompt = ::trim(xbparams.custom_template_prompt);
+        size_t pos = full_prompt.find("{message}");
+        if (pos != std::string::npos) {
+            full_prompt.replace(pos, std::string("{message}").length(), custom_prompt);
+        }
+        else {
+            pos = 0;
+        }
 
         if (xbparams.pfc_mode && !xbparams.pfx_shared.empty()) {
-            // for pfc mode the tokenizable part is the part that keeps changing
-            xbparams.prompt = custom_prompt;
-        } else {
-            // use the full prompt for non-pfc mode 
+            xbparams.prompt = full_prompt.substr(pos);
+        }
+        else {
+            // non pfc mode 
             xbparams.prompt = full_prompt;
         }
-    
+
         console::set_display(console::prompt);
         printf("> Running with custom prompt => [%d/%zd]: [%s]\n",
             prompt_index++,
