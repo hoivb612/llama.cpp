@@ -25,8 +25,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     if (GGML_B612)
+        if (GGML_B612_za)
+            message(STATUS "GGML_B612_za: turn on B612-za mode")
+            set(GGML_SOURCES_B612 ggml-cpu/b612-za/ggml-cpu-b612-za.c)
+            target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu/b612)
+        else()
+            set(GGML_SOURCES_B612 ggml-cpu/b612/ggml-cpu-b612.c)
+        endif()
+    endif()
+    if (GGML_B612)
         list (APPEND GGML_CPU_SOURCES
-            ggml-cpu/b612/ggml-cpu-b612.c
+            ${GGML_SOURCES_B612}
             ggml-cpu/b612/ggml-cpu-quants-b612.c
             ggml-cpu/b612/ops-b612.cpp
             ggml-cpu/b612/simd-mappings-b612.h

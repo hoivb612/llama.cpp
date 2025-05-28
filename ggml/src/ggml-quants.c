@@ -2509,6 +2509,60 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
 
+    // ******* WARNING: This is a modified version that uses the absolute value of amax
+    //         instead of the signed value. This change is being made in a future version
+    //         of the zo code. The new and old code produce different quant block scale
+    //         multipliers and quant values, but the dequantized values are the same.
+    //
+
+    for (int i = 0; i < nb; i++) {
+
+        float amax = 0.f;
+        for (int j = 0; j < QK_K; ++j) {
+            float ax = fabsf(x[j]);
+            if (ax > amax) {
+                amax = ax;
+            }
+        }
+        if (amax == 0.f) {
+            memset(&y[i], 0, sizeof(block_q8_K));
+            goto next_block;
+        }
+        //const float iscale = 128.f / amax;
+        // We need this change for IQ2_XXS, else the AVX implementation becomes very awkward
+
+        const float iscale = 127.f / amax;
+        y[i].d = amax / 127.f;
+
+        const __m128 iscale_ss = _mm_load_ss(&iscale);
+//        const __m128 zero = _mm_setzero_ps();
+        for (int j = 0; j < QK_K; ++j) {
+//            int v = nearest_int(iscale*x[j]);
+//            y[i].qs[j] = MIN(127, v);
+
+            const __m128 xj_ss = _mm_load_ss(&x[j]);
+            __m128 prod = _mm_mul_ss(iscale_ss, xj_ss);
+//            prod = _mm_round_ss(zero, prod, _MM_ROUND_NEAREST);
+            y[i].qs[j] = _mm_cvtss_i32(prod);
+        }
+        for (int j = 0; j < QK_K/16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) {
+                sum += y[i].qs[j*16 + ii];
+            }
+            y[i].bsums[j] = sum;
+        }
+
+next_block:
+        x += QK_K;
+    }
+
+    // ******* WARNING:
+
+#if 0
+
+    // original code
+
     for (int i = 0; i < nb; i++) {
 
         float max = 0;
@@ -2542,6 +2596,9 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
         y[i].d = 1/iscale;
         x += QK_K;
     }
+
+#endif // ifdef 0
+
 }
 
 #ifdef GGML_B612

@@ -182,9 +182,6 @@ if (WIN32)
     if (BUILD_SHARED_LIBS)
         # TODO: should not use this
         # set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-    else()
-        message(STATUS "GGML_B612 - turning off B612 DLL proxies")
-        add_compile_definitions(__GGML_B612_STATIC__)
     endif()
 endif()
 
