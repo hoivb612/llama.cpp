@@ -54,13 +54,13 @@ docker run --privileged -it \
     -v $HOME/llama.cpp/ci-cache:/ci-cache \
     -v $HOME/llama.cpp/ci-results:/ci-results \
     -v $PWD:/ws -w /ws \
-    mthreads/musa:rc3.1.1-devel-ubuntu22.04
+    mthreads/musa:rc4.2.0-devel-ubuntu22.04-amd64
 ```
 
 Inside the container, execute the following commands:
 
 ```bash
-apt update -y && apt install -y bc cmake git python3.10-venv time unzip wget
+apt update -y && apt install -y bc cmake ccache git python3.10-venv time unzip wget
 git config --global --add safe.directory /ws
 GG_BUILD_MUSA=1 bash ./ci/run.sh /ci-results /ci-cache
 ```
