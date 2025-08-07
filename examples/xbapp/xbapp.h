@@ -23,11 +23,16 @@
     #define WIN32_LEAN_AND_MEAN
 #endif // WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
-#define NOMINMAX
+    #define NOMINMAX
 #endif
+
+#include <locale>
+#include <iostream>
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
+#include <intrin.h>
+
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
@@ -59,6 +64,8 @@ struct xbapp_params {
     bool openmp                        = false; // true when openmp is present
     bool verbose_extra                 = false; // true for extra llama logging (i.e. debug messages)
     bool process_affinity              = false; // true if set process affinity is enabled
+    bool cpumask[32]                   = {false}; // for specifying custom CPU mask for process affinity
+    bool cpumask_present               = false; // default is false
 };
 
 

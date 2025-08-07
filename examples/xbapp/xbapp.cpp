@@ -146,118 +146,50 @@ bool processCustomPromptsFromFile(xbapp_params& xbparams) {
 #ifdef _WIN32
 
 #include <intrin.h>
+#include <b612-cpu.h>
 
-uint64_t l1_cache_size = 32ull * 1024ull;
-uint64_t l2_cache_size = 1024ull * 1024ull;
+#else // _WIN32
 
-typedef struct {
-    uint64_t mask;
-    uint16_t group;
-    uint16_t reserved[3];
-} group_affinity_t;
-
-void
-xb_set_process_affinity (
-    uint32_t n_threads
-    )
-{
-#if defined(__x86_64__) || defined(_M_X64)
-    //
-    // Get number of logical processors per physical core and the maximum number of logical
-    // processsors.
-    //
-    struct {
-        uint32_t eax;
-        uint32_t ebx;
-        uint32_t ecx;
-        uint32_t edx;
-    } cpu_info;
-
-    //
-    // Get L1 cache size.
-    //
-    __cpuid((int *)&cpu_info, 0x80000005);
-    l1_cache_size = ((cpu_info.edx >> 24) & 0xff) * 1024ull;
-    printf("%s: l1 cache size in kbytes %zd\n", __func__, l1_cache_size);
-
-    //
-    // Get l2 cache size
-    //
-    __cpuid((int *)&cpu_info, 0x80000006);
-    l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
-    printf("%s: l2 cache size in kbytes %zd\n", __func__, l2_cache_size); 
-
-    printf("%s: n_threads specified %d\n", __func__, n_threads);
-    __cpuid((int *)&cpu_info, 0x8000001e);
-    const uint32_t logical_per_physical_core = ((cpu_info.ebx & 0x300) >> 8) + 1;
-    printf("%s: number of logical processors per physical core %d\n", __func__, logical_per_physical_core);
-
-    if (logical_per_physical_core == 1) {
-        printf("%s: bypassing set process affinity - not SMT system\n", __func__);
-        return;
-    }
-
-    __cpuid((int *)&cpu_info, 0x00000001);
-    const uint32_t maximum_logical = (cpu_info.ebx & 0xff0000) >> 16;
-    printf("%s: maximum number of logical processors %d\n", __func__, maximum_logical);
-
-    //
-    // Check the specified number of threads against the maximum logical processor count.
-    //
-
-    const uint32_t maximum_smt_threads = maximum_logical / 2;
-    if ((n_threads & 1) || (n_threads > maximum_smt_threads)) {
-        printf("%s: bypassing set process affinity - number threads odd or gt maximum logical / 2\n", __func__);
-        return;
-    }
-
-    //
-    // Get the current process group count.
-    //
-
-#if 0
-    uint16_t group_array[4];
-    uint16_t group_count = 4;
-
-    if (GetProcessGroupAffinity(GetCurrentProcess(), &group_count, group_array)) {
-        printf("%s: GetProcessGroupAffinity succeeded with %d groups\n", __func__, group_count);
-        if (group_count != 1) {
-            printf("%s: bypassing set affinity process because group count is greater than one\n", __func__);
-            return;
-        }
-
-    } else {
-        printf("%s: GetProcessGroupAffinity failed\n", __fucn__);
-        return;
-    }
-#endif // if 0
-
-    //
-    // Set process affinity.
-    //
-
-    int64_t affinity_mask = ((1ull << (n_threads * 2)) - 1) & 0x55555555ull;
-    if (SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
-        printf("%s: process group affinity set to 0x%08llx\n", __func__, affinity_mask);
-
-    } else {
-        printf("%s: failed to set process affinity mask\n", __func__);
-    }
-
-#else
-
-    printf("%s: set process affinity is only available for x86 architecture\n", __func__);
-
-#endif // __x86_64__ || _M_X64
-
-    return;
-}
-
-#else
-
-#define ggml_set_process_affinity(n)
+#define xb_set_process_affinity(n, m)
+#define xb_set_optimal_process_affinity(n)
 
 #endif // _WIN32
+
+bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[32]) {
+    // Discard potential 0x prefix
+    size_t start_i = 0;
+    if (mask.length() >= 2 && mask.substr(0, 2) == "0x") {
+        start_i = 2;
+    }
+
+    size_t num_digits = mask.length() - start_i;
+    if (num_digits > 128) num_digits = 128;
+
+    size_t end_i = num_digits + start_i;
+
+    for (size_t i = start_i, n = (num_digits*4 - 1); i < end_i; i++, n-=4) {
+        char c = mask.at(i);
+        int8_t id = c;
+
+        if ((c >= '0' && c <= '9')) {
+            id -= '0';
+        } else if (c >= 'a' && c <= 'f') {
+            id -= 'a' - 10;
+        } else if (c >= 'A' && c <= 'F') {
+            id -= 'A' - 10;
+        } else {
+            fprintf(stderr, "Invalid hex character '%c' at position %d\n", c, int32_t(i));
+            return false;
+        }
+
+        boolmask[n    ] = boolmask[n    ] || ((id & 8) != 0);
+        boolmask[n - 1] = boolmask[n - 1] || ((id & 4) != 0);
+        boolmask[n - 2] = boolmask[n - 2] || ((id & 2) != 0);
+        boolmask[n - 3] = boolmask[n - 3] || ((id & 1) != 0);
+    }
+
+    return true;
+}
 
 void print_system_info(xbapp_params& xb_params) {
     std::ostringstream os;
@@ -305,14 +237,11 @@ int64_t t0;
 int main(int argc, char** argv) {
     xbapp_params xbparams;
 
-    ggml_time_init();
-    t0 = ggml_time_us();
-
     // parse command line args
     {
         int i = 1;
         for (; i < argc; i++) {
-            if (strcmp(argv[i], "-affin") == 0) {
+            if (strcmp(argv[i], "-paffin") == 0) {
                 xbparams.process_affinity = true;
             } else if (strcmp(argv[i], "-cpf") == 0) {
                 if (i + 1 < argc) {
@@ -373,6 +302,19 @@ int main(int argc, char** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "-C") == 0) {
+                if (i + 1 < argc) {
+                    if (!parse_cpu_mask(argv[++i], xbparams.cpumask)) {
+                        fprintf(stderr, "error: failed to parse CPU mask: '%s'\n", argv[i]);
+                        print_usage(argc, argv);
+                        return 1;
+                    } else {
+                        xbparams.cpumask_present = true;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
             } else if (strcmp(argv[i], "-vl") == 0) {
                 if (i + 1 < argc) {
                     try {
@@ -427,13 +369,27 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    printf("%s: Actual using: %d threads\n", __func__, xbparams.n_threads);
+    printf("%s: running with: %d threads\n", __func__, xbparams.n_threads);
 
-    if (xbparams.process_affinity) {
-        #ifdef _WIN32        
-        xb_set_process_affinity(xbparams.n_threads);
-        #endif
+    int64_t cpu_affinity_mask = 0;
+    int32_t cpu_core_count_from_cpumask = 0;
+    if (xbparams.cpumask_present) {
+        for (int i = 0; i < 32; i++) {
+            if (xbparams.cpumask[i]) {
+                cpu_core_count_from_cpumask++;
+                cpu_affinity_mask |= 1ull << i;
+            }
+        }
+        printf("%s: CPU mask requested=[%0llX] - core count=[%d]\n", 
+            __func__, cpu_affinity_mask, cpu_core_count_from_cpumask);
     }
+
+    if (xbparams.cpumask_present && (cpu_core_count_from_cpumask >= xbparams.n_threads)) {
+        cpu_affinity_mask = ggml_b612::xb_set_process_affinity(xbparams.n_threads, cpu_affinity_mask);
+    } else if (xbparams.process_affinity) {
+        cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(xbparams.n_threads);
+    }
+    printf("[%s]: Setting process affinity mask 0x%016llX\n", __func__, cpu_affinity_mask);
 
     console::init(true);
     printf("[%s]: processing cpf input file [%s]\n", __func__, xbparams.custom_p_file.c_str());
@@ -445,9 +401,24 @@ int main(int argc, char** argv) {
     } else {
         // xbapp logging mode
         llama_log_set(xbapp_log_callback, &(xbparams.verbose_level));
+        // map xbapp verbose level to current version of GGML definitions
+        ggml_log_level log_level = GGML_LOG_LEVEL_INFO;
+        switch (xbparams.verbose_level) {
+            case 0: break; // already 0 by default
+            case 1: log_level = GGML_LOG_LEVEL_INFO;  break; // info
+            case 2: log_level = GGML_LOG_LEVEL_WARN;  break; // warn
+            case 3: log_level = GGML_LOG_LEVEL_ERROR; break; // error
+            case 4: log_level = GGML_LOG_LEVEL_DEBUG; break; // debug
+            default: break; // no match then default to no logging (0)
+        }
+        llama_log_set(xbapp_log_callback, &log_level);
     } 
 
     print_system_info(xbparams);
+
+    // print_system_info() initializes the time freq support so we can 
+    // just call ggml_time_us().
+    t0 = ggml_time_us();
 
     // initialize the model
     if (slm_init(xbparams) != 0) {
@@ -456,35 +427,31 @@ int main(int argc, char** argv) {
     }
 
     int prompt_index = 1;
-    std::string full_prompt = ::trim(xbparams.custom_template_prompt);
-    size_t message_index = full_prompt.find("{message}");
-    if (message_index == std::string::npos) {
-        printf("%s: template prompt is not correctly formed for cpf mode - "
-               "no \"{message}\" identifier located\n", __func__);
-    }
-
     while (custom_prompts_it != custom_prompts.end())
     {
-        // extract custom user prompt
-        std::string& custom_prompt = *custom_prompts_it;
+        // Create custom user prompt
+        std::string& custom_prompt = ::trim(*custom_prompts_it);
         custom_prompt.erase(
             std::remove(custom_prompt.begin(), custom_prompt.end(), '\"'),
             custom_prompt.end());
-        custom_prompt = ::trim(custom_prompt);
 
-        // build the full prompt
-        GGML_ASSERT(message_index != std::string::npos);
-        full_prompt.replace(message_index, 
-            std::string("{message}").length(), custom_prompt);
+        std::string full_prompt = ::trim(xbparams.custom_template_prompt);
+        size_t pos = full_prompt.find("{message}");
+        if (pos != std::string::npos) {
+            full_prompt.replace(pos, std::string("{message}").length(), custom_prompt);
+        }
+        else {
+            pos = 0;
+        }
 
         if (xbparams.pfc_mode && !xbparams.pfx_shared.empty()) {
-            // for pfc mode the tokenizable part is the part that keeps changing
-            xbparams.prompt = custom_prompt;
-        } else {
-            // use the full prompt for non-pfc mode 
+            xbparams.prompt = full_prompt.substr(pos);
+        }
+        else {
+            // non pfc mode 
             xbparams.prompt = full_prompt;
         }
-    
+
         console::set_display(console::prompt);
         printf("> Running with custom prompt => [%d/%zd]: [%s]\n",
             prompt_index++,
@@ -507,9 +474,7 @@ int main(int argc, char** argv) {
     console::set_display(console::stats);
     t0 = ggml_time_us() - t0;
     printf("\n\n total elapsed time %7.2fsec\n", (double)t0 / (1000. * 1000.));
-#ifdef GGML_TENSOR_OP_PERF
-    print_tensor_op_perf_data();
-#endif // GGML_TENSOR_OP_PERF
+    // llama_print_tensor_op_perf();
 
     console::cleanup();
 
