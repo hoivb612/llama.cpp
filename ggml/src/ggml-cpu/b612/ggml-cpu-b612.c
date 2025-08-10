@@ -3,11 +3,11 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
-#include "ggml-cpu-traits.h"
+#include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
-#include "ggml-cpu-quants.h"
+#include "quants.h"
 #include "ggml-threading.h"
 
 #include "unary-ops.h"
@@ -86,6 +86,9 @@
 
 #define UNUSED GGML_UNUSED
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
+
+// precomputed f32 table for f16 (256 KB) (simd-mappings.h)
+float ggml_table_f32_f16[1 << 16];
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -4012,6 +4015,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_get_rows_back(params, tensor);
             } break;
+        case GGML_OP_SET_ROWS:
+            {
+                ggml_compute_forward_set_rows(params, tensor);
+            } break;
         case GGML_OP_DIAG:
             {
                 ggml_compute_forward_diag(params, tensor);
@@ -4102,7 +4109,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
+                ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
@@ -5516,6 +5523,14 @@ int ggml_cpu_has_vxe(void) {
 #endif
 }
 
+int ggml_cpu_has_nnpa(void) {
+#if defined(GGML_NNPA)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 int ggml_cpu_has_neon(void) {
 #if defined(__ARM_ARCH) && defined(__ARM_NEON)
     return ggml_arm_arch_features.has_neon;
@@ -5597,6 +5612,7 @@ void ggml_cpu_init(void) {
                     ggml_fp16_t fp16;
                 } u = {i};
                 float f = GGML_FP16_TO_FP32(u.fp16);
+                ggml_table_f32_f16[i] = f;
                 ggml_table_gelu_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_f32(f));
                 ggml_table_gelu_quick_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_quick_f32(f));
             }

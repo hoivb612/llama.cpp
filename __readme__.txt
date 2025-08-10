@@ -61,10 +61,14 @@ CONFLICT (content): Merge conflict in src/llama.cpp ----
 Auto-merging tests/test-tokenizer-0.cpp
 Automatic merge failed; fix conflicts and then commit the result.
 
-====================================
+===========================================
 
 Offspring for hoivb612
 https://github.com/hoivb612/llama.cpp
+
+===========================================
+
+Saved checkpoint for branch 032825 before taking the next plunge 04/16
 
 ===========================================
 
