@@ -746,6 +746,30 @@ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
 
 }
 
+void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_silu(_mm512_loadu_ps(x + i)), _mm512_loadu_ps(g + i)));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_silu(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
+    }
+#elif defined(__SSE2__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i, _mm_mul_ps(ggml_v_silu(_mm_loadu_ps(x + i)), _mm_loadu_ps(g + i)));
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, vmulq_f32(ggml_v_silu(vld1q_f32(x + i)), vld1q_f32(g + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = ggml_silu_f32(x[i]) * g[i];
+    }
+}
+
 ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max) {
 #pragma comment(linker, "/EXPORT:ggml_vec_soft_max_f32=" __FUNCTION__)
 
@@ -1342,6 +1366,21 @@ void ggml_vec_add_f32(const uint64_t n, float * z, const float * x, const float 
         } while (i < n);
     }
 
+    #if )ORG_AVX2
+    int i = 0;
+    #if defined(__AVX2__)
+        for (; i + 7 < n; i += 8) {
+            __m256 vx = _mm256_loadu_ps(x + i);
+            __m256 vy = _mm256_loadu_ps(y + i);
+            __m256 vz = _mm256_add_ps(vx, vy);
+            _mm256_storeu_ps(z + i, vz);
+        }
+    #endif
+    for (; i < n; ++i) {
+        z[i] = x[i] + y[i];
+    }
+    #endif // ORG_AVX2
+}
 #else
 
     for (uint64_t i = 0; i < n; ++i) {
@@ -2641,6 +2680,30 @@ void ggml_vec_scale_f32(const uint64_t n, float * y, const float   v) {
 
 #if defined(GGML_USE_ACCELERATE)
     vDSP_vsmul(y, 1, &v, y, 1, n);
+#elif defined(__ARM_FEATURE_SVE)
+    const int sve_register_length = ggml_cpu_get_sve_cnt() * 8;
+    const int ggml_f32_epr = sve_register_length / 32;//8;//svcntw(); // SVE128:4, SVE256:8, SVE512:16
+    const int ggml_f32_step = 2 * ggml_f32_epr;
+    GGML_F32_VEC vx = GGML_F32_VEC_SET1(v);
+    const int np = (n & ~(ggml_f32_step - 1));
+    svfloat32_t ay1;
+    svfloat32_t ay2;
+    for (int i = 0; i < np; i += ggml_f32_step) {
+        ay1 = GGML_F32_VEC_LOAD(y + i);
+        ay1 = GGML_F32_VEC_MUL(ay1, vx);
+        GGML_F32_VEC_STORE(y + i, ay1);
+        ay2 = GGML_F32_VEC_LOAD(y + i + 1*ggml_f32_epr);
+        ay2 = GGML_F32_VEC_MUL(ay2, vx);
+        GGML_F32_VEC_STORE(y + i + 1*ggml_f32_epr, ay2);
+    }
+    // leftovers
+    // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmad on available elements only
+    if (np < n) {
+        svbool_t pg = svwhilelt_b32(np, n);
+        ay1 = svld1_f32(pg, y + np);
+        ay1 = svmul_f32_m(pg, ay1, vx);
+        svst1_f32(pg, y + np, ay1);
+    }
 #elif defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_scale_f32 version")
 

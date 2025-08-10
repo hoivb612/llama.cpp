@@ -215,6 +215,46 @@ inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int 
 #endif
 }
 
+inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, const float s, const float b) {
+#if defined(GGML_USE_ACCELERATE)
+    vDSP_vsmsa(x, 1, &s, &b, y, 1, n);
+#elif defined(GGML_SIMD)
+    #if defined(__ARM_FEATURE_SVE)
+        // scalar ; TODO: Write SVE code
+        for (int i = 0; i < n; ++i) {
+            y[i] = x[i]*s + b;
+        }
+    #else
+        const int np = (n & ~(GGML_F32_STEP - 1));
+
+        GGML_F32_VEC vs = GGML_F32_VEC_SET1(s);
+        GGML_F32_VEC vb = GGML_F32_VEC_SET1(b);
+
+        GGML_F32_VEC ay[GGML_F32_ARR];
+
+        for (int i = 0; i < np; i += GGML_F32_STEP) {
+            for (int j = 0; j < GGML_F32_ARR; j++) {
+                ay[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
+                ay[j] = GGML_F32_VEC_FMA(ay[j], vs, vb);
+
+                GGML_F32_VEC_STORE(y + i + j*GGML_F32_EPR, ay[j]);
+            }
+        }
+
+        // leftovers
+        for (int i = np; i < n; ++i) {
+            y[i] = x[i]*s + b;
+        }
+    #endif
+#else
+    // scalar
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i]*s + b;
+    }
+#endif
+}
+
+//inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) { for (int i = 0; i < n; ++i) y[i] *= v;          }
 void ggml_vec_scale_f32(const uint64_t n, float * y, const float   v);
 
 void ggml_vec_scale_f16(const uint64_t n, ggml_fp16_t * y, const float v);
@@ -331,6 +371,7 @@ inline static void ggml_vec_exp_f16 (const int n, ggml_fp16_t * y, const ggml_fp
 static const float GELU_COEF_A     = 0.044715f;
 static const float GELU_QUICK_COEF = -1.702f;
 static const float SQRT_2_OVER_PI  = 0.79788456080286535587989211986876f;
+static const float SQRT_2_INV      = 0.70710678118654752440084436210484f;
 
 inline static float ggml_gelu_f32(float x) {
     return 0.5f*x*(1.0f + tanhf(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)));
@@ -340,6 +381,14 @@ inline static void ggml_vec_gelu_f16(const int n, ggml_fp16_t * y, const ggml_fp
     const uint16_t * i16 = (const uint16_t *) x;
     for (int i = 0; i < n; ++i) {
         y[i] = ggml_table_gelu_f16[i16[i]];
+    }
+}
+
+inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+    for (int i = 0; i < n; ++i) {
+        float xi = GGML_CPU_FP16_TO_FP32(x[i]);
+        float res = 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV));
+        y[i] = GGML_CPU_FP32_TO_FP16(res);
     }
 }
 
@@ -365,6 +414,13 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
     }
 }
 #endif
+
+inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
+    for (int i = 0; i < n; ++i) {
+        float xi = x[i];
+        y[i] = 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV));
+    }
+}
 
 inline static float ggml_gelu_quick_f32(float x) {
     return x*(1.0f/(1.0f+expf(GELU_QUICK_COEF*x)));
@@ -413,6 +469,42 @@ inline static ggml_fp16_t ggml_silu_f16(ggml_fp16_t x) {
 #if __FINITE_MATH_ONLY__
 #error "some routines in ggml.c require non-finite math arithmetics -- pass -fno-finite-math-only to the compiler to fix"
 #error "ref: https://github.com/ggml-org/llama.cpp/pull/7154#issuecomment-2143844461"
+#endif
+
+/* Below function was borrowed from the GitHub repository:
+https://github.com/openvinotoolkit/openvino/blob/master/src/plugins/intel_cpu/src/nodes/kernels/scaled_attn/common.hpp */
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    inline static svfloat32_t exp_ps_sve(svbool_t pg, svfloat32_t src) {
+        // Constants
+        const svfloat32_t log2_e = svdup_n_f32(1.4426950409f);
+        const svfloat32_t ln2 = svdup_n_f32(0.6931473921f);
+        const svfloat32_t half_ln2_sq = svdup_n_f32(0.2413862043f);
+        const svuint32_t not_mask17 = svdup_n_u32(~((1u << 17) - 1));
+        const svfloat32_t one = svdup_n_f32(1.0f);
+        const svfloat32_t inactive1 = svdup_n_f32(0.0f);
+        const svint32_t inactive2 = svdup_n_s32(0);
+
+        // Algorithm starts here
+        svfloat32_t t0 = svmul_f32_m(pg, src, log2_e);  // y = x * log2(e)
+        svfloat32_t t1 = svrintm_f32_m(inactive1, pg, t0);         // rount to int (float)
+        svint32_t t2 = svcvt_s32_f32_m(inactive2, pg, t1);         // n
+
+        t1 = svsub_f32_m(pg, t0, t1);   // a = y - floor(y)
+        t1 = svadd_f32_m(pg, t1, one);  // b = a + 1
+
+        svuint32_t t3 = svlsr_n_u32_m(pg, svreinterpret_u32_f32(t1), 17);  // v = b >> 17 (u32)
+        svfloat32_t t4 = svexpa_f32(t3);                                   // c = fexpa(v)
+        t4 = svscale_f32_m(pg, t4, t2);                                    // fexpa(v) * 2^(n)
+
+        // and_(t2.d, t1.d, not_mask17.d)
+        svfloat32_t t5 = svreinterpret_f32_u32(svand_u32_m(pg, svreinterpret_u32_f32(t1), not_mask17));
+        t5 = svsub_f32_m(pg, t1, t5);                // z
+        t0 = svmla_f32_m(pg, ln2, t5, half_ln2_sq);  // ln2 + half_ln2_sq * z
+        t0 = svmla_f32_m(pg, one, t5, t0);           // 1 + (ln2 * z) + (half_ln2_sq * z * z)
+        t0 = svmul_f32_m(pg, t0, t4);                // Final result
+
+        return t0;
+    }
 #endif
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -634,6 +726,100 @@ inline static void ggml_vec_silu_backward_f32(const int n, float * dx, const flo
 inline static void ggml_vec_silu_backward_f16(const int n, ggml_fp16_t * dx, const ggml_fp16_t * x, const ggml_fp16_t * dy) {
     for (int i = 0; i < n; ++i) {
         dx[i] = ggml_silu_backward_f16(x[i], dy[i]);
+    }
+}
+
+inline static void ggml_vec_reglu_f32 (const int n, float * y, const float * x, const float * g) {
+    for (int i = 0; i < n; ++i) {
+        y[i] = (x[i] > 0.f) ? x[i] * g[i] : 0.f;
+    }
+}
+
+inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    for (int i = 0; i < n; ++i) {
+        float v = GGML_FP16_TO_FP32(x[i]);
+        y[i] = GGML_FP32_TO_FP16((v > 0.f) ? v * GGML_FP16_TO_FP32(g[i]) : 0.f);
+    }
+}
+
+#ifdef GGML_GELU_FP16
+inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
+    uint16_t t;
+    for (int i = 0; i < n; ++i) {
+        if (x[i] <= -10.0f) {
+            y[i] = 0.0f;
+        } else if (x[i] >= 10.0f) {
+            y[i] = x[i] * g[i];
+        } else {
+            ggml_fp16_t fp16 = GGML_FP32_TO_FP16(x[i]);
+            memcpy(&t, &fp16, sizeof(uint16_t));
+            y[i] = GGML_FP16_TO_FP32(ggml_table_gelu_f16[t]) * g[i];
+        }
+    }
+}
+#else
+inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
+    for (int i = 0; i < n; ++i) {
+        y[i] = ggml_gelu_f32(x[i]) * g[i];
+    }
+}
+#endif
+
+inline static void ggml_vec_geglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    const uint16_t * i16 = (const uint16_t *) x;
+    for (int i = 0; i < n; ++i) {
+        float v = GGML_FP16_TO_FP32(g[i]);
+        y[i] = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(ggml_table_gelu_f16[i16[i]]) * v);
+    }
+}
+
+void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g);
+
+inline static void ggml_vec_swiglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    for (int i = 0; i < n; ++i) {
+        float xi = GGML_FP16_TO_FP32(x[i]);
+        float gi = GGML_FP16_TO_FP32(g[i]);
+        y[i] = GGML_FP32_TO_FP16((xi/(1.0f + expf(-xi))) * gi);
+    }
+}
+
+inline static void ggml_vec_geglu_erf_f32(const int n, float * y, const float * x, const float * g) {
+    for (int i = 0; i < n; ++i) {
+        float xi = x[i];
+        y[i] = 0.5f * xi * (1.0f + erff(xi*SQRT_2_INV)) * g[i];
+    }
+}
+
+inline static void ggml_vec_geglu_erf_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    for (int i = 0; i < n; ++i) {
+        float xi = GGML_FP16_TO_FP32(x[i]);
+        float gi = GGML_FP16_TO_FP32(g[i]);
+        y[i] = GGML_FP32_TO_FP16(0.5f * xi * (1.0f + erff(xi*SQRT_2_INV)) * gi);
+    }
+}
+
+#ifdef GGML_GELU_QUICK_FP16
+inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
+    uint16_t t;
+    for (int i = 0; i < n; ++i) {
+        ggml_fp16_t fp16 = GGML_FP32_TO_FP16(x[i]);
+        memcpy(&t, &fp16, sizeof(uint16_t));
+        y[i] = GGML_FP16_TO_FP32(ggml_table_gelu_quick_f16[t]) * g[i];
+    }
+}
+#else
+inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
+    for (int i = 0; i < n; ++i) {
+        y[i] = ggml_gelu_quick_f32(x[i]) * g[i];
+    }
+}
+#endif
+
+inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    const uint16_t * i16 = (const uint16_t *) x;
+    for (int i = 0; i < n; ++i) {
+        float v = GGML_FP16_TO_FP32(g[i]);
+        y[i] = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(ggml_table_gelu_quick_f16[i16[i]]) * v);
     }
 }
 
