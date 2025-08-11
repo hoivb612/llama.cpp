@@ -376,7 +376,17 @@ struct llama_mmap::impl {
             throw std::runtime_error(format("CreateFileMappingA failed: %s", llama_format_win_err(error).c_str()));
         }
 
+#ifndef GGML_B612
+
         addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+
+#else
+
+        // for repacking allow copy-on-write 
+        addr = MapViewOfFile(hMapping, FILE_MAP_COPY, 0, 0, 0);
+
+#endif // GGML_B612
+
         DWORD error = GetLastError();
         CloseHandle(hMapping);
 

@@ -420,7 +420,20 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_COUNT   = 40,
+        //
+        // Xbox specific quant types.
+        //
+        GGML_TYPE_Q8_0_x8 = 40,         // - dummy linkage type
+        GGML_TYPE_Q8_0_Q8_0_x8 = 41,    // repacked type
+        GGML_TYPE_Q2_K_x8 = 42,
+        GGML_TYPE_Q2_K_Q8_K_x8 = 43,
+        GGML_TYPE_Q3_K_x8 = 44,
+        GGML_TYPE_Q3_K_Q8_K_x8 = 45,
+        GGML_TYPE_Q4_K_x8 = 46,         // - dummy linkage type
+        GGML_TYPE_Q4_K_Q8_K_x8 = 47,    // repacked type
+        GGML_TYPE_Q4_0_x8 = 48,         // - dummy linkage type
+        GGML_TYPE_Q4_0_Q8_0_x8 = 49,    // repacked type
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision
@@ -2458,6 +2471,21 @@ extern "C" {
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+
+#ifdef GGML_XBOX_PERF
+
+//
+// for tensor repacking
+//
+
+typedef enum {
+    GGML_TENSOR_REPACK_MODE_NONE = 0,
+    GGML_TENSOR_REPACK_MODE_GGML = 1,
+    GGML_TENSOR_REPACK_MODE_XBOX = 2,
+    GGML_TENSOR_REPACK_MODE_MAX  = 3
+} ggml_tensor_repack_mode_t;
+
+#endif // GGML_XBOX_PERF
 
 #ifdef  __cplusplus
 }

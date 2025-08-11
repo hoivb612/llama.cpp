@@ -255,6 +255,12 @@ int main(int argc, char** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (!strcmp(argv[i], "-repack-ggml")) {
+                printf("%s: Selecting GGML tensor repack mode\n", __func__);
+                llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
+            } else if (!strcmp(argv[i], "-repack-xbox")) {
+                printf("%s: Selecting XBOX tensor repack mode\n", __func__);
+                llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
             } else if (strcmp(argv[i], "-m") == 0) {
                 if (i + 1 < argc) {
                     xbparams.model_path = argv[++i];

@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
+#include "ggml-cpu-repack.h"
 
 #include "unary-ops.h"
 #include "ops.h"
@@ -429,6 +430,83 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+
+#ifdef GGML_B612
+
+    //
+    // linkage type after repack of GGML_TYPE_Q2_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q2_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q2_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t)quantize_row_q23_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q2_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q3_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q3_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q3_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q3_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t)quantize_row_q23_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q3_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q4_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q4_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t)quantize_row_q4_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q4_0
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q4_0_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_0_q8_0_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_0_Q8_0_x8] = {
+        .from_float               = (ggml_from_float_t)quantize_row_q8_0_x8,
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_0_q8_0_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
+        .nrows                    = -1,
+    },
+
+#endif // GGML_B612
+
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
@@ -2107,6 +2185,16 @@ int64_t vec_dot_src0_time[GGML_TYPE_COUNT] = {0};
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 int openMP_compute_runs = 0;
+uint64_t _256_madd_count = 0;
+uint64_t _512_madd_count = 0;
+
+//
+// Mul_mat repack time statistics.
+//
+
+int64_t mul_mat_repack_time_us = 0;
+int mul_mat_repack_count = 0;
+int mul_mat_repack_failed_count = 0;
 
 #define GGML_TENSOR_NODE_COUNT 4096
 atomic_int graph_tensor_counts[GGML_TENSOR_NODE_COUNT] = {0};
@@ -2143,9 +2231,11 @@ void ggml_cpu_print_tensor_op_perf() {
     int64_t total_time = 0;
     double percent;
 
-    printf("\n\n OpenMP runs = %d\n\n", openMP_compute_runs);
-    printf("          Total     Total  Tensor\n");
-    printf("   Count Time(sec)   %%     Time(us) Tensor Op\n");
+    if (openMP_compute_runs != 0) {
+        printf("\n\n OpenMP runs = %d\n\n", openMP_compute_runs);
+        printf("          Total     Total  Tensor\n");
+        printf("   Count Time(sec)   %%     Time(us) Tensor Op\n");
+    }
 
     for (uint64_t i = 0; i < ARRAYSIZE(compute_op_counts); i += 1) {
         total_count += compute_op_counts[i];
@@ -2299,15 +2389,23 @@ void ggml_cpu_print_tensor_op_perf() {
 }
 
 // default behavior
-bool allow_tensor_repacking = true;
+ggml_tensor_repack_mode_t g_tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
-bool ggml_cpu_allow_tensor_repacking() {
-    return(allow_tensor_repacking);
+bool ggml_cpu_allow_tensor_repack() {
+    return(g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_NONE);
 }
 
-void ggml_cpu_set_tensor_repacking_flag(bool allow_repacking) {
-    printf("%s: set tensor repacking to %s\n", __func__, allow_repacking ? "true" : "false");
-    allow_tensor_repacking = allow_repacking;
+bool ggml_cpu_tensor_repack_mode_ggml() {
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_GGML);
+}
+
+bool ggml_cpu_tensor_repack_mode_xbox() {
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX);
+}
+
+void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
+    printf("%s: set tensor repacking to %d\n", __func__, repack_mode);
+    g_tensor_repack_mode = repack_mode;
 }
 
 #endif // GGML_XBOX_PERF
@@ -3107,7 +3205,7 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
-    const enum ggml_type type,
+    const enum ggml_type src0_type,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -3121,8 +3219,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t       vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t       vec_dot      = type_traits_cpu[src0_type].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits_cpu[src0_type].vec_dot_type;
 
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -3206,7 +3304,7 @@ void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    const struct ggml_tensor * src0 = dst->src[0];
+    struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -3214,19 +3312,57 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type type = src0->type;
+    enum ggml_type src0_type = src0->type;
+    const enum ggml_type src1_type = src1->type;
 
 #ifdef GGML_XBOX_PERF
+
+    //
+    // Check if an attempt should be made to repack the src0 tensor
+    //
+
+    if ((ggml_cpu_tensor_repack_mode_xbox()) &&
+        (src1_type == GGML_TYPE_F32) &&
+        ((src0_type == GGML_TYPE_Q4_0) ||
+         (src0_type == GGML_TYPE_Q8_0) || 
+         (src0_type == GGML_TYPE_Q2_K) || 
+         (src0_type == GGML_TYPE_Q3_K) ||
+         (src0_type == GGML_TYPE_Q4_K))) {
+
+        //
+        // Attempt to repack tensor.
+        //
+        // N.B. If the tensor is repacked, then the tensor type is changed to
+        //      the new repack type.
+        //
+
+        int64_t repack_t0 = ggml_time_us();
+
+        ggml_repack_tensor(params, src0);
+
+        if (!ith && (src0_type != src0->type)) {
+            mul_mat_repack_count += 1;
+            mul_mat_repack_time_us += ggml_time_us() - repack_t0;
+        }
+
+        //
+        // Refresh src0_type in case the type changed during repack.
+        //
+        
+        src0_type = src0->type;
+    }
+
     int64_t vec_dot_src0_t0 = 0;
     if (!ith) {
         vec_dot_src0_t0 = ggml_time_us();
-        vec_dot_type_counts[type_traits_cpu[type].vec_dot_type] += 1;
+        vec_dot_type_counts[type_traits_cpu[src0_type].vec_dot_type] += 1;
     }
+
 #endif // GGML_XBOX_PERF
 
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[type].vec_dot_type;
+    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0_type].vec_dot_type;
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[type].nrows;
+    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0_type].nrows;
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -3234,8 +3370,8 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(ne3 == ne13);
 
     // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+    GGML_ASSERT(nb00 == ggml_type_size(src0_type));
+    GGML_ASSERT(nb10 == ggml_type_size(src1_type));
 
     // dst cannot be transposed or permuted
     GGML_ASSERT(nb0 == sizeof(float));
@@ -3248,6 +3384,11 @@ void ggml_compute_forward_mul_mat(
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
+    if (ggml_cpu_tensor_repack_mode_xbox()) {
+        // this does not work for LLAMAFILE
+        goto UseGgmlGemm1;
+    }
+
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -3265,8 +3406,8 @@ void ggml_compute_forward_mul_mat(
                                      nb11/ggml_type_size(src1->type),
                                      (char *)dst->data + i12*nb2 + i13*nb3,
                                      nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     src1->type,
+                                     src0_type,
+                                     src1_type,
                                      dst->type))
                     goto UseGgmlGemm1;
         return;
@@ -3274,9 +3415,9 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
-    const bool init_mat = (vec_dot_type != src1->type);
+    const bool init_mat = (vec_dot_type != src1_type);
 #if defined(GGML_XBOX_PERF)
-    // const bool init_mat = ((vec_dot_type != src1->type) && (vec_dot_type != GGML_TYPE_F16));
+    // const bool init_mat = ((vec_dot_type != src1_type) && (vec_dot_type != GGML_TYPE_F16));
     // for ggml_vec_dot_f16_f32() - currently not compatible
     int64_t time_for_float_conversion = 0;
 #endif // GGML_XBOX_PERF
@@ -3294,7 +3435,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1_type == GGML_TYPE_F32);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -3323,7 +3464,7 @@ UseGgmlGemm1:;
 
 #ifdef GGML_XBOX_PERF
         time_for_float_conversion = ggml_time_us() - time_for_float_conversion;
-        vec_dot_type_conversion_time[type_traits_cpu[type].vec_dot_type] += time_for_float_conversion;
+        vec_dot_type_conversion_time[type_traits_cpu[src0_type].vec_dot_type] += time_for_float_conversion;
 #endif // GGML_XBOX_PERF
 
     }
@@ -3336,21 +3477,21 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    if (src1_type != vec_dot_type) {
+        const void* wdata = (src1_type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
-                                     ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                     ne01, ne11, ne00/ggml_blck_size(src0_type),
                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
+                                     nb01/ggml_type_size(src0_type),
                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
                                      row_size/ggml_type_size(vec_dot_type),
                                      (char *)dst->data + i12*nb2 + i13*nb3,
                                      nb1/ggml_type_size(dst->type),
-                                     src0->type,
+                                     src0_type,
                                      vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
@@ -3366,18 +3507,18 @@ UseGgmlGemm2:;
     const int64_t nr1 = ne1 * ne2 * ne3;
 
 #if defined(GGML_XBOX_PERF)
-    uint64_t bucket_index = ggml_row_size(type, ne00);
+    uint64_t bucket_index = ggml_row_size(src0_type, ne00);
     if (!ith) {
         // type == src0->type
-        if (bucket_index > ARRAYSIZE(quant_type_row_size[type].counts)) {
-            bucket_index = ARRAYSIZE(quant_type_row_size[type].counts);
+        if (bucket_index > ARRAYSIZE(quant_type_row_size[src0_type].counts)) {
+            bucket_index = ARRAYSIZE(quant_type_row_size[src0_type].counts);
         }
 
-        quant_type_row_size[type].total_count += 1;
-        quant_type_row_size[type].counts[bucket_index - 1] += 1;
+        quant_type_row_size[src0_type].total_count += 1;
+        quant_type_row_size[src0_type].counts[bucket_index - 1] += 1;
     }
 
-    quant_type_row_size[type].conversion_from_float_times[bucket_index - 1] += time_for_float_conversion;
+    quant_type_row_size[src0_type].conversion_from_float_times[bucket_index - 1] += time_for_float_conversion;
 #endif // GGML_XBOX_PERF
 
     // Now select a reasonable chunk size.
@@ -3428,7 +3569,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0_type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -3439,8 +3580,8 @@ UseGgmlGemm2:;
 
 #ifdef GGML_XBOX_PERF
     if (!ith) {
-        vec_dot_src0_counts[type] += 1;
-        vec_dot_src0_time[type] += ggml_time_us() - vec_dot_src0_t0;
+        vec_dot_src0_counts[src0_type] += 1;
+        vec_dot_src0_time[src0_type] += ggml_time_us() - vec_dot_src0_t0;
     }
 #endif // GGML_XBOX_PERF
 }

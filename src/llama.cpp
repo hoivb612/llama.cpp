@@ -366,12 +366,12 @@ void llama_print_tensor_op_perf() {
     }
 }
 
-void llama_set_tensor_repacking(bool repack_tensor) {
+void llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         auto * reg = ggml_backend_reg_get(i);
-        auto * ggml_set_tensor_repacking_fn = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_tensor_repacking_flag");
-        if (ggml_set_tensor_repacking_fn != nullptr) {
-            ggml_set_tensor_repacking_fn(repack_tensor);
+        auto * ggml_set_tensor_repack_fn = (void (*)(ggml_tensor_repack_mode_t)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_tensor_repack_mode");
+        if (ggml_set_tensor_repack_fn != nullptr) {
+            ggml_set_tensor_repack_fn(repack_mode);
         }
     }
 }

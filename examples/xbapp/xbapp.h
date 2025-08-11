@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ggml.h"
 #include "llama.h"
 #include "log.h"
 

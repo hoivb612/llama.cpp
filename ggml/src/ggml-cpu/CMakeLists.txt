@@ -55,6 +55,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/b612/simd-mappings-b612.h
             ggml-cpu/b612/vec-b612.h
             ggml-cpu/b612/vec-b612.cpp
+            ggml-cpu/b612/ggml-cpu-repack.c
             ${GGML_SOURCES_RYZENAI}
             ${GGML_HEADERS_RYZENAI}
         )

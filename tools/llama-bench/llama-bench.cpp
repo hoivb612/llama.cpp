@@ -286,7 +286,7 @@ struct cmd_params {
     std::vector<int>                 n_threads_prompt;
     std::vector<int>                 n_threads_gen;
     bool                             process_affinity;
-    bool                             no_tensor_repack;
+    int                              tensor_repack_mode;
     bool                             use_openmp;
     bool warmup_run;
     bool cpumask[GGML_MAX_N_THREADS];
@@ -333,7 +333,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_threads_prompt     */ {0},
     /* n_threads_gen        */ {0},
     /* process_affinity     */ false,
-    /* no_tensor_repack     */ false,
+    /* tensor_repack_mode   */ 0,
     /* use_openmp           */ false,
     /* warmup_run           */ false,
     /* cpumask              */ {false},
@@ -415,7 +415,7 @@ static void print_usage(int /* argc */, char ** argv) {
            output_format_str(cmd_params_defaults.output_format_stderr));
 #if defined(GGML_B612)
     printf("  -paffin, --process-affinity               (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
-    printf("  -norepack, --no-tensor-repack             (default: %s)\n", cmd_params_defaults.no_tensor_repack ? "1" : "0");
+    printf("  -repack <0|1|2>                           (default: %d)\n", cmd_params_defaults.tensor_repack_mode);
     printf("  -omp, --openmp                            (default: %s)\n", cmd_params_defaults.use_openmp ? "1" : "0");
     printf("  -warm, --warmup-run                       (default: %s)\n", cmd_params_defaults.warmup_run ? "1" : "0");
 #endif
@@ -477,7 +477,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
 #if defined(GGML_B612)
     params.process_affinity     = cmd_params_defaults.process_affinity;
-    params.no_tensor_repack     = cmd_params_defaults.no_tensor_repack;
+    params.tensor_repack_mode   = cmd_params_defaults.tensor_repack_mode;
     params.use_openmp           = cmd_params_defaults.use_openmp;
     params.warmup_run           = cmd_params_defaults.warmup_run;
     params.cpumask_present      = cmd_params_defaults.cpumask_present;
@@ -862,8 +862,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 #if defined(GGML_B612)
             } else if (arg == "-paffin" || arg == "--process-affinity") {
                 params.process_affinity = true;
-            } else if (arg == "-norepack" || arg == "--no-tensor-repacking") {
-                params.no_tensor_repack = true;
+            } else if (arg == "-repack" || arg == "--repack-mode") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.tensor_repack_mode = std::stoi(argv[i]);
             } else if (arg == "-omp" || arg == "--openmp") {
                 params.use_openmp = true;
             } else if (arg == "-tp" || arg == "--threads-prompt") {
@@ -2002,9 +2006,18 @@ int main(int argc, char ** argv) {
     set_process_priority(params.prio);
 
 #ifdef GGML_B612
-    if (params.no_tensor_repack) {
-        llama_set_tensor_repacking(false);
+    ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
+    switch (params.tensor_repack_mode) {
+        case 1: 
+            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
+            break;
+        case 2:
+            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX;
+            break;
+        default:
+            break;
     }
+    llama_set_tensor_repack_mode(tensor_repack_mode);
 
     if (params.use_openmp) {
         llama_select_OpenMP();

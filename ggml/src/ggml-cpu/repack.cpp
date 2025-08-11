@@ -1668,6 +1668,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+#ifdef GGML_XBOX_PERF
+    if (!ggml_cpu_tensor_repack_mode_ggml()) {
+        return nullptr;
+    }
+#endif // GGML_XBOX_PERF
 
     // instance for Q4
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;

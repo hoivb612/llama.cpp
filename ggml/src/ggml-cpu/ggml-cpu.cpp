@@ -649,12 +649,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_cpu_print_tensor_op_perf;
     }
 
-    if (strcmp(name, "ggml_cpu_allow_tensor_repacking") == 0) {
-        return (void *)ggml_cpu_allow_tensor_repacking;
+    if (strcmp(name, "ggml_cpu_allow_tensor_repack") == 0) {
+        return (void *)ggml_cpu_allow_tensor_repack;
     }
 
-    if (strcmp(name, "ggml_cpu_set_tensor_repacking_flag") == 0) {
-        return (void *)ggml_cpu_set_tensor_repacking_flag;
+    if (strcmp(name, "ggml_cpu_set_tensor_repack_mode") == 0) {
+        return (void *)ggml_cpu_set_tensor_repack_mode;
     }
 #endif
 

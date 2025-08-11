@@ -1,5 +1,6 @@
 llama_add_compile_flags()
 if (GGML_B612)
+    add_compile_definitions(GGML_XBOX_PERF)
     add_compile_definitions(GGML_B612)
 endif()
 

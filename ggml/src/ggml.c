@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-repack.h"
 #include "ggml.h"
 
 // FIXME: required here for quantization functions
@@ -1171,6 +1172,107 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+
+#ifdef GGML_B612
+
+    //
+    // Xbox repack and linkage types.
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q8_0_x8] = {
+        .type_name                = "q8_0_x8",
+        .blck_size                = QK8_0 * 8,
+        .type_size                = sizeof(block_q8_0_repack),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q8_0_Q8_0_x8] = {
+        .type_name                = "q8_0_q8_0_x8",
+        .blck_size                = QK8_0 * 8,
+        .type_size                = sizeof(block_q8_0_repack),
+        .is_quantized             = true,
+        .to_float                 = NULL,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q2_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q2_K_x8] = {
+        .type_name                = "q2_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q2_K),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q2_K_Q8_K_x8] = {
+        .type_name                = "q2_K_q8_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q8_K),
+        .is_quantized             = true,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q3_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q3_K_x8] = {
+        .type_name                = "q3_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q3_K),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q3_K_Q8_K_x8] = {
+        .type_name                = "q3_K_q8_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q8_K),
+        .is_quantized             = true,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q4_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q4_K_x8] = {
+        .type_name                = "q4_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_K),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q4_K_Q8_K_x8] = {
+        .type_name                = "q4_K_q8_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q8_K),
+        .is_quantized             = true,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q4_0
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q4_0_x8] = {
+        .type_name                = "q4_0_x8",
+        .blck_size                = QK4_0 * 8,
+        .type_size                = sizeof(block_q4_0_repack),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q4_0_Q8_0_x8] = {
+        .type_name                = "q4_0_q8_0_x8",
+        .blck_size                = QK8_0 * 8,
+        .type_size                = sizeof(block_q8_0_repack),
+        .is_quantized             = true,
+    },
+
+#endif // GGML_B612
+
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

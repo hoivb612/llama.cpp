@@ -680,15 +680,23 @@ void ggml_cpu_print_tensor_op_perf() {
 }
 
 // default behavior
-bool allow_tensor_repacking = true;
+ggml_tensor_repack_mode_t g_tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
-bool ggml_cpu_allow_tensor_repacking() {
-    return(allow_tensor_repacking);
+bool ggml_cpu_allow_tensor_repack() {
+    return(g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_NONE);
 }
 
-void ggml_cpu_set_tensor_repacking_flag(bool allow_repacking) {
-    printf("%s: set tensor repacking to %s\n", __func__, allow_repacking ? "true" : "false");
-    allow_tensor_repacking = allow_repacking;
+bool ggml_cpu_tensor_repack_mode_ggml() {
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_GGML);
+}
+
+bool ggml_cpu_tensor_repack_mode_xbox() {
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX);
+}
+
+void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
+    printf("%s: set tensor repacking to %d\n", __func__, repack_mode);
+    g_tensor_repack_mode = repack_mode;
 }
 
 #endif // GGML_XBOX_PERF
