@@ -3313,8 +3313,10 @@ UseGgmlGemm1:;
     #endif
 
 #ifdef GGML_XBOX_PERF
-        time_for_float_conversion = ggml_time_us() - time_for_float_conversion;
-        vec_dot_type_conversion_time[type_traits_cpu[type].vec_dot_type] += time_for_float_conversion;
+        if (ith == 0) {
+            time_for_float_conversion = ggml_time_us() - time_for_float_conversion;
+            vec_dot_type_conversion_time[type_traits_cpu[type].vec_dot_type] += time_for_float_conversion;
+        }
 #endif // GGML_XBOX_PERF
 
     }
