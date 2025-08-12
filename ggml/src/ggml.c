@@ -1132,8 +1132,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    [33] = { // refreshed for GGML_TYPE_Q4_x_8_8 (Q4_0_8_8 + Q4_K_8_8) data collection
-        .type_name                = "TYPE_Q4_X_8_8 REPLACED_by_runtime_repacking",
+    [33] = { // refreshed for data collection
+        .type_name                = "q4_0_8_8 repack",
         .blck_size                = QK4_0,
         .type_size                = sizeof(block_q4_0),
         .is_quantized             = true,
@@ -1193,6 +1193,25 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_q8_0_repack),
         .is_quantized             = true,
         .to_float                 = NULL,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q8_0
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q8_0_x8] = {
+        .type_name                = "q8_0_x8",
+        .blck_size                = QK8_0 * 8,
+        .type_size                = sizeof(block_q8_0_repack),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q8_0_Q8_0_x8] = {
+        .type_name                = "q8_0_q8_0_x8",
+        .blck_size                = QK8_0 * 8,
+        .type_size                = sizeof(block_q8_0_repack),
+        .is_quantized             = true,
     },
 
     //
@@ -1269,6 +1288,35 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK8_0 * 8,
         .type_size                = sizeof(block_q8_0_repack),
         .is_quantized             = true,
+    },
+
+    //
+    // GGML repack types included just for stats collection
+    //
+
+    [GGML_TYPE_Q2_K_8_8] = {
+        .type_name                = "q2_K_8_8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q2_K),
+        .is_quantized             = true,    
+    },
+    [GGML_TYPE_Q3_K_8_8] = {
+        .type_name                = "q3_K_8_8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q3_K),
+        .is_quantized             = true,    
+    },
+    [GGML_TYPE_Q4_K_8_8] = {
+        .type_name                = "q4_K_8_8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_K),
+        .is_quantized             = true,    
+    },
+    [GGML_TYPE_Q8_0_8_8] = {
+        .type_name                = "q8_0_8_8",
+        .blck_size                = QK8_0,
+        .type_size                = sizeof(block_q8_0),
+        .is_quantized             = true,    
     },
 
 #endif // GGML_B612

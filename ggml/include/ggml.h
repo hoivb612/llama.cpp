@@ -421,7 +421,7 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         //
-        // Xbox specific quant types.
+        // Xbox repack specific quant types.
         //
         GGML_TYPE_Q8_0_x8 = 40,         // - dummy linkage type
         GGML_TYPE_Q8_0_Q8_0_x8 = 41,    // repacked type
@@ -433,7 +433,15 @@ extern "C" {
         GGML_TYPE_Q4_K_Q8_K_x8 = 47,    // repacked type
         GGML_TYPE_Q4_0_x8 = 48,         // - dummy linkage type
         GGML_TYPE_Q4_0_Q8_0_x8 = 49,    // repacked type
-        GGML_TYPE_COUNT   = 50,
+        //
+        // GGML repack types
+        //
+        GGML_TYPE_Q2_K_8_8 = 50,
+        GGML_TYPE_Q3_K_8_8 = 51, // Future
+        GGML_TYPE_Q4_K_8_8 = 52,
+        GGML_TYPE_Q8_0_8_8 = 53, // Future
+        
+        GGML_TYPE_COUNT   = 54,
     };
 
     // precision
