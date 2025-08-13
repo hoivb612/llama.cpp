@@ -352,6 +352,13 @@ bool create_vector_database(common_params & params) {
     const auto t_end = ggml_time_us();
     printf("\n\ntotal elapsed time %7.2fsec\n\n", (double)(t_end - t_start) / (1000. * 1000.)); 
 
+    printf("Tokenization time      = %6.2fms(%5.2fms per chunk)\n", 
+        (t_tokenization_stop - t_tokenization_start) / 1000.0, 
+        (t_tokenization_stop - t_tokenization_start) / (chunks.size() * 1000.0));
+    printf("Create Embeddings time = %6.2fs (%5.2fms per chunk)\n", 
+        (t_embeddings_stop - t_embeddings_start) / (1000.0 * 1000.0), 
+        (t_embeddings_stop - t_embeddings_start) / (chunks.size() * 1000.0));
+
     llama_print_tensor_op_perf();
 
     // clean up
@@ -512,8 +519,8 @@ bool query_database(common_params & params) {
         int64_t t_end = ggml_time_us();
         printf("Total items processed: %d\n", item_count);
         printf("Query time             = %6.2fs (%5.2fms per item)\n", 
-            (t_end - t_start) / (1000.0 * 1000.0), 
-            (t_end - t_start) / (item_count * 1000.0));
+            (t_end - t_query_start) / (1000.0 * 1000.0), 
+            (t_end - t_query_start) / (item_count * 1000.0));
     }
     
     printf("Errors                 = %3d\n", errors);
