@@ -30,10 +30,22 @@ typedef block_q3_K block_q3_K_repack;
 typedef block_q4_K block_q4_K_repack;
 typedef block_q8_K block_q8_K_repack;
 
+// #define SINGLE_THREAD_REPACK 1
+#ifdef SINGLE_THREAD_REPACK
+
+enum ggml_type
+ggml_repack_tensor(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor *tensor);
+
+#else
+
 void
 ggml_repack_tensor(
     const struct ggml_compute_params * params,
     struct ggml_tensor *tensor);
+
+#endif // SINGLE_THREAD_REPACK
 
 void
 ggml_wait_for_done(

@@ -449,7 +449,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t)quantize_row_q8_0_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q8_0_q8_0_x8,
         .vec_dot_type             = GGML_TYPE_Q8_0_Q8_0_x8,
-        .nrows                    = 1,
+        .nrows                    = -1,
     },
 
     //
@@ -467,7 +467,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t)quantize_row_q23_k_q8_k_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q2_k_q8_k_x8,
         .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
-        .nrows                    = 1,
+        .nrows                    = -1,
     },
 
     //
@@ -485,7 +485,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t)quantize_row_q23_k_q8_k_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q3_k_q8_k_x8,
         .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
-        .nrows                    = 1,
+        .nrows                    = -1,
     },
 
     //
@@ -503,7 +503,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t)quantize_row_q4_k_q8_k_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_k_q8_k_x8,
         .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
-        .nrows                    = 1,
+        .nrows                    = -1,
     },
 
     //
@@ -521,7 +521,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t)quantize_row_q8_0_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_0_q8_0_x8,
         .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
-        .nrows                    = 1,
+        .nrows                    = -1,
     },
 
 #endif // GGML_B612
@@ -603,6 +603,10 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+    atomic_int GGML_CACHE_ALIGN barrier_tb; // tensor barrier
+    atomic_int GGML_CACHE_ALIGN generation_tb; // tensor generation
+    atomic_int GGML_CACHE_ALIGN barrier_db; // dispatch barrier
+    atomic_int GGML_CACHE_ALIGN generation_db; // dispatch generation
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -2376,6 +2380,39 @@ void ggml_cpu_print_tensor_op_perf() {
            total_percent);
 
     //
+    // Mul_mat init statistics.
+    //
+
+    printf("total number of mul_mat init conversions %d\n", mul_mat_init_count);
+    if (mul_mat_init_count) {
+        printf("total elapsed init conversion time %5.2fsec\n",
+               (float)mul_mat_init_time_us / (1000. * 1000.));
+    
+        printf("average init conversion time %5.2fus\n\n",
+               (float)mul_mat_init_time_us / (float)mul_mat_init_count);
+
+    } else {
+        printf("\n");
+    }
+
+    //
+    // Mul_mat repack statistics.
+    //
+
+    printf("total number of mul_mat repack conversions %d\n", mul_mat_repack_count);
+    printf("total number of FAILED mul_mat repack conversions %d\n", mul_mat_repack_failed_count);
+    if (mul_mat_repack_count) {
+        printf("total elapsed repack conversion time %5.2fsec\n",
+               (float)mul_mat_repack_time_us / (1000. * 1000.));
+    
+        printf("average repack conversion time %5.2fus\n\n",
+               (float)mul_mat_repack_time_us / (float)mul_mat_repack_count);
+
+    } else {
+        printf("\n");
+    }
+
+    //
     // Scan through all the quant types looking for types that have a non-zero
     // total count.
     //
@@ -3594,6 +3631,73 @@ UseGgmlGemm2:;
 #endif // GGML_XBOX_PERF
 }
 
+void ggml_wait_for_done_xbox(
+    const struct ggml_compute_params * params
+    )
+{
+
+    //
+    // If the number of tasks is not one, then wait for all tasks to arrive.
+    //
+
+    int n_tasks = params->nth;
+    if (n_tasks != 1) {
+
+        atomic_int * barrier = params->barrier;
+        atomic_int * generation = params->generation;
+    
+        //
+        // Capture the current barrier generation, add one to the barrier value and
+        // check if this is the last task to arrive.
+        //
+    
+        int generation_old = *generation;
+        if (atomic_fetch_add(barrier, 1) == (n_tasks - 1)) {
+    
+            //
+            // This is the last task - reset barrier and increment the generation.
+            //
+    
+            *barrier = 0;
+            atomic_fetch_add(generation, 1);
+    
+        } else {
+    
+            //
+            // Wait for other tasks, i.e., the generation number to change.
+            //
+
+            do {
+                YieldProcessor();
+            } while (*generation == generation_old);
+        }
+    }
+}
+
+void ggml_wait_to_finalize_xbox(
+    const struct ggml_compute_params * params
+    )
+{
+    //
+    // If the number of tasks is not one, then wait for other tasks to arrive.
+    //
+
+    int n_tasks = params->nth;
+    if (n_tasks != 1) {
+
+        atomic_int * barrier = params->barrier;
+    
+        //
+        // Wait until there is only one task left, i.e., the one executing this
+        // code.
+        //
+    
+        do {
+            YieldProcessor();
+        } while (*barrier != (n_tasks - 1));
+    }
+}
+
 void ggml_barrier_xbox(
     const struct ggml_compute_params * params
     )
@@ -3615,16 +3719,6 @@ void ggml_barrier_xbox(
         //      by the zeroth thread which is always involved in the computation of
         //      the barrier and does maximum work.
         //
-
-#ifdef GGML_TENSOR_OP_PERF
-
-        const int ith = params->ith;
-        int64_t wait_us = 0;
-        if (!ith) {
-            wait_us = ggml_time_us();
-        }
-
-#endif // GGML_TENSOR_OP_PERF
 
         //
         // Capture the current barrier passed generation, add one to the barrier
@@ -3652,17 +3746,6 @@ void ggml_barrier_xbox(
                 ggml_thread_cpu_relax();
             } while (tp->n_barrier_passed == n_passed);
         }
-
-#ifdef GGML_TENSOR_OP_PERF
-
-        if (!ith) {
-            wait_us = ggml_time_us() - wait_us;
-            init_wait_us += wait_us;
-            init_wait_count += 1;
-        }
-
-#endif // GGML_TENSOR_OP_PERF
-
     }
 }
 
@@ -3684,6 +3767,62 @@ void ggml_compute_forward_mul_mat_xbox(
     //
     // Check if an attempt should be made to repack the src0 tensor
     //
+
+#ifdef SINGLE_THREAD_REPACK (see ggml-cpu-repack.h)
+
+    if ((ggml_cpu_tensor_repack_mode_xbox()) &&
+        (src1_type == GGML_TYPE_F32) &&
+        ((src0_type == GGML_TYPE_Q4_0) ||
+         (src0_type == GGML_TYPE_Q8_0) || 
+         (src0_type == GGML_TYPE_Q2_K) || 
+         (src0_type == GGML_TYPE_Q3_K) ||
+         (src0_type == GGML_TYPE_Q4_K))) {
+
+        //
+        // If this is the zeroth cpu, then attempt to repack the src0 tensor.
+        //
+        // N.B. Repacking is single threaded on the zeroth cpu.
+        //
+
+        if (!ith) {
+
+            int64_t repack_t0 = ggml_time_us();
+
+            //
+            // N.B. If the repack is successful, then the repack type is returned.
+            //      Otherwise, the original type is returned.
+
+            src0_type = ggml_repack_tensor(params, src0);
+
+            //
+            // Wait for all other threads to arrive at the barrier below before
+            // potentially changing the src0 type.
+            //
+            // N.B. The tensor type cannot be changed until it is guaranteed that
+            //      all other threads are waiting on the barrier below.
+            //
+
+            ggml_wait_to_finalize_xbox(params);
+            src0->type = src0_type;
+
+            mul_mat_repack_count += 1;
+            mul_mat_repack_time_us += ggml_time_us() - repack_t0;
+
+        }
+
+        ggml_wait_for_done_xbox(params);
+    }
+
+    //
+    // Refresh for all threads in case the type has changed through repacking.
+    //
+    // N.B. All repacked tensors require exactly the same amount of memory as their
+    //      unpacked type.
+    //
+    
+    src0_type = src0->type;
+
+#else // SINGLE_THREAD_REPACK
 
     if ((ggml_cpu_tensor_repack_mode_xbox()) &&
         (src1_type == GGML_TYPE_F32) &&
@@ -3715,6 +3854,8 @@ void ggml_compute_forward_mul_mat_xbox(
         
         src0_type = src0->type;
     }
+
+#endif // SINGLE_THREAD_REPACK
 
     // repacking if any is done at this point with new src0_type
 
@@ -3814,7 +3955,7 @@ void ggml_compute_forward_mul_mat_xbox(
         // Wait until all threads are finished with the src1 conversion before proceeding.
         //
 
-        ggml_barrier_xbox(params);
+        ggml_wait_for_done_xbox(params);
 
 #ifdef GGML_XBOX_PERF
 
@@ -3894,7 +4035,7 @@ void ggml_compute_forward_mul_mat_xbox(
         ir111 = nr1;
 
     } else {
-//        printf("nr0 %zd, nr1 %zd\n", nr0, nr1);
+        // printf("nr0 %zd, nr1 %zd\n", nr0, nr1);
         ir010 = 0;
         ir011 = nr0;
         src0_rpc = nr0;
@@ -3907,7 +4048,7 @@ void ggml_compute_forward_mul_mat_xbox(
     //printf("ir010 = %6lld, ir011 = %6lld, ir110 = %6lld, ir111 = %6lld\n", ir010, ir011, ir110, ir111);
 
     if (ir010 >= ir011 || ir110 >= ir111) {
-//        printf("unused cpu %d in mul mat\n", ith);
+        // printf("unused cpu %d in mul mat\n", ith);
         // sched_yield();
         return;
     }
@@ -4007,44 +4148,81 @@ void ggml_compute_forward_mul_mat_xbox(
     // The number of rows in a tile is the blocking factor.
     //
 
-    void * dst_data = dst->data;
-    for (int64_t iir0 = ir010; iir0 < ir011; iir0 += blck0_factor) {
+    char * dst_data = dst->data;
+
+    //
+    // Split the multirow code from the single row code. The multirow code only
+    // contains the repacked quant types and much more is known about the memory
+    // layout of these types. This enables superfluous overhead to be ommitted.
+    //
+
+    if (type_traits_cpu[vec_dot_type].nrows == -1) {
 
         //
-        // This loop sequences through the all src1 columns.
+        // Compute the dot product of the selected set of src1 columns versus a tile
+        // block of src0 rows.
+        //
+        // N.B. ir110 - ir111 is the set of selected columns.
+        //
+        // N.B. ir010 - ir011 is the set of selected rows.
         //
 
-        for (int64_t ir1 = ir110; ir1 < ir111; ++ir1) {
-            const int64_t i13 = (ir1/(ne12*ne1));
-            const int64_t i12 = (ir1 - i13*ne12*ne1)/ne1;
-            const int64_t i11 = (ir1 - i13*ne12*ne1 - i12*ne1);
+        const char * src0_row = src0->data;
+        const char * src1_col = wdata + (row_size * ir110);
+        float * dst_col = (float *)(dst_data + (ir110 * nb1));
 
-            // broadcast src0 into src1
-            const int64_t i03 = i13/r3;
-            const int64_t i02 = i12/r2;
-
-            const char * src0_row = (const char *) src0->data + (0 + i02*nb02 + i03*nb03);
-
-            // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-            //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-            //       the original src1 data pointer, so we should index using the indices directly
-            // TODO: this is a bit of a hack, we should probably have a better way to handle this
-
-            const char * src1_col = (const char *) wdata +
-                (src1_cont || init_mat
-                 ? (i11      + i12*ne11 + i13*ne12*ne11)*row_size
-                 : (i11*nb11 + i12*nb12 + i13*nb13));
-
-            float * dst_col = (float *) ((char *) dst_data + (i11*nb1 + i12*nb2 + i13*nb3));
-
-            //
-            // This loop computes the dot product of one src1 column versus a tile block of
-            // src0 rows.
-            //
+        for (int64_t iir0 = ir010; iir0 < ir011; iir0 += blck0_factor) {
 
             const int64_t limit0 = MIN(iir0 + blck0_factor, ir011);
-            for (int64_t ir0 = iir0; ir0 < limit0; ++ir0) {
-                vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+            vec_dot(ne00,
+                    &dst_col[iir0],
+                    nb1,
+                    src0_row + (iir0 * nb01),
+                    0,
+                    src1_col,
+                    ir111 - ir110,
+                    limit0 - iir0);
+        }
+
+    } else {
+        for (int64_t iir0 = ir010; iir0 < ir011; iir0 += blck0_factor) {
+
+            //
+            // This loop sequences through all the src1 columns.
+            //
+
+            for (int64_t ir1 = ir110; ir1 < ir111; ++ir1) {
+                const int64_t i13 = (ir1/(ne12*ne1));
+                const int64_t i12 = (ir1 - i13*ne12*ne1)/ne1;
+                const int64_t i11 = (ir1 - i13*ne12*ne1 - i12*ne1);
+
+                // broadcast src0 into src1
+                const int64_t i03 = i13/r3;
+                const int64_t i02 = i12/r2;
+
+                const char * src0_row = (const char *) src0->data + (0 + i02*nb02 + i03*nb03);
+
+                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                //       the original src1 data pointer, so we should index using the indices directly
+                // TODO: this is a bit of a hack, we should probably have a better way to handle this
+
+                const char * src1_col = wdata +
+                    (src1_cont || init_mat
+                     ? (i11      + i12*ne11 + i13*ne12*ne11)*row_size
+                     : (i11*nb11 + i12*nb12 + i13*nb13));
+    
+                float * dst_col = (float *)(dst_data + (i11*nb1 + i12*nb2 + i13*nb3));
+    
+                //
+                // This loop computes the dot product of one src1 column versus a tile block of
+                // src0 rows.
+                //
+    
+                const int64_t limit0 = MIN(iir0 + blck0_factor, ir011);
+                for (int64_t ir0 = iir0; ir0 < limit0; ++ir0) {
+                    vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                }
             }
         }
     }
@@ -5638,11 +5816,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(ith);
 
     struct ggml_compute_params params = {
-        /*.ith       =*/ ith,
-        /*.nth       =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
-        /*.wsize     =*/ cplan->work_size,
-        /*.wdata     =*/ cplan->work_data,
-        /*.threadpool=*/ tp,
+        /*.ith        =*/ ith,
+        /*.nth        =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
+        /*.wsize      =*/ cplan->work_size,
+        /*.wdata      =*/ cplan->work_data,
+        /*.threadpool =*/ tp,
+        /*.barrier    =*/ (void *)&(tp->barrier_tb),
+        /*.generation =*/ (void *)&(tp->generation_tb)
     };
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
@@ -5710,6 +5890,47 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+#ifdef GGML_XBOX_PERF
+        // only for XBOX repacking
+        if (ggml_cpu_tensor_repack_mode_xbox()) {
+
+            //
+            // Wait for all threads to complete before continuing to the next tensor.
+            //
+            
+            int n_threads = tp->n_threads_cur;
+            if (n_threads != 1) {
+                //
+                // Capture the current barrier passed generation, add one to the barrier
+                // value, and check if this is the last thread to arrive.
+                //
+            
+                int n_passed = tp->n_barrier_passed;
+                if (atomic_fetch_add(&tp->n_barrier, 1) == (n_threads - 1)) {
+                
+                    //
+                    // This is the last thread, reset barrier and increment the barrier
+                    // passed value.
+                    //
+                
+                    tp->n_barrier = 0;
+                    atomic_fetch_add(&tp->n_barrier_passed, 1);
+                
+                } else {
+                
+                    //
+                    // Wait for other threads, i.e., the barrier passed value to change.
+                    //
+
+                    do {
+                        ggml_thread_cpu_relax();
+                    } while (tp->n_barrier_passed == n_passed);
+                }
+            }
+        }
+
+#endif // GGML_XBOX_PERF
     }
 
     ggml_barrier(state->threadpool);
@@ -5878,6 +6099,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;
+#ifdef GGML_XBOX_PERF
+        threadpool->barrier_tb       = 0;
+        threadpool->barrier_db       = 0;
+        threadpool->generation_tb    = 0;
+        threadpool->generation_db    = 0;
+#endif // GGML_XBOX_PERF
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;

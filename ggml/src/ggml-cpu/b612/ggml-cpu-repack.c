@@ -12,6 +12,10 @@
 #include <float.h>
 #include <stdio.h>
 
+//
+// Repacking Xbox style
+//
+
 void
 make_q4_0_repack_quant (
     uint64_t ne,
@@ -1663,6 +1667,102 @@ quantize_row_q8_0_x8 (
     make_q8_0_repack_quant(vec_size, (block_q8_0_repack *)y, y);
 }
 
+#ifdef SINGLE_THREAD_REPACK
+
+enum ggml_type
+ggml_repack_tensor (
+    const struct ggml_compute_params * params,
+    struct ggml_tensor *tensor
+    ) 
+{
+    enum ggml_type type = tensor->type;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
+                (type == GGML_TYPE_Q4_K) ||
+                (type == GGML_TYPE_Q8_0) ||
+                (type == GGML_TYPE_Q2_K) ||
+                (type == GGML_TYPE_Q3_K));
+
+    //
+    // Check if the tensor is contiguous and the number of elements is 0 mod QK_K.
+    //
+    uint64_t ne = tensor->ne[0];
+    if (!ggml_is_contiguous(tensor) || ((ne % QK_K) != 0)) {
+        if (ith == 0) {
+            mul_mat_repack_failed_count += 1;
+        }
+        return type;
+    }
+
+    //
+    // Make transformed quant based on current type.
+    //
+    // N.B. The original data and the repacked data share the same memory. They are
+    //      exactly the same size and layout. The make repack quant function does
+    //      the repack such that no extra memory needs to be allocated and there are
+    //      no extra copies.
+    //
+    char * src_data = tensor->data;
+    uint64_t nrows = tensor->ne[1];
+    uint64_t stride = tensor->nb[1];
+
+    if (type == GGML_TYPE_Q4_0) {
+        type = GGML_TYPE_Q4_0_x8;
+        for (uint64_t i = 0; i < nrows; i += 1) {
+            make_q4_0_repack_quant(ne,
+                                   (block_q4_0_repack *)src_data,
+                                   (block_q4_0 *)src_data);
+            src_data += stride;
+        }
+    } else if (type == GGML_TYPE_Q2_K) {
+        type = GGML_TYPE_Q2_K_x8;
+        for (uint64_t i = 0; i < nrows; i += 1) {
+            make_q2_k_repack_quant(ne,
+                                   (block_q2_K_repack *)src_data,
+                                   (block_q2_K *)src_data);
+            src_data += stride;
+        }
+    } else if (type == GGML_TYPE_Q3_K) {
+        type = GGML_TYPE_Q3_K_x8;
+        for (uint64_t i = 0; i < nrows; i += 1) {
+            make_q3_k_repack_quant(ne,
+                                   (block_q3_K_repack *)src_data,
+                                   (block_q3_K *)src_data);
+            src_data += stride;
+        }
+    } else if (type == GGML_TYPE_Q4_K) {
+        type = GGML_TYPE_Q4_K_x8;
+        for (uint64_t i = 0; i < nrows; i += 1) {
+            make_q4_k_repack_quant(ne,
+                                   (block_q4_K_repack *)src_data,
+                                   (block_q4_K *)src_data);
+            src_data += stride;
+        }
+    } else if (type == GGML_TYPE_Q8_0) {
+        type = GGML_TYPE_Q8_0_Q8_0_x8;
+        for (uint64_t i = 0; i < nrows; i += 1) {
+            make_q8_0_repack_quant(ne,
+                                   (block_q8_0_repack *)src_data,
+                                   (block_q8_0 *)src_data);
+            src_data += stride;
+        }
+    }
+    /*
+    if (type != tensor->type) {
+        printf("*** XBOX convert tensor %s - type %s - elements %zd succeeded\n",
+               ggml_get_name(tensor),
+               ggml_type_name(type),
+               tensor->ne[0]);
+    }
+    */
+    return type;
+}
+
+#else // SINGLE_THREAD_REPACK
+
 void
 ggml_repack_tensor (
     const struct ggml_compute_params * params,
@@ -1685,6 +1785,9 @@ ggml_repack_tensor (
     //
     uint64_t ne = tensor->ne[0];
     if (!ggml_is_contiguous(tensor) || ((ne % QK_K) != 0)) {
+        if (ith == 0) {
+            mul_mat_repack_failed_count += 1;
+        }
         return;
     }
     //
@@ -1705,7 +1808,8 @@ ggml_repack_tensor (
     const int64_t start_row = rows_per_thread * ith;
     const int64_t end_row = MIN(start_row + rows_per_thread, nrows);
     src_data += start_row * stride;
-/*
+
+    /*
     static uint32_t count = 8;
     if (count != 0) {
         count -= 1;
@@ -1715,7 +1819,8 @@ ggml_repack_tensor (
                ggml_row_size(tensor->type, ne),
                tensor->nb[1]);
     }
-*/
+    */
+
     if (type == GGML_TYPE_Q4_0) {
         type = GGML_TYPE_Q4_0_x8;
         for (i = start_row; i < end_row; i += 1) {
@@ -1758,8 +1863,7 @@ ggml_repack_tensor (
         }
     }
 
-    // ggml_wait_for_done(params);
-    ggml_barrier(params->threadpool);
+    ggml_wait_for_done_xbox(params);
 
     //
     // N.B. All threads write the same value to tensor type so no special
@@ -1769,3 +1873,5 @@ ggml_repack_tensor (
 
     return;
 }
+
+#endif // SINGLE_THREAD_REPACK

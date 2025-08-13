@@ -24,6 +24,12 @@ struct ggml_compute_params {
     void * wdata;
 
     struct ggml_threadpool * threadpool;
+
+#ifdef GGML_XBOX_PERF
+    // required for tensor repack logic
+    void * barrier;
+    void * generation;
+#endif
 };
 
 

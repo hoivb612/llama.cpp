@@ -2493,6 +2493,10 @@ typedef enum {
     GGML_TENSOR_REPACK_MODE_MAX  = 3
 } ggml_tensor_repack_mode_t;
 
+extern int mul_mat_repack_failed_count;
+void ggml_wait_for_done_xbox(const struct ggml_compute_params * params);
+void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params);
+
 #endif // GGML_XBOX_PERF
 
 #ifdef  __cplusplus
