@@ -1667,10 +1667,8 @@ quantize_row_q8_0_x8 (
     make_q8_0_repack_quant(vec_size, (block_q8_0_repack *)y, y);
 }
 
-#ifdef SINGLE_THREAD_REPACK
-
 enum ggml_type
-ggml_repack_tensor (
+ggml_repack_tensor_single (
     const struct ggml_compute_params * params,
     struct ggml_tensor *tensor
     ) 
@@ -1760,8 +1758,6 @@ ggml_repack_tensor (
     */
     return type;
 }
-
-#else // SINGLE_THREAD_REPACK
 
 void
 ggml_repack_tensor (
@@ -1873,5 +1869,3 @@ ggml_repack_tensor (
 
     return;
 }
-
-#endif // SINGLE_THREAD_REPACK

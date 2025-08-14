@@ -125,6 +125,16 @@ bool llm_initialize(
         // either there is no GPU or no CPU forcing function
         common_model_params.n_gpu_layers = 0;
     }
+#else
+    if (params.tensor_repack_mode == 1) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
+
+    } else if (params.tensor_repack_mode == 2) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
+
+    } else if (params.tensor_repack_mode == 3) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+    }
 #endif // GGML_USE_CUDA
 
     llm_model = llama_model_load_from_file(params.model_name.c_str(), common_model_params);
@@ -141,6 +151,7 @@ bool llm_initialize(
     llm_ctx_params.n_batch = params.n_batch;
     llm_ctx_params.n_threads = params.n_threads;
     llm_ctx_params.n_threads_batch = params.n_threads;
+    llm_ctx_params.no_perf = false;
 
     llm_ctx = llama_init_from_model(llm_model, llm_ctx_params);
 
@@ -163,7 +174,7 @@ bool llm_initialize(
             // build the shared prompt
             params.pfx_shared = template_prompt.substr(0, pos);
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, false, false);
+            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, params.add_special, params.parse_special);
             // build the cache file directory
             params.pfx_file = pfx_file_path(params.pfx_shared);
             // load the cache and create one if it does not exist
@@ -245,7 +256,7 @@ bool llm_inference(
     }
 
     // tokenize the remaining prompt or full prompt if pfc_mode is off
-    std::vector<llama_token> tokens_input = slm_tokenize(llm_ctx, params.prompt, false, false);
+    std::vector<llama_token> tokens_input = slm_tokenize(llm_ctx, params.prompt, params.add_special, params.parse_special);
 
     // append the variant part of the prompt or use the full prompt (for non pfc mode)
     embd_inp.insert(embd_inp.end(), tokens_input.begin(), tokens_input.end());
@@ -350,7 +361,7 @@ bool llm_inference(
             // build the shared prompt
             params.pfx_shared = template_prompt.substr(0, pos);
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, false, false);
+            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, params.add_special, params.parse_special);
         }
     }
 
@@ -398,17 +409,18 @@ bool llm_inference(
         }
     }
 
-#if 0
     int64_t t_us = (ggml_time_us() - t2_start);
-    printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
-        t_us / 1000.0f,
-        n_tokens_generated, 
-        n_tokens_generated / (t_us / 1000000.0f),
-        (t_us / (n_tokens_generated * 1000.0f)));
+
+    if (params.verbose != 0) {
+        printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
+            t_us / 1000.0f,
+            n_tokens_generated, 
+            n_tokens_generated / (t_us / 1000000.0f),
+            (t_us / (n_tokens_generated * 1000.0f)));
+    }
 
     // accumulate the token generation time
-    params.t_llm_token_generation_time += t_us;
-#endif
+    params.total_tokens_gen_time += t_us;
 
     params.reply = slm_output;
 
@@ -416,12 +428,16 @@ bool llm_inference(
 }
 
 LLM_INFER_API 
-void llm_terminate(const model_params& ) {
+void llm_terminate(const model_params& params) {
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
 
     int verbose = GGML_LOG_LEVEL_INFO;
     llama_log_set(default_log_callback, &verbose);
     llama_perf_context_print(llm_ctx);
+
+    if (params.verbose == 2) {
+        llama_print_tensor_op_perf();
+    }
 
     llama_free(llm_ctx);
     llama_model_free(llm_model);
@@ -550,7 +566,7 @@ bool embed_encode_batch(
 
     // Tokenize the prompts and trim
     for (auto & chunk : chunks) {
-        auto inp = slm_tokenize(embed_ctx, chunk.textdata, true, false);
+        auto inp = slm_tokenize(embed_ctx, chunk.textdata, params.add_special, params.parse_special);
         if (inp.size() > params.n_batch) {
             fprintf(stderr, "%s: error: chunk size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
                     __func__, (long long int) inp.size(), (long long int) params.n_batch);
@@ -625,7 +641,7 @@ bool embed_encode_batch_single(
 
     // Tokenize the prompts and trim
     for (auto & chunk : chunks) {
-        chunk.tokens = slm_tokenize(embed_ctx, chunk.textdata, true, false);
+        chunk.tokens = slm_tokenize(embed_ctx, chunk.textdata, params.add_special, params.parse_special);
         size_t n_tokens = chunk.tokens.size();
         if (n_tokens > params.n_batch) {
             fprintf(stderr, "%s: error: chunk size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
@@ -666,7 +682,7 @@ bool embed_encode_single(
     const llama_vocab * vocab = llama_model_get_vocab(llm_model);
     std::vector<float> query_embeddings(n_embd, 0);
     
-    std::vector<int32_t> query_tokens = slm_tokenize(embed_ctx, query, true, false);
+    std::vector<int32_t> query_tokens = slm_tokenize(embed_ctx, query, params.add_special, params.parse_special);
     size_t n_tokens = query_tokens.size();
     if (n_tokens > params.n_batch) {
         fprintf(stderr, "%s: error: query string size (%lld) exceeds batch size (%lld), increase batch size and re-run\n",

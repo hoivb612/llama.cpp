@@ -45,18 +45,22 @@ struct model_params {
     std::string model_name             = "";   // model path
     std::string prompt                 = "";
     std::string reply                  = "";
-    int total_llm_tokens_generated     = 0;
+    int total_llm_tokens_generated     = 0; // Total accumulated tokens generated from llm_initialize() -> llm_terminate()
+    uint64_t total_tokens_gen_time     = 0; // Total accumulated tg time from llm_initialize() -> llm_terminate()
     int verbose                        = 0;
     int streaming_reply                = 0; // streaming mode instead of full reply at once
     int force_cpu_mode                 = 0; // default is to use GPU if there is one present
 
     std::string custom_p_file          = "custom_prompts.txt";  // custom prompts input file
     std::string custom_template_prompt = "";
-    std::string pfx_shared             = "";   // shared prompt for prefix cache
-    std::string pfx_file               = "";   // file name for prefix cache
+    std::string pfx_shared             = "";    // shared prompt for prefix cache
+    std::string pfx_file               = "";    // file name for prefix cache
     bool pfc_mode                      = false; // prefix cache mode
-    bool first_prompt                  = true; // indicate first time through
+    bool first_prompt                  = true;  // indicate first time through
     bool save_llm_state                = false;
+    bool add_special                   = false; // for tokenizer: add special tokens before the prompt
+    bool parse_special                 = false; // for tokenizer: parse recognized special tokens in text
+    int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
 };
 
 LLM_INFER_API bool llm_initialize(model_params& params);

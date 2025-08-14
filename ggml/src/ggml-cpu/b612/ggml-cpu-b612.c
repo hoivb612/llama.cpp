@@ -2217,6 +2217,7 @@ uint64_t _512_madd_count = 0;
 //
 
 int64_t mul_mat_repack_time_us = 0;
+int64_t mul_mat_repack_time_current_op_us = 0;
 int mul_mat_repack_count = 0;
 int mul_mat_repack_failed_count = 0;
 
@@ -2473,6 +2474,10 @@ bool ggml_cpu_tensor_repack_mode_ggml() {
 
 bool ggml_cpu_tensor_repack_mode_xbox() {
     return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX);
+}
+
+bool ggml_cpu_tensor_repack_mode_xbox_single_thread() {
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
 }
 
 void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
@@ -3421,7 +3426,8 @@ void ggml_compute_forward_mul_mat(
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
-    if (ggml_cpu_tensor_repack_mode_xbox()) {
+    if (ggml_cpu_tensor_repack_mode_xbox() ||
+        ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
         // this does not work for LLAMAFILE
         goto UseGgmlGemm1;
     }
@@ -3768,69 +3774,66 @@ void ggml_compute_forward_mul_mat_xbox(
     // Check if an attempt should be made to repack the src0 tensor
     //
 
-#ifdef SINGLE_THREAD_REPACK (see ggml-cpu-repack.h)
-
-    if ((ggml_cpu_tensor_repack_mode_xbox()) &&
-        (src1_type == GGML_TYPE_F32) &&
-        ((src0_type == GGML_TYPE_Q4_0) ||
-         (src0_type == GGML_TYPE_Q8_0) || 
-         (src0_type == GGML_TYPE_Q2_K) || 
-         (src0_type == GGML_TYPE_Q3_K) ||
-         (src0_type == GGML_TYPE_Q4_K))) {
-
-        //
-        // If this is the zeroth cpu, then attempt to repack the src0 tensor.
-        //
-        // N.B. Repacking is single threaded on the zeroth cpu.
-        //
-
-        if (!ith) {
-
-            int64_t repack_t0 = ggml_time_us();
+    if (ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
+        if ((src1_type == GGML_TYPE_F32) &&
+           ((src0_type == GGML_TYPE_Q4_0) ||
+            (src0_type == GGML_TYPE_Q8_0) || 
+            (src0_type == GGML_TYPE_Q2_K) || 
+            (src0_type == GGML_TYPE_Q3_K) ||
+            (src0_type == GGML_TYPE_Q4_K))) {
 
             //
-            // N.B. If the repack is successful, then the repack type is returned.
-            //      Otherwise, the original type is returned.
-
-            src0_type = ggml_repack_tensor(params, src0);
-
+            // If this is the zeroth cpu, then attempt to repack the src0 tensor.
             //
-            // Wait for all other threads to arrive at the barrier below before
-            // potentially changing the src0 type.
-            //
-            // N.B. The tensor type cannot be changed until it is guaranteed that
-            //      all other threads are waiting on the barrier below.
+            // N.B. Repacking is single threaded on the zeroth cpu.
             //
 
-            ggml_wait_to_finalize_xbox(params);
-            src0->type = src0_type;
+            if (!ith) {
+                int64_t repack_t0 = ggml_time_us();
 
-            mul_mat_repack_count += 1;
-            mul_mat_repack_time_us += ggml_time_us() - repack_t0;
+                //
+                // N.B. If the repack is successful, then the repack type is returned.
+                //      Otherwise, the original type is returned.
 
+                src0_type = ggml_repack_tensor_single(params, src0);
+
+                //
+                // Wait for all other threads to arrive at the barrier below before
+                // potentially changing the src0 type.
+                //
+                // N.B. The tensor type cannot be changed until it is guaranteed that
+                //      all other threads are waiting on the barrier below.
+                //
+
+                ggml_wait_to_finalize_xbox(params);
+                src0->type = src0_type;
+
+                // for single thread just accumulate as there is no contention
+                mul_mat_repack_count += 1;
+                mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
+                mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
+
+            }
+
+            ggml_wait_for_done_xbox(params);
         }
 
-        ggml_wait_for_done_xbox(params);
-    }
+        //
+        // Refresh for all threads in case the type has changed through repacking.
+        //
+        // N.B. All repacked tensors require exactly the same amount of memory as their
+        //      unpacked type.
+        //
+        
+        src0_type = src0->type;
 
-    //
-    // Refresh for all threads in case the type has changed through repacking.
-    //
-    // N.B. All repacked tensors require exactly the same amount of memory as their
-    //      unpacked type.
-    //
-    
-    src0_type = src0->type;
-
-#else // SINGLE_THREAD_REPACK
-
-    if ((ggml_cpu_tensor_repack_mode_xbox()) &&
-        (src1_type == GGML_TYPE_F32) &&
-        ((src0_type == GGML_TYPE_Q4_0) ||
-         (src0_type == GGML_TYPE_Q8_0) || 
-         (src0_type == GGML_TYPE_Q2_K) || 
-         (src0_type == GGML_TYPE_Q3_K) ||
-         (src0_type == GGML_TYPE_Q4_K))) {
+    } else if (ggml_cpu_tensor_repack_mode_xbox() &&
+               (src1_type == GGML_TYPE_F32) &&
+               ((src0_type == GGML_TYPE_Q4_0) ||
+                (src0_type == GGML_TYPE_Q8_0) || 
+                (src0_type == GGML_TYPE_Q2_K) || 
+                (src0_type == GGML_TYPE_Q3_K) ||
+                (src0_type == GGML_TYPE_Q4_K))) {
 
         //
         // Attempt to repack tensor.
@@ -3845,17 +3848,16 @@ void ggml_compute_forward_mul_mat_xbox(
 
         if (!ith && (src0_type != src0->type)) {
             mul_mat_repack_count += 1;
-            mul_mat_repack_time_us += ggml_time_us() - repack_t0;
+            mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
+            mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
         }
 
         //
         // Refresh src0_type in case the type changed during repack.
         //
-        
+
         src0_type = src0->type;
     }
-
-#endif // SINGLE_THREAD_REPACK
 
     // repacking if any is done at this point with new src0_type
 
@@ -4615,7 +4617,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
 
 #ifdef GGML_XBOX_PERF
-        // if successful then it is one of the repacked computation
+        // if successful then it is one of the GGML repacked computation
         if ((tensor->op == GGML_OP_MUL_MAT) && !params->ith) {
             enum ggml_type repack_type = GGML_TYPE_COUNT;
             const struct ggml_tensor * src0 = tensor->src[0];
@@ -4786,7 +4788,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                if (ggml_cpu_tensor_repack_mode_xbox()) {
+                if (ggml_cpu_tensor_repack_mode_xbox() || 
+                    ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
                     ggml_compute_forward_mul_mat_xbox(params, tensor);
                 } else {
                     ggml_compute_forward_mul_mat(params, tensor);
@@ -5836,6 +5839,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         int64_t tensor_t0 = 0;
         if (!ith) {
             tensor_t0 = ggml_time_us();
+            mul_mat_repack_time_current_op_us = 0;
         }
 #endif // GGML_XBOX_PERF
 
@@ -5844,7 +5848,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (!ith) {
 #if defined(GGML_XBOX_PERF)
             // update tensor op time
-            tensor_t0 = ggml_time_us() - tensor_t0;
+            tensor_t0 = ggml_time_us() - tensor_t0 - mul_mat_repack_time_current_op_us;
             compute_op_time[node->op] += tensor_t0;
             // update tensor op count
             compute_op_counts[node->op] += 1;
