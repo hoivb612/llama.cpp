@@ -3306,6 +3306,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"-repack-ggml", "--repack-mode-ggml"},
+        "enable GGML style repack support",
+        [](common_params & params) {
+            params.tensor_repack_mode = 1;
+        }
+    ));
+    add_opt(common_arg(
+        {"-repack-xbox", "--repack-mode-xbox"},
+        "enable Xbox style repack support",
+        [](common_params & params) {
+            params.tensor_repack_mode = 2;
+        }
+    ));
+    add_opt(common_arg(
+        {"-repack-xbox-st", "--repack-mode-xbox-st"},
+        "enable Xbox single thread style repack support",
+        [](common_params & params) {
+            params.tensor_repack_mode = 3;
+        }
+    ));
+    add_opt(common_arg(
+        {"-mulmat-xbox", "--mulmat-mode-xbox"},
+        "enable Xbox single thread style repack support",
+        [](common_params & params) {
+            params.tensor_repack_mode = 4;
+        }
+    ));
+    add_opt(common_arg(
         {"-omp", "--openmp"},
         "use OpenMP runtime support",
         [](common_params & params) {

@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include "llm-infer.h"
+#include "b612-cpu.h"
 
 #include "log.h"
 
@@ -255,6 +256,9 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[4], "v2")) {
             params.verbose = 2;
 
+        } else if (!strcmp(argv[4], "paffin")) {
+            params.process_affinity = true;
+
         } else if (!strcmp(argv[4], "pfc")) {
             params.pfc_mode = true;
 
@@ -266,6 +270,9 @@ int main(int argc, char** argv) {
 
         } else if (!strcmp(argv[4], "repack-xbox-st")) {
             params.tensor_repack_mode = 3;
+
+        } else if (!strcmp(argv[4], "mulmat-xbox")) {
+            params.tensor_repack_mode = 4;
 
         } else if (!strcmp(argv[4], "stream")) {
             params.streaming_reply = true;
@@ -286,6 +293,7 @@ int main(int argc, char** argv) {
     processCustomPromptsFromFile(params);
     custom_prompts_it = custom_prompts.begin();
 
+    // turn off llama info until there is a need for it to show up
     ggml_log_level log_level = (ggml_log_level) 0;
     llama_log_set(xbapp_log_callback, &log_level);
 
@@ -295,6 +303,11 @@ int main(int argc, char** argv) {
     if (!params.parse_special) {
         // the default config for parse_special for shared custom pprompt is 'true'
         params.parse_special = true;
+    }
+
+    if (params.process_affinity) {
+        int64_t cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(params.n_threads);
+        printf("[%s]: Setting process affinity mask 0x%016llX\n", __func__, cpu_affinity_mask);
     }
 
     // initialize the model

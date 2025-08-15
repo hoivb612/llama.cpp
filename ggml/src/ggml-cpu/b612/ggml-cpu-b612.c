@@ -2480,6 +2480,10 @@ bool ggml_cpu_tensor_repack_mode_xbox_single_thread() {
     return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
 }
 
+bool ggml_cpu_tensor_mulmat_mode_xbox() {
+    return(g_tensor_repack_mode == GGML_TENSOR_MULMAT_MODE_XBOX);
+}
+
 void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
     printf("%s: set tensor repacking to %d\n", __func__, repack_mode);
     g_tensor_repack_mode = repack_mode;
@@ -4789,7 +4793,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 if (ggml_cpu_tensor_repack_mode_xbox() || 
-                    ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
+                    ggml_cpu_tensor_repack_mode_xbox_single_thread() ||
+                    ggml_cpu_tensor_mulmat_mode_xbox()) {
                     ggml_compute_forward_mul_mat_xbox(params, tensor);
                 } else {
                     ggml_compute_forward_mul_mat(params, tensor);

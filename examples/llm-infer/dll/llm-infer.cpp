@@ -134,6 +134,9 @@ bool llm_initialize(
 
     } else if (params.tensor_repack_mode == 3) {
         llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+
+    } else if (params.tensor_repack_mode == 4) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
     }
 #endif // GGML_USE_CUDA
 

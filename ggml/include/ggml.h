@@ -2488,10 +2488,11 @@ extern "C" {
 
 typedef enum {
     GGML_TENSOR_REPACK_MODE_NONE               = 0,
-    GGML_TENSOR_REPACK_MODE_GGML               = 1,
-    GGML_TENSOR_REPACK_MODE_XBOX               = 2,
-    GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 3,
-    GGML_TENSOR_REPACK_MODE_MAX                = 4
+    GGML_TENSOR_REPACK_MODE_GGML               = 1, // forward_mul_mat()
+    GGML_TENSOR_REPACK_MODE_XBOX               = 2, // forward_mul_mat_xbox() with repack
+    GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 3, // forward_mul_mat_xbox() with single-thread repack
+    GGML_TENSOR_MULMAT_MODE_XBOX               = 4, // forward_mul_mat_xbox() no repack
+    GGML_TENSOR_REPACK_MODE_MAX                = 5
 } ggml_tensor_repack_mode_t;
 
 extern int mul_mat_repack_failed_count;

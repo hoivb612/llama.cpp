@@ -376,6 +376,7 @@ struct common_params {
     bool no_tensor_repack  = false; // disable tensor repacking (ex. Q4_0 -> Q4_0_8_8) - currently being done automatically
     bool proc_affinity     = false; // use process affinity
     bool query_mode        = false; // use query mode (for retrieval)
+    int tensor_repack_mode = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox) | 3 (xbox-st)
 #endif
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)

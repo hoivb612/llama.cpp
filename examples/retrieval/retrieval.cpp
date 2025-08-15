@@ -121,14 +121,18 @@ static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & toke
     }
 }
 
-static void batch_process(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
+static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
     // clear previous kv_cache values (irrelevant for embeddings)
     llama_memory_clear(llama_get_memory(ctx), false);
+
+    bool llama_decode_successful = false;
 
     // run model
     // LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
     if (llama_decode(ctx, batch) < 0) {
-        LOG_ERR("%s : failed to process\n", __func__);
+        LOG_ERR("%s : failed to decode\n", __func__);
+    } else {
+        llama_decode_successful = true;
     }
 
     for (int i = 0; i < batch.n_tokens; i++) {
@@ -141,7 +145,10 @@ static void batch_process(llama_context * ctx, llama_batch & batch, float * outp
         if (embd == NULL) {
             embd = llama_get_embeddings_ith(ctx, i);
             if (embd == NULL) {
-                LOG_ERR("%s: failed to get embeddings for token %d\n", __func__, i);
+                // only log if llama_decode() was successful
+                if (llama_decode_successful) {
+                    LOG_ERR("%s: failed to get embeddings for token %d\n", __func__, i);
+                }
                 continue;
             }
         }
@@ -264,6 +271,7 @@ bool create_vector_database(common_params & params) {
 
         // encode if at capacity
         if (batch.n_tokens + n_toks > n_batch) {
+            printf("%s: flushing %d entries\n", __func__, s);
             float * out = emb + p * n_embd;
             batch_decode(ctx, batch, out, s, n_embd);
             common_batch_clear(batch);
@@ -552,11 +560,41 @@ int main(int argc, char ** argv) {
         llama_select_OpenMP();
     }
     if (params.no_tensor_repack) {
-        llama_set_tensor_repacking(false);
+        params.tensor_repack_mode = 0;
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_NONE);
     }
+
+#ifdef GGML_USE_CUDA
+    #pragma message("++++++++ Support both CUDA and CPU for LLM inference")
+    if (ggml_backend_cuda_get_device_count() != 0) {
+        // if there is a GPU then make use of it
+        common_model_params.n_gpu_layers = 999;
+    } else {
+        // either there is no GPU or no CPU forcing function
+        common_model_params.n_gpu_layers = 0;
+    }
+#else
+    if (params.tensor_repack_mode == 1) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
+
+    } else if (params.tensor_repack_mode == 2) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
+
+    } else if (params.tensor_repack_mode == 3) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+
+    } else if (params.tensor_repack_mode == 4) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
+    }
+#endif // GGML_USE_CUDA
+
 #endif // GGML_B612
 
     // For BERT models, batch size must be equal to ubatch size
+    if (params.n_batch > params.n_ctx) {
+        params.n_batch = params.n_ctx;
+        params.n_parallel = params.n_batch;
+    }
     params.n_ubatch = params.n_batch;
     params.embedding = true;
 
@@ -676,6 +714,8 @@ int main(int argc, char ** argv) {
     printf("%s: Creating Embeddings...\n", __func__);
     int64_t t_embeddings_start = ggml_time_us();
 
+    printf("%s: llama_n_seq_max for llama_context is %d\n", __func__, llama_n_seq_max(ctx));
+
     // initialize batch
     const int n_chunks = chunks.size();
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
@@ -697,7 +737,7 @@ int main(int argc, char ** argv) {
         // encode if at capacity
         if (batch.n_tokens + n_toks > n_batch) {
             float * out = emb + p * n_embd;
-            batch_process(ctx, batch, out, s, n_embd);
+            batch_decode(ctx, batch, out, s, n_embd);
             common_batch_clear(batch);
             p += s;
             s = 0;
@@ -714,7 +754,7 @@ int main(int argc, char ** argv) {
 
     // final batch
     float * out = emb + p * n_embd;
-    batch_process(ctx, batch, out, s, n_embd);
+    batch_decode(ctx, batch, out, s, n_embd);
 
     int64_t t_embeddings_stop = ggml_time_us();
 
@@ -747,10 +787,10 @@ int main(int argc, char ** argv) {
         while (std::getline(cpfile, query)) {
             std::vector<int32_t> query_tokens = common_tokenize(ctx, query, true);
 
-            batch_add_seq(query_batch, query_tokens, 0);
+           batch_add_seq(query_batch, query_tokens, 0);
 
             std::vector<float> query_emb(n_embd, 0);
-            batch_process(ctx, query_batch, query_emb.data(), 1, n_embd);
+            batch_decode(ctx, query_batch, query_emb.data(), 1, n_embd);
 
             common_batch_clear(query_batch);
 

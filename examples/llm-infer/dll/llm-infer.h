@@ -61,6 +61,7 @@ struct model_params {
     bool add_special                   = false; // for tokenizer: add special tokens before the prompt
     bool parse_special                 = false; // for tokenizer: parse recognized special tokens in text
     int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
+    bool process_affinity              = false; // true if set process affinity is enabled
 };
 
 LLM_INFER_API bool llm_initialize(model_params& params);
