@@ -963,9 +963,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_embd  = hparams.n_embd;
 
     // when computing embeddings, all tokens are output
-    const bool output_all = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
+    const bool output_all = cparams.embeddings;
 
-    printf("%s: Initialize failed to initialize batch [n_seq_max = %d]\n", __func__), cparams.n_seq_max;
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;

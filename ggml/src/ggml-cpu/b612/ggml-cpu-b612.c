@@ -5900,7 +5900,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
 
-#ifdef GGML_XBOX_PERF
+#if 0
+//#ifdef GGML_XBOX_PERF
         // only for XBOX repacking
         if (ggml_cpu_tensor_repack_mode_xbox()) {
 
