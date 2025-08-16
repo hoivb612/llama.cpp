@@ -147,6 +147,14 @@ extern "C" {
 
 #ifdef GGML_B612
     GGML_BACKEND_API void ggml_cpu_select_OpenMP();
+
+#if _WIN32
+    extern uint64_t l1d_cache_size;
+    extern uint64_t l2_cache_size;
+#endif
+
+    void xb_set_cpu_cache_size();
+
 #endif // GGML_B612
 
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);

@@ -4076,9 +4076,9 @@ void ggml_compute_forward_mul_mat_xbox(
     //      sequences through scr0 tile blocks.
     //
 
-#ifndef l1d_cache_size
+#ifdef __gnu_linux__
     #define l1d_cache_size (48ull * 1024ull)
-#endif // l1d_cache_size
+#endif // __gnu_linux__
 
     size_t src0_row_size = ggml_row_size(src0_type, ne00);
     int64_t blck0_factor = (l1d_cache_size + (src0_row_size / 2) - row_size) / src0_row_size;

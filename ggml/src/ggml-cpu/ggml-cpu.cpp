@@ -33,6 +33,43 @@
 #    include <sys/types.h>
 #endif
 
+#ifdef GGML_B612
+
+#if _WIN32
+
+uint64_t l1d_cache_size = 48ull * 1024ull;
+uint64_t l2_cache_size = 1024ull * 1024ull;
+
+void xb_set_cpu_cache_size () {
+
+    //
+    // Get cpuid information.
+    //
+
+    struct {
+        uint32_t eax;
+        uint32_t ebx;
+        uint32_t ecx;
+        uint32_t edx;
+    } cpu_info;
+
+    //
+    // Get CPU data cache attributes
+    //
+    __cpuid((int *)&cpu_info, 0x80000005);
+    l1d_cache_size = ((cpu_info.ecx >> 24) & 0xff) * 1024ull;
+    __cpuid((int *)&cpu_info, 0x80000006);
+    l2_cache_size = ((cpu_info.ecx >> 16) & 0xffff) * 1024ull;
+}
+
+#else
+
+void xb_set_cpu_cache_size() {}
+
+#endif // _WIN32
+
+#endif // GGML_B612
+
 // ggml-backend interface
 
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
@@ -200,6 +237,13 @@ static ggml_guid_t ggml_backend_cpu_guid(void) {
 ggml_backend_t ggml_backend_cpu_init(void) {
     // initialize CPU backend now to avoid slowing the first graph computation
     ggml_cpu_init();
+
+#ifdef GGML_B612
+
+    // initialize l1d_cache_size for mul_mat_xbox()
+    xb_set_cpu_cache_size();
+
+#endif // GGML_B612
 
     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
     if (ctx == NULL) {

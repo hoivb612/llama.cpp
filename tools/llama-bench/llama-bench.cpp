@@ -2014,6 +2014,12 @@ int main(int argc, char ** argv) {
         case 2:
             tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX;
             break;
+        case 3: 
+            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD;
+            break;
+        case 4: 
+            tensor_repack_mode = GGML_TENSOR_MULMAT_MODE_XBOX;
+            break;
         default:
             break;
     }
