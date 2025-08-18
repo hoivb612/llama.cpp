@@ -3276,7 +3276,9 @@ UseGgmlGemm1:;
         char * wdata = params->wdata;
 
 #ifdef GGML_XBOX_PERF
-        time_for_float_conversion = ggml_time_us();
+        if (!ith) {
+            time_for_float_conversion = ggml_time_us();
+        }
 #endif // GGML_XBOX_PERF
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
