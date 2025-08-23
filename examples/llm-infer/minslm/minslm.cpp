@@ -220,8 +220,7 @@ int main(int argc, char** argv) {
     ggml_time_init();
     int64_t t0 = ggml_time_us(); 
 
-    if (argc == 1 || argv[1][0] == '-')
-    {
+    if (argc == 1 || argv[1][0] == '-') {
         printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [omp] [paffin] [stream] [verbose] [repack-xbox | repack-ggml]\n", argv[0]);
         return 1;
     }
@@ -395,6 +394,10 @@ int main(int argc, char** argv) {
     llm_terminate(params);
 
     console::set_display(console::stats);
+
+    if (params.verbose == 2) {
+        llama_print_tensor_op_perf();
+    }
 
     console::cleanup();
 

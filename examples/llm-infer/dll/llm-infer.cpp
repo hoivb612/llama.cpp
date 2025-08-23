@@ -126,17 +126,21 @@ bool llm_initialize(
         common_model_params.n_gpu_layers = 0;
     }
 #else
-    if (params.tensor_repack_mode == 1) {
-        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
-
-    } else if (params.tensor_repack_mode == 2) {
-        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
-
-    } else if (params.tensor_repack_mode == 3) {
-        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
-
-    } else if (params.tensor_repack_mode == 4) {
-        llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
+    switch (params.tensor_repack_mode) {
+        case 1:
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
+            break;
+        case 2:
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
+            break;
+        case 3:
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+            break;
+        case 4:
+            llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
+            break;
+        default: 
+            break;
     }
 #endif // GGML_USE_CUDA
 
@@ -384,7 +388,9 @@ bool llm_inference(
 
         // check wither it is the end of text generation 
         if (llama_vocab_is_eog(vocab, new_token_id)) {
-            printf("\n");
+            if (params.streaming_reply) {
+                printf("\n");
+            }
             break;
         }
 
@@ -437,10 +443,6 @@ void llm_terminate(const model_params& params) {
     int verbose = GGML_LOG_LEVEL_INFO;
     llama_log_set(default_log_callback, &verbose);
     llama_perf_context_print(llm_ctx);
-
-    if (params.verbose == 2) {
-        llama_print_tensor_op_perf();
-    }
 
     llama_free(llm_ctx);
     llama_model_free(llm_model);
@@ -504,6 +506,23 @@ bool embed_initialize(
     } else {
         // either there is no GPU or no CPU forcing function
         llama_model_params.n_gpu_layers = 0;
+    }
+#else
+    switch (params.tensor_repack_mode) {
+        case 1:
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
+            break;
+        case 2:
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
+            break;
+        case 3:
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+            break;
+        case 4:
+            llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
+            break;
+        default: 
+            break;
     }
 #endif // GGML_USE_CUDA
 
