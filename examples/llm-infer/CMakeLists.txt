@@ -83,5 +83,13 @@ target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_TH
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
+set(TARGET testme)
+add_executable(${TARGET} test/testme.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_include_directories(${TARGET} PRIVATE .)
+target_include_directories(${TARGET} PUBLIC ../../common)
+#target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
 # end of CMakeLists.txt ...
 
