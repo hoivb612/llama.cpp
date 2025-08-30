@@ -69,6 +69,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "gpt-oss",           LLM_CHAT_TEMPLATE_OPENAI_MOE        },
     { "hunyuan-dense",     LLM_CHAT_TEMPLATE_HUNYUAN_DENSE     },
     { "kimi-k2",           LLM_CHAT_TEMPLATE_KIMI_K2           },
+    { "bitnet",            LLM_CHAT_TEMPLATE_BITNET            },
 };
 
 llm_chat_template llm_chat_template_from_str(const std::string & name) {
@@ -201,6 +202,8 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_HUNYUAN_DENSE;
     } else if (tmpl_contains("<|im_assistant|>assistant<|im_middle|>")) {
         return LLM_CHAT_TEMPLATE_KIMI_K2;
+    } else if (tmpl_contains("BITNET")) {
+        return LLM_CHAT_TEMPLATE_BITNET;
     }
     return LLM_CHAT_TEMPLATE_UNKNOWN;
 }
@@ -751,6 +754,25 @@ int32_t llm_chat_apply_template(
         }
         if (add_ass) {
             ss << "<|im_assistant|>assistant<|im_middle|>";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_BITNET) {
+        // bitnet-25
+        std::string system_prompt = "";
+        for (auto message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                ss << "System: ";
+                ss << message->content;
+            } else if (role == "user") {
+                ss << "User: ";
+                if (!system_prompt.empty()) {
+                    ss << system_prompt;
+                    system_prompt = "";
+                }
+                ss << message->content << "<|eot_id|>Assistant: ";
+            } else {
+                ss << message->content;
+            }
         }
     } else {
         // template not supported

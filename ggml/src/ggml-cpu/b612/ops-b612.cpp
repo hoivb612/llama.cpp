@@ -1746,6 +1746,7 @@ void ggml_compute_forward_add(
             } break;
         default:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }
@@ -2200,6 +2201,7 @@ void ggml_compute_forward_add1(
             } break;
         default:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }
@@ -2325,6 +2327,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_IQ2_S:
         default:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }
@@ -6844,6 +6847,7 @@ void ggml_compute_forward_out_prod(
             } break;
         default:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }
@@ -7107,6 +7111,7 @@ void ggml_compute_forward_set(
         case GGML_TYPE_IQ2_S:
         default:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }
@@ -7402,6 +7407,7 @@ void ggml_compute_forward_get_rows(
             } break;
         default:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }
@@ -8108,6 +8114,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_F64:
         case GGML_TYPE_COUNT:
             {
+                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
                 GGML_ABORT("fatal error");
             }
     }

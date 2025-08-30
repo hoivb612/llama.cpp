@@ -3924,7 +3924,7 @@ void ggml_compute_forward_mul_mat_xbox(
         GGML_ASSERT(src1_type == GGML_TYPE_F32);
 
         //
-        // Distribute the src1 converion over all threads.
+        // Distribute the src1 conversion over all threads.
         //
 
 #ifdef GGML_XBOX_PERF
