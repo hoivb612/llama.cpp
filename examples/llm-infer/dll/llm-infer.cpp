@@ -102,6 +102,40 @@ std::string slm_token_to_piece(const struct llama_context * ctx, llama_token tok
     return piece;
 }
 
+void llm_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    ggml_log_level llm_log_level = GGML_LOG_LEVEL_NONE;
+    if (user_data != nullptr) {
+        llm_log_level = *(ggml_log_level *)user_data;
+    }
+
+    if (level == llm_log_level) {
+        fputs(text, stdout);
+    }
+}
+
+LLM_INFER_API
+void llm_disable_log() {
+    ggml_log_level log_level = (ggml_log_level) 0;
+    llama_log_set(llm_log_callback, &log_level);
+
+}
+
+LLM_INFER_API
+void llm_enable_log() {
+    ggml_log_level log_level = GGML_LOG_LEVEL_INFO;
+    llama_log_set(llm_log_callback, &(log_level));
+}
+
+LLM_INFER_API 
+const char * llm_system_info() {
+   return(llama_print_system_info());
+}
+
+LLM_INFER_API
+void llm_print_tensor_op_perf_stats() {
+    llama_print_tensor_op_perf();
+}
+
 LLM_INFER_API
 bool llm_initialize(
     model_params & params) {

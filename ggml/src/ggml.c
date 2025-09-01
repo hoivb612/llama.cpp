@@ -1272,6 +1272,25 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
 
     //
+    // linkage type after repack of GGML_TYPE_Q6_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q6_K_x8] = {
+        .type_name                = "q6_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q6_K),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_Q6_K_Q8_K_x8] = {
+        .type_name                = "q6_K_q8_K_x8",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q8_K),
+        .is_quantized             = true,
+    },
+
+    //
     // linkage type after repack of GGML_TYPE_Q4_0
     //
     // A linkage type is required since there is a different vec_dot function.

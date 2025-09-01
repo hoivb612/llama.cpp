@@ -463,6 +463,122 @@ make_q4_k_repack_quant (
 }
 
 void
+make_q6_k_repack_quant (
+    uint64_t ne,
+    block_q6_K_repack * out,
+    block_q6_K * in
+    )
+//
+// Convert one q6_K quant block to one q6_K_repack quant block. The q6_K quant block
+// values are interleaved in the q6_K_repack quant block such that they can be loaded
+// and acted on directly by the q6_k_q8_k_x8 vector dot code.
+//
+// N.B. The q6_k quant block and q6_K_repack quant block have the same layout and storage
+//      requirements.
+//
+{
+#pragma comment(linker, "/EXPORT:make_q6_k_repack_quant=" __FUNCTION__)
+
+    uint64_t offset;
+    uint8_t qs_in[QK_K];
+    uint8_t qs_out[QK_K];
+    //
+    // Convert one q6_k quant block to one q6_k_repack quant block.
+    //
+    uint64_t nb = ne / QK_K;
+    for (uint64_t k = 0; k < nb; k += 1) {
+        //
+        // Copy the multiplier and scales values directly from the input quant block
+        // to the output quant block.
+        //
+    
+        out->d = in->d;
+        memcpy(out->scales, in->scales, sizeof(in->scales));
+    
+        //
+        // Unpack the 6-bit q6_k quant values into an array of 8-bit quant values.
+        //
+        const __m256i m4_256 = _mm256_set1_epi8(0xf);
+        const __m512i m4_512 = _mm512_set1_epi8(0xf);
+        const __m256i m2_256 = _mm256_set1_epi8(0x30);
+        const __m512i m2_512 = _mm512_set1_epi8(0x30);
+        for (uint64_t j = 0; j < (QK_K / 128); j += 1) {
+            //
+            // Load the low 4-bit values and the high 2-bit values.
+            //
+            __m256i q4bits1 = _mm256_loadu_si256((__m256i *)(in->ql + (j * 64) + 0));
+            __m256i q4bits2 = _mm256_loadu_si256((__m256i *)(in->ql + (j * 64) + 32));
+            const __m256i q2bitsH = _mm256_loadu_si256((__m256i *)(in->qh + (j * 32)));
+            //
+            // Unpack the high (<5:4>) 2-bit values.
+            //
+            const __m256i q2_0 = _mm256_and_si256(_mm256_rol_epi64(q2bitsH, 4), m2_256);
+            const __m256i q2_1 = _mm256_and_si256(_mm256_rol_epi64(q2bitsH, 2), m2_256);
+            const __m256i q2_2 = _mm256_and_si256(q2bitsH, m2_256);
+            const __m256i q2_3 = _mm256_and_si256(_mm256_ror_epi64(q2bitsH, 2), m2_256);
+            //
+            // Unpack the low (<3:0>) 4-bit values and or in the high 2-bit values.
+            //
+            const __m256i q6_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4_256), q2_0);
+            const __m256i q6_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4_256), q2_1);
+            q4bits1 = _mm256_srli_epi16(q4bits1, 4);
+            const __m256i q6_2 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4_256), q2_2);
+            q4bits2 = _mm256_srli_epi16(q4bits2, 4);
+            const __m256i q6_3 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4_256), q2_3);
+            //
+            // Store the 8-bit quant values.
+            //
+            _mm256_storeu_si256((__m256i *)&qs_in[(j * 128) + 0], q6_0);
+            _mm256_storeu_si256((__m256i *)&qs_in[(j * 128) + 32], q6_1);
+            _mm256_storeu_si256((__m256i *)&qs_in[(j * 128) + 64], q6_2);
+            _mm256_storeu_si256((__m256i *)&qs_in[(j * 128) + 96], q6_3);
+        }
+        //
+        // Rearrange the 8-bit quant values into lanes of four bytes interleaved.
+        //
+        // N.B. There are 16 scale values for q6_k, and thus, 16 lanes are required.
+        //
+    
+        for (uint64_t i = 0; i < 16; i += 1) {
+            offset = i * 4;
+    
+            for (uint64_t j = 0; j < 4; j += 1) {
+                uint32_t * qs_dst = (uint32_t *)&qs_out[offset];
+                uint32_t * qs_src = (uint32_t *)&qs_in[i * 16 + j * 4];
+                *qs_dst = *qs_src;
+    
+                offset += 64;
+            }
+        }
+        //
+        // Repack the 8-bit quant values into the q6_k_repack quant block.
+        //
+        const __m512i qs_0 = _mm512_loadu_si512(&qs_out[0]);
+        const __m512i qs_1 = _mm512_loadu_si512(&qs_out[64]);
+        const __m512i qs_2 = _mm512_loadu_si512(&qs_out[128]);
+        const __m512i qs_3 = _mm512_loadu_si512(&qs_out[192]);
+        __m512i qs4_l = _mm512_and_si512(qs_0, m4_512);
+        __m512i qs4_h = _mm512_and_si512(qs_1, m4_512);
+        __m512i qs4 = _mm512_or_si512(qs4_l, _mm512_slli_epi16(qs4_h, 4));
+        _mm512_storeu_si512((__m512i *)&out->ql[0], qs4);
+        qs4_l = _mm512_and_si512(qs_2, m4_512);
+        qs4_h = _mm512_and_si512(qs_3, m4_512);
+        qs4 = _mm512_or_si512(qs4_l, _mm512_slli_epi16(qs4_h, 4));
+        _mm512_storeu_si512((__m512i *)&out->ql[64], qs4);
+        const __m512i qs2_0 = _mm512_srli_epi16(_mm512_and_si512(qs_0, m2_512), 4);
+        const __m512i qs2_1 = _mm512_srli_epi16(_mm512_and_si512(qs_1, m2_512), 2);
+        const __m512i qs2_2 = _mm512_and_si512(qs_2, m2_512);
+        const __m512i qs2_3 = _mm512_slli_epi16(_mm512_and_si512(qs_3, m2_512), 2);
+        __m512i qs2 = _mm512_or_si512(qs2_0, qs2_1);
+        qs2 = _mm512_or_si512(qs2, qs2_2);
+        qs2 = _mm512_or_si512(qs2, qs2_3);
+        _mm512_storeu_si512((__m512i *)&out->qh[0], qs2);
+        out += 1;
+        in += 1;
+    }
+}
+
+void
 make_q8_0_repack_quant (
     uint64_t ne,
     block_q8_0_repack * out,
@@ -531,7 +647,7 @@ make_q8_0_repack_quant (
 }
     
 void
-make_q23_k_q8_k_repack_quant (
+make_q236_k_q8_k_repack_quant (
     uint64_t ne,
     block_q8_K_repack * out,
     block_q8_K * in
@@ -579,7 +695,7 @@ make_q23_k_q8_k_repack_quant (
         //
         // Rearrange the 8-bit quant values into lanes of four bytes interleaved.
         //
-        // N.B. There are 16 scale values for q2_k, and thus, 16 lanes are required.
+        // N.B. There are 16 scale values, and thus, 16 lanes are required.
         //      
 
         for (i = 0; i < 16; i += 1) {
@@ -1395,6 +1511,186 @@ xx_vec_dot_q4_k_q8_k_x8 (
 }
 
 void
+xx_vec_dot_q6_k_q8_k_x8 (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q6_K_repack * vx,
+    size_t bx,
+    const block_q8_K_repack * vy,
+    size_t ncols,
+    int nrc
+    )
+{
+    GGML_UNUSED(bx);
+
+    const uint64_t nb = n / QK_K;
+    const uint64_t nrows = (uint32_t)nrc;
+
+    const __m512i m4 = _mm512_set1_epi8(0xf);
+    const __m512i m2 = _mm512_set1_epi8(0x30);
+    const __m512i m32s = _mm512_set1_epi8(32);
+    const __m512i zero512 = _mm512_setzero_si512();
+
+    //
+    // Iterate through the specified number of columns.
+    //
+
+    block_q8_K_repack * y = (block_q8_K_repack *)vy;
+
+    for (uint64_t l = 0; l < ncols; l += 1) {
+
+        //
+        // Iterate through the specified number of rows.
+        //
+
+        block_q6_K_repack * x = (block_q6_K_repack *)vx;
+
+        for (uint64_t k = 0; k < nrows; k += 1) {
+            __m512 acc = _mm512_setzero_ps();
+
+            for (uint64_t i = 0; i < nb; ++i) {
+        
+                const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+        
+                const uint8_t * q4 = x[i].ql;
+                const uint8_t * q2 = x[i].qh;
+                const int8_t * q8 = y[i].qs;
+        
+                const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
+                const __m512i scales = _mm512_cvtepi8_epi32(scales8);
+        
+                __m512i sumi = _mm512_setzero_si512();
+
+                //
+                // Load the high 2-bits and rotate the bits left by 4 - 256 2-bit values.
+                //
+                // N.B. This lines up the first set of 2-bits in the proper position to
+                //      merge with the first set of 4-bits.
+                //
+
+                __m512i q2bits = _mm512_loadu_si512((const __m512i*)q2);
+                q2bits = _mm512_rol_epi32(q2bits, 4);
+
+                //
+                // Unpack the 6-bit quant values into unsigned 8-bit quant values
+                // and perform dot product.
+                //
+
+                for (uint64_t j = 0; j < QK_K / 128; ++j) {
+
+                    //
+                    // Load 64 nibble packed 4-bit quant values - 128 4-bit values.
+                    //
+
+                    __m512i q4bits = _mm512_loadu_si512((const __m512i*)(q4 + (j * 64)));
+
+                    //
+                    // Merge the low 4-bits and current high 2-bits of the 6-bit quant
+                    // values into unsigned 6-bit quant values.
+                    //
+        
+                    const __m512i q4bits1 = _mm512_and_si512(q4bits, m4);
+                    const __m512i q2bits1 = _mm512_and_si512(q2bits, m2);
+                    const __m512i q6_0 = _mm512_or_si512(q2bits1, q4bits1);
+
+                    //
+                    // Shift next set of high 2-bits into place.
+                    //
+
+                    q2bits = _mm512_ror_epi32(q2bits, 2);
+
+                    //
+                    // Load 8-bit quant values - 64 8-bit values.
+                    //
+
+                    const __m512i q8_0 = _mm512_loadu_si512(q8 + (j * 128) + 0);
+
+                    //
+                    // Multiply the unsigned 6-bit quant values by the 8-bit quant
+                    // values.
+                    // 
+
+                    sumi = _mm512_dpbusd_epi32(sumi, q6_0, q8_0);
+
+                    //
+                    // Multiply the 8-bit quant values by the bias value 32 and
+                    // subtract from the sum.
+                    //
+
+                    __m512i bias = _mm512_dpbusd_epi32(zero512, m32s, q8_0);
+                    sumi = _mm512_sub_epi32(sumi, bias);
+
+                    //
+                    // Shift the next nibble into place.
+                    //
+
+                    __m512i q4bits2 = _mm512_srli_epi16(q4bits, 4);
+
+                    //
+                    // Merge the high 4-bits and current high 2-bits of the 6-bit
+                    // quant value into unsigned 6-bit quant values.
+                    //
+
+                    q4bits2 = _mm512_and_si512(q4bits2, m4);
+                    const __m512i q2bits2 = _mm512_and_si512(q2bits, m2);
+                    const __m512i q6_1 = _mm512_or_si512(q2bits2, q4bits2);
+
+                    //
+                    // Shift next set of high 2-bits into place.
+                    //
+
+                    q2bits = _mm512_ror_epi32(q2bits, 2);
+
+                    //
+                    // Load 8-bit quant values - 64 8-bit values.
+                    //
+
+                    const __m512i q8_1 = _mm512_loadu_si512(q8 + (j * 128) + 64);
+
+                    //
+                    // Multiply the unsigned 6-bit quant values by the 8-bit quant
+                    // values.
+                    // 
+
+                    sumi = _mm512_dpbusd_epi32(sumi, q6_1, q8_1);
+
+                    //
+                    // Multiply the 8-bit quant values by the bias value 32 and
+                    // subtract from the sum.
+                    //
+
+                    bias = _mm512_dpbusd_epi32(zero512, m32s, q8_1);
+                    sumi = _mm512_sub_epi32(sumi, bias);
+                }
+
+                //
+                // Multiply the accumulated integer result by the q6 scale, convert
+                // to float, multiply by the q6 multiplier, and accumulate the results.
+                //
+
+                sumi = _mm512_mullo_epi32(sumi, scales);
+                acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
+            }
+
+            __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
+                                       _mm512_extractf32x8_ps(acc, 1));
+
+            __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
+                                   _mm256_extractf128_ps(res, 1));
+
+            const __m128 t1 = _mm_hadd_ps(t0, t0);
+            s[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+
+            x += nb;
+        }
+
+        s = (float *)((char *)s + nr_nb1);
+        y += nb;
+    }
+}
+
+void
 xx_vec_dot_q8_0_q8_0_x8 (
     const int n,
     float * s,
@@ -1603,7 +1899,29 @@ quantize_row_q4_k_x8 (
 }
 
 void                   
-quantize_row_q23_k_q8_k_x8 (
+quantize_row_q6_k_x8 (
+    const float * x,
+    block_q6_K * y,
+    uint64_t vec_size
+    )
+{
+#pragma comment(linker, "/EXPORT:quantize_row_q6_k_x8=" __FUNCTION__)
+
+    //
+    // Quantize the x vector into q6_K quants.
+    //
+
+    quantize_row_q6_K(x, y, vec_size);
+
+    //
+    // Make q6_k_repack quant blocks.
+    //
+
+    make_q6_k_repack_quant(vec_size, (block_q6_K_repack *)y, y);
+}
+
+void                   
+quantize_row_q236_k_q8_k_x8 (
     const float * x,
     block_q8_K * y,
     uint32_t vec_size
@@ -1620,7 +1938,7 @@ quantize_row_q23_k_q8_k_x8 (
     // Make q8_k_repack quant blocks
     //
 
-    make_q23_k_q8_k_repack_quant(vec_size, (block_q8_K_repack *)y, y);
+    make_q236_k_q8_k_repack_quant(vec_size, (block_q8_K_repack *)y, y);
 }
 
 void                   
@@ -1668,7 +1986,7 @@ quantize_row_q8_0_x8 (
 }
 
 enum ggml_type
-ggml_repack_tensor_single (
+ggml_repack_tensor_single_thread (
     const struct ggml_compute_params * params,
     struct ggml_tensor *tensor
     ) 
@@ -1679,10 +1997,11 @@ ggml_repack_tensor_single (
     const int nth = params->nth;
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
-                (type == GGML_TYPE_Q4_K) ||
-                (type == GGML_TYPE_Q8_0) ||
                 (type == GGML_TYPE_Q2_K) ||
-                (type == GGML_TYPE_Q3_K));
+                (type == GGML_TYPE_Q3_K) ||
+                (type == GGML_TYPE_Q4_K) ||
+                (type == GGML_TYPE_Q6_K) ||
+                (type == GGML_TYPE_Q8_0));
 
     //
     // Check if the tensor is contiguous and the number of elements is 0 mod QK_K.
@@ -1739,6 +2058,15 @@ ggml_repack_tensor_single (
                                    (block_q4_K *)src_data);
             src_data += stride;
         }
+    } else if (type == GGML_TYPE_Q6_K) {
+        type = GGML_TYPE_Q6_K_x8;
+
+        for (uint64_t i = 0; i < nrows; i += 1) {
+            make_q6_k_repack_quant(ne,
+                                    (block_q6_K_repack *)src_data,
+                                    (block_q6_K *)src_data);
+            src_data += stride;
+        }
     } else if (type == GGML_TYPE_Q8_0) {
         type = GGML_TYPE_Q8_0_Q8_0_x8;
         for (uint64_t i = 0; i < nrows; i += 1) {
@@ -1771,10 +2099,11 @@ ggml_repack_tensor (
     const int nth = params->nth;
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
-                (type == GGML_TYPE_Q4_K) ||
-                (type == GGML_TYPE_Q8_0) ||
                 (type == GGML_TYPE_Q2_K) ||
-                (type == GGML_TYPE_Q3_K));
+                (type == GGML_TYPE_Q3_K) ||
+                (type == GGML_TYPE_Q4_K) ||
+                (type == GGML_TYPE_Q6_K) ||
+                (type == GGML_TYPE_Q8_0));
 
     //
     // Check if the tensor is contiguous and the number of elements is 0 mod QK_K.
@@ -1847,6 +2176,15 @@ ggml_repack_tensor (
             make_q4_k_repack_quant(ne,
                                    (block_q4_K_repack *)src_data,
                                    (block_q4_K *)src_data);
+            src_data += stride;
+        }
+    } else if (type == GGML_TYPE_Q6_K) {
+        type = GGML_TYPE_Q6_K_x8;
+
+        for (i = start_row; i < end_row; i += 1) {
+            make_q6_k_repack_quant(ne,
+                                    (block_q6_K_repack *)src_data,
+                                    (block_q6_K *)src_data);
             src_data += stride;
         }
     } else if (type == GGML_TYPE_Q8_0) {

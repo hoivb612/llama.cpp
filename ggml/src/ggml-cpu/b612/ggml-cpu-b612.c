@@ -464,7 +464,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K_Q8_K_x8] = {
-        .from_float               = (ggml_from_float_t)quantize_row_q23_k_q8_k_x8,
+        .from_float               = (ggml_from_float_t)quantize_row_q236_k_q8_k_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q2_k_q8_k_x8,
         .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
         .nrows                    = -1,
@@ -482,7 +482,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
     },
     [GGML_TYPE_Q3_K_Q8_K_x8] = {
-        .from_float               = (ggml_from_float_t)quantize_row_q23_k_q8_k_x8,
+        .from_float               = (ggml_from_float_t)quantize_row_q236_k_q8_k_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q3_k_q8_k_x8,
         .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
         .nrows                    = -1,
@@ -503,6 +503,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t)quantize_row_q4_k_q8_k_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_k_q8_k_x8,
         .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+
+    //
+    // linkage type after repack of GGML_TYPE_Q6_K
+    //
+    // A linkage type is required since there is a different vec_dot function.
+    //
+
+    [GGML_TYPE_Q6_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q6_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q6_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q6_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t)quantize_row_q236_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q6_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q6_K_Q8_K_x8,
         .nrows                    = -1,
     },
 
@@ -3780,11 +3798,12 @@ void ggml_compute_forward_mul_mat_xbox(
 
     if (ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
         if ((src1_type == GGML_TYPE_F32) &&
-           ((src0_type == GGML_TYPE_Q4_0) ||
-            (src0_type == GGML_TYPE_Q8_0) || 
-            (src0_type == GGML_TYPE_Q2_K) || 
-            (src0_type == GGML_TYPE_Q3_K) ||
-            (src0_type == GGML_TYPE_Q4_K))) {
+            ((src0_type == GGML_TYPE_Q4_0) ||
+             (src0_type == GGML_TYPE_Q8_0) || 
+             (src0_type == GGML_TYPE_Q2_K) || 
+             (src0_type == GGML_TYPE_Q3_K) ||
+             (src0_type == GGML_TYPE_Q4_K) ||
+             (src0_type == GGML_TYPE_Q6_K))) {
 
             //
             // If this is the zeroth cpu, then attempt to repack the src0 tensor.
@@ -3799,7 +3818,7 @@ void ggml_compute_forward_mul_mat_xbox(
                 // N.B. If the repack is successful, then the repack type is returned.
                 //      Otherwise, the original type is returned.
 
-                src0_type = ggml_repack_tensor_single(params, src0);
+                src0_type = ggml_repack_tensor_single_thread(params, src0);
 
                 //
                 // Wait for all other threads to arrive at the barrier below before
@@ -3837,7 +3856,8 @@ void ggml_compute_forward_mul_mat_xbox(
                 (src0_type == GGML_TYPE_Q8_0) || 
                 (src0_type == GGML_TYPE_Q2_K) || 
                 (src0_type == GGML_TYPE_Q3_K) ||
-                (src0_type == GGML_TYPE_Q4_K))) {
+                (src0_type == GGML_TYPE_Q4_K) ||
+                (src0_type == GGML_TYPE_Q6_K))) {
 
         //
         // Attempt to repack tensor.
@@ -6543,9 +6563,9 @@ void ggml_init_tables() {
     ggml_cpu_init();
 }
 
-#pragma comment(linker, "/EXPORT:ggml_time_init=ggml-base.ggml_time_init")
+// #pragma comment(linker, "/EXPORT:ggml_time_init=ggml-base.ggml_time_init")
 
-#pragma comment(linker, "/EXPORT:ggml_time_us=ggml-base.ggml_time_us")
+// #pragma comment(linker, "/EXPORT:ggml_time_us=ggml-base.ggml_time_us")
 
 void ggml_disable_core_parking() {
 #pragma comment(linker, "/EXPORT:ggml_disable_core_parking=" __FUNCTION__)

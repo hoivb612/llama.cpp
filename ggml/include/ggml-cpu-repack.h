@@ -28,10 +28,11 @@ static_assert((sizeof(block_q8_0) * 8) == sizeof(block_q8_0_repack));
 typedef block_q2_K block_q2_K_repack;
 typedef block_q3_K block_q3_K_repack;
 typedef block_q4_K block_q4_K_repack;
+typedef block_q6_K block_q6_K_repack;
 typedef block_q8_K block_q8_K_repack;
 
 enum ggml_type
-ggml_repack_tensor_single(
+ggml_repack_tensor_single_thread(
     const struct ggml_compute_params * params,
     struct ggml_tensor *tensor);
 
@@ -95,6 +96,17 @@ xx_vec_dot_q4_k_q8_k_x8 (
     int nrc);
 
 void
+xx_vec_dot_q6_k_q8_k_x8 (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q6_K_repack * x,
+    size_t bx,
+    const block_q8_K_repack * y,
+    size_t ncols,
+    int nrc);
+
+void
 xx_vec_dot_q8_0_q8_0_x8 (
     const int n,
     float * s,
@@ -123,8 +135,14 @@ quantize_row_q4_k_x8 (
     block_q4_K * y,
     uint64_t vec_size);
 
-void                   
-quantize_row_q23_k_q8_k_x8 (
+void
+quantize_row_q6_k_x8 (
+    const float * x,
+    block_q6_K * y,
+    uint64_t vec_size);
+
+void
+quantize_row_q236_k_q8_k_x8 (
     const float * x,
     block_q8_K * y,
     uint32_t vec_size);

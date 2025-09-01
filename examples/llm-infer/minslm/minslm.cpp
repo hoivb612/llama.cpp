@@ -1,6 +1,6 @@
 #pragma warning (disable:4267) //  conversion from 'size_t' to 'int' ...
 
-#include "llama.h"
+// #include "llama.h"
 
 #include "llm-infer.h"
 #include "b612-cpu.h"
@@ -193,25 +193,12 @@ void print_system_info(int32_t n_threads, int32_t n_batch) {
 #if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
     // TODO: windows + arm64 + mingw64
     DWORD logicalProcessorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    os << " / " << logicalProcessorCount << " | " << llama_print_system_info();
+    os << " / " << logicalProcessorCount << " LPs | " << llm_system_info();
 #else
-    os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
+    os << " / " << std::thread::hardware_concurrency() << " | " << llm_system_info();
 #endif
 
     printf("\n%s: %s\n\n", __func__, os.str().c_str());
-}
-
-void xbapp_log_callback(ggml_log_level level, const char * text, void * user_data) {
-    GGML_UNUSED(text);
-
-    ggml_log_level xbapp_log_level = (ggml_log_level)0 /* GGML_LOG_LEVEL_NONE */;
-    if (user_data != nullptr) {
-        xbapp_log_level = *(ggml_log_level *)user_data;
-    }
-
-    if (level == xbapp_log_level) {
-        fputs(text, stdout);
-    }
 }
 
 int main(int argc, char** argv) {
@@ -250,6 +237,9 @@ int main(int argc, char** argv) {
 
     while (argc >= 5) {
         if (!strcmp(argv[4], "verbose")) {
+            params.verbose = 1;
+
+        } else if (!strcmp(argv[4], "v1")) {
             params.verbose = 1;
 
         } else if (!strcmp(argv[4], "v2")) {
@@ -293,8 +283,7 @@ int main(int argc, char** argv) {
     custom_prompts_it = custom_prompts.begin();
 
     // turn off llama info until there is a need for it to show up
-    ggml_log_level log_level = (ggml_log_level) 0;
-    llama_log_set(xbapp_log_callback, &log_level);
+    llm_disable_log();
 
     print_system_info(params.n_threads, params.n_batch);
     
@@ -389,14 +378,13 @@ int main(int argc, char** argv) {
     t0 = ggml_time_us() - t0;
     printf("\n\n total elapsed time %7.2fsec\n", (double)t0 / (1000. * 1000.));
 
-    log_level = GGML_LOG_LEVEL_INFO;
-    llama_log_set(xbapp_log_callback, &(log_level));
+    llm_enable_log();
     llm_terminate(params);
 
     console::set_display(console::stats);
 
     if (params.verbose == 2) {
-        llama_print_tensor_op_perf();
+        llm_print_tensor_op_perf_stats();
     }
 
     console::cleanup();

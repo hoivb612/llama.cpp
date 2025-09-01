@@ -431,17 +431,19 @@ extern "C" {
         GGML_TYPE_Q3_K_Q8_K_x8 = 45,
         GGML_TYPE_Q4_K_x8 = 46,         // - dummy linkage type
         GGML_TYPE_Q4_K_Q8_K_x8 = 47,    // repacked type
-        GGML_TYPE_Q4_0_x8 = 48,         // - dummy linkage type
-        GGML_TYPE_Q4_0_Q8_0_x8 = 49,    // repacked type
+        GGML_TYPE_Q6_K_x8 = 48,         // - dummy linkage type
+        GGML_TYPE_Q6_K_Q8_K_x8 = 49,    // repacked type
+        GGML_TYPE_Q4_0_x8 = 50,         // - dummy linkage type
+        GGML_TYPE_Q4_0_Q8_0_x8 = 51,    // repacked type
         //
         // GGML repack types
         //
-        GGML_TYPE_Q2_K_8_8 = 50,
-        GGML_TYPE_Q3_K_8_8 = 51, // Future
-        GGML_TYPE_Q4_K_8_8 = 52,
-        GGML_TYPE_Q8_0_8_8 = 53, // Future
+        GGML_TYPE_Q2_K_8_8 = 52,
+        GGML_TYPE_Q3_K_8_8 = 53, // Future
+        GGML_TYPE_Q4_K_8_8 = 54,
+        GGML_TYPE_Q8_0_8_8 = 55, // Future
         
-        GGML_TYPE_COUNT   = 54,
+        GGML_TYPE_COUNT   = 56,
     };
 
     // precision

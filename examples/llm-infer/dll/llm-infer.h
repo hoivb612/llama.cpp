@@ -67,6 +67,10 @@ struct model_params {
 LLM_INFER_API bool llm_initialize(model_params& params);
 LLM_INFER_API bool llm_inference(model_params& params);
 LLM_INFER_API void llm_terminate(const model_params&);
+LLM_INFER_API const char * llm_system_info();
+LLM_INFER_API void llm_print_tensor_op_perf_stats();
+LLM_INFER_API void llm_disable_log();
+LLM_INFER_API void llm_enable_log();
 
 typedef int32_t llama_token;
 struct chunk {
