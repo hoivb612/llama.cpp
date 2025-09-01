@@ -1,7 +1,5 @@
 #pragma warning (disable:4267) //  conversion from 'size_t' to 'int' ...
 
-// #include "llama.h"
-
 #include "llm-infer.h"
 #include "b612-cpu.h"
 
@@ -119,6 +117,27 @@ namespace console {
     }
 } // namespace console
 
+static int64_t timer_freq = 0, timer_start = 0;
+void timer_init(void) {
+    if (!timer_freq) {
+        LARGE_INTEGER t;
+        QueryPerformanceFrequency(&t);
+        timer_freq = t.QuadPart;
+
+        // The multiplication by 1000 or 1000000 below can cause an overflow if timer_freq
+        // and the uptime is high enough.
+        // We subtract the program start time to reduce the likelihood of that happening.
+        QueryPerformanceCounter(&t);
+        timer_start = t.QuadPart;
+    }
+}
+
+int64_t timer_us(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
+}
+
 // trim whitespace from the beginning and end of a string
 static std::string trim(const std::string & str) {
     if (str.empty()) {
@@ -204,8 +223,8 @@ void print_system_info(int32_t n_threads, int32_t n_batch) {
 int main(int argc, char** argv) {
     model_params params = {0};
 
-    ggml_time_init();
-    int64_t t0 = ggml_time_us(); 
+    timer_init();
+    int64_t t0 = timer_us(); 
 
     if (argc == 1 || argv[1][0] == '-') {
         printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [omp] [paffin] [stream] [verbose] [repack-xbox | repack-ggml]\n", argv[0]);
@@ -294,7 +313,7 @@ int main(int argc, char** argv) {
     }
 
     if (params.process_affinity) {
-        int64_t cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(params.n_threads);
+        int64_t cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(params.n_threads, params.verbose);
         printf("[%s]: Setting process affinity mask 0x%016llX\n", __func__, cpu_affinity_mask);
     }
 
@@ -375,7 +394,7 @@ int main(int argc, char** argv) {
         custom_prompts_it++;
     }
 
-    t0 = ggml_time_us() - t0;
+    t0 = timer_us() - t0;
     printf("\n\n total elapsed time %7.2fsec\n", (double)t0 / (1000. * 1000.));
 
     llm_enable_log();
