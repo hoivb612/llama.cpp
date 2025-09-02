@@ -831,7 +831,6 @@ xx_vec_dot_q4_0_q8_0_x8 (
     const uint64_t nb = n / QK_K;
     const uint64_t nrows = (uint32_t)nrc;
 
-    const __m512i zero512 = _mm512_setzero_si512();
     const __m512i offset = _mm512_set1_epi8(8);
     const __m512i m4 = _mm512_set1_epi8(0xf);
 
@@ -854,10 +853,11 @@ xx_vec_dot_q4_0_q8_0_x8 (
 
             for (uint64_t i = 0; i < nb; ++i) {
         
+                __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
         
                 //
-                // Compute combined scale for the an entire quant block.
+                // Compute combined multiplier for the quant block.
                 //
         
                 const __m128h xd = _mm_loadu_ph(x[i].d);
@@ -881,30 +881,27 @@ xx_vec_dot_q4_0_q8_0_x8 (
                     qx = _mm512_and_si512(m4, qx);
         
                     //
-                    // Multiply unsigned scaled q4 bytes by signed q8 bytes.
+                    // Multiply unsigned scaled q4 quant values by signed q8 quant
+                    // values and acculate the results.
                     //
         
                     sumi = _mm512_dpbusd_epi32(sumi, qx, qy);
         
                     //
-                    // Multiply the unsigned bias value by the signed q8 bytes.
+                    // Multiply the unsigned bias quant values by the signed q8 quant
+                    // values and acculate the results.
                     //
         
-                    const __m512i bias = _mm512_dpbusd_epi32(zero512, offset, qy);
-        
-                    //
-                    // Subtract the bias value from the sumi value.
-                    //
-        
-                    sumi = _mm512_sub_epi32(sumi, bias);
+                    bias = _mm512_dpbusd_epi32(bias, offset, qy);
                 }
         
                 //
-                // Multiply q with scale and accumulate.
+                // Subtract the bias values from the sum, convert to float, multiply
+                // by the block multiplier, and accumulate the results.
                 //
         
-                const __m512 q = _mm512_cvtepi32_ps(sumi);
-                acc = _mm512_fmadd_ps(d, q, acc);
+                sumi = _mm512_sub_epi32(sumi, bias);
+                acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(sumi), acc);
             }
         
             const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
@@ -1118,6 +1115,7 @@ xx_vec_dot_q3_k_q8_k_x8 (
                 // integer results.
                 //
         
+                __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
         
                 __m512i q3bytes = _mm512_loadu_si512((const __m512i*)q3);
@@ -1138,7 +1136,8 @@ xx_vec_dot_q3_k_q8_k_x8 (
                     q3bytes = _mm512_srli_epi16(q3bytes, 2);
         
                     //
-                    // Multiply the low 2-bit values by the q8 values.
+                    // Multiply the low 2-bit unsigned values by the signed q8 quant
+                    // values and acculate the results.
                     //
         
                     sumi = _mm512_dpbusd_epi32(sumi, q3lv, q8v);
@@ -1155,18 +1154,20 @@ xx_vec_dot_q3_k_q8_k_x8 (
                     const __m512i q3hv = _mm512_mask_blend_epi8(hmask, m4, zero512);
         
                     //
-                    // Multiply the high values by the q8 values and subtract from the sum.
+                    // Multiply the unsigned high values by the signed q8 quant
+                    // values and accumulate the results.
                     //
         
-                    const __m512i bias = _mm512_dpbusd_epi32(zero512, q3hv, q8v);
-                    sumi = _mm512_sub_epi32(sumi, bias);
+                    bias = _mm512_dpbusd_epi32(bias, q3hv, q8v);
                 }
         
                 //
-                // Multiply the accumulated integer result by the q3 scale, convert to float,
-                // multiply by the q8 multiplier, and accumulate the results.
+                // Subtract the bias values from the sum, multiply the accumulated sum
+                // by the q3 scale, convert to float, multiply by the block multiplier,
+                // and accumulate the results.
                 //
         
+                sumi = _mm512_sub_epi32(sumi, bias);
                 sumi = _mm512_mullo_epi32(sumi, scales);
                 acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
             }
@@ -1530,7 +1531,6 @@ xx_vec_dot_q6_k_q8_k_x8 (
     const __m512i m4 = _mm512_set1_epi8(0xf);
     const __m512i m2 = _mm512_set1_epi8(0x30);
     const __m512i m32s = _mm512_set1_epi8(32);
-    const __m512i zero512 = _mm512_setzero_si512();
 
     //
     // Iterate through the specified number of columns.
@@ -1560,6 +1560,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
                 const __m512i scales = _mm512_cvtepi8_epi32(scales8);
         
+                __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
 
                 //
@@ -1607,19 +1608,18 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q8_0 = _mm512_loadu_si512(q8 + (j * 128) + 0);
 
                     //
-                    // Multiply the unsigned 6-bit quant values by the 8-bit quant
-                    // values.
+                    // Multiply the unsigned q6 quant values by the signed q8 quant
+                    // values and accumulate the results.
                     // 
 
                     sumi = _mm512_dpbusd_epi32(sumi, q6_0, q8_0);
 
                     //
-                    // Multiply the 8-bit quant values by the bias value 32 and
-                    // subtract from the sum.
+                    // Multiply the unsigned bias values by the signed q8 quant
+                    // values, and accumulate the results.
                     //
 
-                    __m512i bias = _mm512_dpbusd_epi32(zero512, m32s, q8_0);
-                    sumi = _mm512_sub_epi32(sumi, bias);
+                    bias = _mm512_dpbusd_epi32(bias, m32s, q8_0);
 
                     //
                     // Shift the next nibble into place.
@@ -1649,26 +1649,27 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q8_1 = _mm512_loadu_si512(q8 + (j * 128) + 64);
 
                     //
-                    // Multiply the unsigned 6-bit quant values by the 8-bit quant
-                    // values.
+                    // Multiply the unsigned q6 quant values by the signed q8 quant
+                    // values and accumulate the results.
                     // 
 
                     sumi = _mm512_dpbusd_epi32(sumi, q6_1, q8_1);
 
                     //
-                    // Multiply the 8-bit quant values by the bias value 32 and
-                    // subtract from the sum.
+                    // Multiply the unsigned bias values by the signed q8 quant
+                    // values and accumulate the results.
                     //
 
-                    bias = _mm512_dpbusd_epi32(zero512, m32s, q8_1);
-                    sumi = _mm512_sub_epi32(sumi, bias);
+                    bias = _mm512_dpbusd_epi32(bias, m32s, q8_1);
                 }
 
                 //
-                // Multiply the accumulated integer result by the q6 scale, convert
-                // to float, multiply by the q6 multiplier, and accumulate the results.
+                // Subtract the bias values from the sum, multiply the accumulated
+                // sum by the q6 scale, convert to float, multiply by the block
+                // multiplier, and accumulate the results.
                 //
 
+                sumi = _mm512_sub_epi32(sumi, bias);
                 sumi = _mm512_mullo_epi32(sumi, scales);
                 acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
             }

@@ -2237,6 +2237,7 @@ uint64_t _512_madd_count = 0;
 int64_t mul_mat_repack_time_us = 0;
 int64_t mul_mat_repack_time_current_op_us = 0;
 int mul_mat_repack_count = 0;
+int mul_mat_repack_shared = 0;
 int mul_mat_repack_failed_count = 0;
 
 #define GGML_TENSOR_NODE_COUNT 4096
@@ -2424,8 +2425,10 @@ void ggml_cpu_print_tensor_op_perf() {
         printf("total elapsed repack conversion time %5.2fsec\n",
                (float)mul_mat_repack_time_us / (1000. * 1000.));
     
-        printf("average repack conversion time %5.2fus\n\n",
+        printf("average repack conversion time %5.2fus\n",
                (float)mul_mat_repack_time_us / (float)mul_mat_repack_count);
+
+        printf("total shared repack conversions %d\n\n", mul_mat_repack_shared);
 
     } else {
         printf("\n");
@@ -3797,6 +3800,7 @@ void ggml_compute_forward_mul_mat_xbox(
     //
 
     if (ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
+
         if ((src1_type == GGML_TYPE_F32) &&
             ((src0_type == GGML_TYPE_Q4_0) ||
              (src0_type == GGML_TYPE_Q8_0) || 
@@ -3850,14 +3854,15 @@ void ggml_compute_forward_mul_mat_xbox(
         
         src0_type = src0->type;
 
-    } else if (ggml_cpu_tensor_repack_mode_xbox() &&
-               (src1_type == GGML_TYPE_F32) &&
+    } else if ((src1_type == GGML_TYPE_F32) &&
                ((src0_type == GGML_TYPE_Q4_0) ||
                 (src0_type == GGML_TYPE_Q8_0) || 
                 (src0_type == GGML_TYPE_Q2_K) || 
                 (src0_type == GGML_TYPE_Q3_K) ||
                 (src0_type == GGML_TYPE_Q4_K) ||
                 (src0_type == GGML_TYPE_Q6_K))) {
+
+        GGML_ASSERT(ggml_cpu_tensor_repack_mode_xbox());
 
         //
         // Attempt to repack tensor.
@@ -3866,14 +3871,28 @@ void ggml_compute_forward_mul_mat_xbox(
         //      the new repack type.
         //
 
-        int64_t repack_t0 = ggml_time_us();
+        int64_t repack_t0 = 0;
+        if (!ith) {
+            repack_t0 = ggml_time_us();
+        }
 
         ggml_repack_tensor(params, src0);
 
-        if (!ith && (src0_type != src0->type)) {
-            mul_mat_repack_count += 1;
-            mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
-            mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
+        if (!ith) {
+            if (src0_type != src0->type) {
+                mul_mat_repack_count += 1;
+                mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
+                mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
+            }
+
+        } else {
+            if (src0_type != src0->type) {
+                // 
+                // this thread does participate in repacking but not the 
+                // main driver thread (ith == 0)
+                // 
+                mul_mat_repack_shared += 1;
+            }
         }
 
         //
