@@ -363,7 +363,7 @@ make_q3_k_repack_quant (
         in += 1;
     }
 }
-                      
+
 void
 make_q4_k_repack_quant (
     uint64_t ne,
@@ -599,7 +599,7 @@ make_q8_0_repack_quant (
     uint64_t j;
     uint64_t k;
     uint64_t offset;
-    block_q8_0_repack qs_out;
+    int8_t qs_out[QK_K];
     int8_t * src;
 
     //
@@ -609,12 +609,22 @@ make_q8_0_repack_quant (
     uint64_t nb = ne / QK_K;
 
     for (k = 0; k < nb; k += 1) {
+
+        //
+        // Rearrange the 8-bit quant values into lanes of four bytes interleaved.
+        //
+        // N.B. There are 8 scale values, and thus, 8 lanes are required.
+        //
+        // N.B. A separate output buffer is required since the in and out quants
+        //      may share the same memory.
+        //
+
         for (i = 0; i < 8; i += 1) {
-            qs_out.d[i] = in[i].d;
+            out->d[i] = in[i].d;
             offset = i * 4;
     
             for (j = 0; j < 8; j += 1) {
-                uint32_t * qs_dst = (uint32_t *)&qs_out.qs[offset + 0];
+                uint32_t * qs_dst = (uint32_t *)&qs_out[offset];
                 uint32_t * qs_src = (uint32_t *)&in[i].qs[j * 4 + 0];
                 *qs_dst = *qs_src;
                 offset += 32;
@@ -622,24 +632,21 @@ make_q8_0_repack_quant (
         }
 
         //
-        // Copy the temporary q8_0_repack quant block to the output quant block.
+        // Copy the rearranged q8_0 quants into the q8_0_repack quants.
         //
 
-        src = (int8_t *)&qs_out;
-        dst = (int8_t *)out;
+        src = qs_out;
+        dst = out->qs;
 
-        const __m128i dv = _mm_loadu_si128((__m128i *)src);
-        _mm_storeu_si128((__m128i *)dst, dv);
+        const __m512i q0 = _mm512_loadu_si512(src);
+        const __m512i q1 = _mm512_loadu_si512(src + 64);
+        const __m512i q2 = _mm512_loadu_si512(src + 128);
+        const __m512i q3 = _mm512_loadu_si512(src + 192);
 
-        const __m512i q0 = _mm512_loadu_si512(src + 16);
-        const __m512i q1 = _mm512_loadu_si512(src + 80);
-        const __m512i q2 = _mm512_loadu_si512(src + 144);
-        const __m512i q3 = _mm512_loadu_si512(src + 208);
-
-        _mm512_storeu_si512(dst + 16, q0);
-        _mm512_storeu_si512(dst + 80, q1);
-        _mm512_storeu_si512(dst + 144, q2);
-        _mm512_storeu_si512(dst + 208, q3);
+        _mm512_storeu_si512(dst, q0);
+        _mm512_storeu_si512(dst + 64, q1);
+        _mm512_storeu_si512(dst + 128, q2);
+        _mm512_storeu_si512(dst + 192, q3);
 
         out += 1;
         in += 8;
@@ -663,13 +670,15 @@ make_q236_k_q8_k_repack_quant (
 //
 
 {
-#pragma comment(linker, "/EXPORT:make_q23_k_q8_k_repack_quant=" __FUNCTION__)
+#pragma comment(linker, "/EXPORT:make_q236_k_q8_k_repack_quant=" __FUNCTION__)
 
+    int8_t * dst;
     uint64_t i;
     uint64_t j;
     uint64_t k;
     uint64_t offset;
-    uint8_t qs_out[QK_K];
+    int8_t qs_out[QK_K];
+    int8_t * src;
 
     //
     // Convert one q8_k quant block to one q8_k_repack quant block.
@@ -696,7 +705,10 @@ make_q236_k_q8_k_repack_quant (
         // Rearrange the 8-bit quant values into lanes of four bytes interleaved.
         //
         // N.B. There are 16 scale values, and thus, 16 lanes are required.
-        //      
+        //
+        // N.B. A separate output buffer is required since the in and out quants
+        //      may share the same memory.
+        //
 
         for (i = 0; i < 16; i += 1) {
             offset = i * 4;
@@ -713,8 +725,19 @@ make_q236_k_q8_k_repack_quant (
         //
         // Copy the rearranged q8_k quant block into the q8_k_repack quant block.
         //
-    
-        memcpy(out->qs, qs_out, sizeof(out->qs));
+
+        src = qs_out;
+        dst = out->qs;
+
+        const __m512i q0 = _mm512_loadu_si512(src);
+        const __m512i q1 = _mm512_loadu_si512(src + 64);
+        const __m512i q2 = _mm512_loadu_si512(src + 128);
+        const __m512i q3 = _mm512_loadu_si512(src + 192);
+
+        _mm512_storeu_si512(dst, q0);
+        _mm512_storeu_si512(dst + 64, q1);
+        _mm512_storeu_si512(dst + 128, q2);
+        _mm512_storeu_si512(dst + 192, q3);
 
         out += 1;
         in += 1;
@@ -776,7 +799,12 @@ make_q4_k_q8_k_repack_quant (
 
         //
         // Rearrange the 8-bit quant values into lanes of four bytes interleaved.
-        // 
+        //
+        // N.B. There are 8 scale values, and thus, 8 lanes are required.
+        //
+        // N.B. A separate output buffer is required since the in and out quants
+        //      may share the same memory.
+        //
     
         for (i = 0; i < 8; i += 1) {
             offset = i * 4;

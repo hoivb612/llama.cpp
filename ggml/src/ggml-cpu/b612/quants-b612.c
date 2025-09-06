@@ -1843,32 +1843,26 @@ void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) 
 
     const uint64_t nb = k / qk;
 
-    float amax;
-
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 
     const __m128i one = _mm_set1_epi8(1);
     const __m128i zero128i = _mm_setzero_si128();
-    const __m512 sign_bit = _mm512_set1_ps(-0.0f);
 
     for (uint64_t i = 0; i < nb; i++) {
-        __m512 ax = _mm512_loadu_ps(x);
-        __m512 maxvx = _mm512_andnot_ps(sign_bit, ax);
 
-        for (uint64_t j = 16; j < QK_K; j += 16) {
-            ax = _mm512_loadu_ps(x + j);
-            maxvx = _mm512_max_ps(maxvx, _mm512_andnot_ps(sign_bit, ax));
+        __m512 maxvx = _mm512_setzero_ps();
+
+        for (uint64_t j = 0; j < QK_K; j += 64) {
+            __m512 ax0 = _mm512_abs_ps(_mm512_loadu_ps(x + j + 0));
+            __m512 ax1 = _mm512_abs_ps(_mm512_loadu_ps(x + j + 16));
+            maxvx = _mm512_max_ps(maxvx, _mm512_max_ps(ax0, ax1));
+
+            __m512 ax2 = _mm512_abs_ps(_mm512_loadu_ps(x + j + 32));
+            __m512 ax3 = _mm512_abs_ps(_mm512_loadu_ps(x + j + 48));
+            maxvx = _mm512_max_ps(maxvx, _mm512_max_ps(ax2, ax3));
         }
 
-        __m256 t0 = _mm256_max_ps(_mm512_castps512_ps256(maxvx),
-                                  _mm512_extractf32x8_ps(maxvx, 1));
-
-        __m128 t1 = _mm_max_ps(_mm256_castps256_ps128(t0),
-                               _mm256_extractf128_ps(t0, 1));
-
-        t1 = _mm_max_ps(t1, _mm_movehl_ps(t1, t1));
-        t1 = _mm_max_ss(t1, _mm_movehdup_ps(t1));
-        amax = _mm_cvtss_f32(t1);
+        const float amax = _mm512_reduce_max_ps(maxvx);
 
         //
         // Initialize loop values.
@@ -1877,7 +1871,11 @@ void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) 
         //      or the actual quant values will be computed.
         //
 
-        const float iscale = (amax == 0.0f) ? 0.0f : 127.f / amax;
+        float iscale = 0.0f;
+
+        if (amax != 0.0f) {
+            iscale = 127.f / amax;
+        }
 
         y[i].d = amax / 127.f;
 
@@ -1890,45 +1888,41 @@ void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) 
             xv0 = _mm512_mul_ps(xscale, xv0);
 //              xv0 = _mm512_round_ps(xv0, _MM_ROUND_NEAREST);
             const __m128i v0 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(xv0));
+            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 0), v0);
 
             __m128i v0sum = _mm_dpbusd_epi32(zero128i, one, v0);
             v0sum = _mm_hadd_epi32(v0sum, v0sum);
             y[i].bsums[(l * 4) + 0] = _mm_cvtsi128_si32(_mm_hadd_epi32(v0sum, v0sum));
 
-            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 0), v0);
-
             __m512 xv1 = _mm512_loadu_ps(x + (l * 64) + 16);
             xv1 = _mm512_mul_ps(xscale, xv1);
 //              xv1 = _mm512_round_ps(xv1, _MM_ROUND_NEAREST);
             const __m128i v1 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(xv1));
+            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 16), v1);
 
             __m128i v1sum = _mm_dpbusd_epi32(zero128i, one, v1);
             v1sum = _mm_hadd_epi32(v1sum, v1sum);
             y[i].bsums[(l * 4) + 1] = _mm_cvtsi128_si32(_mm_hadd_epi32(v1sum, v1sum));
 
-            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 16), v1);
-
             __m512 xv2 = _mm512_loadu_ps(x + (l * 64) + 32);
             xv2 = _mm512_mul_ps(xscale, xv2);
 //              xv2 = _mm512_round_ps(xv2, _MM_ROUND_NEAREST);
             const __m128i v2 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(xv2));
+            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 32), v2);
 
             __m128i v2sum = _mm_dpbusd_epi32(zero128i, one, v2);
             v2sum = _mm_hadd_epi32(v2sum, v2sum);
             y[i].bsums[(l * 4) + 2] = _mm_cvtsi128_si32(_mm_hadd_epi32(v2sum, v2sum));
 
-            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 32), v2);
-
             __m512 xv3 = _mm512_loadu_ps(x + (l * 64) + 48);
             xv3 = _mm512_mul_ps(xscale, xv3);
 //              xv3 = _mm512_round_ps(xv3, _MM_ROUND_NEAREST);
             const __m128i v3 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(xv3));
+            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 48), v3);
 
             __m128i v3sum = _mm_dpbusd_epi32(zero128i, one, v3);
             v3sum = _mm_hadd_epi32(v3sum, v3sum);
             y[i].bsums[(l * 4) + 3] = _mm_cvtsi128_si32(_mm_hadd_epi32(v3sum, v3sum));
-
-            _mm_storeu_si128((__m128i *)(q8 + (l * 64) + 48), v3);
         }
 
         x += 256;
@@ -1942,6 +1936,8 @@ void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) 
     for (uint64_t i = 0; i < nb; i += 1) {
         __m256 ax;
         __m256 maxvx = _mm256_setzero_ps();
+
+        float amax;
 
         for (uint64_t j = 0; j < QK_K / 32; j += 1) {
             for (uint64_t l = 0; l < 4; l += 1) {
@@ -1999,7 +1995,6 @@ void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) 
 
 #else
 
-    // inlined version of quantize_row_q8_K_ref() in ggml/src/ggml-quants.c
     for (int i = 0; i < nb; i++) {
 
         float amax = 0.0f;

@@ -204,7 +204,7 @@ bool llm_initialize(
     printf("\n%s: n_len = %d, n_ctx = %d\n", __func__, params.n_len, llama_n_ctx(llm_ctx));
     printf("%s: n_threads = %d, n_threads_batch = %d\n\n", __func__, llm_ctx_params.n_threads, llm_ctx_params.n_threads_batch);
 
-    std::vector<llama_token> llm_tokens_shared;
+    llm_tokens_shared = {};
     if (params.pfc_mode) {
         // start from a known point
         llama_kv_self_clear(llm_ctx);
@@ -226,19 +226,18 @@ bool llm_initialize(
                                        llm_session_tokens.data(),
                                        llm_session_tokens.capacity(),
                                        &n_token_count_out)) {
-                printf("%s: Load state file failed: %s\n", __func__, params.pfx_file.c_str());
+                printf("%s: State file does not exist or load failed: '%s'\n", __func__, params.pfx_file.c_str());
                 llm_session_tokens.resize(0);
                 params.save_llm_state = true;
+                // the load failed so start from scratch to initialize all internal 
+                // state with the first full prompt 
                 llm_tokens_shared.clear();
                 params.pfx_shared = "";
 
-                // for now this plug-in should not create cache files - comment this out for cache generation
-                // return false;
-            }
-            else {
-                printf("%s: Loading saved state from '%s'...\n", __func__, params.pfx_file.c_str());
+            } else {
+                printf("%s: Loading saved state successfully from '%s'...\n", __func__, params.pfx_file.c_str());
                 llm_session_tokens.resize(n_token_count_out);
-                // printf("%s: n_token_count_out=%zd: %s\n", __func__, n_token_count_out, LOG_TOKENS_TOSTR_PRETTY(ctx, session_tokens).c_str());
+                // printf("%s: n_token_count_out=%zd: %s\n", __func__, n_token_count_out, LOG_TOKENS_TOSTR_PRETTY(ctx, llm_session_tokens).c_str());
 
                 // sanity check
                 // assert(llm_tokens_shared.size() <= llm_session_tokens.size());
@@ -249,19 +248,15 @@ bool llm_initialize(
                         return false;
                     }
                 }
-
                 //printf("%s: token_shared=%zd\n", __func__, llm_tokens_shared.size());
-
-                // remove any "future" tokens that we might have inherited from the previous session
-                llama_kv_self_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
             }
-        }
-        else {
+
+        } else {
             // no shared prompt detected
             llm_tokens_shared.clear();
         }
-    }
-    else {
+
+    } else {
         // No pfc mode
         llm_tokens_shared.clear();
     }
@@ -275,23 +270,26 @@ bool llm_inference(
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
 
     std::vector<llama_token> embd_inp;
-    int n_consumed = 0;
     int n_past = 0;
     int n_kv_pfx = 0;
 
-    std::vector<llama_token> llm_tokens_shared = llm_tokens_shared;
     if (params.pfc_mode) {
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_self_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
-        embd_inp.insert(embd_inp.end(), llm_tokens_shared.begin(), llm_tokens_shared.end());
-        n_consumed = llm_tokens_shared.size();
+        if (llm_tokens_shared.size() != 0) {
+            //
+            // current version of llama does not support seq_id being negative
+            // llama_kv_self_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
+            //
+            llama_kv_self_seq_rm(llm_ctx, 0, llm_tokens_shared.size(), -1);
+            embd_inp.insert(embd_inp.end(), llm_tokens_shared.begin(), llm_tokens_shared.end());
+        }
         n_past = llm_tokens_shared.size();
         n_kv_pfx = llm_tokens_shared.size();
+
     } else {
         // start from a known point
         llama_kv_self_clear(llm_ctx);
-
-        n_consumed = 0;
+        embd_inp.clear();
         n_past = 0;
         n_kv_pfx = 0;
     }
@@ -299,7 +297,7 @@ bool llm_inference(
     // tokenize the remaining prompt or full prompt if pfc_mode is off
     std::vector<llama_token> tokens_input = slm_tokenize(llm_ctx, params.prompt, params.add_special, params.parse_special);
 
-    // append the variant part of the prompt or use the full prompt (for non pfc mode)
+    // append the variant part of the prompt (pfc mode) or the full prompt (for non-pfc mode)
     embd_inp.insert(embd_inp.end(), tokens_input.begin(), tokens_input.end());
 
     const int n_ctx = llama_n_ctx(llm_ctx);
@@ -316,7 +314,9 @@ bool llm_inference(
         return false;
     }
 
-    // calculate how much has been processed through the saved state file
+    //
+    // calculate how much has been processed through the saved state file (pfc mode)
+    // 
     int prompt_index = 0;
     if (params.pfc_mode) {
         int n_tokens_processed = 0;
@@ -336,7 +336,7 @@ bool llm_inference(
         }
     }
 
-    // build token list for inference
+    // build token list of new tokens for inference
     std::vector<llama_token> embd;
     for (int i = prompt_index; i < embd_inp.size(); i++) {
         embd.push_back(embd_inp[i]);
@@ -387,15 +387,20 @@ bool llm_inference(
             t_prompt_eval_ms / embd.size());
     }
 
+    // 
+    // Save the state file here because we need llama to process once
+    // to initialize all the different internal states - doing this in 
+    // llm_initialize() does not work because at that time, llama has not 
+    // done any token processing yet.
+    // 
+
     if (params.pfc_mode && params.save_llm_state) {
         llm_session_tokens.insert(llm_session_tokens.end(), embd_inp.begin(), embd_inp.end());
-    }
 
-    if (params.save_llm_state) {
         llama_state_save_file(llm_ctx, params.pfx_file.c_str(), llm_session_tokens.data(), llm_session_tokens.size());
         params.save_llm_state = false;
 
-        // update token_shared
+        // llm_token_shared must be updated for next inference 
         std::string template_prompt = params.custom_template_prompt;
         size_t pos = template_prompt.find("{message}");
         if (pos != std::string::npos) {

@@ -383,10 +383,10 @@ int main(int argc, char** argv) {
                     printf("%c", c);
                 }
                 if (c == '}') {
-                    printf("\n\n");
                     break;
                 }
             }
+            printf("\n\n");
         }
 
         params.first_prompt = false;
