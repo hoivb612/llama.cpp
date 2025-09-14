@@ -290,6 +290,9 @@ int main(int argc, char** argv) {
 
         } else if (!strcmp(argv[4], "parse-special")) {
             params.parse_special = true;
+
+        } else if (!strcmp(argv[4], "gpu")) {
+            params.gpu_offload = true;
         }
 
         argv += 1;

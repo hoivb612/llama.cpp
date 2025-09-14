@@ -62,6 +62,7 @@ struct model_params {
     bool parse_special                 = false; // for tokenizer: parse recognized special tokens in text
     int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
     bool process_affinity              = false; // true if set process affinity is enabled
+    bool gpu_offload                   = false; // true of GPU offload is requested (valid if a GPU device is available)
 };
 
 LLM_INFER_API bool llm_initialize(model_params& params);

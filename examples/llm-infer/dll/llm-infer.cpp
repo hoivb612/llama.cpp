@@ -160,6 +160,11 @@ bool llm_initialize(
         common_model_params.n_gpu_layers = 0;
     }
 #else
+    if (params.gpu_offload) {
+        // try to do GPU offload if requested (Vulkan build)
+        common_model_params.n_gpu_layers = 999;
+    }
+
     switch (params.tensor_repack_mode) {
         case 1:
             llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
