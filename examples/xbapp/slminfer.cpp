@@ -190,7 +190,7 @@ int slm_init(xbapp_params& xbparams) {
                 //printf("%s: token_shared=%zd - %s\n", __func__, tokens_shared.size(), LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_shared).c_str());
 
                 // remove any "future" tokens that we might have inherited from the previous session
-                llama_kv_self_seq_rm(ctx, -1, tokens_shared.size(), -1);
+                llama_kv_self_seq_rm(ctx, 0, tokens_shared.size(), -1);
             }
 
 #else // use llama_set_state_data()
@@ -234,7 +234,7 @@ int slm_inference(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_self_seq_rm(ctx, -1, tokens_shared.size(), -1);
+        llama_kv_self_seq_rm(ctx, 0, tokens_shared.size(), -1);
         embd_inp.insert(embd_inp.end(), tokens_shared.begin(), tokens_shared.end());
         n_past = tokens_shared.size();
         n_kv_pfx = tokens_shared.size();
