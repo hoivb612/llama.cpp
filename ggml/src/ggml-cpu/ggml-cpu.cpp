@@ -68,6 +68,216 @@ void xb_set_cpu_cache_size() {}
 
 #endif // _WIN32
 
+// check if node is part of the graph
+static bool ggml_graph_find(const struct ggml_cgraph * cgraph, const struct ggml_tensor * node) {
+    if (cgraph == NULL) {
+        return true;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i] == node) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static struct ggml_tensor * ggml_graph_get_parent(const struct ggml_cgraph * cgraph, const struct ggml_tensor * node) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * parent = cgraph->nodes[i];
+        struct ggml_tensor * grad = ggml_graph_get_grad(cgraph, parent);
+
+        if (grad == node) {
+            return parent;
+        }
+    }
+
+    return NULL;
+}
+
+static void ggml_graph_dump_dot_node_edge(FILE * fp, const struct ggml_cgraph * gb, struct ggml_tensor * node, struct ggml_tensor * parent, const char * label)  {
+    struct ggml_tensor * gparent = ggml_graph_get_parent(gb, node);
+    struct ggml_tensor * gparent0 = ggml_graph_get_parent(gb, parent);
+    fprintf(fp, "  \"%p\" -> \"%p\" [ arrowhead = %s; style = %s; label = \"%s\"; ]\n",
+            gparent0 ? (void *) gparent0 : (void *) parent,
+            gparent ? (void *) gparent : (void *) node,
+            gparent ? "empty" : "vee",
+            gparent ? "dashed" : "solid",
+            label);
+}
+
+static void ggml_graph_dump_dot_leaf_edge(FILE * fp, struct ggml_tensor * node, struct ggml_tensor * parent, const char * label)  {
+    fprintf(fp, "  \"%p\" -> \"%p\" [ label = \"%s\"; ]\n",
+            (void *) parent,
+            (void *) node,
+            label);
+}
+
+#include <vector>
+void ggml_graph_dump_dot_b612(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename) {
+    char color[16];
+#ifdef GGML_B612
+    std::vector<struct ggml_tensor *> nodes_visited;
+#endif
+
+    FILE * fp = ggml_fopen(filename, "w");
+    GGML_ASSERT(fp);
+
+    fprintf(fp, "digraph G {\n");
+    fprintf(fp, "  newrank = true;\n");
+    fprintf(fp, "  rankdir = TB;\n");
+
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+        struct ggml_tensor * grad = ggml_graph_get_grad(gb, node);
+
+        if (ggml_graph_get_parent(gb, node) != NULL) {
+            continue;
+        }
+
+        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            snprintf(color, sizeof(color), "yellow");
+        } else if (grad) {
+            if (ggml_graph_find(gf, node)) {
+                snprintf(color, sizeof(color), "green");
+            } else {
+                snprintf(color, sizeof(color), "lightblue");
+            }
+        } else {
+            snprintf(color, sizeof(color), "white");
+        }
+
+        fprintf(fp, "  \"%p\" [ "
+                    "style = filled; fillcolor = %s; shape = record; "
+                    "label=\"",
+                (void *) node, color);
+
+        if (strlen(node->name) > 0) {
+            fprintf(fp, "%s (%s)|", node->name, ggml_type_name(node->type));
+        } else {
+            fprintf(fp, "(%s)|", ggml_type_name(node->type));
+        }
+
+        if (ggml_is_matrix(node)) {
+            // fprintf(fp, "%d [%" PRId64 ", %" PRId64 "] | <x>%s", i, node->ne[0], node->ne[1], ggml_op_symbol(node->op));
+            fprintf(fp, "%d [%zd, %zd] | <x>%s", i, node->ne[0], node->ne[1], ggml_op_symbol(node->op));
+        } else {
+            //fprintf(fp, "%d [%" PRId64 ", %" PRId64 ", %" PRId64 "] | <x>%s", i, node->ne[0], node->ne[1], node->ne[2], ggml_op_symbol(node->op));
+            fprintf(fp, "%d [%zd, %zd, %zd] | <x>%s", i, node->ne[0], node->ne[1], node->ne[2], ggml_op_symbol(node->op));
+        }
+
+        if (grad) {
+            fprintf(fp, " | <g>%s\"; ]\n", ggml_op_symbol(grad->op));
+        } else {
+            fprintf(fp, "\"; ]\n");
+        }
+
+#ifdef GGML_B612
+        nodes_visited.push_back(node);
+        // stop once this node is hit (after one pass through all 32 layers)
+        if (strstr(node->name, "norm-1")) { printf("%s: Found the break\n", __func__); break; }
+#endif
+    }
+
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+
+#ifdef GGML_B612
+        if ((strstr(node->name, "blk.0.attn_qkv.weight") == NULL) &&
+            (strstr(node->name, "blk.0.attn_output.weight") == NULL) &&
+            (strstr(node->name, "blk.0.attn_norm.weight") == NULL) &&
+            (strstr(node->name, "blk.0.ffn_norm.weight") == NULL) &&
+            (strstr(node->name, "blk.0.ffn_up.weight") == NULL) &&
+            (strstr(node->name, "blk.0.ffn_down.weight") == NULL)) { 
+            // limit to just the number of leaf nodes that mattered
+            continue; 
+        }
+        nodes_visited.push_back(node);
+#endif
+
+        snprintf(color, sizeof(color), "pink");
+
+        fprintf(fp, "  \"%p\" [ "
+                    "style = filled; fillcolor = %s; shape = record; "
+                    "label=\"<x>",
+                (void *) node, color);
+
+        if (strlen(node->name) > 0) {
+            fprintf(fp, "%s (%s)|", node->name, ggml_type_name(node->type));
+        } else {
+            fprintf(fp, "(%s)|", ggml_type_name(node->type));
+        }
+
+        fprintf(fp, "CONST %d [%zd, %zd]", i, node->ne[0], node->ne[1]);
+        if (ggml_nelements(node) < 5 && node->data != NULL) {
+            fprintf(fp, " | (");
+            for (int j = 0; j < ggml_nelements(node); j++) {
+                // FIXME: use ggml-backend to obtain the tensor data
+                //if (node->type == GGML_TYPE_I8 || node->type == GGML_TYPE_I16 || node->type == GGML_TYPE_I32) {
+                //    fprintf(fp, "%d", ggml_get_i32_1d(node, j));
+                //}
+                //else if (node->type == GGML_TYPE_F32 ||
+                //         node->type == GGML_TYPE_F16 ||
+                //         node->type == GGML_TYPE_BF16) {
+                //    fprintf(fp, "%.1e", (double)ggml_get_f32_1d(node, j));
+                //}
+                //else
+                {
+                    fprintf(fp, "#");
+                }
+                if (j < ggml_nelements(node) - 1) {
+                    fprintf(fp, ", ");
+                }
+            }
+            fprintf(fp, ")");
+        }
+        fprintf(fp, "\"; ]\n");
+    }
+
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                char label[16];
+                snprintf(label, sizeof(label), "src %d", j);
+#ifdef GGML_B612
+                if ((std::find(nodes_visited.begin(), nodes_visited.end(), node) != nodes_visited.end()) &&
+                    (std::find(nodes_visited.begin(), nodes_visited.end(), node->src[j]) != nodes_visited.end())) 
+#endif
+                {
+                    ggml_graph_dump_dot_node_edge(fp, gb, node, node->src[j], label);
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                char label[16];
+                snprintf(label, sizeof(label), "src %d", j);
+#ifdef GGML_B612
+                if ((std::find(nodes_visited.begin(), nodes_visited.end(), node) != nodes_visited.end()) &&
+                    (std::find(nodes_visited.begin(), nodes_visited.end(), node->src[j]) != nodes_visited.end()))
+#endif
+                {
+                    ggml_graph_dump_dot_leaf_edge(fp, node, node->src[j], label);
+                }
+            }
+        }
+    }
+
+    fprintf(fp, "}\n");
+
+    fclose(fp);
+
+    printf("%s: dot -Tpng %s -o %s.png && open %s.png\n", __func__, filename, filename, filename);
+}
+
 #endif // GGML_B612
 
 // ggml-backend interface

@@ -635,6 +635,9 @@ extern "C" {
         GGML_TENSOR_FLAG_OUTPUT =  2, // ...is an output for the GGML compute graph
         GGML_TENSOR_FLAG_PARAM  =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS   =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+#ifdef GGML_B612
+        GGML_TENSOR_FLAG_DUP    = 16, // ...is duplicated - cannot be changed (e.g. repacking) 
+#endif  
     };
 
     struct ggml_init_params {
@@ -861,6 +864,9 @@ extern "C" {
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
+#ifdef GGML_B612
+    GGML_API void ggml_set_duplicated(struct ggml_tensor * tensor);
+#endif
 
     //
     // operations on tensors with backpropagation
@@ -2378,6 +2384,11 @@ extern "C" {
 
     // dump the graph into a file using the dot format
     GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
+
+#ifdef GGML_B612
+    // dump the graph into a file using the dot format (same as above but using C++)
+    GGML_API void ggml_graph_dump_dot_b612(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
+#endif
 
     // TODO these functions were sandwiched in the old optimization interface, is there a better place for them?
     typedef void (*ggml_log_callback)(enum ggml_log_level level, const char * text, void * user_data);

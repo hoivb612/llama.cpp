@@ -2020,10 +2020,22 @@ ggml_repack_tensor_single_thread (
     struct ggml_tensor *tensor
     ) 
 {
+
     enum ggml_type type = tensor->type;
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
+        //
+        // this tensor is duplicated in multiple operations so it is not safe for repacking
+        // 
+
+        if (ith == 0) {
+            mul_mat_repack_failed_count += 1;
+        }
+        return type;
+    }
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
                 (type == GGML_TYPE_Q2_K) ||
@@ -2126,6 +2138,17 @@ ggml_repack_tensor (
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
+        //
+        // this tensor is duplicated in multiple operations so it is not safe for repacking
+        // 
+
+        if (ith == 0) {
+            mul_mat_repack_failed_count += 1;
+        }
+        return type;
+    }
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
                 (type == GGML_TYPE_Q2_K) ||

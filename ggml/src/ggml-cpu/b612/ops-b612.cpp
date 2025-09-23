@@ -7364,6 +7364,9 @@ void ggml_compute_forward_get_rows(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+    //printf("%s: GET ROWS type for tensor [%p][%s] - [%d]\n", __func__ , src0, src0->name, src0->type);
+    //const ggml_tensor * src1 = dst->src[1];
+    //printf("%s:                          [%p][%s] - [%d]\n", __func__ , src1, src1->name, src1->type);
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
@@ -7407,7 +7410,7 @@ void ggml_compute_forward_get_rows(
             } break;
         default:
             {
-                printf("%s: Unknown type [%d]\n", __func__ , src0->type);
+                printf("%s: Unknown type for tensor [%s] - [%d]\n", __func__ , src0->name, src0->type);
                 GGML_ABORT("fatal error");
             }
     }

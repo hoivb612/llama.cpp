@@ -2174,6 +2174,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (flags & TENSOR_DUPLICATED) {
                 ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
                 if (t) {
+                    ggml_set_duplicated(t);
                     return t;
                 }
             }
@@ -2192,6 +2193,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_GRANITE_MOE:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    //printf("%s: model.tok_embd [%p]['%s'] - type [%d]\n",
+                    //    __func__, tok_embd, tok_embd->name, tok_embd->type);
 
                     // output
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -18737,6 +18740,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b);
+
+#ifdef GGML_B612
+    // auto *gf = llm->res->get_gf();
+    // ggml_graph_print(gf);
+    // ggml_graph_dump_dot_b612(gf, NULL, "ggml_new.dot");
+#endif
 
     return llm->res->get_gf();
 }

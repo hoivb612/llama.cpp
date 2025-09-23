@@ -7382,6 +7382,14 @@ void ggml_set_loss(struct ggml_tensor * tensor) {
     tensor->flags |= GGML_TENSOR_FLAG_LOSS;
 }
 
+#ifdef GGML_B612
+
+void ggml_set_duplicated(struct ggml_tensor * tensor) {
+    tensor->flags |= GGML_TENSOR_FLAG_DUP;
+}
+
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_quantize_init(enum ggml_type type) {

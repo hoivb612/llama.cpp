@@ -3899,6 +3899,17 @@ void ggml_compute_forward_mul_mat_xbox(
         // Refresh src0_type in case the type changed during repack.
         //
 
+#if 0
+        if (strcmp(src0->name, "token_embd.weight") == 0) {
+            printf("Switching type for src0 [%p]['%s'] - from [%d] to type [%d]\n"
+                   "                   src1 [%p]['%s'] - type [%d] \n"
+                   "                   dst  [%p]['%s'] - type [%d] \n",
+            src0, src0->name, src0_type, src0->type,
+            src1, src1->name, src1->type,
+            dst, dst->name, dst->type);
+        }
+#endif
+
         src0_type = src0->type;
     }
 
@@ -6210,6 +6221,25 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
+
+#ifdef GGML_B612
+/*
+Child-SP          RetAddr               Call Site
+00000079`386fcac8 00007ff6`4dc25678     llama_bench!ggml_graph_compute [D:\llama.cpp\b612.dc.080625\ggml\src\ggml-cpu\b612\ggml-cpu-b612.c @ 6218]
+00000079`386fcad0 00007ff6`4dca9983     llama_bench!ggml_backend_cpu_graph_compute+0x98 [D:\llama.cpp\b612.dc.080625\ggml\src\ggml-cpu\ggml-cpu.cpp @ 214]
+00000079`386fcb60 00007ff6`4ddb0253     llama_bench!ggml_backend_sched_compute_splits+0x1a3 [D:\llama.cpp\b612.dc.080625\ggml\src\ggml-backend.cpp @ 1397]
+00000079`386fcca0 00007ff6`4ddb1e20     llama_bench!llama_context::graph_compute+0xa3 [D:\llama.cpp\b612.dc.080625\src\llama-context.cpp @ 1460]
+00000079`386fccd0 00007ff6`4ddaeb57     llama_bench!llama_context::process_ubatch+0xe0 [D:\llama.cpp\b612.dc.080625\src\llama-context.cpp @ 766]
+00000079`386febe0 00007ff6`4ddb384b     llama_bench!llama_context::decode+0x407 [D:\llama.cpp\b612.dc.080625\src\llama-context.cpp @ 1085]
+00000079`386fede0 00007ff6`4dd224d0     llama_bench!llama_decode+0xb [D:\llama.cpp\b612.dc.080625\src\llama-context.cpp @ 2868]
+00000079`386fee10 00007ff6`4dd249e0     llama_bench!test_prompt+0x170 [D:\llama.cpp\b612.dc.080625\tools\llama-bench\llama-bench.cpp @ 1912]
+00000079`386fef10 00007ff6`4de445b4     llama_bench!main+0xa40 [D:\llama.cpp\b612.dc.080625\tools\llama-bench\llama-bench.cpp @ 2162]
+(Inline Function) --------`--------     llama_bench!invoke_main+0x22 [D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_common.inl @ 78]
+00000079`386ffc60 00007fff`57d4e8d7     llama_bench!__scrt_common_main_seh+0x10c [D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_common.inl @ 288]
+00000079`386ffca0 00007fff`59168d9c     KERNEL32!BaseThreadInitThunk+0x17
+00000079`386ffcd0 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+*/
+#endif
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
