@@ -2494,7 +2494,8 @@ bool ggml_cpu_tensor_repack_mode_ggml() {
 }
 
 bool ggml_cpu_tensor_repack_mode_xbox() {
-    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX);
+    return((g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX) ||
+           (g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD));
 }
 
 bool ggml_cpu_tensor_repack_mode_xbox_single_thread() {

@@ -1984,6 +1984,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // one ggml context per buffer type
     int max_n_tensors = ml.n_tensors;
     max_n_tensors += 1;         // duplicated output tensor
+
+#ifdef GGML_B612
+    if (ggml_cpu_tensor_repack_mode_xbox()) {
+        //
+        // Only Xbox style repack mode changes the tensor type directly
+        // in the tensor object so a new tensor object has to be 
+        // created. This scenario only happens for token.embd weight 
+        // which can be used for both input and output. The context 
+        // size if determined early so there is no easy way to know 
+        // exactly that we need this extra tensor.
+        //
+        max_n_tensors += 1;
+    }
+#endif
+
     max_n_tensors += n_layer*2; // duplicated rope freq tensors
     const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
@@ -2174,7 +2189,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (flags & TENSOR_DUPLICATED) {
                 ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
                 if (t) {
-                    ggml_set_duplicated(t);
+#ifdef GGML_B612
+                    //
+                    // token.embd can be used for both input and output.
+                    // Set the flag to indicate this tensor is a reused
+                    // one for repacking to not stomp over the tensor data.
+                    // At the same time create a new tensor object so it
+                    // does not cause problem when repack code modifies
+                    // the tensor type.
+                    //
+                    if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && flags & TENSOR_DUPLICATED) {
+                        if (ggml_cpu_tensor_repack_mode_xbox()) {
+                            t = ml.create_tensor(ctx, tn, ne, flags);
+                            ggml_set_duplicated(t);
+                        }
+                    }
+#endif
                     return t;
                 }
             }

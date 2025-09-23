@@ -2026,6 +2026,7 @@ ggml_repack_tensor_single_thread (
     const int ith = params->ith;
     const int nth = params->nth;
 
+#if 0
     if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
         //
         // this tensor is duplicated in multiple operations so it is not safe for repacking
@@ -2036,6 +2037,7 @@ ggml_repack_tensor_single_thread (
         }
         return type;
     }
+#endif
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
                 (type == GGML_TYPE_Q2_K) ||
@@ -2053,6 +2055,18 @@ ggml_repack_tensor_single_thread (
             mul_mat_repack_failed_count += 1;
         }
         return type;
+    }
+
+    if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
+        //
+        // Duplication is active meaning there is a copy of the 
+        // tensor data being used by some other OPs. Allocate
+        // a new buffer for this specific instance for repacking so 
+        // the original copy remains intact for the other OPs.
+        //
+        char *duplicate_data = (char *)malloc(ggml_nbytes(tensor));
+        memcpy(duplicate_data, tensor->data, ggml_nbytes(tensor));
+        tensor->data = duplicate_data;
     }
 
     //
@@ -2139,6 +2153,7 @@ ggml_repack_tensor (
     const int ith = params->ith;
     const int nth = params->nth;
 
+#if 0 // do not give up - try later on below
     if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
         //
         // this tensor is duplicated in multiple operations so it is not safe for repacking
@@ -2149,6 +2164,7 @@ ggml_repack_tensor (
         }
         return type;
     }
+#endif
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
                 (type == GGML_TYPE_Q2_K) ||
@@ -2167,6 +2183,32 @@ ggml_repack_tensor (
         }
         return;
     }
+
+    if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
+        //
+        // Duplication is active meaning there is a copy of the 
+        // tensor data being used by some other OPs. Allocate
+        // a new buffer for this specific instance for repacking so 
+        // the original copy remains intact for the other OPs.
+        //
+        if (!ith) {
+            char *duplicate_data = (char *)malloc(ggml_nbytes(tensor));
+            memcpy(duplicate_data, tensor->data, ggml_nbytes(tensor));
+
+            //
+            // wait for all threads to arrive before we change tensor->data
+            //
+            ggml_wait_to_finalize_xbox(params);
+            tensor->data = duplicate_data;
+        }
+
+        //
+        // wait for !ith to be done and tensor->data to be updated
+        //
+        ggml_wait_for_done_xbox(params);
+    }
+
+
     //
     // Make transformed quant based on current type.
     //
