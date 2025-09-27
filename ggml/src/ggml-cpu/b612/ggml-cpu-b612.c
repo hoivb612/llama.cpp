@@ -2231,6 +2231,13 @@ uint64_t _256_madd_count = 0;
 uint64_t _512_madd_count = 0;
 
 //
+// Mul_mat repack early time stats.
+//
+int mul_mat_repack_callgraph_count = 0;
+int64_t mul_mat_repack_early_time_us = 0;
+int mul_mat_repack_early_count = 0;
+
+//
 // Mul_mat repack time statistics.
 //
 
@@ -2419,19 +2426,27 @@ void ggml_cpu_print_tensor_op_perf() {
     // Mul_mat repack statistics.
     //
 
-    printf("total number of mul_mat repack conversions %d\n", mul_mat_repack_count);
-    printf("total number of FAILED mul_mat repack conversions %d\n", mul_mat_repack_failed_count);
-    if (mul_mat_repack_count) {
+    if (mul_mat_repack_early_count != 0) {
+        printf("total number of callgraph repack %d\n", mul_mat_repack_callgraph_count);
+        printf("total number of mul_mat repack early conversions %d\n", mul_mat_repack_early_count);
+        printf("total elapsed repack early conversion time %5.2fsec\n",
+            (float)mul_mat_repack_early_time_us / (1000. * 1000.));    
+        printf("average conversion time per repack %5.2fus\n",
+            (float)mul_mat_repack_early_time_us / (float)mul_mat_repack_early_count);
+        printf("total number of mul_mat repack conversions at runtime >> %d <<\n", mul_mat_repack_count);
+        printf("Total FAILED repack count %d\n\n", mul_mat_repack_failed_count);
+    }
+
+    if (mul_mat_repack_count != 0) {
+        printf("total number of mul_mat repack conversions %d\n", mul_mat_repack_count);
         printf("total elapsed repack conversion time %5.2fsec\n",
                (float)mul_mat_repack_time_us / (1000. * 1000.));
     
         printf("average repack conversion time %5.2fus\n",
                (float)mul_mat_repack_time_us / (float)mul_mat_repack_count);
 
-        printf("total shared repack conversions %d\n\n", mul_mat_repack_shared);
-
-    } else {
-        printf("\n");
+        printf("total shared repack conversions %d\n", mul_mat_repack_shared);
+        printf("total number of FAILED mul_mat repack conversions %d\n\n", mul_mat_repack_failed_count);
     }
 
     //
@@ -3855,63 +3870,67 @@ void ggml_compute_forward_mul_mat_xbox(
         
         src0_type = src0->type;
 
-    } else if ((src1_type == GGML_TYPE_F32) &&
-               ((src0_type == GGML_TYPE_Q4_0) ||
-                (src0_type == GGML_TYPE_Q8_0) || 
-                (src0_type == GGML_TYPE_Q2_K) || 
-                (src0_type == GGML_TYPE_Q3_K) ||
-                (src0_type == GGML_TYPE_Q4_K) ||
-                (src0_type == GGML_TYPE_Q6_K))) {
+    } else if (ggml_cpu_tensor_repack_mode_xbox()) {
+    
+        if ((src1_type == GGML_TYPE_F32) &&
+            ((src0_type == GGML_TYPE_Q4_0) ||
+             (src0_type == GGML_TYPE_Q8_0) || 
+             (src0_type == GGML_TYPE_Q2_K) || 
+             (src0_type == GGML_TYPE_Q3_K) ||
+             (src0_type == GGML_TYPE_Q4_K) ||
+             (src0_type == GGML_TYPE_Q6_K))) {
 
-        GGML_ASSERT(ggml_cpu_tensor_repack_mode_xbox());
+            //
+            // Attempt to repack tensor.
+            //
+            // N.B. If the tensor is repacked, then the tensor type is changed to
+            //      the new repack type.
+            //
 
-        //
-        // Attempt to repack tensor.
-        //
-        // N.B. If the tensor is repacked, then the tensor type is changed to
-        //      the new repack type.
-        //
-
-        int64_t repack_t0 = 0;
-        if (!ith) {
-            repack_t0 = ggml_time_us();
-        }
-
-        ggml_repack_tensor(params, src0);
-
-        if (!ith) {
-            if (src0_type != src0->type) {
-                mul_mat_repack_count += 1;
-                mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
-                mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
+            int64_t repack_t0 = 0;
+            if (!ith) {
+                repack_t0 = ggml_time_us();
             }
 
-        } else {
-            if (src0_type != src0->type) {
-                // 
-                // this thread does participate in repacking but not the 
-                // main driver thread (ith == 0)
-                // 
-                mul_mat_repack_shared += 1;
+            ggml_repack_tensor(params, src0);
+
+            if (!ith) {
+                if (src0_type != src0->type) {
+                    mul_mat_repack_count += 1;
+                    mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
+                    mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
+                }
+
+            } else {
+                if (src0_type != src0->type) {
+                    // 
+                    // this thread does participate in repacking but not the 
+                    // main driver thread (ith == 0)
+                    // 
+                    mul_mat_repack_shared += 1;
+                }
             }
+
+            //
+            // Refresh src0_type in case the type changed during repack.
+            //
+
+#if 0   
+            if (strcmp(src0->name, "token_embd.weight") == 0) {
+                printf("Switching type for src0 [%p]['%s'] - from [%d] to type [%d]\n"
+                       "                   src1 [%p]['%s'] - type [%d] \n"
+                       "                   dst  [%p]['%s'] - type [%d] \n",
+                src0, src0->name, src0_type, src0->type,
+                src1, src1->name, src1->type,
+                dst, dst->name, dst->type);
+            }
+#endif  
+
+            src0_type = src0->type;
         }
 
-        //
-        // Refresh src0_type in case the type changed during repack.
-        //
-
-#if 0
-        if (strcmp(src0->name, "token_embd.weight") == 0) {
-            printf("Switching type for src0 [%p]['%s'] - from [%d] to type [%d]\n"
-                   "                   src1 [%p]['%s'] - type [%d] \n"
-                   "                   dst  [%p]['%s'] - type [%d] \n",
-            src0, src0->name, src0_type, src0->type,
-            src1, src1->name, src1->type,
-            dst, dst->name, dst->type);
-        }
-#endif
-
-        src0_type = src0->type;
+    } else {
+        GGML_ASSERT(ggml_cpu_tensor_mulmat_mode_xbox());
     }
 
     // repacking if any is done at this point with new src0_type

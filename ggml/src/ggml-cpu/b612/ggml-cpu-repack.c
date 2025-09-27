@@ -2023,7 +2023,10 @@ ggml_repack_tensor_single_thread (
 
     enum ggml_type type = tensor->type;
 
-    const int ith = params->ith;
+    int ith = 0;
+    if (params != NULL) {
+        ith = params->ith;
+    }
 
     GGML_ASSERT((type == GGML_TYPE_Q4_0) ||
                 (type == GGML_TYPE_Q2_K) ||

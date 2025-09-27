@@ -18772,9 +18772,13 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b);
 
 #ifdef GGML_B612
-    // auto *gf = llm->res->get_gf();
+    auto *gf = llm->res->get_gf();
     // ggml_graph_print(gf);
     // ggml_graph_dump_dot_b612(gf, NULL, "ggml_new.dot");
+
+    if (ggml_cpu_tensor_repack_mode_xbox()) {
+        ggml_repack_tensor_callgraph(gf);
+    }
 #endif
 
     return llm->res->get_gf();
