@@ -2053,9 +2053,14 @@ ggml_repack_tensor_single_thread (
         // a new buffer for this specific instance for repacking so 
         // the original copy remains intact for the other OPs.
         //
-        char *duplicate_data = (char *)malloc(ggml_nbytes(tensor));
-        memcpy(duplicate_data, tensor->data, ggml_nbytes(tensor));
+        size_t tensor_size = ggml_nbytes(tensor);
+        char *duplicate_data = (char *)malloc(tensor_size);
+        memcpy(duplicate_data, tensor->data, tensor_size);
+
         tensor->data = duplicate_data;
+
+        mul_mat_repack_duplicate_tensor_count += 1;
+        mul_mat_repack_duplicate_tensor_total_size += tensor_size;
     }
 
     //
@@ -2168,14 +2173,18 @@ ggml_repack_tensor (
         // the original copy remains intact for the other OPs.
         //
         if (!ith) {
-            char *duplicate_data = (char *)malloc(ggml_nbytes(tensor));
-            memcpy(duplicate_data, tensor->data, ggml_nbytes(tensor));
+            size_t tensor_size = ggml_nbytes(tensor);
+            char *duplicate_data = (char *)malloc(tensor_size);
+            memcpy(duplicate_data, tensor->data, tensor_size);
 
             //
             // wait for all threads to arrive before we change tensor->data
             //
             ggml_wait_to_finalize_xbox(params);
             tensor->data = duplicate_data;
+
+            mul_mat_repack_duplicate_tensor_count += 1;
+            mul_mat_repack_duplicate_tensor_total_size += tensor_size;
         }
 
         //

@@ -162,6 +162,8 @@ quantize_row_q8_0_x8 (
 extern uint64_t _256_madd_count;
 extern uint64_t _512_madd_count;
 extern int mul_mat_repack_failed_count;
+extern int mul_mat_repack_duplicate_tensor_count;
+extern int64_t mul_mat_repack_duplicate_tensor_total_size;
 
 #ifdef __cplusplus
 }

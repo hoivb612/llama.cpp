@@ -2245,6 +2245,8 @@ int64_t mul_mat_repack_time_us = 0;
 int64_t mul_mat_repack_time_current_op_us = 0;
 int mul_mat_repack_count = 0;
 int mul_mat_repack_shared = 0;
+int mul_mat_repack_duplicate_tensor_count;
+int64_t mul_mat_repack_duplicate_tensor_total_size;
 int mul_mat_repack_failed_count = 0;
 
 #define GGML_TENSOR_NODE_COUNT 4096
@@ -2447,6 +2449,13 @@ void ggml_cpu_print_tensor_op_perf() {
 
         printf("total shared repack conversions %d\n", mul_mat_repack_shared);
         printf("total number of FAILED mul_mat repack conversions %d\n\n", mul_mat_repack_failed_count);
+    }
+
+    if (mul_mat_repack_duplicate_tensor_count != 0) {
+        printf("total number of mul_mat repack tensor with duplicated memory buffers %d\n",
+            mul_mat_repack_duplicate_tensor_count);
+        printf("total memory allocated for duplicated mul_mat repack tensor %5.2f MB\n\n",
+            (float) mul_mat_repack_duplicate_tensor_total_size / (1024 * 1024));
     }
 
     //
