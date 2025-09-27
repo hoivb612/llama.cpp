@@ -49,7 +49,7 @@ struct model_params {
     uint64_t total_tokens_gen_time     = 0; // Total accumulated tg time from llm_initialize() -> llm_terminate()
     int verbose                        = 0;
     int streaming_reply                = 0; // streaming mode instead of full reply at once
-    int force_cpu_mode                 = 0; // default is to use GPU if there is one present
+    int force_cpu_mode                 = 0; // true to force CPU mode even when GPU is available
 
     std::string custom_p_file          = "custom_prompts.txt";  // custom prompts input file
     std::string custom_template_prompt = "";
@@ -62,7 +62,6 @@ struct model_params {
     bool parse_special                 = false; // for tokenizer: parse recognized special tokens in text
     int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
     bool process_affinity              = false; // true if set process affinity is enabled
-    bool gpu_offload                   = false; // true of GPU offload is requested (valid if a GPU device is available)
 };
 
 LLM_INFER_API bool llm_initialize(model_params& params);

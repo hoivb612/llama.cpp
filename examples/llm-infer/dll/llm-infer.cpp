@@ -148,22 +148,44 @@ bool llm_initialize(
     llama_log_set(default_log_callback, &(params.verbose));
 
     // initialize the model
-    llama_model_params common_model_params = llama_model_default_params();
+    llama_model_params model_params = llama_model_default_params();
 
 #ifdef GGML_USE_CUDA
-    #pragma message("++++++++ Support both CUDA and CPU for LLM inference")
+    #pragma message("++++++++ Support both CUDA and CPU for inference")
     if ((ggml_backend_cuda_get_device_count() != 0) && (params.force_cpu_mode == 0)) {
-        // if there is a GPU then make use of it
-        common_model_params.n_gpu_layers = 999;
+        model_params.n_gpu_layers = 999;
+        if (params.verbose == 2) {
+            printf("%s: Running in full GPU-offload mode\n", __func__);
+        }
     } else {
-        // either there is no GPU or no CPU forcing function
-        common_model_params.n_gpu_layers = 0;
+        // either there is no GPU or CPU forcing function
+        model_params.n_gpu_layers = 0;
+        if (params.verbose == 2) {
+            printf("%s: Running in full CPU mode\n", __func__);
+        }
+    }
+#elif defined(GGML_USE_VULKAN)
+    #pragma message("++++++++ Support both Vulkan and CPU for inference")
+    if (params.force_cpu_mode != 0) {
+        // CPU forcing mode
+        model_params.n_gpu_layers = 0;
+        if (params.verbose == 2) {
+            printf("%s: Running in full CPU mode\n", __func__);
+        }
+    } else {
+        // GPU offload is default on a Vulkan build 
+        model_params.n_gpu_layers = 999;
+        if (params.verbose == 2) {
+            printf("%s: Running in full GPU-offload mode\n", __func__);
+        }
     }
 #else
-    if (params.gpu_offload) {
-        // try to do GPU offload if requested (Vulkan build)
-        common_model_params.n_gpu_layers = 999;
+    #pragma message("++++++++ Support CPU-only for inference")
+    // CPU is the default (there is no CUDA nor Vulkan devices)
+    if (params.verbose == 2) {
+        printf("%s: Running in full CPU mode\n", __func__);
     }
+    model_params.n_gpu_layers = 0;
 
     switch (params.tensor_repack_mode) {
         case 1:
@@ -183,7 +205,7 @@ bool llm_initialize(
     }
 #endif // GGML_USE_CUDA
 
-    llm_model = llama_model_load_from_file(params.model_name.c_str(), common_model_params);
+    llm_model = llama_model_load_from_file(params.model_name.c_str(), model_params);
     if (llm_model == NULL) {
         printf("%s: error: unable to load model\n" , __func__);
         return false;
@@ -384,7 +406,7 @@ bool llm_inference(
 
     int64_t t2_start = ggml_time_us();
     float t_prompt_eval_ms = (t2_start - t1_start) / 1000.0f;
-    if (params.verbose != 0) {
+    if (params.verbose == 2) {
         printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n", 
             t_prompt_eval_ms, 
             embd.size(), 
@@ -464,7 +486,7 @@ bool llm_inference(
 
     int64_t t_us = (ggml_time_us() - t2_start);
 
-    if (params.verbose != 0) {
+    if (params.verbose == 2) {
         printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
             t_us / 1000.0f,
             n_tokens_generated, 
@@ -540,18 +562,45 @@ bool embed_initialize(
     llama_log_set(default_log_callback, &(params.verbose));
 
     // initialize the model
-   llama_model_params llama_model_params = llama_model_default_params();
+    llama_model_params model_params = llama_model_default_params();
 
 #ifdef GGML_USE_CUDA
-    #pragma message("++++++++ Support both CUDA and CPU for embeddings")
+    #pragma message("++++++++ Support both CUDA and CPU for inference")
     if ((ggml_backend_cuda_get_device_count() != 0) && (params.force_cpu_mode == 0)) {
-        // if there is a GPU then make use of it
-        llama_model_params.n_gpu_layers = 999;
+        model_params.n_gpu_layers = 999;
+        if (params.verbose == 2) {
+            printf("%s: Running in full GPU-offload mode\n", __func__);
+        }
     } else {
-        // either there is no GPU or no CPU forcing function
-        llama_model_params.n_gpu_layers = 0;
+        // either there is no GPU or CPU forcing function
+        model_params.n_gpu_layers = 0;
+        if (params.verbose == 2) {
+            printf("%s: Running in full CPU mode\n", __func__);
+        }
+    }
+#elif defined(GGML_USE_VULKAN)
+    #pragma message("++++++++ Support both Vulkan and CPU for inference")
+    if (params.force_cpu_mode != 0) {
+        // CPU forcing mode
+        model_params.n_gpu_layers = 0;
+        if (params.verbose == 2) {
+            printf("%s: Running in full CPU mode\n", __func__);
+        }
+    } else {
+        // GPU offload is default on a Vulkan build 
+        model_params.n_gpu_layers = 999;
+        if (params.verbose == 2) {
+            printf("%s: Running in full GPU-offload mode\n", __func__);
+        }
     }
 #else
+    #pragma message("++++++++ Support CPU-only for inference")
+    // CPU is the default (there is no CUDA nor Vulkan devices)
+    if (params.verbose == 2) {
+        printf("%s: Running in full CPU mode\n", __func__);
+    }
+    model_params.n_gpu_layers = 0;
+
     switch (params.tensor_repack_mode) {
         case 1:
             llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
@@ -570,11 +619,11 @@ bool embed_initialize(
     }
 #endif // GGML_USE_CUDA
 
-   embed_model = llama_model_load_from_file(params.model_name.c_str(), llama_model_params);
-   if (embed_model == NULL) {
+    embed_model = llama_model_load_from_file(params.model_name.c_str(), model_params);
+    if (embed_model == NULL) {
        printf("%s: error: unable to load model\n" , __func__);
        return false;
-   }
+    }
 
    // initialize the context
    llama_context_params embed_ctx_params = llama_context_default_params();

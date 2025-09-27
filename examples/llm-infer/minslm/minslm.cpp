@@ -291,8 +291,9 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[4], "parse-special")) {
             params.parse_special = true;
 
-        } else if (!strcmp(argv[4], "gpu")) {
-            params.gpu_offload = true;
+        } else if (!strcmp(argv[4], "cpu")) {
+            // only meaningful for GGML_CUDA or GGML_VULKAN builds
+            params.force_cpu_mode = true;
         }
 
         argv += 1;

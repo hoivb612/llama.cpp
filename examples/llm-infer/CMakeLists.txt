@@ -6,6 +6,15 @@ if(MSVC)
     add_definitions(-D_CRT_NONSTDC_NO_DEPRECATE)
 endif()
 
+if(GGML_CUDA)
+    add_compile_definitions(GGML_USE_CUDA)
+endif()
+
+if(GGML_VULKAN)
+    add_compile_definitions(GGML_USE_VULKAN)
+endif()
+
+
 set(TARGET slm-infer)
 
 add_library(
