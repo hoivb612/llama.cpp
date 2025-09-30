@@ -2428,27 +2428,28 @@ void ggml_cpu_print_tensor_op_perf() {
     // Mul_mat repack statistics.
     //
 
+    printf("total number of mul_mat repack (pre-compute-forward) conversions %d\n", mul_mat_repack_early_count);
     if (mul_mat_repack_early_count != 0) {
         printf("total number of callgraph repack %d\n", mul_mat_repack_callgraph_count);
-        printf("total number of mul_mat repack early conversions %d\n", mul_mat_repack_early_count);
-        printf("total elapsed repack early conversion time %5.2fsec\n",
+        printf("total elapsed pre-compute-forward repack conversion time %5.2fsec\n",
             (float)mul_mat_repack_early_time_us / (1000. * 1000.));    
         printf("average conversion time per repack %5.2fus\n",
             (float)mul_mat_repack_early_time_us / (float)mul_mat_repack_early_count);
-        printf("total number of mul_mat repack conversions at runtime >> %d <<\n", mul_mat_repack_count);
         printf("Total FAILED repack count %d\n\n", mul_mat_repack_failed_count);
+    } else {
+        printf("\n");
     }
 
+    printf("total number of mul_mat repack (inline-compute-forward) conversions %d\n", mul_mat_repack_count);
     if (mul_mat_repack_count != 0) {
-        printf("total number of mul_mat repack conversions %d\n", mul_mat_repack_count);
         printf("total elapsed repack conversion time %5.2fsec\n",
                (float)mul_mat_repack_time_us / (1000. * 1000.));
-    
-        printf("average repack conversion time %5.2fus\n",
+        printf("average repack conversion time per repack %5.2fus\n",
                (float)mul_mat_repack_time_us / (float)mul_mat_repack_count);
-
         printf("total shared repack conversions %d\n", mul_mat_repack_shared);
         printf("total number of FAILED mul_mat repack conversions %d\n\n", mul_mat_repack_failed_count);
+    } else {
+        printf("\n");
     }
 
     if (mul_mat_repack_duplicate_tensor_count != 0) {
