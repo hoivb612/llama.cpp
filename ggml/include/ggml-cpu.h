@@ -142,6 +142,7 @@ extern "C" {
     GGML_BACKEND_API bool ggml_cpu_allow_tensor_repack();
     GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_ggml();
     GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox_callgraph();
     GGML_BACKEND_API void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t);
 #endif // GGML_XBOX_PERF
 
@@ -154,6 +155,8 @@ extern "C" {
 #endif
 
     void xb_set_cpu_cache_size();
+
+    extern ggml_tensor_repack_mode_t g_tensor_repack_mode;
 
 #endif // GGML_B612
 

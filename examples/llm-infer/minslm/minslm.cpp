@@ -276,11 +276,14 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[4], "repack-xbox")) {
             params.tensor_repack_mode = 2;
 
-        } else if (!strcmp(argv[4], "repack-xbox-st")) {
+        } else if (!strcmp(argv[4], "repack-xbcg")) {
             params.tensor_repack_mode = 3;
 
-        } else if (!strcmp(argv[4], "mulmat-xbox")) {
+        } else if (!strcmp(argv[4], "repack-xbox-st")) {
             params.tensor_repack_mode = 4;
+
+        } else if (!strcmp(argv[4], "mulmat-xbox")) {
+            params.tensor_repack_mode = 5;
 
         } else if (!strcmp(argv[4], "stream")) {
             params.streaming_reply = true;

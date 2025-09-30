@@ -2519,8 +2519,11 @@ bool ggml_cpu_tensor_repack_mode_ggml() {
 }
 
 bool ggml_cpu_tensor_repack_mode_xbox() {
-    return((g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX) ||
-           (g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD));
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBOX);
+}
+
+bool ggml_cpu_tensor_repack_mode_xbox_callgraph() {
+    return(g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_XBCG);
 }
 
 bool ggml_cpu_tensor_repack_mode_xbox_single_thread() {
@@ -3940,7 +3943,8 @@ void ggml_compute_forward_mul_mat_xbox(
         }
 
     } else {
-        GGML_ASSERT(ggml_cpu_tensor_mulmat_mode_xbox());
+        GGML_ASSERT(ggml_cpu_tensor_mulmat_mode_xbox() ||
+                    ggml_cpu_tensor_repack_mode_xbox_callgraph());
     }
 
     // repacking if any is done at this point with new src0_type
@@ -4873,6 +4877,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 if (ggml_cpu_tensor_repack_mode_xbox() || 
+                    ggml_cpu_tensor_repack_mode_xbox_callgraph() ||
                     ggml_cpu_tensor_repack_mode_xbox_single_thread() ||
                     ggml_cpu_tensor_mulmat_mode_xbox()) {
                     ggml_compute_forward_mul_mat_xbox(params, tensor);

@@ -2503,9 +2503,10 @@ typedef enum {
     GGML_TENSOR_REPACK_MODE_NONE               = 0,
     GGML_TENSOR_REPACK_MODE_GGML               = 1, // forward_mul_mat()
     GGML_TENSOR_REPACK_MODE_XBOX               = 2, // forward_mul_mat_xbox() with repack
-    GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 3, // forward_mul_mat_xbox() with single-thread repack
-    GGML_TENSOR_MULMAT_MODE_XBOX               = 4, // forward_mul_mat_xbox() no repack
-    GGML_TENSOR_REPACK_MODE_MAX                = 5
+    GGML_TENSOR_REPACK_MODE_XBCG               = 3, // repack callgraph pre-compute phase
+    GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 4, // forward_mul_mat_xbox() with single-thread repack
+    GGML_TENSOR_MULMAT_MODE_XBOX               = 5, // forward_mul_mat_xbox() no repack
+    GGML_TENSOR_REPACK_MODE_MAX                = 6
 } ggml_tensor_repack_mode_t;
 
 extern int mul_mat_repack_callgraph_count;

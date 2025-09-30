@@ -415,7 +415,7 @@ static void print_usage(int /* argc */, char ** argv) {
            output_format_str(cmd_params_defaults.output_format_stderr));
 #if defined(GGML_B612)
     printf("  -paffin, --process-affinity               (default: %s)\n", cmd_params_defaults.process_affinity ? "1" : "0");
-    printf("  -repack <0|1|2>                           (default: %d)\n", cmd_params_defaults.tensor_repack_mode);
+    printf("  -repack <0|1|2|3>                         (default: %d)\n", cmd_params_defaults.tensor_repack_mode);
     printf("  -omp, --openmp                            (default: %s)\n", cmd_params_defaults.use_openmp ? "1" : "0");
     printf("  -warm, --warmup-run                       (default: %s)\n", cmd_params_defaults.warmup_run ? "1" : "0");
 #endif
@@ -868,6 +868,16 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.tensor_repack_mode = std::stoi(argv[i]);
+            } else if (arg == "repack-ggml") {
+                params.tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
+            } else if (arg == "repack-xbox") {
+                params.tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX;
+            } else if (arg == "repack-xbcg") {
+                params.tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBCG;
+            } else if (arg == "repack-xbox-st") {
+                params.tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD;
+            } else if (arg == "mulmat-xbox") {
+                params.tensor_repack_mode = GGML_TENSOR_MULMAT_MODE_XBOX;
             } else if (arg == "-omp" || arg == "--openmp") {
                 params.use_openmp = true;
             } else if (arg == "-tp" || arg == "--threads-prompt") {
@@ -2007,7 +2017,11 @@ int main(int argc, char ** argv) {
 
 #ifdef GGML_B612
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
+    printf("Set repacking mode to %d\n", tensor_repack_mode);
     switch (params.tensor_repack_mode) {
+        case 0:
+            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
+            break;
         case 1: 
             tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             break;
@@ -2015,9 +2029,12 @@ int main(int argc, char ** argv) {
             tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX;
             break;
         case 3: 
+            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBCG;
+            break;
+        case 4:
             tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD;
             break;
-        case 4: 
+        case 5:
             tensor_repack_mode = GGML_TENSOR_MULMAT_MODE_XBOX;
             break;
         default:

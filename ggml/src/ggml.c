@@ -7392,6 +7392,10 @@ void ggml_set_duplicated(struct ggml_tensor * tensor) {
 
 void ggml_repack_tensor_callgraph(struct ggml_cgraph *cgraph) {
 
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
+        return;
+    }
+
     struct ggml_tensor * const * tensors = cgraph->nodes;
     if (cgraph->n_nodes != 0) {
         mul_mat_repack_callgraph_count++;

@@ -18776,7 +18776,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // ggml_graph_print(gf);
     // ggml_graph_dump_dot_b612(gf, NULL, "ggml_new.dot");
 
-    if (ggml_cpu_tensor_repack_mode_xbox()) {
+    if (ggml_cpu_tensor_repack_mode_xbox_callgraph()) {
         ggml_repack_tensor_callgraph(gf);
     }
 #endif
