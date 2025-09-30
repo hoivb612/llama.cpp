@@ -2509,11 +2509,11 @@ typedef enum {
     GGML_TENSOR_REPACK_MODE_MAX                = 6
 } ggml_tensor_repack_mode_t;
 
-extern int mul_mat_repack_callgraph_count;
-extern int64_t mul_mat_repack_early_time_us;
-extern int mul_mat_repack_early_count;
-extern int mul_mat_repack_early_failed_count;
-extern int mul_mat_repack_failed_count;
+//extern int mul_mat_repack_callgraph_count;
+//extern int64_t mul_mat_repack_early_time_us;
+//extern int mul_mat_repack_early_count;
+//extern int mul_mat_repack_early_failed_count;
+//extern int mul_mat_repack_failed_count;
 
 void ggml_wait_for_done_xbox(const struct ggml_compute_params * params);
 void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params);

@@ -369,9 +369,19 @@ void llama_print_tensor_op_perf() {
 void llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         auto * reg = ggml_backend_reg_get(i);
-        auto * ggml_set_tensor_repack_fn = (void (*)(ggml_tensor_repack_mode_t)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_tensor_repack_mode");
-        if (ggml_set_tensor_repack_fn != nullptr) {
-            ggml_set_tensor_repack_fn(repack_mode);
+        auto * ggml_set_tensor_repack_mode_fn = (void (*)(ggml_tensor_repack_mode_t)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_tensor_repack_mode");
+        if (ggml_set_tensor_repack_mode_fn != nullptr) {
+            ggml_set_tensor_repack_mode_fn(repack_mode);
+        }
+    }
+}
+
+void llama_repack_tensor_callgraph(struct ggml_cgraph *cgraph) {
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        auto * reg = ggml_backend_reg_get(i);
+        auto * ggml_repack_tensor_callgraph_fn = (void (*)(struct ggml_cgraph *)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_repack_tensor_callgraph");
+        if (ggml_repack_tensor_callgraph_fn != nullptr) {
+            ggml_repack_tensor_callgraph_fn(cgraph);
         }
     }
 }

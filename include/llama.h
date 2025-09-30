@@ -1421,6 +1421,7 @@ extern "C" {
 
     LLAMA_API void                           llama_print_tensor_op_perf();
     LLAMA_API void                           llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t mode);
+    LLAMA_API void                           llama_repack_tensor_callgraph(struct ggml_cgraph *cgraph);
     LLAMA_API void                           llama_select_OpenMP();
 
     //

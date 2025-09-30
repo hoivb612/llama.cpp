@@ -2017,7 +2017,6 @@ int main(int argc, char ** argv) {
 
 #ifdef GGML_B612
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
-    printf("Set repacking mode to %d\n", tensor_repack_mode);
     switch (params.tensor_repack_mode) {
         case 0:
             tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
@@ -2040,6 +2039,7 @@ int main(int argc, char ** argv) {
         default:
             break;
     }
+    printf("Set repacking mode to %d\n", tensor_repack_mode);
     llama_set_tensor_repack_mode(tensor_repack_mode);
 
     if (params.use_openmp) {

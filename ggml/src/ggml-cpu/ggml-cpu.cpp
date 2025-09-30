@@ -910,6 +910,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_set_tensor_repack_mode") == 0) {
         return (void *)ggml_cpu_set_tensor_repack_mode;
     }
+
+    if (strcmp(name, "ggml_cpu_repack_tensor_callgraph") == 0) {
+        return (void *)ggml_cpu_repack_tensor_callgraph;
+    }
 #endif
 
 #if defined(GGML_B612)
