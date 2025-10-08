@@ -139,7 +139,9 @@ void llm_print_tensor_op_perf_stats() {
 LLM_INFER_API
 bool llm_initialize(
     model_params & params) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     // init Llama backend
     llama_backend_init();
@@ -297,7 +299,9 @@ bool llm_initialize(
 LLM_INFER_API
 bool llm_inference(
     model_params& params) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     std::vector<llama_token> embd_inp;
     int n_past = 0;
@@ -507,7 +511,9 @@ bool llm_inference(
 
 LLM_INFER_API 
 void llm_terminate(const model_params& params) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     int verbose = GGML_LOG_LEVEL_INFO;
     llama_log_set(default_log_callback, &verbose);
@@ -558,7 +564,9 @@ static void batch_decode(
 LLM_INFER_API
 bool embed_initialize(
     model_params & params) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     llama_backend_init();
 
@@ -676,7 +684,9 @@ LLM_INFER_API
 bool embed_encode_batch(
     const model_params & params, 
     std::vector<chunk> & chunks) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     const size_t n_chunks = chunks.size();
     struct llama_batch batch = llama_batch_init(params.n_batch, 0, 1);
@@ -750,7 +760,9 @@ LLM_INFER_API
 bool embed_encode_batch_single(
     const model_params & params, 
     std::vector<chunk> & chunks) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     const size_t n_chunks = chunks.size();
     struct llama_batch batch = llama_batch_init(params.n_batch, 0, 1);
@@ -797,7 +809,9 @@ bool embed_encode_single(
     const model_params & params,
     const std::string& query,
     std::vector<float> & embeddings) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     const int n_embd = llama_model_n_embd(embed_model);
     const llama_vocab * vocab = llama_model_get_vocab(llm_model);
@@ -835,7 +849,9 @@ bool embed_encode_single(
 
 LLM_INFER_API
 void embed_terminate() {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
 
     llama_free(embed_ctx);
     llama_model_free(embed_model);

@@ -53,6 +53,9 @@ target_link_libraries(${TARGET} PRIVATE common llama llm-infer ${CMAKE_THREAD_LI
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
+if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+# Disable ragBuilder-dll with Clang - embed_initialize() dup symbol
+else()
 set(TARGET ragBuilder-dll)
 add_executable(${TARGET} ragbuild/RAGbuilder/llm.cpp ragbuild/RAGbuilder/RAGbuilder.cpp ragbuild/RAGbuilder/RAGHelper.cpp ragbuild/RAGbuilder/Debug.cpp)
 install(TARGETS ${TARGET} RUNTIME)
@@ -65,6 +68,7 @@ target_include_directories(${TARGET} PUBLIC ../../common)
 target_link_libraries(${TARGET} PRIVATE common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+endif()
 
 set(TARGET server-dll)
 add_executable(${TARGET} server/server.cpp)

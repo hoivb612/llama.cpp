@@ -446,7 +446,7 @@ void ggml_fp32_to_fp16_row_org(const float * x, ggml_fp16_t * y, int64_t n) {
 void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n) {
 #endif // GGML_B612
     int64_t i = 0;
-#if defined(__F16C__)
+#if defined(__F16C__) && !defined(__clang__)
     //if (ggml_cpu_has_f16c()) {
         for (; i + 7 < n; i += 8) {
             __m256 x_vec = _mm256_loadu_ps(x + i);
@@ -471,7 +471,7 @@ void ggml_bf16_to_fp32_row_org(const ggml_bf16_t * x, float * y, int64_t n) {
 void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
 #endif // GGML_B612
     int64_t i = 0;
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) && !defined(__clang__)
 #ifdef GGML_B612
 // This flag (__AVX512F__) is not defined for ggml.c compilation so this code
 // should never be compiled.
@@ -514,7 +514,7 @@ void ggml_fp32_to_bf16_row_org(const float * x, ggml_bf16_t * y, int64_t n) {
 void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
 #endif
     int i = 0;
-#if defined(__AVX512BF16__)
+#if defined(__AVX512BF16__) && !defined(__clang__)
 #ifdef GGML_B612
 // This flag (__AVX512BF16__) is not defined for ggml.c compilation so this code
 // should never be compiled.

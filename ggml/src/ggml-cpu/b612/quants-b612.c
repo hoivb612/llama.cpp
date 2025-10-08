@@ -708,7 +708,9 @@ static inline __m128i packNibbles( __m256i bytes ) {
 #endif  //__loongarch_asx
 
 void quantize_row_q4_0(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q4_0=" __FUNCTION__)
+#endif
 
     const uint64_t qk = QK4_0;
 
@@ -764,7 +766,9 @@ void quantize_row_q5_1(const float * restrict x, void * restrict y, int64_t k) {
 }
 
 void quantize_row_q8_0(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q8_0=" __FUNCTION__)
+#endif
 
     uint64_t qk = QK8_0;
 
@@ -1608,7 +1612,9 @@ static inline void get_scale_min_k4(int j, const uint8_t * restrict q, uint8_t *
 //========================- 2-bit (de)-quantization
 
 void quantize_row_q2_K(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q2_K=" __FUNCTION__)
+#endif
 
     const uint64_t qk = QK_K;
 
@@ -1686,7 +1692,9 @@ void quantize_row_q2_K(const float * restrict x, void * restrict vy, int64_t k) 
 //========================= 3-bit (de)-quantization
 
 void quantize_row_q3_K(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q3_K=" __FUNCTION__)
+#endif
 
     quantize_row_q3_K_ref(x, vy, k);
 }
@@ -1694,7 +1702,9 @@ void quantize_row_q3_K(const float * restrict x, void * restrict vy, int64_t k) 
 // ====================== 4-bit (de)-quantization
 
 void quantize_row_q4_K(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q4_K=" __FUNCTION__)
+#endif
 
     const uint64_t qk = QK_K;
     block_q4_K * restrict y = vy;
@@ -1782,7 +1792,9 @@ void quantize_row_q5_K(const float * restrict x, void * restrict vy, int64_t k) 
 // ====================== 6-bit (de)-quantization
 
 void quantize_row_q6_K(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q6_K=" __FUNCTION__)
+#endif
 
     assert(k % QK_K == 0);
     block_q6_K * restrict y = vy;
@@ -1834,7 +1846,9 @@ inline int hsum_i32_16(__m512i x) {
 #endif
 
 void quantize_row_q8_K(const float * restrict x, void * restrict vy, int64_t k) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q8_K=" __FUNCTION__)
+#endif
 
     const uint64_t qk = QK_K;
     block_q8_K * restrict y = vy;
@@ -2124,7 +2138,9 @@ static inline __m128i get_scale_shuffle(int i) {
 #endif
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_q4_0_q8_0=" __FUNCTION__)
+#endif
 
     const uint64_t qk = QK8_0;
     const uint64_t nb = n / qk;
@@ -2872,7 +2888,9 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_q8_0_q8_0=" __FUNCTION__)
+#endif
 
     const uint64_t qk = QK8_0;
     const uint64_t nb = n / qk;
@@ -3368,7 +3386,9 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * restrict s, size_t bs, const void * 
 }
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_q2_K_q8_K=" __FUNCTION__)
+#endif
 
     assert(nrc == 1);
     UNUSED(nrc);
@@ -3720,7 +3740,9 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_q3_K_q8_K=" __FUNCTION__)
+#endif
 
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -4352,7 +4374,9 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_q4_K_q8_K=" __FUNCTION__)
+#endif
 
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -5046,7 +5070,9 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * restrict s, size_t bs, const void * r
 }
 
 void ggml_vec_dot_q6_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_q6_K_q8_K=" __FUNCTION__)
+#endif
 
     assert(n % QK_K == 0);
     assert(nrc == 1);

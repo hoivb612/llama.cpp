@@ -3,7 +3,7 @@
 #include "ggml.h"
 #include "ggml-common.h"
 #include "ggml-cpu-impl.h"
-#include "ggml-quants.h"
+#include "quants.h"
 #include "ggml-cpu-repack.h"
 
 #include <math.h>
@@ -30,7 +30,9 @@ make_q4_0_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q4_0_repack_quant=" __FUNCTION__)
+#endif
 
     uint64_t i;
     uint64_t j;
@@ -127,7 +129,9 @@ make_q2_k_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q2_k_repack_quant=" __FUNCTION__)
+#endif
 
     uint64_t i;
     uint64_t j;
@@ -224,7 +228,9 @@ make_q3_k_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q3_k_repack_quant=" __FUNCTION__)
+#endif
 
     uint64_t i;
     uint64_t j;
@@ -381,7 +387,9 @@ make_q4_k_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q4_k_repack_quant=" __FUNCTION__)
+#endif
 
     uint64_t i;
     uint64_t j;
@@ -477,7 +485,9 @@ make_q6_k_repack_quant (
 //      requirements.
 //
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q6_k_repack_quant=" __FUNCTION__)
+#endif
 
     uint64_t offset;
     uint8_t qs_in[QK_K];
@@ -592,7 +602,9 @@ make_q8_0_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q8_0_repack_quant=" __FUNCTION__)
+#endif
 
     int8_t * dst;
     uint64_t i;
@@ -670,7 +682,9 @@ make_q236_k_q8_k_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q236_k_q8_k_repack_quant=" __FUNCTION__)
+#endif
 
     int8_t * dst;
     uint64_t i;
@@ -761,7 +775,9 @@ make_q4_k_q8_k_repack_quant (
 //
 
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:make_q4_k_q8_k_repack_quant=" __FUNCTION__)
+#endif
 
     int8_t * dst;
     uint64_t i;
@@ -852,7 +868,9 @@ xx_vec_dot_q4_0_q8_0_x8 (
     int nrc
     )
 {
-    #pragma comment(linker, "/EXPORT:xx_vec_dot_q4_0_q8_0_x8=" __FUNCTION__)
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:xx_vec_dot_q4_0_q8_0_x8=" __FUNCTION__)
+#endif
 
     GGML_UNUSED(bx);
 
@@ -887,7 +905,29 @@ xx_vec_dot_q4_0_q8_0_x8 (
                 //
                 // Compute combined multiplier for the quant block.
                 //
-        
+
+#ifdef __clang__
+
+                uint16_t* x_half = (uint16_t*)(x[i].d);
+                uint16_t* y_half = (uint16_t*)(y[i].d);
+
+                // Load as 128-bit integer vectors
+                __m128i x_raw = _mm_loadu_si128((__m128i*)x_half);
+                __m128i y_raw = _mm_loadu_si128((__m128i*)y_half);
+
+                // Convert to 256-bit single-precision float vectors
+                __m256 x_fp32 = _mm256_cvtph_ps(x_raw);
+                __m256 y_fp32 = _mm256_cvtph_ps(y_raw);
+
+                // Multiply
+                __m256 scale = _mm256_mul_ps(x_fp32, y_fp32);
+
+                // Cast and insert into __m512
+                __m512 d = _mm512_castps256_ps512(scale);
+                d = _mm512_insertf32x8(d, scale, 1);
+
+#else
+
                 const __m128h xd = _mm_loadu_ph(x[i].d);
                 const __m128h yd = _mm_loadu_ph(y[i].d);
                 const __m256 scale = _mm256_mul_ps(_mm256_cvtph_ps(xd),
@@ -895,6 +935,8 @@ xx_vec_dot_q4_0_q8_0_x8 (
         
                 __m512 d = _mm512_castps256_ps512(scale);
                 d = _mm512_insertf32x8(d, scale, 1);
+
+#endif // __clang__
         
                 //
                 // Compute the dot product and accumulate.
@@ -1731,7 +1773,9 @@ xx_vec_dot_q8_0_q8_0_x8 (
     int nrc
     )
 {
-    #pragma comment(linker, "/EXPORT:xx_vec_dot_q8_0_q8_0_x8=" __FUNCTION__)
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:xx_vec_dot_q8_0_q8_0_x8=" __FUNCTION__)
+#endif
 
     GGML_UNUSED(bx);
 
@@ -1765,6 +1809,24 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 // Compute combined scale for the an entire quant block.
                 //
 
+#ifdef __clang__
+
+                __m128i xd_raw = _mm_loadu_si128((__m128i*)x[i].d);
+                __m128i yd_raw = _mm_loadu_si128((__m128i*)y[i].d);
+
+                // Convert to single-precision floats
+                __m256 xd_fp32 = _mm256_cvtph_ps(xd_raw);
+                __m256 yd_fp32 = _mm256_cvtph_ps(yd_raw);
+
+                // Multiply
+                __m256 scale = _mm256_mul_ps(xd_fp32, yd_fp32);
+
+                // Expand to __m512
+                __m512 d = _mm512_castps256_ps512(scale);
+                d = _mm512_insertf32x8(d, scale, 1);
+
+#else
+
                 const __m128h xd = _mm_loadu_ph(x[i].d);
                 const __m128h yd = _mm_loadu_ph(y[i].d);
                 const __m256 scale = _mm256_mul_ps(_mm256_cvtph_ps(xd),
@@ -1772,6 +1834,8 @@ xx_vec_dot_q8_0_q8_0_x8 (
 
                 __m512 d = _mm512_castps256_ps512(scale);
                 d = _mm512_insertf32x8(d, scale, 1);
+
+#endif // __clang__
 
                 //
                 // Compute the dot product and accumulate.
@@ -1847,7 +1911,9 @@ quantize_row_q4_0_x8 (
     uint32_t vec_size
     )
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q4_0_x8=" __FUNCTION__)
+#endif
 
     //
     // Quantize the x vector into q4_0 quants.
@@ -1912,7 +1978,9 @@ quantize_row_q4_k_x8 (
     uint64_t vec_size
     )
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q4_k_x8=" __FUNCTION__)
+#endif
 
     //
     // Quantize the x vector into q4_K quants.
@@ -1934,7 +2002,9 @@ quantize_row_q6_k_x8 (
     uint64_t vec_size
     )
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q6_k_x8=" __FUNCTION__)
+#endif
 
     //
     // Quantize the x vector into q6_K quants.
@@ -1977,7 +2047,9 @@ quantize_row_q4_k_q8_k_x8 (
     uint64_t vec_size
     )
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q4_k_q8_k_x8=" __FUNCTION__)
+#endif
 
     //
     // Quantize the x vector into q8_K quants.
@@ -1999,7 +2071,9 @@ quantize_row_q8_0_x8 (
     uint64_t vec_size
     )
 {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:quantize_row_q8_0_x8=" __FUNCTION__)
+#endif
 
     //
     // Quantize the x vector into q8_0 guants.

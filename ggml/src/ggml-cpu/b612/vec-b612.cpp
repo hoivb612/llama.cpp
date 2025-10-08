@@ -24,7 +24,9 @@ ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 
 float ggml_cosine_similarity_f32(int n, float *x, float *y) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_cosine_similarity_f32=" __FUNCTION__)
+#endif // __clang__
 
     float denom_x;
     float denom_y;
@@ -37,7 +39,9 @@ float ggml_cosine_similarity_f32(int n, float *x, float *y) {
 }
 
 void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_f32=" __FUNCTION__)
+#endif
 
    assert(nrc == 1);
    GGML_UNUSED(nrc);
@@ -160,7 +164,9 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
 }
 
 float ggml_cosine_similarity_bf16(int n, ggml_bf16_t *x, ggml_bf16_t *y) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_cosine_similarity_bf16=" __FUNCTION__)
+#endif
 
     float denom_x;
     float denom_y;
@@ -173,7 +179,9 @@ float ggml_cosine_similarity_bf16(int n, ggml_bf16_t *x, ggml_bf16_t *y) {
 }
 
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_bf16=" __FUNCTION__)
+#endif
 
     assert(nrc == 1);
     GGML_UNUSED(nrc);
@@ -300,7 +308,9 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 }
 
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_f16=" __FUNCTION__)
+#endif
 
     assert(nrc == 1);
     GGML_UNUSED(nrc);
@@ -423,7 +433,9 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
 }
 
 void ggml_vec_dot_bf16_f32(const int n, float * GGML_RESTRICT s, size_t bs, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_bf16_f32=" __FUNCTION__)
+#endif
 
     assert(nrc == 1);
     GGML_UNUSED(nrc);
@@ -566,7 +578,9 @@ void ggml_vec_dot_bf16_f32(const int n, float * GGML_RESTRICT s, size_t bs, cons
 }
 
 void ggml_vec_dot_f16_f32(const int64_t n, float * GGML_RESTRICT s, size_t bs, const ggml_fp16_t * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_dot_f16_f32=" __FUNCTION__)
+#endif
 
     assert(nrc == 1);
     GGML_UNUSED(nrc);
@@ -692,7 +706,9 @@ void ggml_vec_dot_f16_f32(const int64_t n, float * GGML_RESTRICT s, size_t bs, c
 }
 
 void ggml_vec_silu_f32(const int n, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_silu_f32=" __FUNCTION__)
+#endif
 
     uint64_t nc = n;
     uint64_t i = 0;
@@ -771,7 +787,9 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * 
 }
 
 ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_soft_max_f32=" __FUNCTION__)
+#endif
 
     uint64_t nc = n;
     uint64_t i = 0;
@@ -877,7 +895,9 @@ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, fl
 }
 
 void ggml_vec_max_f32(const uint32_t n, float * s, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_max_f32=" __FUNCTION__)
+#endif
 
 #ifndef GGML_USE_ACCELERATE
     uint64_t nc = n;
@@ -982,7 +1002,9 @@ void ggml_vec_max_f32(const uint32_t n, float * s, const float * x) {
 }
 
 void ggml_vec_sum_f32(const uint64_t n, float * s, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_sum_f32=" __FUNCTION__)
+#endif
 
     float sumf = 0.0f;
 
@@ -1086,7 +1108,9 @@ void ggml_vec_sum_f32(const uint64_t n, float * s, const float * x) {
 }
 
 void ggml_vec_sumsq_f32(const uint64_t n, float * s, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_sumsq_f32=" __FUNCTION__)
+#endif
 
     float sumf = 0.0f;
 
@@ -1189,7 +1213,9 @@ void ggml_vec_sumsq_f32(const uint64_t n, float * s, const float * x) {
 }
 
 void ggml_vec_sumsq_bf16(const uint64_t n, float * s, const ggml_bf16_t * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_sumsq_bf16=" __FUNCTION__)
+#endif
 
     uint64_t i = 0;
     float sumf = 0.0f;
@@ -1291,7 +1317,9 @@ void ggml_vec_sumsq_bf16(const uint64_t n, float * s, const ggml_bf16_t * x) {
 }
 
 void ggml_vec_add_f32(const uint64_t n, float * z, const float * x, const float * y) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_add_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_add_f32 version")
@@ -1392,7 +1420,9 @@ void ggml_vec_add_f32(const uint64_t n, float * z, const float * x, const float 
 }
 
 void ggml_vec_add1_f32(const uint64_t n, float * z, const float * x, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_add1_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_add1_f32 version")
@@ -1474,7 +1504,9 @@ void ggml_vec_add1_f32(const uint64_t n, float * z, const float * x, const float
 }
 
 void ggml_vec_acc_f32(const uint64_t n, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_acc_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_acc_f32 version")
@@ -1561,7 +1593,9 @@ void ggml_vec_acc_f32(const uint64_t n, float * y, const float * x) {
 }
 
 void ggml_vec_acc1_f32(const uint64_t n, float * y, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_acc1_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_acc1_f32 version")
@@ -1643,7 +1677,9 @@ void ggml_vec_acc1_f32(const uint64_t n, float * y, const float v) {
 }
 
 void ggml_vec_sub_f32(const uint64_t n, float * z, const float * x, const float * y) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_sub_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_sub_f32 version")
@@ -1729,7 +1765,9 @@ void ggml_vec_sub_f32(const uint64_t n, float * z, const float * x, const float 
 }
 
 void ggml_vec_set_f32(const uint64_t n, float * x, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_set_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_set_f32 version")
@@ -1801,7 +1839,9 @@ void ggml_vec_set_f32(const uint64_t n, float * x, const float v) {
 }
 
 void ggml_vec_cpy_f32(const uint64_t n, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_cpy_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_cpy_f32 version")
@@ -1877,7 +1917,9 @@ void ggml_vec_cpy_f32(const uint64_t n, float * y, const float * x) {
 }
 
 void ggml_vec_neg_f32(const uint64_t n, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_neg_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_neg_f32 version")
@@ -1961,7 +2003,9 @@ void ggml_vec_neg_f32(const uint64_t n, float * y, const float * x) {
 }
 
 void ggml_vec_mul_f32(const uint32_t n, float * z, const float * x, const float * y) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_mul_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_mul_f32 version")
@@ -2050,7 +2094,9 @@ void ggml_vec_mul_f32(const uint32_t n, float * z, const float * x, const float 
 }
 
 void ggml_vec_mul1_f32(const uint64_t n, float * z, const float * x, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_mul1_f32=" __FUNCTION__)
+#endif
 
     uint64_t i = 0;
 
@@ -2129,7 +2175,9 @@ void ggml_vec_mul1_f32(const uint64_t n, float * z, const float * x, const float
 }
 
 void ggml_vec_div_f32(const uint64_t n, float * z, const float * x, const float * y) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_div_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_div_f32 version")
@@ -2215,7 +2263,9 @@ void ggml_vec_div_f32(const uint64_t n, float * z, const float * x, const float 
 }
 
 void ggml_vec_normsq_f32(const uint64_t n, float * s, const float mean, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_normsq_f32=" __FUNCTION__)
+#endif
 
     float sumf = 0.0f;
 
@@ -2340,7 +2390,9 @@ void ggml_vec_normsq_f32(const uint64_t n, float * s, const float mean, float * 
 }
 
 void ggml_vec_sqrt_f32(const uint64_t n, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_sqrt_f32=" __FUNCTION__)
+#endif
 
     uint64_t i = 0;
 
@@ -2418,7 +2470,9 @@ void ggml_vec_sqrt_f32(const uint64_t n, float * y, const float * x) {
 }
 
 void ggml_vec_abs_f32(const uint64_t n, float * y, const float * x) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_abs_f32=" __FUNCTION__)
+#endif
 
     uint64_t i = 0;
 
@@ -2498,7 +2552,9 @@ void ggml_vec_abs_f32(const uint64_t n, float * y, const float * x) {
 }
 
 void ggml_vec_mad_f32(const uint64_t n, float * GGML_RESTRICT y, const float * GGML_RESTRICT x, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_mad_f32=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_mad_f32 version")
@@ -2587,7 +2643,9 @@ void ggml_vec_mad_f32(const uint64_t n, float * GGML_RESTRICT y, const float * G
 }
 
 void ggml_vec_mad_f16(const uint64_t n, ggml_fp16_t * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_mad_f16=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_mad_f16 version")
@@ -2676,7 +2734,9 @@ void ggml_vec_mad_f16(const uint64_t n, ggml_fp16_t * GGML_RESTRICT y, const ggm
 }
 
 void ggml_vec_scale_f32(const uint64_t n, float * y, const float   v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_scale_f32=" __FUNCTION__)
+#endif
 
 #if defined(GGML_USE_ACCELERATE)
     vDSP_vsmul(y, 1, &v, y, 1, n);
@@ -2785,7 +2845,9 @@ void ggml_vec_scale_f32(const uint64_t n, float * y, const float   v) {
 }
 
 void ggml_vec_scale_f16(const uint64_t n, ggml_fp16_t * y, const float v) {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_vec_scale_f16=" __FUNCTION__)
+#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__)
 #pragma message("Building AVX512F ggml_vec_scale_f16 version")

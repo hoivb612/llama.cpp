@@ -93,3 +93,15 @@ bin\llama-bench.exe -m c:\llama.cpp\models\Phi-3.5-mini-instruct-Q2_K.gguf -t 8 
 | phi3 3B Q2_K - Medium          |   1.32 GiB |     3.82 B | CPU        |       8 |         pp128 |         50.47 ± 5.81 |
 | phi3 3B Q2_K - Medium          |   1.32 GiB |     3.82 B | CPU        |       8 |          tg64 |         34.63 ± 0.20 |
 
+=========================================
+
+Build b612_dc_080625 with CLang:
+
+cmake .. -T ClangCL -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DGGML_NATIVE=ON -DGGML_AVX512_BF16=ON -DGGML_AVX512_VNNI=ON
+cmake --build . --config RelWithDebInfo -j 12
+
+=========================================
+
+
+ 
+

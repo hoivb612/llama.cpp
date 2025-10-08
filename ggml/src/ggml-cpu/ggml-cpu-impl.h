@@ -518,6 +518,9 @@ void ggml_barrier(struct ggml_threadpool * tp);
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 
+void ggml_wait_for_done_xbox(const struct ggml_compute_params * params);
+void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params);
+
 #ifdef __cplusplus
 }
 #endif

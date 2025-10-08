@@ -439,7 +439,7 @@ int main(int argc, char** argv) {
     while (custom_prompts_it != custom_prompts.end())
     {
         // Create custom user prompt
-        std::string& custom_prompt = ::trim(*custom_prompts_it);
+        std::string custom_prompt = ::trim(*custom_prompts_it);
         custom_prompt.erase(
             std::remove(custom_prompt.begin(), custom_prompt.end(), '\"'),
             custom_prompt.end());

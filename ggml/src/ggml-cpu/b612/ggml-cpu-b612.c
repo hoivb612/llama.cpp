@@ -743,7 +743,9 @@ struct ggml_compute_state {
 
 void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_bf16_to_fp32_row=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t nc = n;
@@ -831,7 +833,9 @@ void ggml_bf16_to_fp32_row_cpu(const ggml_bf16_t * x, float * y, int64_t n) {
 
 void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_fp32_to_bf16_row=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t nc = n;
@@ -937,7 +941,9 @@ void ggml_fp32_to_bf16_row_cpu(const float * x, ggml_bf16_t * y, int64_t n) {
 
 void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_fp16_to_fp32_row=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t nc = n;
@@ -1020,7 +1026,9 @@ void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
 
 void ggml_fp32_to_fp16_row_cpu(const float * x, ggml_fp16_t * y, int64_t n) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_fp32_to_fp16_row=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t nc = n;
@@ -1105,7 +1113,9 @@ void ggml_fp32_to_fp16_row_cpu(const float * x, ggml_fp16_t * y, int64_t n) {
 
 void dequantize_row_q2_K_cpu(const block_q2_K * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q2_K=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK_K;
@@ -1259,7 +1269,9 @@ void dequantize_row_q2_K_cpu(const block_q2_K * restrict x, float * restrict y, 
 
 void dequantize_row_q3_K_cpu(const block_q3_K * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q3_K=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK_K;
@@ -1607,7 +1619,9 @@ void dequantize_row_q3_K_cpu(const block_q3_K * restrict x, float * restrict y, 
 
 void dequantize_row_q4_0_cpu(const block_q4_0 * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q4_0=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK4_0;
@@ -1686,7 +1700,9 @@ void dequantize_row_q4_0_cpu(const block_q4_0 * restrict x, float * restrict y, 
 
 void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q4_K=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK_K;
@@ -1864,7 +1880,9 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
 
 void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q6_K=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK_K;
@@ -2091,7 +2109,9 @@ void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, 
 
 void dequantize_row_q8_0_cpu(const block_q8_0 * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q8_0=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK8_0;
@@ -2154,7 +2174,9 @@ void dequantize_row_q8_0_cpu(const block_q8_0 * restrict x, float * restrict y, 
 
 void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, int64_t k) {
 #ifdef GGML_B612
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:dequantize_row_q8_K=" __FUNCTION__)
+#endif
 #endif // GGML_B612
 
     const uint64_t qk = QK_K;
@@ -3691,6 +3713,8 @@ UseGgmlGemm2:;
 #endif // GGML_XBOX_PERF
 }
 
+#ifdef GGML_XBOX_PERF
+
 void ggml_wait_for_done_xbox(
     const struct ggml_compute_params * params
     )
@@ -3808,6 +3832,8 @@ void ggml_barrier_xbox(
         }
     }
 }
+
+#endif // GGML_XBOX_PERF
 
 void ggml_compute_forward_mul_mat_xbox(
     const struct ggml_compute_params * params,
@@ -6642,7 +6668,10 @@ void ggml_cpu_init(void) {
 }
 
 void ggml_init_tables() {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_init_tables=" __FUNCTION__)
+#endif
+
     // for perfafx
     ggml_cpu_init();
 }
@@ -6652,7 +6681,9 @@ void ggml_init_tables() {
 // #pragma comment(linker, "/EXPORT:ggml_time_us=ggml-base.ggml_time_us")
 
 void ggml_disable_core_parking() {
+#ifndef __clang__
 #pragma comment(linker, "/EXPORT:ggml_disable_core_parking=" __FUNCTION__)
+#endif
 }
 
 // Early repack code only for repack-xbox (from llama_model::build_graph())

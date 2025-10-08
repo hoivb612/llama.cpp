@@ -2515,9 +2515,6 @@ typedef enum {
 //extern int mul_mat_repack_early_failed_count;
 //extern int mul_mat_repack_failed_count;
 
-void ggml_wait_for_done_xbox(const struct ggml_compute_params * params);
-void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params);
-
     GGML_API void ggml_repack_tensor_callgraph(struct ggml_cgraph *gf);
 
 #endif // GGML_XBOX_PERF
