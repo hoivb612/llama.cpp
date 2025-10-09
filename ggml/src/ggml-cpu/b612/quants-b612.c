@@ -3022,7 +3022,6 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     *s = hsum_float_16(acc);
-    return; // do not fall through to common code below
 
 #elif defined(__AVX2__)
 #pragma message("Building AVX2 vec_dot_q8_0_q8_0 version")
@@ -3073,7 +3072,9 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     *s = hsum_float_8(acc);
 
 #elif defined(__AVX2_ORG__)
+#ifndef __clang__
 #pragma message("Building ------ default ------ AVX2 vec_dot_q8_0_q8_0 version")
+#endif
 
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -3091,8 +3092,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         acc = _mm256_fmadd_ps( d, q, acc );
     }
 
-    sumf = hsum_float_8(acc);
-    return; // do not fall through to common code below
+    *s = hsum_float_8(acc);
 
 #elif defined(__AVX__)
 #pragma message("Building ------ default ------ AVX vec_dot_q8_0_q8_0 version")
@@ -3114,9 +3114,9 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
     }
 
-    sumf = hsum_float_8(accum);
+    *s = hsum_float_8(accum);
 
-#endif // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
+#else // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
 
     // common code to join in only for __AVX2_ORG__ and __AVX__
     for (; ib < nb; ++ib) {
@@ -3130,6 +3130,9 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     }
 
     *s = sumf;
+
+#endif // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
+
 }
 
 void ggml_vec_dot_tq1_0_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
