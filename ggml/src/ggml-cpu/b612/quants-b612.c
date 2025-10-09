@@ -1826,13 +1826,11 @@ inline float hmax_f32_8(__m256 x) {
     return _mm_cvtss_f32(max4);
 }
 
-#if !defined(__clang__) // unreferenced and clang generates errors for _mm512_castps512_ps256()
 inline float hmax_f32_16(__m512 x) {
     __m256 max8 = _mm256_max_ps(_mm512_castps512_ps256(x),
                                 _mm512_extractf32x8_ps(x, 1));
     return hmax_f32_8(max8);
 }
-#endif
 
 #if defined(__AVX512F__) && defined(__GEN_AVX512__) // only referenced for AVX512
 
@@ -2159,7 +2157,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     int ib = 0;
     float sumf = 0.0;
 
-#if (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
+#if (defined(__AVX512F__) && defined(__GEN_AVX512__))
 #pragma message("Building AVX512F vec_dot_q4_0_q8_0 version")
 
     __m512 acc = _mm512_setzero_ps();
@@ -2493,7 +2491,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
     sumf = hsum_float_4x4(acc_0, acc_1, acc_2, acc_3);
 
-#endif // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
+#endif // __AVX512F__ && __GEN_AVX512__
 
     // common scalar portion for __AVX2_ORG__, __AVX__ and __SSSE3__
 
@@ -2909,9 +2907,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
     int ib = 0;
     float sumf = 0;
 
-#if (defined(__AVX512F__) && defined(__GEN_AVX512__)) && !defined(__clang__) // clang generates errors for _mm256_dpbusd_epi32()
-
-// #if defined(__AVX2__) || defined(__AVX512F__) // original code for both AVX2 and AVX512
+#if (defined(__AVX512F__) && defined(__GEN_AVX512__))
 #pragma message("Building AVX512F vec_dot_q8_0_q8_0 version")
 
     __m512 acc = _mm512_setzero_ps();
@@ -3116,7 +3112,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
     *s = hsum_float_8(accum);
 
-#else // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
+#else // __AVX512F__ && __GEN_AVX512__
 
     // common code to join in only for __AVX2_ORG__ and __AVX__
     for (; ib < nb; ++ib) {
@@ -3131,7 +3127,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
     *s = sumf;
 
-#endif // __AVX512F__ && __GEN_AVX512__ && !(__clang__)
+#endif // __AVX512F__ && __GEN_AVX512__
 
 }
 
