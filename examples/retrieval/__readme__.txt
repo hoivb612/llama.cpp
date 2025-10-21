@@ -1,3 +1,28 @@
+From Misc. bug: Retrieval sample not decoding token successfully #13102
+
+https://github.com/ggml-org/llama.cpp/issues/13102#issuecomment-3219300530 (bug
+
+Hi,
+I suspect the problem is input dependent, because the sequence numbers are misused:
+
+the batch is initialized with a max_sequence of 1 (line 217):
+struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+however, the batching loop (retrieval.cpp lines 227-245) keeps adding prompts until n_tokens is reached:
+batch_add_seq(batch, inp, s);
+with number of sequences eventually going beyond 1 (if the number of tokens is small enough).
+so in addition, the number of sequences in the batch must be checked in the loop.
+One fix is the following (works on my variant of the same retrieval example code, so don't have a PR ready)
+
+batch initialized like:
+struct llama_batch batch = llama_batch_init(n_batch, 0, max_seq); 
+(64 is the max currently)
+then processing a batch needs the additional condition (line 234):
+if ((s >= max_seq - 1) || (batch.n_tokens + n_toks > n_batch)) { 
+Sorry for possibly confusing explanation (and lack of patch :).
+
+==============================================
+
+
 D:\llama.cpp\b612.dc.080625\build>bin\RelWithDebInfo\llama-retrieval.exe -t 8 --chunk-size 1 -c 63 --context-file ..\examples\retrieval\1liners.txt -m d:\llama.cpp\models\BGE\bge-large-en-v1.5-q8_0.gguf -paffin -repack-xbox
 ggml_cpu_init: from ggml-cpu-b612.c - calling ggml!ggml_init() to initialize fp16 tables
 ggml_cpu_init: from ggml-cpu-b612.c - initializing GELU, SILU and EXP fp32 tables
