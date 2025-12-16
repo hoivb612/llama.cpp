@@ -3,6 +3,15 @@ https://github.com/hoivb612/llama.cpp
 
 ===========================================
 
+Just make sure you never edit master. Keep it in the state of the original upstream fork (github.com/ggerganov/llama.cpp.git). Then, you can always:
+
+1.	“Sync fork” to merge the master branch of the original upstream fork (github.com/ggerganov/llama.cpp.git) into the master branch of your downstream GitHub fork (github.com/HoiV/llama.cpp.git).
+2.	“git fetch” to merge the master branch of your downstream GitHub fork (github.com/HoiV/llama.cpp.git) to the master branch of your local clone.
+3.	While on your topic branch, “git merge origin/master” to merge the master branch of your local clone to your topic branch.
+4.	#3 might have conflicts that you need to resolve.
+
+===========================================
+
 MSYS2 ucrt support: 
 pacman -S --needed base-devel mingw-w64-ucrt-x86_64-toolchain
 
