@@ -6,45 +6,50 @@ llama_context *ctx;
 llama_context_params ctx_params;
 llama_model *model;
 llama_model_params model_params;
+llama_memory_t lmem;
 static int total_tokens_generated = 0;
 bool save_slm_state = false;
 std::vector<llama_token> session_tokens;
-static int64_t t_token_generation = 0;
+static int64_t t_token_generation_ms = 0;
 std::vector<llama_token> tokens_shared;
 
-std::vector<llama_token> llama_tokenize(
-    const struct llama_model * model,
+std::vector<llama_token> slm_tokenize(
+  const struct llama_context * ctx,
            const std::string & text,
                         bool   add_special,
-                        bool   parse_special = false) {
+                        bool   parse_special) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
     // upper limit for the number of tokens
     int n_tokens = text.length() + 2 * add_special;
     std::vector<llama_token> result(n_tokens);
-    n_tokens = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
-        GGML_UNUSED(check);
+        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
         GGML_ASSERT(check == -n_tokens);
-    }
-    else {
+    } else {
         result.resize(n_tokens);
     }
     return result;
 }
 
-std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token, bool special = true) {
-    std::vector<char> result(8, 0);
-    const int n_tokens = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size(), 0, special);
-    if (n_tokens < 0) {
-        result.resize(-n_tokens);
-        int check = llama_token_to_piece(llama_get_model(ctx), token, result.data(), result.size(), 0, special);
-        GGML_ASSERT(check == -n_tokens);
-    } else {
-        result.resize(n_tokens);
+std::string slm_token_to_piece(const struct llama_context * ctx, llama_token token, bool special = false) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::string piece;
+    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    }
+    else {
+        piece.resize(n_chars);
     }
 
-    return std::string(result.data(), result.size());
+    return piece;
 }
 
 void llama_batch_add(struct llama_batch & batch, llama_token id, llama_pos pos, const std::vector<llama_seq_id> & seq_ids, bool logits) {
@@ -59,7 +64,7 @@ void llama_batch_add(struct llama_batch & batch, llama_token id, llama_pos pos, 
 }
 
 std::string pfx_file_path(std::string pfx) {
-#ifdef _WIN32    
+#ifdef _WIN32
 
     static std::hash<std::string> hasher;
     static std::string dir = "./llama_cache";
@@ -104,7 +109,7 @@ int slm_init(xbapp_params& xbparams) {
     model_params = llama_model_default_params();
     model_params.n_gpu_layers = xbparams.n_ngl;
 
-    model = llama_load_model_from_file(xbparams.model_path.c_str(), model_params);
+    model = llama_model_load_from_file(xbparams.model_path.c_str(), model_params);
     if (model == NULL) {
         printf("%s: error: unable to load model\n" , __func__);
         return 1;
@@ -126,7 +131,9 @@ int slm_init(xbapp_params& xbparams) {
     // enable perf counters
     ctx_params.no_perf = false;
 
-    ctx = llama_new_context_with_model(model, ctx_params);
+    ctx = llama_init_from_model(model, ctx_params);
+    lmem = llama_get_memory(ctx);
+
     if (ctx == NULL) {
         printf("%s: error: failed to create the llama_context\n" , __func__);
         return 1;
@@ -137,7 +144,8 @@ int slm_init(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // start from a known point
-        llama_kv_cache_clear(ctx);
+        //llama_kv_self_clear(ctx);
+        llama_memory_clear(lmem, true);
 
         std::string template_prompt = xbparams.custom_template_prompt;
         size_t pos = template_prompt.find("{message}");
@@ -145,7 +153,7 @@ int slm_init(xbapp_params& xbparams) {
             // build the shared prompt
             xbparams.pfx_shared = ::trim(template_prompt.substr(0, pos));
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            tokens_shared = llama_tokenize(model, xbparams.pfx_shared, false, false);
+            tokens_shared = slm_tokenize(ctx, xbparams.pfx_shared, false, true);
 
 #if 1 // use llama_state_load_file()
             // build the cache file directory
@@ -186,7 +194,7 @@ int slm_init(xbapp_params& xbparams) {
                 //printf("%s: token_shared=%zd - %s\n", __func__, tokens_shared.size(), LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_shared).c_str());
 
                 // remove any "future" tokens that we might have inherited from the previous session
-                llama_kv_cache_seq_rm(ctx, -1, tokens_shared.size(), -1);
+                llama_memory_seq_rm(lmem, -1, tokens_shared.size(), -1);
             }
 
 #else // use llama_set_state_data()
@@ -230,7 +238,7 @@ int slm_inference(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_seq_rm(ctx, -1, tokens_shared.size(), -1);
+        llama_memory_seq_rm(lmem, -1, tokens_shared.size(), -1);
         embd_inp.insert(embd_inp.end(), tokens_shared.begin(), tokens_shared.end());
         n_past = tokens_shared.size();
         n_kv_pfx = tokens_shared.size();
@@ -239,13 +247,13 @@ int slm_inference(xbapp_params& xbparams) {
         xbparams.prompt.append("\"\n<|end|>\n<|Assistant|>\nYou:");
     } else {
         // start from a known point for each new user prompt
-        llama_kv_cache_clear(ctx);
+        llama_memory_clear(lmem, true);
         n_past = 0;
         n_kv_pfx = 0;
     }
 
     // tokenize the remaining prompt or full prompt if pfc_mode is off
-    std::vector<llama_token> tokens_input = llama_tokenize(model, xbparams.prompt, false, false);
+    std::vector<llama_token> tokens_input = slm_tokenize(ctx, xbparams.prompt, false, true);
 
     // append the variant part of the prompt or the full prompt for non pfc mode
     embd_inp.insert(embd_inp.end(), tokens_input.begin(), tokens_input.end());
@@ -328,9 +336,12 @@ int slm_inference(xbapp_params& xbparams) {
     }
 
     int64_t t_start_generation = ggml_time_us();
-    printf("Prompt TTFT = %.2fms (size = %zu)\n", 
-        ((t_start_generation - t_start_decoding) / 1000.0f), 
-        embd.size());
+    float t_prompt_eval_ms = (t_start_generation - t_start_decoding) / 1000.0f;
+    printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n", 
+        t_prompt_eval_ms, 
+        embd.size(), 
+        (embd.size() * 1000.0f) / t_prompt_eval_ms, 
+        t_prompt_eval_ms / embd.size());
 
     if (xbparams.pfc_mode && save_slm_state) {
         session_tokens.insert(session_tokens.end(), embd_inp.begin(), embd_inp.end());
@@ -348,7 +359,7 @@ int slm_inference(xbapp_params& xbparams) {
             // build the shared prompt
             xbparams.pfx_shared = ::trim(template_prompt.substr(0, pos));
             // tokenize(a) + tokenize(b) != tokenize(a+b), we tokenize pfx and content separately
-            tokens_shared = llama_tokenize(model, xbparams.pfx_shared, false, false);
+            tokens_shared = slm_tokenize(ctx, xbparams.pfx_shared, false, true);
         }
 
 #else // use llama_set_state_data()
@@ -372,6 +383,9 @@ int slm_inference(xbapp_params& xbparams) {
     bool valid_reply = false;
     int n_tokens_generated = 0;
 
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
     while (n_past <= max_len) {
 
         // sample the last token just received
@@ -379,11 +393,11 @@ int slm_inference(xbapp_params& xbparams) {
 
         {
             // is it an end of generation - are we done?
-            if (llama_token_is_eog(model, new_token_id)) {
+            if (llama_vocab_is_eog(vocab, new_token_id)) {
                 break;
             }
 
-            const std::string token_str = llama_token_to_piece(ctx, new_token_id);
+            const std::string token_str = slm_token_to_piece(ctx, new_token_id);
 
             if (token_str.find('{') != std::string::npos) {
                 // accepted answers have '{' characters
@@ -435,10 +449,10 @@ int slm_inference(xbapp_params& xbparams) {
     printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
         t_ms,
         n_tokens_generated, 
-        n_tokens_generated / (t_ms / 1000.0f),
+        (t_ms == 0) ? 0.0 : n_tokens_generated / (t_ms / 1000.0f),
         (t_ms / n_tokens_generated));
 
-    t_token_generation += (t_end_generation - t_start_generation);
+    t_token_generation_ms += t_ms;
     return 0;
 }
 
@@ -447,13 +461,13 @@ void slm_terminate() {
 
     printf("%s: generated %d tokens in %.2f s, speed: %.2f t/s\n",
             __func__, 
-            total_tokens_generated, (t_token_generation / 1000000.0f), 
-            total_tokens_generated / (t_token_generation / 1000000.0f));
+            total_tokens_generated, (t_token_generation_ms / 1000.0f), 
+            (t_token_generation_ms == 0) ? 0.0: total_tokens_generated / (t_token_generation_ms / 1000.0f));
 
     llama_perf_context_print(ctx);
 
     llama_free(ctx);
-    llama_free_model(model);
+    llama_model_free(model);
 
     llama_backend_free();
 }
