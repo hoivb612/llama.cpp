@@ -62,6 +62,10 @@ struct model_params {
     bool parse_special                 = false; // for tokenizer: parse recognized special tokens in text
     int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
     bool process_affinity              = false; // true if set process affinity is enabled
+
+    // Multi-turn fields
+    std::string turn_template          = "";    // template for subsequent user turns (e.g. "<|user|>\n{message}<|end|>\n<|assistant|>\n")
+    char stop_char                     = 0;     // if set, stop generation when this character appears in output
 };
 
 LLM_INFER_API bool llm_initialize(model_params& params);
@@ -71,6 +75,18 @@ LLM_INFER_API const char * llm_system_info();
 LLM_INFER_API void llm_print_tensor_op_perf_stats();
 LLM_INFER_API void llm_disable_log();
 LLM_INFER_API void llm_enable_log();
+
+// Multi-turn conversation API
+// Call llm_multiturn_begin() after llm_initialize() to start a multi-turn session.
+// Then call llm_infer_multiturn() for each turn — KV cache accumulates across calls.
+// Use llm_multiturn_rewind() to drop the last N turns from the KV cache.
+// Use llm_multiturn_clear() to fully reset the KV cache and start over.
+LLM_INFER_API void llm_multiturn_begin(const model_params& params);
+LLM_INFER_API bool llm_infer_multiturn(model_params& params);
+LLM_INFER_API void llm_multiturn_rewind(int n_turns);
+LLM_INFER_API void llm_multiturn_clear();
+LLM_INFER_API int  llm_multiturn_turn_count();
+LLM_INFER_API int  llm_multiturn_token_count();
 
 typedef int32_t llama_token;
 struct chunk {

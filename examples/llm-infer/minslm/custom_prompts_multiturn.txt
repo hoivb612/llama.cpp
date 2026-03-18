@@ -1,0 +1,25 @@
+CUSTOM_TEMPLATE_PROMPT
+<|system|>
+You are a helpful geography teacher. Answer student questions about world geography.
+Keep answers concise - no more than 2 sentences.
+<|end|>
+<|user|>
+{message}<|end|>
+<|assistant|>
+END_SECTION
+CUSTOM_TURN_TEMPLATE
+<|user|>
+{message}<|end|>
+<|assistant|>
+END_SECTION
+CUSTOM_PROMPT
+What is the capital of France?
+What is the population of that city?
+What river runs through it?
+REWIND 2
+What famous landmarks are in that capital city?
+Now tell me about the capital of Japan.
+What is the population of that city?
+REWIND 1
+What traditional food is that city known for?
+END_SECTION

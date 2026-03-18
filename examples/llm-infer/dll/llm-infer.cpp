@@ -404,6 +404,7 @@ bool llm_inference(
 
         if (llama_decode(llm_ctx, llama_batch_get_one(&embd[i], n_eval))) {
             printf("%s : failed to eval\n", __func__);
+            llama_sampler_free(smpl);
             return false;
         }
 
@@ -474,6 +475,12 @@ bool llm_inference(
             slm_output += token_str;
         }
 
+        // Stop on caller-specified character
+        if (params.stop_char && token_str.find(params.stop_char) != std::string::npos) {
+            if (params.streaming_reply) printf("\n");
+            break;
+        }
+
         // save this new token for next evaluation
         embd.clear();
         embd.push_back(new_token_id);
@@ -487,6 +494,7 @@ bool llm_inference(
         // decode the output for the new generated token
         if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1))) {
             printf("%s : failed to eval, return code %d\n", __func__, 1);
+            llama_sampler_free(smpl);
             return false;
         }
     }
@@ -506,7 +514,291 @@ bool llm_inference(
 
     params.reply = slm_output;
 
+    llama_sampler_free(smpl);
+
     return true;
+}
+
+// Multi-turn global state
+static int llm_mt_n_past = 0;
+static std::vector<int> llm_mt_turn_starts;  // n_past at the START of each turn's prompt
+
+LLM_INFER_API
+void llm_multiturn_begin(const model_params& params) {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+
+    llm_mt_turn_starts.clear();
+
+    if (!llm_tokens_shared.empty()) {
+        // PFC mode: shared prefix is already decoded in KV cache
+        // Remove any tokens past the shared prefix
+        llama_kv_self_seq_rm(llm_ctx, 0, (int)llm_tokens_shared.size(), -1);
+        llm_mt_n_past = (int)llm_tokens_shared.size();
+        if (params.verbose >= 1) {
+            printf("%s: multi-turn started with %d prefix tokens in KV cache (PFC)\n",
+                    __func__, llm_mt_n_past);
+        }
+    } else {
+        // Fresh start — clear everything
+        llama_kv_self_clear(llm_ctx);
+        llm_mt_n_past = 0;
+
+        // Pre-decode the system prefix from the template so it's protected from REWIND.
+        // If {message} exists in the template, split at the last user tag to avoid
+        // overlap with the turn template. If no {message}, the entire template IS
+        // the system prefix (turn template is provided separately).
+        std::string tmpl = params.custom_template_prompt;
+        std::string sys_prefix;
+        size_t msg_pos = tmpl.find("{message}");
+
+        if (msg_pos != std::string::npos && msg_pos > 0) {
+            // Template contains {message} — split at the last user tag
+            std::string before_msg = tmpl.substr(0, msg_pos);
+
+            // Find the last user tag in the text before {message}
+            size_t split = std::string::npos;
+            size_t p;
+            if ((p = before_msg.rfind("<|user|>"))            != std::string::npos) split = p;
+            if ((p = before_msg.rfind("<|im_start|>user"))    != std::string::npos && (split == std::string::npos || p > split)) split = p;
+            if ((p = before_msg.rfind("[INST]"))              != std::string::npos && (split == std::string::npos || p > split)) split = p;
+            if ((p = before_msg.rfind("<start_of_turn>user")) != std::string::npos && (split == std::string::npos || p > split)) split = p;
+
+            sys_prefix = (split != std::string::npos)
+                         ? tmpl.substr(0, split)
+                         : before_msg;
+        } else if (!tmpl.empty()) {
+            // No {message} in template — the entire template is the system prefix
+            // (turn template is provided via CUSTOM_TURN_TEMPLATE section)
+            sys_prefix = tmpl;
+        }
+
+        if (!sys_prefix.empty()) {
+            std::vector<llama_token> sys_tokens = slm_tokenize(llm_ctx, sys_prefix,
+                                                                params.add_special, params.parse_special);
+            if (!sys_tokens.empty()) {
+                for (int i = 0; i < (int)sys_tokens.size(); i += params.n_batch) {
+                    int n_eval = std::min((int)sys_tokens.size() - i, params.n_batch);
+                    llama_decode(llm_ctx, llama_batch_get_one(&sys_tokens[i], n_eval));
+                }
+                llm_mt_n_past = (int)sys_tokens.size();
+            }
+        }
+
+        if (params.verbose >= 1) {
+            printf("%s: multi-turn started with %d system prefix tokens in KV cache\n",
+                    __func__, llm_mt_n_past);
+        }
+    }
+}
+
+LLM_INFER_API
+bool llm_infer_multiturn(model_params& params) {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+
+    // Record turn boundary (position before this turn's prompt)
+    llm_mt_turn_starts.push_back(llm_mt_n_past);
+
+    // Tokenize the prompt for this turn
+    std::vector<llama_token> tokens_input = slm_tokenize(llm_ctx, params.prompt,
+                                                          params.add_special, params.parse_special);
+
+    // Check context size — leave room for generation
+    const int n_ctx = llama_n_ctx(llm_ctx);
+    int projected = llm_mt_n_past + (int)tokens_input.size() + 128;
+    if (projected > n_ctx) {
+        printf("%s: error: projected tokens (%d) > n_ctx (%d), context full\n",
+               __func__, projected, n_ctx);
+        printf("%s:        use llm_multiturn_rewind() to free space or increase n_ctx\n", __func__);
+        llm_mt_turn_starts.pop_back();
+        return false;
+    }
+
+    int64_t t1_start = ggml_time_us();
+
+    // Decode prompt tokens — positions auto-assigned from KV cache state
+    for (int i = 0; i < (int)tokens_input.size(); i += params.n_batch) {
+        int n_eval = std::min((int)tokens_input.size() - i, params.n_batch);
+
+        if (llama_decode(llm_ctx, llama_batch_get_one(&tokens_input[i], n_eval))) {
+            printf("%s: failed to decode prompt\n", __func__);
+            llm_mt_turn_starts.pop_back();
+            return false;
+        }
+
+        llm_mt_n_past += n_eval;
+    }
+
+    int64_t t2_start = ggml_time_us();
+    float t_prompt_eval_ms = (t2_start - t1_start) / 1000.0f;
+    if (params.verbose == 2) {
+        printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n",
+            t_prompt_eval_ms,
+            tokens_input.size(),
+            (tokens_input.size() * 1000.0f) / t_prompt_eval_ms,
+            t_prompt_eval_ms / tokens_input.size());
+    }
+
+    // Handle PFC state save on first inference (same as llm_inference)
+    if (params.pfc_mode && params.save_llm_state) {
+        std::vector<llama_token> save_tokens;
+        save_tokens.insert(save_tokens.end(), llm_tokens_shared.begin(), llm_tokens_shared.end());
+        save_tokens.insert(save_tokens.end(), tokens_input.begin(), tokens_input.end());
+
+        llama_state_save_file(llm_ctx, params.pfx_file.c_str(), save_tokens.data(), save_tokens.size());
+        params.save_llm_state = false;
+
+        // Update llm_tokens_shared for consistency
+        std::string template_prompt = params.custom_template_prompt;
+        size_t pos = template_prompt.find("{message}");
+        if (pos != std::string::npos) {
+            params.pfx_shared = template_prompt.substr(0, pos);
+            llm_tokens_shared = slm_tokenize(llm_ctx, params.pfx_shared, params.add_special, params.parse_special);
+        }
+    }
+
+    // Initialize sampler
+    auto sparams = llama_sampler_chain_default_params();
+    sparams.no_perf = false;
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
+
+    const int   top_k = 40;
+    const float top_p = 0.9f;
+    const float min_keep = 1.0f;
+    const float temp = 0.1f;
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, min_keep));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(params.seed));
+
+    // Compute max generation length
+    // In multi-turn, use n_ctx as the ceiling (not n_len which was designed for single-turn)
+    int max_len = std::min(n_ctx - 1, (llm_mt_n_past + 128));
+
+    std::string slm_output;
+    int n_tokens_generated = 0;
+    const llama_vocab * vocab = llama_model_get_vocab(llm_model);
+    std::vector<llama_token> embd;
+
+    while (llm_mt_n_past <= max_len) {
+
+        llama_token new_token_id = llama_sampler_sample(smpl, llm_ctx, -1);
+
+        if (llama_vocab_is_eog(vocab, new_token_id)) {
+            if (params.streaming_reply) {
+                printf("\n");
+            }
+            break;
+        }
+
+        const std::string token_str = slm_token_to_piece(llm_ctx, new_token_id);
+        if (params.streaming_reply) {
+            printf("%s", token_str.c_str());
+        } else {
+            slm_output += token_str;
+        }
+
+        // Stop on caller-specified character
+        if (params.stop_char && token_str.find(params.stop_char) != std::string::npos) {
+            if (params.streaming_reply) printf("\n");
+            break;
+        }
+
+        embd.clear();
+        embd.push_back(new_token_id);
+
+        n_tokens_generated += 1;
+        params.total_llm_tokens_generated += 1;
+        llm_mt_n_past += 1;
+
+        if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1))) {
+            printf("%s: failed to decode generated token\n", __func__);
+            llama_sampler_free(smpl);
+            return false;
+        }
+    }
+
+    int64_t t_us = (ggml_time_us() - t2_start);
+
+    if (params.verbose == 2) {
+        printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n",
+            t_us / 1000.0f,
+            n_tokens_generated,
+            n_tokens_generated / (t_us / 1000000.0f),
+            (t_us / (n_tokens_generated * 1000.0f)));
+    }
+
+    // Accumulate timing
+    params.total_tokens_gen_time += t_us;
+
+    params.reply = slm_output;
+
+    if (params.verbose >= 1) {
+        printf("%s: turn %d complete, n_past = %d / %d\n",
+               __func__, (int)llm_mt_turn_starts.size(), llm_mt_n_past, n_ctx);
+    }
+
+    llama_sampler_free(smpl);
+
+    return true;
+}
+
+LLM_INFER_API
+void llm_multiturn_rewind(int n_turns) {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+
+    if (n_turns <= 0 || llm_mt_turn_starts.empty()) return;
+
+    // Clamp to available turns
+    n_turns = std::min(n_turns, (int)llm_mt_turn_starts.size());
+
+    // Get the position to rewind to
+    int rewind_pos = llm_mt_turn_starts[llm_mt_turn_starts.size() - n_turns];
+
+    printf("%s: rewinding %d turn(s), n_past %d -> %d\n",
+           __func__, n_turns, llm_mt_n_past, rewind_pos);
+
+    // Remove tokens from KV cache from rewind_pos onward
+    llama_kv_self_seq_rm(llm_ctx, 0, rewind_pos, -1);
+
+    // Update state
+    llm_mt_n_past = rewind_pos;
+    llm_mt_turn_starts.resize(llm_mt_turn_starts.size() - n_turns);
+}
+
+LLM_INFER_API
+void llm_multiturn_clear() {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+
+    printf("%s: clearing all %d turns, n_past %d -> 0\n",
+           __func__, (int)llm_mt_turn_starts.size(), llm_mt_n_past);
+
+    llama_kv_self_clear(llm_ctx);
+    llm_mt_n_past = 0;
+    llm_mt_turn_starts.clear();
+}
+
+LLM_INFER_API
+int llm_multiturn_turn_count() {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+    return (int)llm_mt_turn_starts.size();
+}
+
+LLM_INFER_API
+int llm_multiturn_token_count() {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+    return llm_mt_n_past;
 }
 
 LLM_INFER_API 

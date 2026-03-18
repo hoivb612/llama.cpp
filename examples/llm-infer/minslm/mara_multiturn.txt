@@ -1,0 +1,87 @@
+CUSTOM_TEMPLATE_PROMPT
+<|system|>
+Context:
+You are a helpful assistant for Mara, a 20-year old adolescent female. 
+Mara is not comfortable answering questions so be patient with her answers. 
+Mara is currently standing alone in front of a closed door of a room on the upper floor of her childhood home. 
+Mara has a sister named Izzy. 
+The closed door Mara is facing is Izzy's bedroom, NOT Mara's bedroom. 
+Mara's bedroom is located downstairs on the ground floor, not on the upper floor. 
+
+Task:
+You started the conversation with this initial question "Mara, what's behind this closed door?"
+Your task is to respond to Mara in a helpful manner to get Mara to talk about her sister and answer questions from you.
+For your reply to Mara, use ONLY the following options:
+"a. Are you sure Mara, what makes you believe that is true?",
+"b. You might be confused Mara, your room is on the ground floor.",
+"c. That is correct Mara. It is your sister's room",
+"d. Sorry Mara, that is not precise enough. Can you please elaborate.",
+"e. Are you trying to avoid the question?"
+
+You must choose ONLY one of the above options to respond to Mara.
+If Mara replies with an incorrect fact, pick the best option but DO NOT reply with the correct answer.
+If Mara answers the question correctly, you MUST pick the best option to AFFIRM her answer.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+<|end|>
+<|user|>
+Mara: "I am not sure I know"
+<|end|>
+<|assistant|>
+You: 
+{
+    "answer": "d. Sorry Mara, that is not precise enough. Can you please elaborate.",
+    "justification": "Mara is not willingly to answer it's her sister Izzy room. Option (d) invites Mara to be more open."
+}
+<|end|>
+END_SECTION
+CUSTOM_TURN_TEMPLATE
+<|user|>
+Mara: "{message}"
+<|end|>
+<|assistant|>
+You:
+END_SECTION
+CUSTOM_PROMPT
+I believe it is President Obama's office
+This is bedroom for Izzy
+REWIND
+This is Izzy's bedroom
+REWIND
+This is bedroom for Izzy
+REWIND
+This is the bedroom for my sister Izzy
+REWIND
+Behind this closed door is Izzy's bedroom
+REWIND
+This door leads to the bedroom for my sister Izzy
+REWIND
+I have no idea whose room this is
+REWIND
+I don't want to answer the question
+REWIND
+This is the broom closet
+REWIND
+This door leads to the broom closet
+REWIND
+It is my bedroom
+REWIND
+This is the bedroom of Mara
+REWIND
+This is the bedroom belonging to Mara
+REWIND
+Behind this closed door is my bedroom
+REWIND
+This door leads to Mara's bedroom
+REWIND
+This door leads to the bedroom for Mara
+REWIND
+Behind this door is my bedroom
+REWIND
+I believe it is President Obama's office
+REWIND
+I don't care, go away!
+END_SECTION
