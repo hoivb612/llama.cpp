@@ -143,13 +143,10 @@ static void batch_process(llama_context * ctx, llama_batch & batch, float * outp
 }
 
 int main(int argc, char ** argv) {
-<<<<<<< HEAD
-=======
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
 
->>>>>>> master
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_RETRIEVAL, print_usage)) {
         return 1;
     }
