@@ -147,13 +147,11 @@ int main(int argc, char ** argv) {
 
     common_params params;
 
+    common_init();
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_RETRIEVAL, print_usage)) {
         return 1;
     }
-
-    common_init();
-
-    llama_log_set(retrieval_log_callback, &(params.verbosity));
 
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;
@@ -321,7 +319,7 @@ int main(int argc, char ** argv) {
             return false;
         }
 
-    std::string query;
+        std::string query;
         int64_t t_query_start = ggml_time_us();
 
         while (std::getline(cpfile, query)) {
@@ -329,28 +327,18 @@ int main(int argc, char ** argv) {
 
            batch_add_seq(query_batch, query_tokens, 0);
 
-        std::vector<float> query_emb(n_embd_out, 0);
-        batch_process(ctx, query_batch, query_emb.data(), 1, n_embd_out);
+            std::vector<float> query_emb(n_embd_out, 0);
+            batch_process(ctx, query_batch, query_emb.data(), 1, n_embd_out);
 
             common_batch_clear(query_batch);
 
-<<<<<<< HEAD
             // compute cosine similarities
             {
                 std::vector<std::pair<int, float>> similarities;
                 for (int i = 0; i < n_chunks; i++) {
-                    float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd);
+                    float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd_out);
                     similarities.push_back(std::make_pair(i, sim));
                 }
-=======
-        // compute cosine similarities
-        {
-            std::vector<std::pair<int, float>> similarities;
-            for (int i = 0; i < n_chunks; i++) {
-                float sim = common_embd_similarity_cos(chunks[i].embedding.data(), query_emb.data(), n_embd_out);
-                similarities.push_back(std::make_pair(i, sim));
-            }
->>>>>>> master
 
                 // sort similarities
                 std::sort(similarities.begin(), similarities.end(), [](const std::pair<int, float> & a, const std::pair<int, float> & b) {
