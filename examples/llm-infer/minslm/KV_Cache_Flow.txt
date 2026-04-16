@@ -1,0 +1,421 @@
+  KV Cache Flow
+
+  1. Initialization (llm_initialize, lines 139-297)
+
+  Two modes:
+
+   - Non-PFC mode: Simple — KV cache starts empty, nothing cached.
+   - PFC (Prefix Cache) mode (lines 240-294):
+    - Parses custom_template_prompt looking for {message} placeholder
+    - The portion before {message} becomes pfx_shared (the shared prefix)
+    - Tokenizes this prefix into llm_tokens_shared
+    - Attempts to load a saved state file via llama_state_load_file() — this restores the full KV cache from a
+  previous session
+    - If load fails, marks save_llm_state = true to save on first inference
+
+  2. Inference (llm_inference, lines 299-510)
+
+  The KV cache is populated in two phases:
+
+  Phase 1 — Prompt processing / prefill (lines 306-412):
+
+   - PFC mode (lines 310-321): Removes "future" tokens from KV cache with llama_kv_self_seq_rm(), sets n_past to the
+  shared prefix length. Only new tokens (after the shared prefix) need decoding.
+   - Non-PFC mode (lines 323-329): Clears KV cache entirely with llama_kv_self_clear(), starts from scratch.
+   - Lines 354-371: Calculates prompt_index — how many tokens from the input match the cached prefix. Only tokens
+  after this index need to be decoded.
+   - Lines 399-412: Actual KV cache generation — calls llama_decode() in batches of n_batch size. Each llama_decode()
+  call processes tokens through all transformer layers and populates the KV cache for those positions.
+
+  Phase 2 — Token generation / autoregressive (lines 457-492):
+
+   - Samples one token at a time via llama_sampler_sample()
+   - Each new token is decoded with llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1)) — this adds one KV entry
+  per call
+   - n_past increments by 1 each iteration
+
+  3. State saving (lines 431-446):
+
+   - On first inference in PFC mode, saves the full state (model weights + KV cache) via llama_state_save_file() so
+  subsequent runs can skip prefill.
+
+  Key llama.cpp functions called
+
+  ┌─────────────────────────┬──────────────────────────────────────────────────────┐
+  │ Function                │ Purpose                                              │
+  ├─────────────────────────┼──────────────────────────────────────────────────────┤
+  │ llama_kv_self_clear()   │ Wipe entire KV cache                                 │
+  ├─────────────────────────┼──────────────────────────────────────────────────────┤
+  │ llama_kv_self_seq_rm()  │ Remove specific token range from KV cache            │
+  ├─────────────────────────┼──────────────────────────────────────────────────────┤
+  │ llama_decode()          │ Run forward pass, populate KV cache for input tokens │
+  ├─────────────────────────┼──────────────────────────────────────────────────────┤
+  │ llama_state_save_file() │ Serialize KV cache + state to disk                   │
+  ├─────────────────────────┼──────────────────────────────────────────────────────┤
+  │ llama_state_load_file() │ Restore KV cache + state from disk                   │
+  └─────────────────────────┴──────────────────────────────────────────────────────┘
+
+  Comparison to ORT GenAI
+
+  ┌─────────────────┬──────────────────────────────┬───────────────────────────────────┐
+  │ Concept         │ llm-infer (llama.cpp)        │ ORT GenAI                         │
+  ├─────────────────┼──────────────────────────────┼───────────────────────────────────┤
+  │ KV clear        │ llama_kv_self_clear()        │ Create new generator              │
+  ├─────────────────┼──────────────────────────────┼───────────────────────────────────┤
+  │ KV truncate     │ llama_kv_self_seq_rm()       │ generator->RewindTo()             │
+  ├─────────────────┼──────────────────────────────┼───────────────────────────────────┤
+  │ Prefill         │ llama_decode() in batches    │ generator->AppendTokenSequences() │
+  ├─────────────────┼──────────────────────────────┼───────────────────────────────────┤
+  │ Token gen       │ llama_decode() + sampler     │ generator->GenerateNextToken()    │
+  ├─────────────────┼──────────────────────────────┼───────────────────────────────────┤
+  │ State save/load │ llama_state_save/load_file() │ Not available                     │
+  └─────────────────┴──────────────────────────────┴───────────────────────────────────┘
+
+  Current `llm_inference()` behavior:
+  - In PFC mode: `llama_kv_self_seq_rm(llm_ctx, 0, llm_tokens_shared.size(), -1)` — removes everything past the shared
+   prefix, rewinding to the prefix boundary every call
+  - In non-PFC mode: `llama_kv_self_clear(llm_ctx)` — clears the entire KV cache every call
+
+  This means each call to `llm_inference()` is essentially stateless (except for the shared prefix in PFC mode).
+  Multi-turn conversation context is lost.
+
+  So I need to create a new function that preserves the KV cache across calls. I'll add a global variable to track the
+   current position in the cache, then build `llm_infer_multiturn()` as a variant that skips the cache clearing step
+  and lets context accumulate naturally across multiple generations.
+
+  For the API design, I'm setting up helper functions to manage the multi-turn session state — one to initialize it,
+  one to rewind the cache by a specific number of tokens if needed, and one to completely reset everything. I'll keep
+  the implementation simple by using global state variables like the existing pattern does.
+
+  Defining the API functions...
+
+  Now I'm reconsidering whether token-level rewinding is what the user actually needs, or if turn-level rewinding
+  (like the gamechat implementation uses) would be more practical. Looking at how minslm.cpp works, each turn
+  processes a prompt and generates a response, so the KV cache accumulates both. I need to think through what the
+  right granularity is for rewinding in this context.
+
+  I'm sketching out a design that tracks turn boundaries using a vector to store the KV cache position at the start of
+   each turn, similar to how gamechat handles it. This way I can rewind to any previous turn rather than counting
+  individual tokens.
+
+  Defining the API... I'm looking at how to implement the rewind operation—I'd pop the last n turns from the
+  boundaries list, find the corresponding token position, and use the KV cache truncation to roll back to that point.
+  For the system prompt handling, the caller would format each turn's message into the template themselves, similar to
+   how the existing implementation substitutes the message placeholder. I need to set `llm_n_past` to the size of the
+  shared tokens if PFC mode was active, then outline the implementation plan for the multi-turn API. I'm laying out
+  the changes needed across the header and implementation files, including new global state for tracking past tokens
+  and turn boundaries, plus the core functions for beginning a multi-turn session, running inference while preserving
+  KV cache, rewinding to earlier turns, and clearing everything.
+
+  Now I'm reconsidering the API design based on what the user actually needs — the KV cache should persist across
+  calls until explicitly rewound, and I need to think through how PFC mode interacts with this, particularly how the
+  shared prefix gets handled on subsequent turns.
+
+  Writing the implementation... I'm realizing the PFC prefix handling is more nuanced—if the state file loaded
+  successfully, the KV cache already contains the decoded prefix, but if it failed to load, the first inference needs
+  to process the full prompt. For multi-turn, I should keep `llm_multiturn_begin()` simple and just track state,
+  setting `llm_mt_n_past` based on whether PFC mode successfully loaded the prefix. I see the user wants to keep
+  `llm_initialize()` unchanged for PFC mode, then add a separate `llm_infer_multiturn()` method that accumulates
+  KV-cache across multiple calls without mixing in the state save/load logic that's specific to single-inference PFC
+  mode.
+
+  When PFC loads a prefix state, the multi-turn method needs to recognize that the KV-cache already contains the
+  shared prefix and set the past token count accordingly so new prompts build on top of it rather than replacing it.
+
+  I'll implement the multi-turn inference function now, handling both the case where PFC pre-loaded a state and where
+  we're starting fresh. PFC mode is on, `params.prompt` is set to `full_prompt.substr(pos)` — just the variable part
+  (after the shared prefix). When PFC is off, `params.prompt` is the full prompt.
+
+  For multi-turn:
+  - First call in PFC mode: shared prefix is already in KV cache (loaded from state file or will be decoded), so we
+  just need to decode the variable part
+  - Subsequent calls: everything is already in KV, just decode the new prompt
+  - First call NOT in PFC mode: we need to decode the full prompt
+
+  For the multi-turn function itself, I can keep it simple: record where the turn starts in the KV cache, tokenize the
+   prompt, decode any new tokens from that position onward, generate the response, then update the position to account
+   for both prompt and response. The PFC overlap detection from the main inference function can stay for the first
+  call if needed, but really the caller should just pass the right prompt — if PFC already loaded the prefix, they
+  shouldn't include it again.
+
+  Writing the multi-turn function... I'm checking the projected token count against the context window and validating
+  the input before processing. Now I'm decoding the prompt tokens in batches, tracking the time it takes to evaluate
+  them and calculating the throughput metrics.
+
+  After that, I'm handling the state save logic when PFC mode is enabled—building the full token sequence from both
+  shared and input tokens, then saving it to a file before clearing the save flag.
+
+  Setting up the sampler chain... Setting up the generation loop... I'm wrapping up the token generation loop by
+  calculating elapsed time and logging performance metrics if verbose mode is enabled, then storing the accumulated
+  output and freeing the sampler before returning. Now I'm moving on to implement the rewind function for multiturn
+  conversations.
+
+  Implementing the rewind logic... Writing the multiturn API functions...
+
+  Now I'm thinking about how this integrates with minslm.cpp and what the user needs to implement there to actually
+  use these multiturn capabilities. I'm going back and forth on scope here — the user mentioned "from minslm.cpp"
+  which suggests they want to see it integrated there, so I should update that file along with the new API
+  declarations and implementations in the llm-infer module. Let me outline the three files I need to modify and start
+  implementing the multi-turn functionality.
+
+  Now I'm thinking through how the prompt template actually works with multi-turn conversations. The template has a
+  system prefix, then a user message placeholder, then an assistant response marker. In PFC mode, the shared prefix
+  gets cached on the first call, and subsequent turns only need to process the new user message portion. The key
+  insight is that each turn's prompt should be the full formatted version of just that turn's content, not including
+  the cached system prefix again. I'm thinking through how the template structure handles multi-turn conversations —
+  the system prefix gets cached once, then each new user message just needs the user/assistant wrapping added to the
+  existing KV cache. The tricky part is managing what gets reused versus what's new for each turn. I'm realizing the
+  chat template handling is getting complex, so I'll simplify by letting the caller handle prompt formatting properly.
+   For the minslm.cpp integration, I need to extract the user wrap portion from the template—the part that surrounds
+  `{message}` without the system prefix—then apply it consistently: the full template for the first turn in multiturn
+  mode with PFC, and just the user wrap for subsequent turns.
+
+  Looking at the template structure more carefully, I can decompose it into the shared prefix (everything before
+  `{message}`, including system and user tags) and the suffix (everything after, like end and assistant tags). For
+  follow-up turns, I'd use just the user portion like `<|user|>\n{message}<|end|>\n<|assistant|>\n`, but extracting
+  that cleanly from the template requires knowing where the system prompt boundary is, which isn't always obvious. I
+  think the cleaner approach is to let the template structure itself guide the extraction—many models follow a
+  consistent pattern where I can identify the user wrap by looking for the message placeholder and working backward to
+   find where the user tag starts. I'm settling on a clean API design where the DLL just handles tokenization and
+  inference on whatever prompt is provided, leaving the turn formatting to the caller in slm.cpp. Now I'm defining the
+   multiturn functions I'll need to expose: beginning a session, running inference for each turn, rewinding to
+  previous states, clearing history, and tracking turn count.
+
+  For the minslm.cpp implementation, I'll add a multiturn flag to enable the feature, then wire up the begin and
+  inference calls in the main loop. I also need to support a REWIND command in the prompt file format. To handle
+  custom turn templates properly, I'm adding a new section that lets users specify how their messages should be
+  wrapped before being passed to the inference function. I could derive the turn template from the existing template
+  by finding the last special token boundary before `{message}`, but that's fragile and template-specific. Instead,
+  I'll add a dedicated `turn_template` field to `model_params` that callers can provide for subsequent turns in
+  multi-turn mode, defaulting to the full template if empty to keep things safe.
+
+  Adding API functions...
+
+  Implementing the multi-turn logic...
+
+  Now I need to handle the prompt file format for REWIND directives and the custom turn template section.
+
+  I also spotted a memory leak in the sampler — `llama_sampler_chain_init()` is called but never freed, so I'll make
+  sure to clean that up properly in my implementation.
+
+  For the `llm_infer_multiturn()` function, I'll adapt the main inference logic but skip the KV cache clearing and
+  instead track the past token count using the multi-turn state.
+
+  Implementing multi-turn state management... I'm thinking through the logic for handling the KV cache in different
+  scenarios—when PFC mode loads successfully versus when it fails or isn't used at all. The key insight is that if the
+   state file loaded, the prefix tokens are already cached and I just need to handle the variable part of the prompt,
+  but if loading failed or PFC wasn't used, I need to clear any stale data from the cache first.
+
+  Now I'm working through the first inference call in PFC mode: the caller provides just the new tokens to append,
+  which I decode from the cached position, then generate. If PFC failed to load, the full prompt gets passed instead
+  and I start fresh. I'm leaning toward including the state save logic for compatibility even in multi-turn scenarios,
+   then moving on to the actual implementation. includes everything. ✓
+
+  The logic checks out across all three scenarios. Now I'm considering the multi-turn case without PFC—the caller
+  would handle the formatting, sending the full template with system prompt on the first turn, then just the user wrap
+   for subsequent turns so the KV cache naturally accumulates the conversation.
+
+  I'm confident in the design now. Let me start implementing it.
+
+  Actually, I should double-check the first turn behavior in the current code more carefully.
+
+  Examining minslm.cpp...
+
+  For both PFC and non-PFC modes, the logic is the same: if PFC is loaded, I extract just the variable part after the
+  template substitution; otherwise I use the full prompt. This same approach works for multi-turn's first turn, and
+  for subsequent turns I'd just pass the user wrap without the system prompt so the KV cache builds up naturally.
+
+  For subsequent turns, I need to handle the turn template separately—just the user/assistant wrapper without the
+  system context. Rather than trying to parse this fragile from the full template, I should add an explicit
+  CUSTOM_TURN_TEMPLATE field to the prompt file format, with a fallback to auto-detecting by finding the last user tag
+   before the {message} placeholder. I see the pattern now—I can extract the turn template by finding where the user
+  block starts in the prefix. The key is locating the last occurrence of a user tag marker in everything before the
+  message placeholder, then that becomes the start of the turn template. From there, I just need to figure out what
+  comes after the message to complete the pattern.
+
+  I'm going to stop deliberating and start implementing. I'll add the multi-turn API to the core library, integrate it
+   into the command-line tool with a flag, and support custom turn templates in the prompt configuration. I should
+  also consider whether to expose context usage statistics through a separate function.
+
+  Writing the implementation... I need to handle the `CUSTOM_TURN_TEMPLATE` section in the prompt file parser, storing
+   it in a new field on the model parameters, and if it's not provided I'll auto-detect it by looking for common user
+  tag patterns like `<|user|>` or `[INST]`. I also need to add support for REWIND commands in the prompt loop to
+  handle multi-turn rewinding.
+
+  Let me create a plan file to track this multi-file change, then work through the implementation systematically. I'm
+  deciding whether `multiturn_mode` belongs in the model_params struct itself or if it should just be controlled at
+  the command-line level in minslm.cpp—having it in params is cleaner for the DLL API, but I need to think through
+  whether it actually affects the DLL interface or if it's just an internal flag.
+
+  Actually, the DLL exposes `llm_infer_multiturn()` as a separate function, so the caller decides which one to invoke.
+   That means `multiturn_mode` is really just a local variable in main(). For `turn_template`, I'll add it to
+  model_params since it's useful for any caller, not just minslm.cpp.
+
+  So I'm adding `std::string turn_template` to the struct and keeping `multiturn_mode` as a local flag in main(), then
+   I'll start implementing the changes.
+
+  Wait, I need to figure out how `llm_infer_multiturn` works with `llama_batch_get_one`. The batch function creates a
+  batch at position 0, but the context tracks position internally through the KV cache. Let me look at how the
+  existing inference handles this...
+
+  Actually, I'm realizing the position tracking depends on how llama.cpp manages the KV cache. When `llm_inference()`
+  clears the cache and re-decodes, it starts from position 0, so the batch positions must be relative to that cleared
+  state. Let me trace through how `llama_batch_get_one` actually works with the decode function. I see the issue
+  now—when processing a long prompt in batches, each call to `llama_batch_get_one()` resets positions to 0, but they
+  should continue from where the previous batch left off. The `n_past` variable tracks how many tokens have been
+  processed, so the second batch should start at position `n_past`, not 0. Let me check what `llama_batch_get_one()`
+  actually does in the source to confirm this is the problem. I'm realizing the key issue: when `llama_batch_get_one`
+  creates a batch with NULL positions, it auto-generates sequential positions starting from 0, which would overwrite
+  the KV cache if you're processing tokens that were already decoded. But the actual inference code handles this
+  correctly, so there must be logic that adjusts these positions based on the current context state during the decode
+  step. When I rewind the KV cache with `llama_kv_self_seq_rm`, I need to verify whether the context's internal
+  position tracker also resets, or if it stays at the old position and causes issues on the next decode call. Let me
+  check the llama.cpp source to see how position tracking actually works after a rewind operation. Looking at how
+  `llama_batch_get_one` actually works, I'm realizing that if the existing code successfully decodes tokens after
+  `llama_kv_self_seq_rm`, then the position assignment must be handling this correctly—either it's assigning positions
+   from 0 regardless of context state, or the KV cache is managing it properly under the hood.
+
+  But here's the critical issue: without clearing the KV cache between turns, decoding a new batch at positions 0..N
+  would overwrite the cached entries from the previous turn, which would corrupt the context. This means the current
+  approach only works because we're explicitly clearing the KV cache before each new decode batch. This would be a
+  problem! If `llama_batch_get_one` always starts from 0, then multi-turn won't work.
+
+  Wait, let me re-read the code. In `llm_inference()`, the prompt processing loop batches tokens in chunks. If `embd`
+  has 1024 tokens and `n_batch` is 512, the first call processes tokens 0-511 and the second call processes tokens
+  512-1023. But if both calls use positions 0-511, the second batch would overwrite the first in the KV cache. Since
+  the code works, either the positions aren't actually 0-511 for the second batch, or the KV cache appends regardless
+  of position.
+
+  Looking at the llama.h documentation for `llama_batch_get_one`, it says the position of tokens is "tracked
+  automatically by the context" — meaning the context maintains an internal position counter that advances with each
+  decode call.
+
+  So the first decode assigns positions 0-511 and increments the counter to 512, the second decode assigns positions
+  512-1023 and increments to 1024, and then during token generation each single-token decode gets the next position.
+  The `llama_kv_self_seq_rm` call must reset or adjust this counter appropriately.
+
+  Let me check the actual implementation to confirm how the position counter works.
+
+● Let me check how llama_batch_get_one handles positions, which is critical for multi-turn accumulation.
+
+◐ Good. So `llama_batch_get_one` creates a batch with `pos = nullptr`, and the comment says "The position of the
+  tokens will be tracked automatically by llama_decode". Let me now find how `llama_decode` handles `pos == nullptr` —
+   specifically how the auto-tracking works and what happens after `llama_kv_self_seq_rm`.
+
+● Now let me check how llama_decode handles the auto position tracking when pos is NULL, and how llama_kv_self_seq_rm
+  affects it.
+
+◐ Now I understand the position tracking. When `batch.pos == nullptr`, the `llama_batch_allocr::init` function
+  auto-generates positions using:
+
+  1. If there's no memory (KV cache): starts from 0
+  2. If there IS memory: starts from `memory->seq_pos_max(s) + 1` for each sequence `s`
+
+  So the positions are automatically derived from the KV cache state! This means:
+  - After clearing KV: `seq_pos_max` returns -1 (or similar), so positions start from 0 ✓
+  - After decoding 512 tokens: `seq_pos_max(0)` returns 511, so next batch starts from 512 ✓
+
+
+  - After rewinding with `llama_kv_self_seq_rm`: `seq_pos_max(0)` reflects the new boundary, so positions continue
+  from the right place ✓
+
+  The KV cache itself handles all the position management automatically, so my `llm_mt_n_past` variable is really just
+   for tracking state externally — the actual positions are always correct based on what's in the cache. I can now
+  implement `llm_infer_multiturn()` knowing that `llama_batch_get_one` will generate the right positions without any
+  manual intervention.
+
+  I still need `llm_mt_n_past` for overflow detection, generation limits, and knowing where turn boundaries are, but
+  the position assignment itself is handled by llama.cpp's internal state. Now I'm ready to start building this out —
+  I'll create the plan document, update the header and implementation files, and modify the main code. First, let me
+  check how to query the current KV cache position using the API function that retrieves the maximum sequence position
+   for a given context.
+
+● Now I understand the position tracking. When pos == nullptr, positions are auto-derived from memory->seq_pos_max(s)
+  + 1 — so after KV removal, positions automatically adjust. This confirms multi-turn accumulation will work
+  correctly.
+
+  Let me also check the llama_kv_self_seq_pos_max API for introspection:
+
+● Grep "llama_kv_self_seq_pos_max" (D:\llama.cpp\b612.dc.080625\include\llama.h)
+  └ 15 lines found
+
+◐ Good, `llama_kv_self_seq_pos_max` is deprecated but available. It returns -1 when empty, otherwise the max position.
+   I can use this for my own sanity checks but I'll track `llm_mt_n_past` manually.
+
+  Now let me implement everything. I'll create the plan first, then make the changes.
+
+  Let me finalize the REWIND handling in the prompt file. The custom prompts are just a list of strings. I'll support
+  lines starting with "REWIND" as commands rather than prompts.
+
+  For the turn template auto-detection, I need to handle the common patterns. Let me keep it simple:
+
+
+  I'll check for `<|user|>` (Phi-3 style) or `<|im_start|>user` (ChatML style) in the shared prefix to identify the
+  turn template. Once I find one of these markers, I know where the turn template starts.
+
+  The plan is straightforward enough from our discussion, so I'll skip the formal writeup and just start implementing.
+   Actually, wait—the instructions say I need to create a plan.md file at the session folder root before diving in.
+  Let me do that first.
+
+● Now I have a complete understanding. Let me create the plan and implement.
+
+● Fixed: Added llama_sampler_free(smpl) in three places in llm_inference():
+
+   - Line ~407: early return on prompt decode failure
+   - Line ~490: early return on token generation decode failure
+   - Line ~509: normal return path (end of function)
+
+Added the following APIs:
+  New Multi-Turn API (llm-infer.h / llm-infer.cpp)
+
+  ┌───────────────────────────────┬──────────────────────────────────────────────────────────────────┐
+  │ Function                      │ Purpose                                                          │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ llm_multiturn_begin(params)   │ Initialize multi-turn session; preserves PFC prefix if available │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ llm_infer_multiturn(params)   │ Inference that accumulates KV cache across calls                 │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ llm_multiturn_rewind(n_turns) │ Drop last N turns from KV cache via llama_kv_self_seq_rm         │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ llm_multiturn_clear()         │ Full KV clear + reset                                            │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ llm_multiturn_turn_count()    │ Number of turns in cache                                         │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ llm_multiturn_token_count()   │ Current KV cache position (n_past)                               │
+  └───────────────────────────────┴──────────────────────────────────────────────────────────────────┘
+
+Files Changed:
+  ┌─────────────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+  │ File                                │ Status                                                               │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ dll/llm-infer.h                     │ Modified — added turn_template field + 6 multi-turn API declarations │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ dll/llm-infer.cpp                   │ Modified — implemented all 6 multi-turn functions                    │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ minslm/minslm.cpp                   │ Unchanged (reverted)                                                 │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ minslm/minslm-multi.cpp             │ New — standalone multi-turn driver                                   │
+  ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ minslm/custom_prompts_multiturn.txt │ New — sample prompt file with REWIND commands                        │
+  └─────────────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+
+  The new minslm-multi.cpp is a clean, self-contained multi-turn driver that:
+
+   - Always uses llm_infer_multiturn() (no single-turn fallback — that's what minslm.cpp is for)
+   - Parses CUSTOM_TURN_TEMPLATE section or auto-derives it from <|user|> / <|im_start|>user / [INST] /
+  <start_of_turn>user tags
+   - Handles REWIND N directives in the prompt list
+   - Uses full template on first turn, turn-only template on subsequent turns
+
+  Key Design Decisions
+
+   1. Positions auto-tracked — llama_batch_get_one() with pos=nullptr derives positions from memory->seq_pos_max(s)+1,
+   so after llama_kv_self_seq_rm() positions automatically adjust correctly.
+   2. Turn-level rewind — llm_mt_turn_starts vector tracks the n_past at the start of each turn's prompt, enabling
+  precise rewind to any turn boundary.
+   3. Sampler properly freed — Unlike the original llm_inference(), the new function calls llama_sampler_free(smpl).
+
+  Usage
+
+   minslm.exe model.gguf 4 custom_prompts_multiturn.txt multiturn stream
+   
