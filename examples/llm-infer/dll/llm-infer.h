@@ -76,6 +76,9 @@ LLM_INFER_API void llm_print_tensor_op_perf_stats();
 LLM_INFER_API void llm_disable_log();
 LLM_INFER_API void llm_enable_log();
 
+// Returns the model's built-in chat template string, or nullptr if none.
+LLM_INFER_API const char * llm_get_chat_template();
+
 // Multi-turn conversation API
 // Call llm_multiturn_begin() after llm_initialize() to start a multi-turn session.
 // Then call llm_infer_multiturn() for each turn — KV cache accumulates across calls.
