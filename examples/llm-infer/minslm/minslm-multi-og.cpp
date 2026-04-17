@@ -45,6 +45,66 @@ Usage:
 by llama_chat_apply_template()
 - Fix: 3-level template detection — API → jinja pattern scan → ChatML fallback — with Gemma-4 pattern added to the scanner
 
+ 1. Get the model's raw template string
+
+  After llm_initialize(), llm_get_chat_template() — a thin wrapper I added around llama_model_chat_template(model, nullptr). 
+  This reads the chat_template field from the GGUF metadata. For the Gemma-4 model, it returned a 16,317-character jinja2 
+  template string.
+
+  2. Try the official API first (failed)
+
+  Pass the template string to llama_chat_apply_template(), which pattern-matches against a hardcoded list of 
+  ~20 known template formats. Gemma-4 template isn't in that list, so it returns -1.
+
+  3. Scan the jinja source for known tokens
+
+  The function detect_chat_format_from_jinja() checks the following in order:
+
+  ┌──────────────────────────────────────────┬────────────────────────────┐
+  │ Pattern searched                         │ Model family               │
+  ├──────────────────────────────────────────┼────────────────────────────┤
+  │ <|user|> + <|assistant|> + <|end|>       │ Phi-3/4                    │
+  ├──────────────────────────────────────────┼────────────────────────────┤
+  │ <|start_header_id|>                      │ Llama-3                    │
+  ├──────────────────────────────────────────┼────────────────────────────┤
+  │ <|turn> + <turn|>                        │ Gemma-4                    │
+  ├──────────────────────────────────────────┼────────────────────────────┤
+  │ <start_of_turn>                          │ Gemma 1/2                  │
+  ├──────────────────────────────────────────┼────────────────────────────┤
+  │ <|im_start|>                             │ ChatML                     │
+  ├──────────────────────────────────────────┼────────────────────────────┤
+  │ [INST]                                   │ Mistral/Llama-2            │
+  └──────────────────────────────────────────┴────────────────────────────┘
+
+  The 16K jinja string contains the literals <|turn> and <turn|>, so Gemma-4 matches.
+
+  3. Extract the template format
+
+  From the reference implementation:
+
+  b612_Onnx/examples/cpp/Gemma-4/gemma4_tokenizer.cpp, lines 93–105:
+
+   // System turn
+   text += "<|turn>system\n";
+   text += system_prompt;
+   text += "<turn|>\n";
+   
+   // User turn
+   text += "<|turn>user\n";
+   text += user_text;
+   text += "<turn|>\n";
+   
+   // Generation prompt
+   text += "<|turn>model\n";
+
+  From this construct the full prompt:
+
+   - System prefix: <|turn>system\n{sys_text}<turn|>\n
+   - Turn template: <|turn>user\n{message}<turn|>\n<|turn>model\n
+
+  The system prefix is decoded once into the KV cache by llm_multiturn_begin(). 
+  Each user turn substitutes {message} with the actual text and feeds it to llm_infer_multiturn().
+
 */
 
 #pragma warning (disable:4267) //  conversion from 'size_t' to 'int' ...
