@@ -105,6 +105,76 @@ by llama_chat_apply_template()
   The system prefix is decoded once into the KV cache by llm_multiturn_begin(). 
   Each user turn substitutes {message} with the actual text and feeds it to llm_infer_multiturn().
 
+========================================
+
+  Jinja is a Python templating language (from the Flask ecosystem) that uses {{ variable }}, {% if %}, {% for %} blocks to generate text
+  from data. HuggingFace adopted it as the standard way to define chat templates in model configs.
+
+  Every GGUF model can embed a chat_template metadata field — a Jinja string that describes how to format a conversation. For example, a
+  ChatML model's template looks like:
+
+   {% for message in messages %}
+   <|im_start|>{{ message.role }}
+   {{ message.content }}<|im_end|>
+   {% endfor %}
+
+  Given messages = [{role: "user", content: "Hello"}], the Jinja engine renders:
+
+   <|im_start|>user
+   Hello<|im_end|>
+
+  Gemma-4 model has a 16,317-character Jinja template — complex with conditionals for tools, thinking, multimodal content, etc.
+  llama.cpp's llama_chat_apply_template() doesn't run a Jinja engine; it pattern-matches against ~20 hardcoded template names. Your
+  template wasn't recognized → returned -1.
+
+  Instead of parsing the Jinja, detect_chat_format_from_jinja() searches the raw Jinja source text for known special-token literals:
+
+   // The Jinja source contains these literal strings
+   if (t.find("<|turn>") != std::string::npos &&
+       t.find("<turn|>") != std::string::npos) {
+       // → Gemma-4 format
+
+  Scan it for token markers to identify the model family, then hardcode the correct format. It's a
+  pragmatic shortcut that avoids needing a full Jinja parser in C++.
+
+  There are two levels to extract the Jinja template from the model
+
+  1. At runtime in our code
+
+  We call the llama.cpp API:
+
+   // llm-infer.cpp — our wrapper
+   const char * llm_get_chat_template() {
+       return llama_model_chat_template(llm_model, nullptr);
+   }
+
+  llama_model_chat_template() reads the tokenizer.chat_template key from the GGUF metadata that was loaded when the model file was
+  opened. It returns the raw Jinja string (or nullptr if absent).
+
+  2. What's inside the GGUF file
+
+  GGUF is a binary format with a key-value metadata section. When a model is converted from HuggingFace (via convert_hf_to_gguf.py), the
+  converter copies tokenizer_config.json's chat_template field into the GGUF metadata.
+
+  You can inspect it offline with Python:
+
+   python -c "
+   from gguf.gguf_reader import GGUFReader
+   r = GGUFReader('your_model.gguf')
+   for k in r.fields:
+       if 'chat_template' in k:
+           val = bytes(r.fields[k].parts[-1]).decode('utf-8')
+           print(f'{k}: {val[:200]}...')
+   "
+
+  The chain
+
+   HuggingFace tokenizer_config.json
+     → "chat_template": "{% for message in messages %}..."
+       → convert_hf_to_gguf.py bakes it into GGUF metadata
+         → llama_model_chat_template() reads it at load time
+           → our code gets the 16K-char Jinja string
+
 */
 
 #pragma warning (disable:4267) //  conversion from 'size_t' to 'int' ...
@@ -865,6 +935,9 @@ int main(int argc, char** argv) {
     llm_multiturn_begin(params);
     printf("[%s]: multi-turn mode — KV cache will accumulate across turns\n", __func__);
 
+    // Stop generation when '}' is encountered (for JSON responses)
+    params.stop_char = '}';
+
     int prompt_index = 1;
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -981,7 +1054,17 @@ int main(int argc, char** argv) {
         if (params.streaming_reply) {
             printf("\n<<\n");
         } else {
-            printf("%s\n\n", params.reply.c_str());
+            if (params.stop_char) {
+                for (auto c : params.reply) {
+                    printf("%c", c);
+                    if (c == params.stop_char) {
+                        break;
+                    }
+                }
+                printf("\n\n");
+            } else {
+                printf("%s\n\n", params.reply.c_str());
+            }
         }
 
         // Record turn stats
