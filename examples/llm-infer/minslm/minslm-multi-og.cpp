@@ -238,6 +238,18 @@ static std::string trim(const std::string & str) {
     return str.substr(start, end - start);
 }
 
+static std::string to_lower(const std::string & str) {
+    std::string s = str;
+    for (auto & c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Case-insensitive check for meta commands (/context, /rewind, quit())
+static bool is_meta_command(const std::string & t) {
+    std::string lc = to_lower(t);
+    return lc == "/context" || lc.substr(0, 7) == "/rewind" || lc == "quit()";
+}
+
 // ─── Parsed Prompt / Script Types (OG format from cpf_gem4mm) ───────────────
 
 struct ParsedPrompt {
@@ -291,7 +303,7 @@ static ParsedPrompt ParsePromptBlock(const std::vector<std::string>& lines) {
                     break;
             }
         }
-        else if (t == "/context" || t.substr(0, 7) == "/rewind" || t == "quit()") {
+        else if (is_meta_command(t)) {
             p.is_meta = true;
             p.text = t;
         }
@@ -338,7 +350,7 @@ Script ParseScriptFile(const std::string& filepath) {
 
 // Returns N for "/rewind N" (default 1). Returns 0 if not a rewind command.
 static int ParseRewindCommand(const std::string& input) {
-    std::string t = trim(input);
+    std::string t = to_lower(trim(input));
     if (t.size() < 7 || t.substr(0, 7) != "/rewind") return 0;
     std::string rest = trim(t.substr(7));
     if (rest.empty()) return 1;
@@ -696,7 +708,7 @@ ParsedPrompt ReadPromptFromStdin() {
         lines.push_back(line);
 
         // Single-line meta commands
-        if (t == "/context" || t.substr(0, 7) == "/rewind" || t == "quit()") break;
+        if (is_meta_command(t)) break;
 
         // If first line has no T: prefix, treat as single-line text
         if (lines.size() == 1 && !(t.size() >= 3 && t[1] == ':' && t[2] == ' ' &&
@@ -715,7 +727,7 @@ ParsedPrompt ReadPromptFromStdin() {
     if (lines.size() == 1) {
         std::string t = trim(lines[0]);
         bool has_prefix = (t.size() >= 3 && t[1] == ':' && t[2] == ' ');
-        bool is_meta = (t == "/context" || t.substr(0, 7) == "/rewind" || t == "quit()");
+        bool is_meta = is_meta_command(t);
         if (!has_prefix && !is_meta) {
             ParsedPrompt p;
             p.text = t;
@@ -878,13 +890,13 @@ int main(int argc, char** argv) {
             continue;
 
         // ── Handle quit() ──
-        if (prompt.text == "quit()") {
+        if (to_lower(prompt.text) == "quit()") {
             std::cout << "Exiting." << std::endl;
             break;
         }
 
         // ── Handle /context ──
-        if (prompt.text == "/context") {
+        if (to_lower(prompt.text) == "/context") {
             print_context_info();
             continue;
         }
