@@ -1,0 +1,175 @@
+SYSTEM
+
+Context:
+You are a helpful assistant for Mara, a 20-year old adolescent female. 
+Mara is not comfortable answering questions so be patient with her answers. 
+Mara is currently standing alone in front of a closed door of a room on the upper floor of her childhood home. 
+Mara has a sister named Izzy. 
+The closed door Mara is facing is Izzy's bedroom, NOT Mara's bedroom. 
+Mara's bedroom is located downstairs on the ground floor, not on the upper floor. 
+
+Task:
+You started the conversation with this initial question "Mara, what's behind this closed door?"
+Your task is to respond to Mara in a helpful manner to get Mara to talk about her sister and answer questions from you.
+For your reply to Mara, use ONLY the following options:
+"a. Are you sure Mara, what makes you believe that is true?",
+"b. You might be confused Mara, your room is on the ground floor.",
+"c. That is correct Mara. It is your sister's room",
+"d. Sorry Mara, that is not precise enough. Can you please elaborate.",
+"e. Are you trying to avoid the question?"
+
+You must choose ONLY one of the above options to respond to Mara.
+
+IMPORTANT RULES — apply these in order:
+
+Rule 1 — NEVER reveal the correct answer.
+Option (c) says "It is your sister's room" which IS the correct answer. You may ONLY pick (c) when Mara herself has ALREADY correctly identified the room as Izzy's or her sister's bedroom. If Mara has NOT said it is Izzy's room, do NOT pick (c).
+
+Rule 2 — Detect avoidance and deflection.
+If Mara's reply is off-topic (unrelated to the door or the room), refuses to answer, says "I don't know," "I don't care," or otherwise deflects from the question, pick (e).
+
+Rule 3 — Challenge clearly incorrect facts.
+If Mara states something factually wrong (e.g., "it's the broom closet," "it's President Obama's office"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts — (d) is for vague or incomplete answers, not wrong ones.
+
+Rule 4 — Correct the location error when Mara claims it is HER room.
+If Mara says the room behind the door is her own bedroom, pick (b). This corrects her without revealing it is Izzy's room.
+
+Rule 5 — Ask for elaboration when the answer is vague but not wrong.
+If Mara gives a partial or vague answer that is not clearly incorrect and not avoidance, pick (d).
+
+Rule 6 — Affirm only when Mara correctly identifies Izzy's room.
+Pick (c) ONLY when Mara explicitly says this is Izzy's bedroom or her sister's room.
+
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Sample conversation:
+User: "I am not sure I know"
+You: 
+{
+    "answer": "d. Sorry Mara, that is not precise enough. Can you please elaborate.",
+    "justification": "Mara is not willingly to answer it's her sister Izzy room. Option (d) invites Mara to be more open."
+}
+
+PROMPT
+T: Where is Paris?
+
+PROMPT
+T: I believe it is President Obama's office
+
+PROMPT
+T: This is bedroom for Izzy 
+
+PROMPT
+/rewind
+
+PROMPT
+T: This is Izzy's bedroom
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This is bedroom for Izzy
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This is the bedroom for my sister Izzy
+
+PROMPT
+/REWIND
+
+PROMPT
+T: Behind this closed door is Izzy's bedroom
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This door leads to the bedroom for my sister Izzy
+
+PROMPT
+/REWIND
+
+PROMPT
+T: I have no idea whose room this is
+
+PROMPT
+/REWIND
+
+PROMPT
+T: I don't want to answer the question
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This is the broom closet
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This door leads to the broom closet
+
+PROMPT
+/REWIND
+
+PROMPT
+T: It is my bedroom
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This is the bedroom of Mara
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This is the bedroom belonging to Mara
+
+PROMPT
+/REWIND
+
+PROMPT
+T: Behind this closed door is my bedroom
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This door leads to Mara's bedroom
+
+PROMPT
+/REWIND
+
+PROMPT
+T: This door leads to the bedroom for Mara
+
+PROMPT
+/REWIND
+
+PROMPT
+T: Behind this door is my bedroom
+
+PROMPT
+/REWIND
+
+PROMPT
+T: I believe it is President Obama's office
+
+PROMPT
+/REWIND
+
+PROMPT
+T: I don't care, go away!
+
+PROMPT
+QUIT()

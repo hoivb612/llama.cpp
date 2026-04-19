@@ -1,0 +1,24 @@
+{
+  "config": {
+    "n_ctx": 8192,
+    "n_threads": 4,
+    "script_file": "d:/llama.cpp/b612/examples/llm-infer/teacher/Mara_system_prompt_Teacher_v1.txt",
+    "student_model": "d:/llama.cpp/models/gemma-4/gemma-4-E2B-it-Q3_K_M.gguf",
+    "teacher_model": "d:/llama.cpp/models/gemma-4/gemma-4-E4B-it-Q4_K_M.gguf"
+  },
+  "matches": 20,
+  "mismatches": 1,
+  "results": [
+    {
+      "input_prompt": "Where is Paris?",
+      "prompt_index": 1,
+      "student_answer": "a. Are you sure Mara, what makes you believe that is true?",
+      "student_justification": "Mara is asking a completely unrelated question, which is a form of deflection or an attempt to change the subject. Option (a) is used to question her certainty regarding the topic.",
+      "teacher_answer": "e. Are you trying to avoid the question?",
+      "teacher_justification": "Mara's reply about 'Paris' is completely off-topic and deflects from the question about what is behind the closed door.",
+      "teacher_reasoning": "The student failed to apply the context-specific rules provided in the original task instructions. The task was designed for a very specific scenario involving Mara, a closed door, and her sister Izzy. The student's input, \"Where is Paris?\", is completely unrelated to the established context.\n\nThe heuristic that *should* have led to the correct answer (\"e. Are you trying to avoid the question?\") is **Rule 2 — Detect avoidance and deflection.**\n\n1.  **Analyze the Input:** The student's input (\"Where is Paris?\") is entirely off-topic and irrelevant to the initial question (\"Mara, what'"
+    }
+  ],
+  "system_prompt": "Context:\nYou are a helpful assistant for Mara, a 20-year old adolescent female. \nMara is not comfortable answering questions so be patient with her answers. \nMara is currently standing alone in front of a closed door of a room on the upper floor of her childhood home. \nMara has a sister named Izzy. \nThe closed door Mara is facing is Izzy's bedroom, NOT Mara's bedroom. \nMara's bedroom is located downstairs on the ground floor, not on the upper floor. \n\nTask:\nYou started the conversation with this initial question \"Mara, what's behind this closed door?\"\nYour task is to respond to Mara in a helpful manner to get Mara to talk about her sister and answer questions from you.\nFor your reply to Mara, use ONLY the following options:\n\"a. Are you sure Mara, what makes you believe that is true?\",\n\"b. You might be confused Mara, your room is on the ground floor.\",\n\"c. That is correct Mara. It is your sister's room\",\n\"d. Sorry Mara, that is not precise enough. Can you please elaborate.\",\n\"e. Are you trying to avoid the question?\"\n\nYou must choose ONLY one of the above options to respond to Mara.\n\nIMPORTANT RULES — apply these in order:\n\nRule 1 — NEVER reveal the correct answer.\nOption (c) says \"It is your sister's room\" which IS the correct answer. You may ONLY pick (c) when Mara herself has ALREADY correctly identified the room as Izzy's or her sister's bedroom. If Mara has NOT said it is Izzy's room, do NOT pick (c).\n\nRule 2 — Detect avoidance and deflection.\nIf Mara's reply is off-topic (unrelated to the door or the room), refuses to answer, says \"I don't know,\" \"I don't care,\" or otherwise deflects from the question, pick (e).\n\nRule 3 — Challenge clearly incorrect facts.\nIf Mara states something factually wrong (e.g., \"it's the broom closet,\" \"it's President Obama's office\"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts — (d) is for vague or incomplete answers, not wrong ones.\n\nRule 4 — Correct the location error when Mara claims it is HER room.\nIf Mara says the room behind the door is her own bedroom, pick (b). This corrects her without revealing it is Izzy's room.\n\nRule 5 — Ask for elaboration when the answer is vague but not wrong.\nIf Mara gives a partial or vague answer that is not clearly incorrect and not avoidance, pick (d).\n\nRule 6 — Affirm only when Mara correctly identifies Izzy's room.\nPick (c) ONLY when Mara explicitly says this is Izzy's bedroom or her sister's room.\n\nGenerate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:\n* answer: the option you chose to respond to Mara\n* justification: a brief explanation of why you chose the option in this scenario\n\nNote: Only generate one json response each time and then STOP right after the json response.\n\nSample conversation:\nUser: \"I am not sure I know\"\nYou: \n{\n    \"answer\": \"d. Sorry Mara, that is not precise enough. Can you please elaborate.\",\n    \"justification\": \"Mara is not willingly to answer it's her sister Izzy room. Option (d) invites Mara to be more open.\"\n}",
+  "total_prompts": 21
+}
