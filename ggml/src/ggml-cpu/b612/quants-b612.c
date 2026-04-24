@@ -21,6 +21,12 @@
 #define GROUP_MAX_EPS_IQ1_M 1e-7f
 #define GROUP_MAX_EPS_IQ1_S 1e-12f
 
+// Clang requires explicit target attributes for VNNI/BF16 intrinsics even when
+// the translation unit is intended for AVX-512 targets. MSVC does not enforce this.
+#ifdef __clang__
+#pragma clang attribute push(__attribute__((target("avx512f,avx512vnni,avx512vl,avx512bf16"))), apply_to=function)
+#endif
+
 #if defined(_MSC_VER)
 // disable "possible loss of data" to avoid warnings for hundreds of casts
 // we should just be careful :)
@@ -7243,3 +7249,7 @@ void quantize_row_iq4_xs(const float * restrict x, void * restrict y, int64_t k)
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+#ifdef __clang__
+#pragma clang attribute pop
+#endif

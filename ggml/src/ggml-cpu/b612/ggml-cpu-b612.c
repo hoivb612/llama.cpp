@@ -66,6 +66,12 @@
 #pragma warning(disable: 4702)
 #endif
 
+// Clang requires explicit target attributes for VNNI/BF16 intrinsics even when
+// the translation unit is intended for AVX-512 targets. MSVC does not enforce this.
+#ifdef __clang__
+#pragma clang attribute push(__attribute__((target("avx512f,avx512vnni,avx512vl,avx512bf16"))), apply_to=function)
+#endif
+
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
@@ -6762,4 +6768,8 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph *cgraph) {
         }
     }   
 }
+
+#ifdef __clang__
+#pragma clang attribute pop
+#endif
 

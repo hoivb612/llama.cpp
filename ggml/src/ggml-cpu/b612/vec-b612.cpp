@@ -8,6 +8,12 @@
 #pragma warning(disable: 4244 4267)
 #endif
 
+// Clang requires explicit target attributes for VNNI/BF16 intrinsics even when
+// the translation unit is intended for AVX-512 targets. MSVC does not enforce this.
+#ifdef __clang__
+#pragma clang attribute push(__attribute__((target("avx512f,avx512vnni,avx512vl,avx512bf16"))), apply_to=function)
+#endif
+
 // For AVX512_BF16 full time
 #ifndef __AVX512BF16__
     #define __AVX512BF16__
@@ -2935,4 +2941,8 @@ void ggml_vec_scale_f16(const uint64_t n, ggml_fp16_t * y, const float v) {
 #endif // defined(__AVX512F__) && defined(__GEN_AVX512__) 
 
 }
+
+#ifdef __clang__
+#pragma clang attribute pop
+#endif
 

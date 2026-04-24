@@ -62,8 +62,36 @@ xx_vec_dot_q4_0_q8_0_x8 (
     size_t ncols,
     int nrc);
 
+// Batch-optimized variant: tiles 4 activation columns per weight load.
+// Same repack format as xx_vec_dot_q4_0_q8_0_x8. Drop-in replacement
+// that reduces weight memory traffic ~4x when ncols >= 4 (prompt prefill).
+void
+xx_vec_dot_q4_0_q8_0_x8_cp (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q4_0_repack * x,
+    size_t bx,
+    const block_q8_0_repack * y,
+    size_t ncols,
+    int nrc);
+
 void
 xx_vec_dot_q2_k_q8_k_x8 (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q2_K_repack * x,
+    size_t bx,
+    const block_q8_K_repack * y,
+    size_t ncols,
+    int nrc);
+
+// Batch-optimized variant: tiles 4 activation columns per weight load.
+// Same repack format as xx_vec_dot_q2_k_q8_k_x8. Drop-in replacement
+// that reduces weight memory traffic ~4x when ncols >= 4 (prompt prefill).
+void
+xx_vec_dot_q2_k_q8_k_x8_cp (
     const int n,
     float * s,
     size_t nr_nb1,
@@ -84,8 +112,36 @@ xx_vec_dot_q3_k_q8_k_x8 (
     size_t ncols,
     int nrc);
 
+// Batch-optimized variant: tiles 4 activation columns per weight load.
+// Same repack format as xx_vec_dot_q3_k_q8_k_x8. Drop-in replacement
+// that reduces weight memory traffic ~4x when ncols >= 4 (prompt prefill).
+void
+xx_vec_dot_q3_k_q8_k_x8_cp (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q3_K_repack * x,
+    size_t bx,
+    const block_q8_K_repack * y,
+    size_t ncols,
+    int nrc);
+
 void
 xx_vec_dot_q4_k_q8_k_x8 (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q4_K_repack * x,
+    size_t bx,
+    const block_q8_K_repack * y,
+    size_t ncols,
+    int nrc);
+
+// Batch-optimized variant: tiles 4 activation columns per weight load.
+// Same repack format as xx_vec_dot_q4_k_q8_k_x8. Drop-in replacement
+// that reduces weight memory traffic ~4x when ncols >= 4 (prompt prefill).
+void
+xx_vec_dot_q4_k_q8_k_x8_cp (
     const int n,
     float * s,
     size_t nr_nb1,
@@ -106,8 +162,37 @@ xx_vec_dot_q6_k_q8_k_x8 (
     size_t ncols,
     int nrc);
 
+// Batch-optimized variant: tiles 4 activation columns per weight load.
+// Same repack format as xx_vec_dot_q6_k_q8_k_x8. Drop-in replacement
+// that reduces weight memory traffic ~4x when ncols >= 4 (prompt prefill).
+void
+xx_vec_dot_q6_k_q8_k_x8_cp (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q6_K_repack * x,
+    size_t bx,
+    const block_q8_K_repack * y,
+    size_t ncols,
+    int nrc);
+
 void
 xx_vec_dot_q8_0_q8_0_x8 (
+    const int n,
+    float * s,
+    size_t nr_nb1,
+    const block_q8_0_repack * x,
+    size_t bx,
+    const block_q8_0_repack * y,
+    size_t ncols,
+    int nrc);
+
+// Batch-optimized variant: tiles 4 activation columns per weight load.
+// Same repack format as xx_vec_dot_q8_0_q8_0_x8. Drop-in replacement
+// that reduces weight memory traffic ~4x when ncols >= 4 (prompt prefill).
+// Additional savings from shared sign-correction (abs + mask) ops.
+void
+xx_vec_dot_q8_0_q8_0_x8_cp (
     const int n,
     float * s,
     size_t nr_nb1,
