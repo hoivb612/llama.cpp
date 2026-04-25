@@ -256,14 +256,11 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             } else if (!strcmp(argv[i], "-repack-ggml")) {
-                printf("%s: Selecting GGML tensor repack mode\n", __func__);
-                llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_GGML);
+                printf("%s: -repack-ggml is no longer supported (removed API)\n", __func__);
             } else if (!strcmp(argv[i], "-repack-xbox")) {
-                printf("%s: Selecting XBOX tensor repack mode\n", __func__);
-                llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
+                printf("%s: -repack-xbox is no longer supported (removed API)\n", __func__);
             } else if (!strcmp(argv[i], "-repack-xbcg")) {
-                printf("%s: Selecting XBOX tensor repack mode\n", __func__);
-                llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBCG);
+                printf("%s: -repack-xbcg is no longer supported (removed API)\n", __func__);
             } else if (strcmp(argv[i], "-m") == 0) {
                 if (i + 1 < argc) {
                     xbparams.model_path = argv[++i];
@@ -483,7 +480,7 @@ int main(int argc, char** argv) {
     console::set_display(console::stats);
     t0 = ggml_time_us() - t0;
     printf("\n\n total elapsed time %7.2fsec\n", (double)t0 / (1000. * 1000.));
-    llama_print_tensor_op_perf();
+    // llama_print_tensor_op_perf() removed in newer API
 
     console::cleanup();
 

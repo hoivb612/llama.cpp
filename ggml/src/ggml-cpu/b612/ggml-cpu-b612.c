@@ -97,6 +97,9 @@
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
 
+// precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
+float ggml_table_f32_e8m0_half[1 << 8];
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int has_neon;
@@ -658,6 +661,14 @@ struct ggml_compute_state {
     struct ggml_threadpool * threadpool;
     int ith;
 };
+
+void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
+    atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
+}
+
+int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
+    return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
+}
 
 //
 // fundamental operations -> vec.h / vec.cpp
@@ -5946,6 +5957,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wsize      =*/ cplan->work_size,
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
+        /*.use_ref    =*/ false,
         /*.barrier    =*/ (void *)&(tp->barrier_tb),
         /*.generation =*/ (void *)&(tp->generation_tb)
     };
@@ -6500,6 +6512,14 @@ int ggml_cpu_has_riscv_v(void) {
 #endif
 }
 
+int ggml_cpu_get_rvv_vlen(void) {
+#if defined(__riscv) && defined(__riscv_v_intrinsic)
+    return ggml_riscv_arch_features.rvv_vlen;
+#else
+    return 0;
+#endif
+}
+
 int ggml_cpu_has_f16c(void) {
 #if defined(__F16C__)
     return 1;
@@ -6656,6 +6676,11 @@ void ggml_cpu_init(void) {
                 ggml_table_f32_f16[i] = f;
                 ggml_table_gelu_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_f32(f));
                 ggml_table_gelu_quick_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_quick_f32(f));
+            }
+
+            // initialize E8M0 half table (256 entries)
+            for (int i = 0; i < (1 << 8); ++i) {
+                ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

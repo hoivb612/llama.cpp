@@ -239,7 +239,7 @@ bool llm_initialize(
     llm_tokens_shared = {};
     if (params.pfc_mode) {
         // start from a known point
-        llama_kv_self_clear(llm_ctx);
+        llama_memory_clear(llama_get_memory(llm_ctx), true);
 
         std::string template_prompt = params.custom_template_prompt;
         size_t pos = template_prompt.find("{message}");
@@ -314,7 +314,7 @@ bool llm_inference(
             // current version of llama does not support seq_id being negative
             // llama_kv_self_seq_rm(llm_ctx, -1, llm_tokens_shared.size(), -1);
             //
-            llama_kv_self_seq_rm(llm_ctx, 0, llm_tokens_shared.size(), -1);
+            llama_memory_seq_rm(llama_get_memory(llm_ctx), 0, llm_tokens_shared.size(), -1);
             embd_inp.insert(embd_inp.end(), llm_tokens_shared.begin(), llm_tokens_shared.end());
         }
         n_past = llm_tokens_shared.size();
@@ -322,7 +322,7 @@ bool llm_inference(
 
     } else {
         // start from a known point
-        llama_kv_self_clear(llm_ctx);
+        llama_memory_clear(llama_get_memory(llm_ctx), true);
         embd_inp.clear();
         n_past = 0;
         n_kv_pfx = 0;
@@ -534,7 +534,7 @@ void llm_multiturn_begin(const model_params& params) {
     if (!llm_tokens_shared.empty()) {
         // PFC mode: shared prefix is already decoded in KV cache
         // Remove any tokens past the shared prefix
-        llama_kv_self_seq_rm(llm_ctx, 0, (int)llm_tokens_shared.size(), -1);
+        llama_memory_seq_rm(llama_get_memory(llm_ctx), 0, (int)llm_tokens_shared.size(), -1);
         llm_mt_n_past = (int)llm_tokens_shared.size();
         if (params.verbose >= 1) {
             printf("%s: multi-turn started with %d prefix tokens in KV cache (PFC)\n",
@@ -542,7 +542,7 @@ void llm_multiturn_begin(const model_params& params) {
         }
     } else {
         // Fresh start — clear everything
-        llama_kv_self_clear(llm_ctx);
+        llama_memory_clear(llama_get_memory(llm_ctx), true);
         llm_mt_n_past = 0;
 
         // Pre-decode the system prefix from the template so it's protected from REWIND.
@@ -764,7 +764,7 @@ void llm_multiturn_rewind(int n_turns) {
            __func__, n_turns, llm_mt_n_past, rewind_pos);
 
     // Remove tokens from KV cache from rewind_pos onward
-    llama_kv_self_seq_rm(llm_ctx, 0, rewind_pos, -1);
+    llama_memory_seq_rm(llama_get_memory(llm_ctx), 0, rewind_pos, -1);
 
     // Update state
     llm_mt_n_past = rewind_pos;
@@ -780,7 +780,7 @@ void llm_multiturn_clear() {
     printf("%s: clearing all %d turns, n_past %d -> 0\n",
            __func__, (int)llm_mt_turn_starts.size(), llm_mt_n_past);
 
-    llama_kv_self_clear(llm_ctx);
+    llama_memory_clear(llama_get_memory(llm_ctx), true);
     llm_mt_n_past = 0;
     llm_mt_turn_starts.clear();
 }
@@ -825,7 +825,7 @@ static void batch_decode(
     int n_embd) {
 
     // clear previous kv_cache values (irrelevant for embeddings)
-    llama_kv_self_clear(ctx);
+    llama_memory_clear(llama_get_memory(ctx), true);
 
     // run model
     // fprintf(stderr, "%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
