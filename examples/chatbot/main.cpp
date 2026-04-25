@@ -353,7 +353,7 @@ void chat_loop() {
         _write(1, get_role_color(g_role), strlen(get_role_color(g_role)));
 
         // color user input only
-        console::set_display(console::user_input);
+        console::set_display(DISPLAY_TYPE_USER_INPUT);
 
         std::string line;
         std::string buffer;
@@ -364,7 +364,7 @@ void chat_loop() {
         } while (another_line);
 
         // done taking input, reset color
-        console::set_display(console::reset);
+        console::set_display(DISPLAY_TYPE_RESET);
 
         _write(1, RESET, strlen(RESET));
         g_last_printed_char = '\n';

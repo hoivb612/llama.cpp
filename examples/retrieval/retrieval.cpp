@@ -179,10 +179,10 @@ bool create_vector_database(common_params & params) {
     llama_numa_init(params.numa);
 
     // load the model
-    common_init_result llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model.get();
-    llama_context * ctx = llama_init.context.get();
+    llama_model * model = llama_init->model();
+    llama_context * ctx = llama_init->context();
 
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
@@ -376,10 +376,10 @@ bool query_database(common_params & params) {
     }
 
     // load the model
-    common_init_result llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model.get();
-    llama_context * ctx = llama_init.context.get();
+    llama_model * model = llama_init->model();
+    llama_context * ctx = llama_init->context();
 
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
@@ -742,7 +742,7 @@ int main(int argc, char ** argv) {
         // encode if at capacity
         if (batch.n_tokens + n_toks > n_batch || s >= llama_n_seq_max(ctx)) {
             float * out = emb + p * n_embd_out;
-            batch_process(ctx, batch, out, s, n_embd_out);
+            batch_decode(ctx, batch, out, s, n_embd_out);
             common_batch_clear(batch);
             p += s;
             s = 0;
@@ -759,7 +759,9 @@ int main(int argc, char ** argv) {
 
     // final batch
     float * out = emb + p * n_embd_out;
-    batch_process(ctx, batch, out, s, n_embd_out);
+    batch_decode(ctx, batch, out, s, n_embd_out);
+
+    int64_t t_embeddings_stop = ggml_time_us();
 
     // save embeddings to chunks
     for (int i = 0; i < n_chunks; i++) {
@@ -793,7 +795,7 @@ int main(int argc, char ** argv) {
            batch_add_seq(query_batch, query_tokens, 0);
 
         std::vector<float> query_emb(n_embd_out, 0);
-        batch_process(ctx, query_batch, query_emb.data(), 1, n_embd_out);
+        batch_decode(ctx, query_batch, query_emb.data(), 1, n_embd_out);
 
             common_batch_clear(query_batch);
 

@@ -2340,38 +2340,6 @@ int main(int argc, char ** argv) {
     printf("\n");
     printf("\n\nsystem_info: %s\n\n", llama_print_system_info());
 
-#ifdef GGML_B612
-    ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
-    switch (params.tensor_repack_mode) {
-        case 0:
-            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
-            break;
-        case 1: 
-            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
-            break;
-        case 2:
-            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX;
-            break;
-        case 3: 
-            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBCG;
-            break;
-        case 4:
-            tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD;
-            break;
-        case 5:
-            tensor_repack_mode = GGML_TENSOR_MULMAT_MODE_XBOX;
-            break;
-        default:
-            break;
-    }
-    printf("Set repacking mode to %d\n", tensor_repack_mode);
-    llama_set_tensor_repack_mode(tensor_repack_mode);
-
-    if (params.use_openmp) {
-        llama_select_OpenMP();
-    }
-#endif // GGML_B612
-
     printf("\n");
     printf("\n\nsystem_info: %s\n\n", llama_print_system_info());
 

@@ -193,8 +193,8 @@ void on_forget(const std::vector<std::string> &args) {
         return;
     }
     printf(FAINT "forgetting: %s" RESET "\n", describe_erasure(erase_begin, erase_end).c_str());
-    llama_kv_self_seq_rm(g_ctx, 0, erase_begin, erase_end);
-    llama_kv_self_seq_add(g_ctx, 0, erase_end, -1, -erase_count);
+    llama_memory_seq_rm(llama_get_memory(g_ctx), 0, erase_begin, erase_end);
+    llama_memory_seq_add(llama_get_memory(g_ctx), 0, erase_end, -1, -erase_count);
     g_history.erase(g_history.begin() + erase_begin, //
                     g_history.begin() + erase_end);
     adjust_stacks(erase_begin, erase_end);
@@ -203,7 +203,7 @@ void on_forget(const std::vector<std::string> &args) {
 
 void rewind(int pos) {
     //(pos <= tokens_used());
-    llama_kv_self_seq_rm(g_ctx, 0, pos, -1);
+    llama_memory_seq_rm(llama_get_memory(g_ctx), 0, pos, -1);
     g_history.resize(pos);
 }
 
