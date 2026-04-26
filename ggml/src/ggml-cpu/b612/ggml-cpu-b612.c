@@ -6719,11 +6719,141 @@ void ggml_disable_core_parking() {
 
 // Early repack code only for repack-xbox (from llama_model::build_graph())
 
-void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph *cgraph) {
+//
+// Pre-scan the compute graph to detect data-pointer aliasing between
+// MUL_MAT weight tensors and non-MUL_MAT ops.
+//
+// Pass 1: collect data pointers of repackable MUL_MAT src[0] tensors.
+//         This is the small "repack candidate" set (~100-200 per model).
+//
+// Pass 2: scan non-MUL_MAT ops. If any of their src tensors share a data
+//         pointer with a repack candidate, mark it GGML_TENSOR_FLAG_DUP
+//         so the repack code allocates a separate buffer.
+//
+// This handles models like Gemma-4 where TOKEN_EMBD is used both as the
+// output projection (MUL_MAT src[0]) and the embedding table (GET_ROWS).
+//
 
-    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
+typedef struct {
+    void *            data;
+    struct ggml_tensor * tensor;
+} repack_candidate_t;
+
+static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) {
+
+    #define MAX_REPACK_CANDIDATES 512
+
+    repack_candidate_t candidates[MAX_REPACK_CANDIDATES];
+    uint32_t n_candidates = 0;
+
+    struct ggml_tensor * const * tensors = cgraph->nodes;
+    const uint32_t n_nodes = cgraph->n_nodes;
+
+    //
+    // Pass 1: collect unique data pointers from repackable MUL_MAT src[0].
+    //
+
+    for (uint32_t node_n = 0; node_n < n_nodes; node_n++) {
+        struct ggml_tensor * tensor = tensors[node_n];
+
+        if (tensor->is_skipped || tensor->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        struct ggml_tensor * src0 = tensor->src[0];
+        if (src0 == NULL || src0->data == NULL) {
+            continue;
+        }
+
+        // only repackable types
+        enum ggml_type t = src0->type;
+        if (t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q8_0 &&
+            t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
+            t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q6_K) {
+            continue;
+        }
+
+        // deduplicate by data pointer
+        bool found = false;
+        for (uint32_t c = 0; c < n_candidates; c++) {
+            if (candidates[c].data == src0->data) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && n_candidates < MAX_REPACK_CANDIDATES) {
+            candidates[n_candidates].data   = src0->data;
+            candidates[n_candidates].tensor = src0;
+            n_candidates++;
+        }
+    }
+
+    if (n_candidates == 0) {
         return;
     }
+
+    //
+    // Pass 2: scan non-MUL_MAT ops. If any src tensor's data pointer
+    // matches a repack candidate, mark that candidate as DUP.
+    //
+
+    for (uint32_t node_n = 0; node_n < n_nodes; node_n++) {
+        struct ggml_tensor * tensor = tensors[node_n];
+
+        if (tensor->is_skipped || tensor->op == GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            struct ggml_tensor * src = tensor->src[s];
+            if (src == NULL) {
+                break;
+            }
+            if (src->data == NULL) {
+                continue;
+            }
+
+            for (uint32_t c = 0; c < n_candidates; c++) {
+                if (candidates[c].data == src->data) {
+                    candidates[c].tensor->flags |= GGML_TENSOR_FLAG_DUP;
+
+                    // remove from candidates to avoid redundant checks
+                    candidates[c] = candidates[n_candidates - 1];
+                    n_candidates--;
+                    break;
+                }
+            }
+        }
+
+        if (n_candidates == 0) {
+            break;
+        }
+    }
+
+    #undef MAX_REPACK_CANDIDATES
+}
+
+void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph *cgraph) {
+
+    if ((g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_NONE) ||
+        (g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_GGML)) {
+        return;
+    }
+
+    //
+    // Scan for data-pointer aliasing and mark shared tensors as DUP.
+    // This runs for ALL repack modes (XBCG, XBOX, XBOX_SINGLE_THREAD)
+    // since the graph is available at build time for all of them.
+    //
+
+    ggml_repack_scan_aliased_data_pointers(cgraph);
+
+    //
+    // Early single-threaded repack of all MUL_MAT weight tensors.
+    // This runs for ALL repack modes so the first MUL_MAT compute
+    // doesn't pay the repack cost.  For XBOX/XBOX_SINGLE_THREAD modes,
+    // the inline repack code will see the type already changed and skip.
+    //
 
     struct ggml_tensor * const * tensors = cgraph->nodes;
     if (cgraph->n_nodes != 0) {
@@ -6768,17 +6898,7 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph *cgraph) {
              (src0_type == GGML_TYPE_Q4_K) ||
              (src0_type == GGML_TYPE_Q6_K))) {
 
-            //
-            // If this is the zeroth cpu, then attempt to repack the src0 tensor.
-            //
-            // N.B. Repacking is single threaded on the zeroth cpu.
-            //
-
             int64_t repack_t0 = ggml_time_us();
-
-            //
-            // N.B. If the repack is successful, then the repack type is returned.
-            //      Otherwise, the original type is returned.
 
             src0_type = ggml_repack_tensor_single_thread(NULL, src0);
 

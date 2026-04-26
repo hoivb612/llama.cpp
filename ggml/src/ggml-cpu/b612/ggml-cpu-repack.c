@@ -4517,13 +4517,12 @@ ggml_repack_tensor (
         return;
     }
 
+    //
+    // If the tensor data is shared with non-MUL_MAT ops (detected by
+    // ggml_repack_scan_aliased_data_pointers at graph build time),
+    // allocate a new buffer so the original data remains intact.
+    //
     if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
-        //
-        // Duplication is active meaning there is a copy of the 
-        // tensor data being used by some other OPs. Allocate
-        // a new buffer for this specific instance for repacking so 
-        // the original copy remains intact for the other OPs.
-        //
         if (!ith) {
             size_t tensor_size = ggml_nbytes(tensor);
             char *duplicate_data = (char *)malloc(tensor_size);

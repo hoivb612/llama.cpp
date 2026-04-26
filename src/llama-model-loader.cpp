@@ -1051,19 +1051,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             // one ggml context per buffer type
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                 // duplicated output tensor
-#ifdef GGML_B612
-            if (ggml_cpu_tensor_repack_mode_xbox()) {
-                //
-                // Only Xbox style repack mode changes the tensor type directly
-                // in the tensor object so a new tensor object has to be 
-                // created. This scenario only happens for token.embd weight 
-                // which can be used for both input and output. The context 
-                // size if determined early so there is no easy way to know 
-                // exactly that we need this extra tensor.
-                //
-                max_n_tensors += 1;
-            }
-#endif
             max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
@@ -1272,27 +1259,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_DUPLICATED) {
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
         if (t) {
-#ifdef GGML_B612
-            //
-            // token.embd can be used for both input and output.
-            // Set the flag to indicate this tensor is a reused
-            // one for repacking to not stomp over the tensor data.
-            // At the same time create a new tensor object so it
-            // does not cause problem when repack code modifies
-            // the tensor type.
-            //
-            if ((tn.tensor == LLM_TENSOR_TOKEN_EMBD) && (flags & TENSOR_DUPLICATED)) {
-                if (ggml_cpu_tensor_repack_mode_xbox()) {
-                    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED));
-                    if (cur != NULL) {
-                        t = ggml_dup_tensor(ctx, cur);
-                        ggml_set_name(t, ggml_get_name(cur));
-                        size_data += ggml_nbytes(cur);
-                    }
-                    ggml_set_duplicated(t);
-                }
-            }
-#endif
             return t;
         }
     }
