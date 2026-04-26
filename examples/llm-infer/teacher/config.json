@@ -1,0 +1,10 @@
+{
+   "teacher_model": "d:/llama.cpp/models/gemma-4/gemma-4-E4B-it-Q4_K_M.gguf",
+   "student_model": "d:/llama.cpp/models/gemma-4/gemma-4-E2B-it-Q3_K_M.gguf",
+   "script_file":   "d:/llama.cpp/b612/examples/llm-infer/teacher/Mara_system_prompt_Teacher_v1.txt",
+   "output_file":   "d:/llama.cpp/b612/examples/llm-infer/teacher/Gemma-4_E2B_Q3_K_M_results.json",
+   "n_threads":     4,
+   "n_ctx":         8192,
+   "verbose":       0,
+   "stop_char":     "}"
+}

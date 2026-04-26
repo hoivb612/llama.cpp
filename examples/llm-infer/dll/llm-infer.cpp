@@ -137,6 +137,15 @@ void llm_print_tensor_op_perf_stats() {
 }
 
 LLM_INFER_API
+const char * llm_get_chat_template() {
+#ifndef __clang__
+#pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
+#endif
+    if (!llm_model) return nullptr;
+    return llama_model_chat_template(llm_model, nullptr);
+}
+
+LLM_INFER_API
 bool llm_initialize(
     model_params & params) {
 #ifndef __clang__
