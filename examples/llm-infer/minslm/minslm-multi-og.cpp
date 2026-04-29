@@ -41,6 +41,27 @@ Usage:
 
  minslminfer-multi-og MODEL #threads SCRIPT [template=FILE] [stream] [verbose] ...
 
+Template file format — two sections delimited by END_SECTION:
+
+ CUSTOM_TEMPLATE_PROMPT
+ <|turn>system
+ You are a helpful assistant.
+ <turn|>
+ END_SECTION
+ CUSTOM_TURN_TEMPLATE
+ <|turn>user
+ {message}<turn|>
+ <|turn>model
+ END_SECTION
+
+ - CUSTOM_TEMPLATE_PROMPT — the system prefix (decoded once into KV cache at start)
+ - CUSTOM_TURN_TEMPLATE — the per-user-turn wrapper; must contain {message} placeholder
+
+When to use:
+
+ - If you omit template=, the program auto-detects the model's chat format from GGUF metadata (Gemma-4, Phi-3/4, Llama-3, ChatML, etc.)
+ - Use template= only when auto-detection fails or you want to override the format manually
+
 - Fix template: Gemma-4 uses <|turn>role/<turn|> tokens (not <start_of_turn>/<end_of_turn> like older Gemma), and its 16K-char jinja template isn't recognized 
 by llama_chat_apply_template()
 - Fix: 3-level template detection — API → jinja pattern scan → ChatML fallback — with Gemma-4 pattern added to the scanner

@@ -46,6 +46,10 @@
 #include "ggml-vulkan.h"
 #endif
 
+#ifdef GGML_USE_DX12
+#include "ggml-dx12.h"
+#endif
+
 #ifdef GGML_USE_WEBGPU
 #include "ggml-webgpu.h"
 #endif
@@ -128,6 +132,13 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_vk_reg());
     } else {
         GGML_LOG_DEBUG("Vulkan backend disabled by GGML_DISABLE_VULKAN environment variable\n");
+    }
+#endif
+#ifdef GGML_USE_DX12
+    if (getenv("GGML_DISABLE_DX12") == nullptr) {
+        register_backend(ggml_backend_dx12_reg());
+    } else {
+        GGML_LOG_DEBUG("DX12 backend disabled by GGML_DISABLE_DX12 environment variable\n");
     }
 #endif
 #ifdef GGML_USE_WEBGPU

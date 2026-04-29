@@ -14,6 +14,10 @@ if(GGML_VULKAN)
     add_compile_definitions(GGML_USE_VULKAN)
 endif()
 
+if(GGML_DX12)
+    add_compile_definitions(GGML_USE_DX12)
+endif()
+
 
 set(TARGET slm-infer)
 

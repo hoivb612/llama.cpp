@@ -225,6 +225,8 @@ option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics ou
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
+option(GGML_DX12                            "ggml: use DirectX 12"                            OFF)
+option(GGML_DX12_DEBUG                      "ggml: enable DirectX 12 debug output"            OFF)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
@@ -336,6 +338,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-virtgpu.h
     include/ggml-sycl.h
     include/ggml-vulkan.h
+    include/ggml-dx12.h
     include/ggml-webgpu.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
@@ -442,6 +445,7 @@ if (MSVC)
     configure_msvc_target(ggml-base)
     configure_msvc_target(ggml)
     configure_msvc_target(ggml-cpu)
+    configure_msvc_target(ggml-dx12)
     configure_msvc_target(ggml-cpu-x64)
     configure_msvc_target(ggml-cpu-sse42)
     configure_msvc_target(ggml-cpu-sandybridge)
