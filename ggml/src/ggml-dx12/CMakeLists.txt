@@ -73,11 +73,15 @@ if (DXC_EXECUTABLE)
         flash_attn
         set_rows
         rope_set_rows
+        mul_mat_q2k
+        mul_mat_q3k
         mul_mat_q4k
         get_rows_q4k
         mul_mat_q5k
         get_rows_q5k
         mul_mat_q6k
+        get_rows_q2k
+        get_rows_q3k
         get_rows_q6k
         glu
         rms_norm_mul
@@ -85,7 +89,10 @@ if (DXC_EXECUTABLE)
         add_rms_norm_mul
         mul_mat_vec
         mul_mat_vec_q4k
+        mul_mat_vec_q4k_mr
         mul_mat_vec_q5k
+        mul_mat_vec_q2k
+        mul_mat_vec_q3k
         mul_mat_vec_q6k
         mul_mat_vec_q6k_32
         mul_mat_vec_q5_0
@@ -133,13 +140,25 @@ if (DXC_EXECUTABLE)
         list(APPEND DX12_SHADER_HEADERS ${shader_hdr})
     endforeach()
 
-    # Generate a master include header
+    # Generate a master include header at build time (survives partial cleans)
     set(SHADER_MASTER_HEADER "${SHADER_OUTPUT_DIR}/ggml_dx12_shaders.h")
-    set(SHADER_INCLUDES "")
+
+    # Write a cmake script that generates the header (stored outside shaders/ dir)
+    set(_gen_script "${CMAKE_CURRENT_BINARY_DIR}/_gen_master_header.cmake")
+    file(WRITE "${_gen_script}" "set(_h \"${SHADER_MASTER_HEADER}\")\n")
+    file(APPEND "${_gen_script}" "file(WRITE \${_h} \"// Auto-generated shader includes\\n#pragma once\\n\")\n")
     foreach(shader_name ${DX12_SHADERS})
-        string(APPEND SHADER_INCLUDES "#include \"${shader_name}_dxil.h\"\n")
+        file(APPEND "${_gen_script}" "file(APPEND \${_h} \"#include \\\"${shader_name}_dxil.h\\\"\\n\")\n")
     endforeach()
-    file(WRITE "${SHADER_MASTER_HEADER}" "// Auto-generated shader includes\n#pragma once\n${SHADER_INCLUDES}")
+
+    # Run the script at build time when any shader header changes or master is missing
+    add_custom_command(
+        OUTPUT ${SHADER_MASTER_HEADER}
+        COMMAND ${CMAKE_COMMAND} -P "${_gen_script}"
+        DEPENDS ${DX12_SHADER_HEADERS}
+        COMMENT "Generating ggml_dx12_shaders.h"
+    )
+    list(APPEND DX12_SHADER_HEADERS ${SHADER_MASTER_HEADER})
 
     target_sources(ggml-dx12 PRIVATE ${DX12_SHADER_HEADERS})
     target_include_directories(ggml-dx12 PRIVATE ${SHADER_OUTPUT_DIR})

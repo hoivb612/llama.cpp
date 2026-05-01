@@ -32,43 +32,57 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     precise float acc = 0.0f;
 
     if (src0_esize == 2) {
-        // F16 weights: vectorized 2-element loads
+        // F16 weights: vectorized 4-element loads with mad() FMA chains
         // Input is always contiguous F32 during generation (nb10=4)
-        uint k = tid * 2;
+        uint k = tid * 4;
         if (nb10 == 4) {
-            // Fast path: paired Load2 for contiguous F32 input
-            for (; k + 1 < K; k += GROUP_SIZE * 2) {
-                uint w2 = src0.Load(src0_base + k * 2);
-                float w0 = f16tof32(w2 & 0xFFFFu);
-                float w1 = f16tof32(w2 >> 16);
-                uint2 xp = src1.Load2(src1_base + k * 4);
-                acc += w0 * asfloat(xp.x) + w1 * asfloat(xp.y);
+            // Fast path: Load4 for contiguous F32 input, paired F16 loads
+            for (; k + 3 < K; k += GROUP_SIZE * 4) {
+                uint w01 = src0.Load(src0_base + k * 2);
+                uint w23 = src0.Load(src0_base + k * 2 + 4);
+                float w0 = f16tof32(w01 & 0xFFFFu);
+                float w1 = f16tof32(w01 >> 16);
+                float w2 = f16tof32(w23 & 0xFFFFu);
+                float w3 = f16tof32(w23 >> 16);
+                uint4 xp = src1.Load4(src1_base + k * 4);
+                acc = mad(w0, asfloat(xp.x), mad(w1, asfloat(xp.y),
+                      mad(w2, asfloat(xp.z), mad(w3, asfloat(xp.w), acc))));
+            }
+            // Handle remaining 0-3 elements
+            for (; k < K; k++) {
+                float w = load_auto(src0, src0_base + k * 2, src0_esize);
+                float x = asfloat(src1.Load(src1_base + k * 4));
+                acc += w * x;
             }
         } else {
+            k = tid * 2;
             for (; k + 1 < K; k += GROUP_SIZE * 2) {
                 uint w2 = src0.Load(src0_base + k * 2);
                 float w0 = f16tof32(w2 & 0xFFFFu);
                 float w1 = f16tof32(w2 >> 16);
                 float x0 = load_auto(src1, src1_base + k * nb10, src1_esize);
                 float x1 = load_auto(src1, src1_base + (k + 1) * nb10, src1_esize);
-                acc += w0 * x0 + w1 * x1;
-            }
-        }
-        if (k < K) {
-            float w = load_auto(src0, src0_base + k * 2, src0_esize);
-            float x = load_auto(src1, src1_base + k * nb10, src1_esize);
-            acc += w * x;
-        }
-    } else {
-        // F32 weights: use Load2 for paired reads when possible
-        if (nb10 == 4) {
-            uint k = tid * 2;
-            for (; k + 1 < K; k += GROUP_SIZE * 2) {
-                uint2 wp = src0.Load2(src0_base + k * 4);
-                uint2 xp = src1.Load2(src1_base + k * 4);
-                acc += asfloat(wp.x) * asfloat(xp.x) + asfloat(wp.y) * asfloat(xp.y);
+                acc = mad(w0, x0, mad(w1, x1, acc));
             }
             if (k < K) {
+                float w = load_auto(src0, src0_base + k * 2, src0_esize);
+                float x = load_auto(src1, src1_base + k * nb10, src1_esize);
+                acc += w * x;
+            }
+        }
+    } else {
+        // F32 weights: use Load4 for quad reads when possible
+        if (nb10 == 4) {
+            uint k = tid * 4;
+            for (; k + 3 < K; k += GROUP_SIZE * 4) {
+                uint4 wp = src0.Load4(src0_base + k * 4);
+                uint4 xp = src1.Load4(src1_base + k * 4);
+                acc = mad(asfloat(wp.x), asfloat(xp.x),
+                      mad(asfloat(wp.y), asfloat(xp.y),
+                      mad(asfloat(wp.z), asfloat(xp.z),
+                      mad(asfloat(wp.w), asfloat(xp.w), acc))));
+            }
+            for (; k < K; k++) {
                 acc += asfloat(src0.Load(src0_base + k * 4)) * asfloat(src1.Load(src1_base + k * 4));
             }
         } else {

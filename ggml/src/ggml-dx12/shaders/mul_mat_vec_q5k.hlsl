@@ -176,7 +176,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         float q14 = float((qs64_hi4 >> 16) & 0xFFu);
         float q15 = float((qs64_hi4 >> 24) & 0xFFu);
 
-        // Load 16 activation values using paired Load2 (F32 contiguous)
+        // Load 16 activation values using paired Load2 (strided access, pairs 64 bytes apart)
         uint y1_off = src1_base + (block_idx * QK_K + y_offset) * 4;
         uint y2_off = y1_off + 128 * 4;
 
@@ -198,16 +198,16 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         float by12 = asfloat(pcd.x); float by13 = asfloat(pcd.y);
         float by14 = asfloat(pef.x); float by15 = asfloat(pef.y);
 
-        // Compute partial dot products
-        float sx = q0*by0 + q1*by1 + q2*by2 + q3*by3;
-        float sy = q4*by4 + q5*by5 + q6*by6 + q7*by7;
-        float sz = q8*by8 + q9*by9 + q10*by10 + q11*by11;
-        float sw = q12*by12 + q13*by13 + q14*by14 + q15*by15;
+        // Compute partial dot products using mad() FMA chains
+        float sx = mad(q0, by0, mad(q1, by1, mad(q2, by2, q3*by3)));
+        float sy = mad(q4, by4, mad(q5, by5, mad(q6, by6, q7*by7)));
+        float sz = mad(q8, by8, mad(q9, by9, mad(q10, by10, q11*by11)));
+        float sw = mad(q12, by12, mad(q13, by13, mad(q14, by14, q15*by15)));
 
-        float smin = sc2*(by0+by1+by2+by3) + sc3*(by4+by5+by6+by7)
-                   + sc6*(by8+by9+by10+by11) + sc7*(by12+by13+by14+by15);
+        float smin = mad(sc2, by0+by1+by2+by3, mad(sc3, by4+by5+by6+by7,
+                     mad(sc6, by8+by9+by10+by11, sc7*(by12+by13+by14+by15))));
 
-        acc += dall * (sx*sc0 + sy*sc1 + sz*sc4 + sw*sc5) - dmin * smin;
+        acc += dall * mad(sx, sc0, mad(sy, sc1, mad(sz, sc4, sw*sc5))) - dmin * smin;
     }
 
     // Wave-intrinsic reduction (2 barriers instead of 8)

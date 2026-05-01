@@ -111,40 +111,35 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         float q14 = float((qs64 >> 20) & 0xFu);
         float q15 = float((qs64 >> 28) & 0xFu);
 
-        // Load 16 activation values (4 groups of 4)
-        // Use Load2 for consecutive pairs when input is contiguous F32
+        // Load 16 activation values using Load4 (128-bit reads, 4× bandwidth vs scalar)
         uint y1_off = src1_base + (block_idx * QK_K + y_offset) * 4;
         uint y2_off = y1_off + 128 * 4;
 
-        uint2 p01 = src1.Load2(y1_off);
-        uint2 p23 = src1.Load2(y1_off + 8);
-        uint2 p45 = src1.Load2(y1_off + 128);
-        uint2 p67 = src1.Load2(y1_off + 136);
-        uint2 p89 = src1.Load2(y2_off);
-        uint2 pab = src1.Load2(y2_off + 8);
-        uint2 pcd = src1.Load2(y2_off + 128);
-        uint2 pef = src1.Load2(y2_off + 136);
+        uint4 a0 = src1.Load4(y1_off);
+        uint4 a1 = src1.Load4(y1_off + 128);
+        uint4 a2 = src1.Load4(y2_off);
+        uint4 a3 = src1.Load4(y2_off + 128);
 
-        float by0 = asfloat(p01.x); float by1 = asfloat(p01.y);
-        float by2 = asfloat(p23.x); float by3 = asfloat(p23.y);
-        float by4 = asfloat(p45.x); float by5 = asfloat(p45.y);
-        float by6 = asfloat(p67.x); float by7 = asfloat(p67.y);
-        float by8 = asfloat(p89.x); float by9 = asfloat(p89.y);
-        float by10 = asfloat(pab.x); float by11 = asfloat(pab.y);
-        float by12 = asfloat(pcd.x); float by13 = asfloat(pcd.y);
-        float by14 = asfloat(pef.x); float by15 = asfloat(pef.y);
+        float by0  = asfloat(a0.x); float by1  = asfloat(a0.y);
+        float by2  = asfloat(a0.z); float by3  = asfloat(a0.w);
+        float by4  = asfloat(a1.x); float by5  = asfloat(a1.y);
+        float by6  = asfloat(a1.z); float by7  = asfloat(a1.w);
+        float by8  = asfloat(a2.x); float by9  = asfloat(a2.y);
+        float by10 = asfloat(a2.z); float by11 = asfloat(a2.w);
+        float by12 = asfloat(a3.x); float by13 = asfloat(a3.y);
+        float by14 = asfloat(a3.z); float by15 = asfloat(a3.w);
 
-        // Compute partial dot products (4 sub-blocks)
-        float sx = q0*by0 + q1*by1 + q2*by2 + q3*by3;
-        float sy = q4*by4 + q5*by5 + q6*by6 + q7*by7;
-        float sz = q8*by8 + q9*by9 + q10*by10 + q11*by11;
-        float sw = q12*by12 + q13*by13 + q14*by14 + q15*by15;
+        // Compute partial dot products using mad() FMA chains for better ILP
+        float sx = mad(q0, by0, mad(q1, by1, mad(q2, by2, q3*by3)));
+        float sy = mad(q4, by4, mad(q5, by5, mad(q6, by6, q7*by7)));
+        float sz = mad(q8, by8, mad(q9, by9, mad(q10, by10, q11*by11)));
+        float sw = mad(q12, by12, mad(q13, by13, mad(q14, by14, q15*by15)));
 
-        // Min compensation
-        float smin = sc2*(by0+by1+by2+by3) + sc3*(by4+by5+by6+by7)
-                   + sc6*(by8+by9+by10+by11) + sc7*(by12+by13+by14+by15);
+        // Min compensation with mad() chains
+        float smin = mad(sc2, by0+by1+by2+by3, mad(sc3, by4+by5+by6+by7,
+                     mad(sc6, by8+by9+by10+by11, sc7*(by12+by13+by14+by15))));
 
-        acc += dall * (sx*sc0 + sy*sc1 + sz*sc4 + sw*sc5) - dmin * smin;
+        acc += dall * mad(sx, sc0, mad(sy, sc1, mad(sz, sc4, sw*sc5))) - dmin * smin;
     }
 
     // Wave-intrinsic reduction (2 barriers instead of 8)

@@ -1155,6 +1155,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             if (op->src[0]) {
                 ggml_type t = op->src[0]->type;
                 if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+                    t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
                     t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
                     t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q4_1 &&
                     t != GGML_TYPE_Q5_0 && t != GGML_TYPE_Q5_1 &&
@@ -1168,6 +1169,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             if (op->src[0]) {
                 ggml_type t = op->src[0]->type;
                 if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+                    t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
                     t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
                     t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q4_1 &&
                     t != GGML_TYPE_Q5_0 && t != GGML_TYPE_Q5_1 &&
@@ -1434,10 +1436,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->src[0]) {
             ggml_type t = node->src[0]->type;
             if (t == GGML_TYPE_F16 || t == GGML_TYPE_F32 ||
+                t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
                 t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
                 t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q5_0 ||
                 t == GGML_TYPE_Q8_0) {
                 key.flags = 1;
+                // Multi-row matvec for Q4_K (2 rows per group, halves activation traffic)
+                if (t == GGML_TYPE_Q4_K) key.flags = 2;
                 // Auto-tuning: use alternate variant if benchmarked as faster
                 if (t == GGML_TYPE_Q5_0 && bctx->dev->q5_0_use_256) key.flags = 5;
                 if (t == GGML_TYPE_Q8_0 && bctx->dev->q8_0_use_256) key.flags = 5;
@@ -1682,10 +1687,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 bool is_matvec = (node->ne[1] == 1); // M=1: single token generation
 
                 if (is_matvec) {
-                    // Matvec dispatch: one group per output row
+                    // Matvec dispatch
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
-                    groups_x = N;
+                    if (key.flags == 2) {
+                        // Multi-row: 2 rows per thread group
+                        groups_x = (N + 1) / 2;
+                    } else {
+                        groups_x = N;
+                    }
                     groups_y = 1;
                     groups_z = batches;
                 } else if (key.flags == 4) {
@@ -1695,6 +1705,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
                     groups_x = (N + 31) / 32;
                     groups_y = (M + 31) / 32;
+                    groups_z = batches;
+                } else if (node->src[0] && (node->src[0]->type == GGML_TYPE_Q2_K ||
+                                            node->src[0]->type == GGML_TYPE_Q3_K)) {
+                    // Cooperative batch matmul: 16 rows/group, 16 K-threads/row
+                    uint32_t N = (uint32_t)node->ne[0];
+                    uint32_t M = (uint32_t)node->ne[1];
+                    uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
+                    groups_x = (N + 15) / 16;
+                    groups_y = M;
                     groups_z = batches;
                 } else if (node->src[0] && (node->src[0]->type == GGML_TYPE_Q4_K ||
                                             node->src[0]->type == GGML_TYPE_Q5_K ||
@@ -2457,9 +2476,21 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             static const dx12_shader_blob wmma_blob = { g_mul_mat_wmma_dxil, sizeof(g_mul_mat_wmma_dxil) };
             blob = &wmma_blob;
         }
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 2) {
+        // Multi-row matvec (2 rows per group)
+        if (key.src0_type == GGML_TYPE_Q4_K) {
+            static const dx12_shader_blob mr_q4k_blob = { g_mul_mat_vec_q4k_mr_dxil, sizeof(g_mul_mat_vec_q4k_mr_dxil) };
+            blob = &mr_q4k_blob;
+        }
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 1) {
         // Matvec path (M=1 single-token generation)
-        if (key.src0_type == GGML_TYPE_Q4_K) {
+        if (key.src0_type == GGML_TYPE_Q2_K) {
+            static const dx12_shader_blob mv_q2k_blob = { g_mul_mat_vec_q2k_dxil, sizeof(g_mul_mat_vec_q2k_dxil) };
+            blob = &mv_q2k_blob;
+        } else if (key.src0_type == GGML_TYPE_Q3_K) {
+            static const dx12_shader_blob mv_q3k_blob = { g_mul_mat_vec_q3k_dxil, sizeof(g_mul_mat_vec_q3k_dxil) };
+            blob = &mv_q3k_blob;
+        } else if (key.src0_type == GGML_TYPE_Q4_K) {
             static const dx12_shader_blob mv_q4k_blob = { g_mul_mat_vec_q4k_dxil, sizeof(g_mul_mat_vec_q4k_dxil) };
             blob = &mv_q4k_blob;
         } else if (key.src0_type == GGML_TYPE_Q5_K) {
@@ -2499,6 +2530,12 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                 blob = &mv_blob;
             }
         }
+    } else if (key.op == GGML_OP_MUL_MAT && key.src0_type == GGML_TYPE_Q2_K) {
+        static const dx12_shader_blob q2k_blob = { g_mul_mat_q2k_dxil, sizeof(g_mul_mat_q2k_dxil) };
+        blob = &q2k_blob;
+    } else if (key.op == GGML_OP_MUL_MAT && key.src0_type == GGML_TYPE_Q3_K) {
+        static const dx12_shader_blob q3k_blob = { g_mul_mat_q3k_dxil, sizeof(g_mul_mat_q3k_dxil) };
+        blob = &q3k_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.src0_type == GGML_TYPE_Q4_K) {
         // Q4_K quantized matmul (batch path)
         static const dx12_shader_blob q4k_blob = { g_mul_mat_q4k_dxil, sizeof(g_mul_mat_q4k_dxil) };
@@ -2527,6 +2564,12 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     } else if (key.op == GGML_OP_MUL_MAT && key.src0_type == GGML_TYPE_Q8_1) {
         static const dx12_shader_blob q81_blob = { g_mul_mat_q8_1_dxil, sizeof(g_mul_mat_q8_1_dxil) };
         blob = &q81_blob;
+    } else if (key.op == GGML_OP_GET_ROWS && key.src0_type == GGML_TYPE_Q2_K) {
+        static const dx12_shader_blob q2k_gr_blob = { g_get_rows_q2k_dxil, sizeof(g_get_rows_q2k_dxil) };
+        blob = &q2k_gr_blob;
+    } else if (key.op == GGML_OP_GET_ROWS && key.src0_type == GGML_TYPE_Q3_K) {
+        static const dx12_shader_blob q3k_gr_blob = { g_get_rows_q3k_dxil, sizeof(g_get_rows_q3k_dxil) };
+        blob = &q3k_gr_blob;
     } else if (key.op == GGML_OP_GET_ROWS && key.src0_type == GGML_TYPE_Q4_K) {
         // Q4_K dequantizing get_rows
         static const dx12_shader_blob q4k_gr_blob = { g_get_rows_q4k_dxil, sizeof(g_get_rows_q4k_dxil) };
