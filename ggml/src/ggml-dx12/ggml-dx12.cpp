@@ -1708,12 +1708,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     groups_z = batches;
                 } else if (node->src[0] && (node->src[0]->type == GGML_TYPE_Q2_K ||
                                             node->src[0]->type == GGML_TYPE_Q3_K)) {
-                    // Cooperative batch matmul: 16 rows/group, 16 K-threads/row
+                    // Cooperative batch matmul: 16 rows/group, 16 K-threads/row, TILE_M=4
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t M = (uint32_t)node->ne[1];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
                     groups_x = (N + 15) / 16;
-                    groups_y = M;
+                    groups_y = (M + 3) / 4;
                     groups_z = batches;
                 } else if (node->src[0] && (node->src[0]->type == GGML_TYPE_Q4_K ||
                                             node->src[0]->type == GGML_TYPE_Q5_K ||
