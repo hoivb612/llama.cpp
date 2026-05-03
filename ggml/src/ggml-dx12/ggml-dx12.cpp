@@ -3,11 +3,12 @@
 // Implements a GPU compute backend using D3D12, with optional Cooperative Vector
 // acceleration for matrix-vector operations (SM 6.9 / Agility SDK 1.717+).
 
-#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
+#ifdef _WIN32
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -357,12 +358,12 @@ struct dx12_buffer_context {
 // Backend context (stream)
 // ---------------------------------------------------------------------------
 
-static const int CMD_RING_SIZE = 3;
+static const int CMD_RING_SIZE = 16;
 
 struct dx12_backend_context {
     dx12_device * dev = nullptr;
 
-    // Command allocator ring — 3 allocators so CPU can record while GPU executes
+    // Command allocator ring — multiple allocators so CPU can record while GPU executes
     ComPtr<ID3D12CommandAllocator>    cmd_allocs[CMD_RING_SIZE];
     uint64_t                          cmd_alloc_fence[CMD_RING_SIZE] = {}; // fence value when submitted
     int                               cmd_ring_head = 0; // next allocator to use
@@ -1701,7 +1702,22 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Try ADD + RMS_NORM + MUL triple fusion first
         static bool no_fusion = (getenv("GGML_DX12_NO_FUSION") != nullptr);
         bool skip_fusion = no_fusion || (is_prompt && getenv("GGML_DX12_NO_PROMPT_FUSION"));
-        if (!skip_fusion && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        // Per-fusion control: GGML_DX12_FUSION_MASK bitmask enables specific fusions:
+        //   bit 0 (1):  ADD+RMS_NORM+MUL
+        //   bit 1 (2):  RMS_NORM+MUL
+        //   bit 2 (4):  RMS_NORM+MUL+ROPE  (disabled by default — broken on AMD RDNA 3)
+        //   bit 3 (8):  ROPE+VIEW+SET_ROWS
+        //   bit 4 (16): MUL_MAT+ADD bias
+        // When set, only fusions with set bits are attempted. When not set, all fusions work.
+        static int fusion_mask = -1;
+        if (fusion_mask == -1) {
+            const char * env = getenv("GGML_DX12_FUSION_MASK");
+            fusion_mask = env ? atoi(env) : 0x1B;  // 27 = all except RMS+MUL+ROPE
+        }
+        if (!skip_fusion && !(fusion_mask & 1) && !(fusion_mask & 2) && !(fusion_mask & 4) && !(fusion_mask & 8) && !(fusion_mask & 16))
+            skip_fusion = true;
+
+        if (!skip_fusion && (fusion_mask & 1) && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
             struct ggml_tensor * rms = cgraph->nodes[i + 1];
             struct ggml_tensor * mul = cgraph->nodes[i + 2];
             if (rms->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL &&
@@ -1719,11 +1735,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // Fallback: try RMS_NORM + MUL + ROPE triple fusion, or RMS_NORM + MUL double fusion
         struct ggml_tensor * fused_rope_after_rms = nullptr;
-        if (!skip_fusion && !fused_add_rms_node && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+         if (!skip_fusion && (fusion_mask & 6) && !fused_add_rms_node && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
             struct ggml_tensor * next = cgraph->nodes[i + 1];
             if (next->op == GGML_OP_MUL && next->src[0] == node) {
                 // Check for RMS_NORM + MUL + ROPE triple fusion
-                if (i + 2 < cgraph->n_nodes) {
+                if ((fusion_mask & 4) && i + 2 < cgraph->n_nodes) {
                     struct ggml_tensor * rope = cgraph->nodes[i + 2];
                     int mode = rope->op == GGML_OP_ROPE ? ((const int32_t *)rope->op_params)[2] : -1;
                     if (rope->op == GGML_OP_ROPE && rope->src[0] == next &&
@@ -1737,7 +1753,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
                 }
                 // If triple fusion didn't trigger, use double fusion
-                if (!fused_rope_after_rms) {
+                if (!fused_rope_after_rms && (fusion_mask & 2)) {
                     fused_mul_node = next;
                     key.op = GGML_OP_RMS_NORM;
                     key.flags = 2;  // flags=2 means fused rms_norm_mul
@@ -1749,7 +1765,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Eliminates 2 dispatches per KV cache write
         struct ggml_tensor * fused_rope_set_rows = nullptr;  // the SET_ROWS node
         struct ggml_tensor * fused_rope_view = nullptr;       // the VIEW node
-        if (!skip_fusion && node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes && !fused_add_rms_node) {
+        if (!skip_fusion && (fusion_mask & 8) && node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes && !fused_add_rms_node) {
             struct ggml_tensor * view = cgraph->nodes[i + 1];
             struct ggml_tensor * set_rows = cgraph->nodes[i + 2];
             if (view->op == GGML_OP_VIEW && set_rows->op == GGML_OP_SET_ROWS &&
@@ -1804,7 +1820,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Op fusion: MUL_MAT(M=1) + ADD → matvec with fused bias add
         struct ggml_tensor * fused_bias_add = nullptr;
         struct ggml_tensor * fused_bias_tensor = nullptr;
-        if (!skip_fusion && is_matvec_dispatch && i + 1 < cgraph->n_nodes) {
+        if (!skip_fusion && (fusion_mask & 16) && is_matvec_dispatch && i + 1 < cgraph->n_nodes) {
             struct ggml_tensor * next = cgraph->nodes[i + 1];
             if (next->op == GGML_OP_ADD) {
                 struct ggml_tensor * bias = nullptr;
@@ -2098,6 +2114,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         params.src0_offset = saved_src0_off;
                         params.dst_offset  = saved_dst_off;
 
+                        // Flush after chunked dispatch for decode: the `continue` below
+                        // skips the periodic decode flush, so explicitly drain here.
+                        if (!is_prompt) {
+                            bctx->close_and_execute();
+                            bctx->wait_for_gpu();
+                            bctx->ensure_cmd_list_open();
+                            bctx->reset_binding_cache();
+                        }
+
                         unsynced_writes.insert((uintptr_t)node);  // no fusions, dst = node
                         dispatch_weight = 0;
                         continue;  // skip normal dispatch path
@@ -2180,6 +2205,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 groups_x = (uint32_t)node->src[0]->ne[1]; // N_queries
                 groups_y = (uint32_t)node->src[0]->ne[2]; // n_heads
                 groups_z = (uint32_t)node->src[0]->ne[3]; // batch
+                break;
+            }
+            case GGML_OP_SET_ROWS: {
+                // 2D dispatch to handle tensors exceeding 65535 groups in X
+                uint32_t total_elements = (uint32_t)(ggml_nelements(node));
+                uint32_t total_groups = (total_elements + 255) / 256;
+                if (total_groups <= 65535) {
+                    groups_x = total_groups;
+                } else {
+                    groups_x = 65535;
+                    groups_y = (total_groups + 65534) / 65535;
+                }
                 break;
             }
             default: {
@@ -2303,8 +2340,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // D3D12 dispatch limit: 65535 per axis
         if (groups_x > 65535 || groups_y > 65535 || groups_z > 65535) {
-            fprintf(stderr, "ggml-dx12: SKIP dispatch #%d %s — groups (%u,%u,%u) exceeds D3D12 limit 65535\n",
-                    i, ggml_op_name(node->op), groups_x, groups_y, groups_z);
+            if (dx12_diag) {
+                fprintf(stderr, "ggml-dx12: SKIP dispatch #%d %s — groups (%u,%u,%u) exceeds D3D12 limit 65535\n",
+                        i, ggml_op_name(node->op), groups_x, groups_y, groups_z);
+            }
             continue;
         }
 
@@ -2424,25 +2463,26 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             i += 2;  // skip the VIEW and SET_ROWS nodes
         }
 
-        // Periodic CL flush for decode phase (M=1) to work around AMD RDNA 3
-        // stale cache issue.  UAV barriers alone are insufficient — full pipeline
-        // drains (close CL + execute + wait) are required.  The prompt path has
-        // its own weight-based TDR flushing.  For decode, flush every N dispatches
-        // throughout the graph body.  The model head CL splits below handle the
-        // tail.  Configurable via GGML_DX12_FLUSH_INTERVAL (default: 16).
-        if (!is_prompt && cgraph->n_nodes > 100) {
+        // Periodic CL flush for decode phase (M=1) to prevent stale GPU caches
+        // on AMD RDNA 3.  CL boundaries provide GPU pipeline drains (separate
+        // ExecuteCommandLists calls are implicitly ordered).  No CPU-side wait
+        // is needed — the cmd allocator ring handles CPU-GPU pipelining.
+        // Default: flush after every dispatch (interval=1).
+        // Override via GGML_DX12_DECODE_FLUSH env var.
+        if (!is_prompt && cgraph->n_nodes > 10) {
             static int decode_flush_interval = 0;
             if (decode_flush_interval == 0) {
-                const char * env = getenv("GGML_DX12_FLUSH_INTERVAL");
-                decode_flush_interval = env ? atoi(env) : 16;
-                if (decode_flush_interval <= 0) decode_flush_interval = 16;
+                const char * env = getenv("GGML_DX12_DECODE_FLUSH");
+                if (!env) env = getenv("GGML_DX12_FLUSH_INTERVAL");
+                decode_flush_interval = env ? atoi(env) : 1;
+                if (decode_flush_interval <= 0) decode_flush_interval = 1;
             }
             dispatch_weight++;
             if (dispatch_weight >= decode_flush_interval) {
                 bctx->close_and_execute();
-                bctx->wait_for_gpu();
+                // No wait_for_gpu() — CL boundary is the GPU pipeline drain.
+                // The ring of CMD_RING_SIZE allocators handles CPU pipelining.
                 bctx->ensure_cmd_list_open();
-                bctx->reset_binding_cache();
                 unsynced_writes.clear();
                 dispatch_weight = 0;
             }
@@ -3141,6 +3181,19 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
 
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     auto * d = (dx12_device *)dev->context;
+    // Query fresh memory info from DXGI to reflect current allocations
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (SUCCEEDED(d->adapter.As(&adapter3))) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO mem_info = {};
+        if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mem_info))
+            && mem_info.Budget > 0) {
+            if (total) *total = (size_t)mem_info.Budget;
+            if (free)  *free  = mem_info.Budget > mem_info.CurrentUsage
+                              ? (size_t)(mem_info.Budget - mem_info.CurrentUsage) : 0;
+            return;
+        }
+    }
+    // Fallback to cached values
     if (free)  *free  = d->vram_free;
     if (total) *total = d->vram_total;
 }
