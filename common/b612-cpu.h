@@ -298,6 +298,17 @@ xb_set_process_affinity (
 
 #endif
 
+    const char * default_mode = "none";
+    uint32_t mxcsr = 0;
+    uint32_t round_mode = 0;
+
+    struct {
+        uint32_t eax;
+        uint32_t ebx;
+        uint32_t ecx;
+        uint32_t edx;
+    } cpu_info = {};
+
     uint64_t affinity_mask = affinity_mask_requested;
 
     if (affinity_mask_requested != 0) {
@@ -308,11 +319,9 @@ xb_set_process_affinity (
     // Get the default rounding mode.
     //
 
-    char * default_mode = "none";
+    mxcsr = _mm_getcsr();
 
-    uint32_t mxcsr = _mm_getcsr();
-
-    uint32_t round_mode = mxcsr & _MM_ROUND_MASK;
+    round_mode = mxcsr & _MM_ROUND_MASK;
 
     switch (round_mode) {
     case _MM_ROUND_NEAREST:
@@ -340,13 +349,6 @@ xb_set_process_affinity (
     //
     // Get cpuid information.
     //
-
-    struct {
-        uint32_t eax;
-        uint32_t ebx;
-        uint32_t ecx;
-        uint32_t edx;
-    } cpu_info;
 
     if (verbose) {
         //

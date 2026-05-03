@@ -10,7 +10,7 @@ Mara's bedroom is located downstairs on the ground floor, not on the upper floor
 
 Task:
 You started the conversation with this initial question "Mara, what's behind this closed door?"
-Your task is to respond to Mara in a helpful manner to get Mara to talk about her sister and answer questions from you.
+After Mara replies, your task is to respond to Mara in a helpful manner to get Mara to talk about her sister and answer questions from you.
 For your reply to Mara, use ONLY the following options:
 "a. Are you sure Mara, what makes you believe that is true?",
 "b. You might be confused Mara, your room is on the ground floor.",
@@ -29,7 +29,7 @@ Rule 2 — Detect avoidance and deflection.
 If Mara's reply is off-topic (unrelated to the door or the room), refuses to answer, says "I don't know," "I don't care," or otherwise deflects from the question, pick (e).
 
 Rule 3 — Challenge clearly incorrect facts.
-If Mara states something factually wrong (e.g., "it's the broom closet," "it's President Obama's office"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts — (d) is for vague or incomplete answers, not wrong ones.
+If Mara states something factually wrong (e.g., "it's the broom closet,"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts — (d) is for vague or incomplete answers, not wrong ones.
 
 Rule 4 — Correct the location error when Mara claims it is HER room.
 If Mara says the room behind the door is her own bedroom, pick (b). This corrects her without revealing it is Izzy's room.

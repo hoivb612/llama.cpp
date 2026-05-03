@@ -190,6 +190,19 @@ bool llm_initialize(
             printf("%s: Running in full GPU-offload mode\n", __func__);
         }
     }
+#elif defined(GGML_USE_DX12)
+    #pragma message("++++++++ Support both DX12 and CPU for inference")
+    if (params.force_cpu_mode != 0) {
+        model_params.n_gpu_layers = 0;
+        if (params.verbose == 2) {
+            printf("%s: Running in full CPU mode\n", __func__);
+        }
+    } else {
+        model_params.n_gpu_layers = 999;
+        if (params.verbose == 2) {
+            printf("%s: Running in full GPU-offload mode (DX12)\n", __func__);
+        }
+    }
 #else
     #pragma message("++++++++ Support CPU-only for inference")
     // CPU is the default (there is no CUDA nor Vulkan devices)
@@ -884,6 +897,19 @@ bool embed_initialize(
         model_params.n_gpu_layers = 999;
         if (params.verbose == 2) {
             printf("%s: Running in full GPU-offload mode\n", __func__);
+        }
+    }
+#elif defined(GGML_USE_DX12)
+    #pragma message("++++++++ Support both DX12 and CPU for inference")
+    if (params.force_cpu_mode != 0) {
+        model_params.n_gpu_layers = 0;
+        if (params.verbose == 2) {
+            printf("%s: Running in full CPU mode\n", __func__);
+        }
+    } else {
+        model_params.n_gpu_layers = 999;
+        if (params.verbose == 2) {
+            printf("%s: Running in full GPU-offload mode (DX12)\n", __func__);
         }
     }
 #else
