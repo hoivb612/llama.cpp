@@ -78,10 +78,10 @@ static inline bool dx12_platform_filter_adapter(dx12_adapter_filter & filter,
 // WSL2: DXCore-based adapter filtering — uses IDXCoreAdapter properties
 static inline bool dx12_platform_filter_adapter(dx12_adapter_filter & filter,
                                                 IDXCoreAdapter * adapter) {
-    // Skip software adapters
-    bool is_software = false;
-    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsSoftwareAdapter,
-                                       sizeof(is_software), &is_software)) && is_software) {
+    // Skip software adapters (IsHardware == false)
+    bool is_hardware = false;
+    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsHardware,
+                                       sizeof(is_hardware), &is_hardware)) && !is_hardware) {
         return true;
     }
 

@@ -218,6 +218,8 @@ struct dx12_device {
 
     size_t                    vram_total   = 0;
     size_t                    vram_free    = 0;
+    uint32_t                  vendor_id    = 0;
+    uint32_t                  device_id    = 0;
 
     bool cooperative_vector_supported = false;
 
@@ -577,10 +579,10 @@ static void dx12_ensure_initialized() {
         hr = adapter_list->GetAdapter(i, IID_PPV_ARGS(&adapter));
         if (FAILED(hr)) continue;
 
-        // Skip software adapters
-        bool is_software = false;
-        if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsSoftwareAdapter,
-                                           sizeof(is_software), &is_software)) && is_software) {
+        // Skip software adapters (IsHardware == false)
+        bool is_hardware = false;
+        if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsHardware,
+                                           sizeof(is_hardware), &is_hardware)) && !is_hardware) {
             continue;
         }
 
@@ -698,6 +700,8 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     } else {
         vram_free = vram_total;
     }
+    vendor_id = adapter_desc.VendorId;
+    device_id = adapter_desc.DeviceId;
 #else
 void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
     adapter   = std::move(adapter_);
@@ -737,6 +741,13 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
         }
     }
     vram_free = vram_total;
+
+    // Get hardware IDs from DXCore
+    DXCoreHardwareID hw_id = {};
+    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::HardwareID, sizeof(hw_id), &hw_id))) {
+        vendor_id = hw_id.vendorID;
+        device_id = hw_id.deviceID;
+    }
 #endif
 
     // Check Cooperative Vector support
@@ -1639,10 +1650,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
     // Track wall time for TDR yield: GPU must periodically yield to DWM
     // to prevent display-level TDR from cumulative compute monopolization.
+    // (WSL2 has no DWM, so this is Windows-only)
+#ifdef _WIN32
     LARGE_INTEGER tdr_t0, tdr_freq;
     QueryPerformanceFrequency(&tdr_freq);
     QueryPerformanceCounter(&tdr_t0);
     static constexpr double TDR_YIELD_MS = 800.0;  // yield to DWM every 800ms
+#endif
 
     // Prompt diagnostics gated under GGML_DX12_DIAG
     static int prompt_eval_count = 0;
@@ -2214,8 +2228,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->cmd_list->SetComputeRoot32BitConstants(0, sizeof(params) / 4, &params, 0);
         }
 
+#ifdef _WIN32
         LARGE_INTEGER t0, t1, freq;
         if (do_profile) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0); }
+#else
+        std::chrono::steady_clock::time_point t0;
+        if (do_profile) { t0 = std::chrono::steady_clock::now(); }
+#endif
 
         // Determine the effective destination tensor (accounting for fusion)
         struct ggml_tensor * dst_tensor = fused_rope_after_rms ? fused_rope_after_rms :
@@ -2511,8 +2530,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->ensure_cmd_list_open();
             bctx->reset_binding_cache();
             unsynced_writes.clear();
+#ifdef _WIN32
             QueryPerformanceCounter(&t1);
             double ms = (double)(t1.QuadPart - t0.QuadPart) / freq.QuadPart * 1000.0;
+#else
+            auto t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
             char key[128];
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
             snprintf(key, sizeof(key), "%s(src0t=%d,grp=%u)", ggml_op_name(node->op), src0t, groups_x);
@@ -2535,6 +2559,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (dispatch_weight >= TDR_FLUSH_THRESHOLD) {
                 static int flush_num = 0;
                 flush_num++;
+#ifdef _WIN32
                 if (trace_prompt) {
                     LARGE_INTEGER tdr_now;
                     QueryPerformanceCounter(&tdr_now);
@@ -2542,6 +2567,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     fprintf(stderr, "  F#%d @d%d w=%d t=%.0fms\n", flush_num, i, dispatch_weight, elapsed_ms);
                     fflush(stderr);
                 }
+#else
+                if (trace_prompt) {
+                    fprintf(stderr, "  F#%d @d%d w=%d\n", flush_num, i, dispatch_weight);
+                    fflush(stderr);
+                }
+#endif
                 bctx->close_and_execute();
                 bctx->wait_for_gpu();
                 bctx->ensure_cmd_list_open();
@@ -2559,6 +2590,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // monopolize the GPU and prevent display compositing.  The Windows
                 // TDR timer covers the ENTIRE adapter — if DWM can't draw for ~2s,
                 // the OS resets the GPU even though individual CLs are fast.
+#ifdef _WIN32
                 {
                     LARGE_INTEGER tdr_now;
                     QueryPerformanceCounter(&tdr_now);
@@ -2572,6 +2604,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         }
                     }
                 }
+#endif
 
                 if (dx12_diag) {
                     fprintf(stderr, "ggml-dx12: flush #%d OK after dispatch %d\n", flush_num, i);
@@ -2783,9 +2816,15 @@ void dx12_device::run_autotune() {
 
     // Check for cache file first
     char cache_path[512];
+#ifdef _WIN32
     snprintf(cache_path, sizeof(cache_path), "%s/.ggml_dx12_tune_%04X_%04X.txt",
              getenv("LOCALAPPDATA") ? getenv("LOCALAPPDATA") : ".",
-             adapter_desc.VendorId, adapter_desc.DeviceId);
+             vendor_id, device_id);
+#else
+    snprintf(cache_path, sizeof(cache_path), "%s/.ggml_dx12_tune_%04X_%04X.txt",
+             getenv("HOME") ? getenv("HOME") : "/tmp",
+             vendor_id, device_id);
+#endif
 
     FILE * f = fopen(cache_path, "r");
     if (f) {
