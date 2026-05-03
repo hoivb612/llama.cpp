@@ -1703,9 +1703,94 @@ std::mutex vk_memory_logger::log_mutex;
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
+static bool vk_perf_op_stats_enabled = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+
+// Per-op perf stats (gated by GGML_VULKAN_PERF env var)
+static std::atomic<int64_t> vk_op_counts[GGML_OP_COUNT] = {};
+static std::atomic<int64_t> vk_op_time_us[GGML_OP_COUNT] = {};
+
+// MUL_MAT breakdown by quant type: VEC (n<=8) vs GEMM (n>8)
+static std::atomic<int64_t> vk_mm_vec_counts[GGML_TYPE_COUNT] = {};
+static std::atomic<int64_t> vk_mm_vec_time_us[GGML_TYPE_COUNT] = {};
+static std::atomic<int64_t> vk_mm_gemm_counts[GGML_TYPE_COUNT] = {};
+static std::atomic<int64_t> vk_mm_gemm_time_us[GGML_TYPE_COUNT] = {};
+
+static void ggml_vk_print_tensor_op_perf() {
+    int64_t total_count = 0;
+    int64_t total_time  = 0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        total_count += vk_op_counts[i].load();
+        total_time  += vk_op_time_us[i].load();
+    }
+    if (total_count == 0) return;
+
+    printf("\n\n[Vulkan] Per-Op GPU Timing (GGML_VULKAN_PERF)\n");
+    printf("          Total     Total  Tensor\n");
+    printf("   Count Time(sec)   %%     Time(us) Tensor Op\n");
+
+    double total_percent = 0.0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        int64_t c = vk_op_counts[i].load();
+        int64_t t = vk_op_time_us[i].load();
+        if (c > 0) {
+            double percent = (double)t * 100.0 / (double)total_time;
+            total_percent += percent;
+            printf("%8lld %8.2f  %5.2f   %8.2f GGML_OP_%s\n",
+                   (long long)c,
+                   (double)t / 1e6,
+                   percent,
+                   (double)t / (double)c,
+                   ggml_op_name((enum ggml_op)i));
+        }
+    }
+    printf("\n%8lld %8.2f %6.2f\n",
+           (long long)total_count,
+           (double)total_time / 1e6,
+           total_percent);
+
+    // MUL_MAT breakdown by src0 quant type
+    int64_t mm_total_count = 0, mm_total_time = 0;
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        mm_total_count += vk_mm_gemm_counts[i].load() + vk_mm_vec_counts[i].load();
+        mm_total_time  += vk_mm_gemm_time_us[i].load() + vk_mm_vec_time_us[i].load();
+    }
+    if (mm_total_count > 0) {
+        printf("\nMUL_MAT Src0 Type Frequency\n");
+        printf("          Total     Total  Tensor\n");
+        printf("   Count Time(sec)   %%     Time(us) Shader / Src0 Type\n");
+
+        // Print GEMM rows first (n>8, prompt eval)
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            int64_t c = vk_mm_gemm_counts[i].load();
+            int64_t t = vk_mm_gemm_time_us[i].load();
+            if (c > 0) {
+                printf("%8lld %8.2f  %5.2f   %8.2f MUL_MAT      %s\n",
+                       (long long)c, (double)t / 1e6,
+                       (double)t * 100.0 / (double)mm_total_time,
+                       (double)t / (double)c,
+                       ggml_type_name((enum ggml_type)i));
+            }
+        }
+        // Print VEC rows (n<=8, decode)
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            int64_t c = vk_mm_vec_counts[i].load();
+            int64_t t = vk_mm_vec_time_us[i].load();
+            if (c > 0) {
+                printf("%8lld %8.2f  %5.2f   %8.2f MUL_MAT_VEC  %s\n",
+                       (long long)c, (double)t / 1e6,
+                       (double)t * 100.0 / (double)mm_total_time,
+                       (double)t / (double)c,
+                       ggml_type_name((enum ggml_type)i));
+            }
+        }
+        printf("\n%8lld %8.2f 100.00\n",
+               (long long)mm_total_count, (double)mm_total_time / 1e6);
+    }
+    printf("\n");
+}
 
 class vk_perf_logger {
   public:
@@ -5818,6 +5903,9 @@ static void ggml_vk_instance_init() {
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_op_stats_enabled = getenv("GGML_VULKAN_PERF") != nullptr;
+    // GGML_VULKAN_PERF piggybacks on the timestamp query infrastructure
+    if (vk_perf_op_stats_enabled) vk_perf_logger_enabled = true;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
@@ -14680,7 +14768,27 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             for (int i = 1; i < ctx->query_idx; i++) {
                 auto node = ctx->query_nodes[i];
                 auto name = ctx->query_fusion_names[i];
-                ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                uint64_t elapsed_ns = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+                ctx->perf_logger->log_timing(node, name, elapsed_ns);
+                // Accumulate per-op stats for GGML_VULKAN_PERF
+                if (vk_perf_op_stats_enabled && node) {
+                    int64_t elapsed_us = (int64_t)(elapsed_ns / 1000);
+                    vk_op_counts[node->op].fetch_add(1, std::memory_order_relaxed);
+                    vk_op_time_us[node->op].fetch_add(elapsed_us, std::memory_order_relaxed);
+                    // MUL_MAT breakdown by src0 type
+                    if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+                        int type = node->src[0]->type;
+                        if (type >= 0 && type < GGML_TYPE_COUNT) {
+                            if (node->ne[1] <= (int64_t)mul_mat_vec_max_cols) {
+                                vk_mm_vec_counts[type].fetch_add(1, std::memory_order_relaxed);
+                                vk_mm_vec_time_us[type].fetch_add(elapsed_us, std::memory_order_relaxed);
+                            } else {
+                                vk_mm_gemm_counts[type].fetch_add(1, std::memory_order_relaxed);
+                                vk_mm_gemm_time_us[type].fetch_add(elapsed_us, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
             }
         } else {
             // Log each group of nodes
@@ -14698,10 +14806,35 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     node_idx += ctx->query_fusion_node_count[node_idx];
                 }
                 prev_node_idx = cur_node_idx;
-                ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                uint64_t elapsed_ns = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+                ctx->perf_logger->log_timing(nodes, names, elapsed_ns);
+                // Accumulate per-op stats for GGML_VULKAN_PERF (split evenly among fused nodes)
+                if (vk_perf_op_stats_enabled && !nodes.empty()) {
+                    int64_t elapsed_us = (int64_t)(elapsed_ns / 1000);
+                    int64_t per_node_us = elapsed_us / (int64_t)nodes.size();
+                    for (auto * n : nodes) {
+                        vk_op_counts[n->op].fetch_add(1, std::memory_order_relaxed);
+                        vk_op_time_us[n->op].fetch_add(per_node_us, std::memory_order_relaxed);
+                        // MUL_MAT breakdown by src0 type
+                        if (n->op == GGML_OP_MUL_MAT && n->src[0]) {
+                            int type = n->src[0]->type;
+                            if (type >= 0 && type < GGML_TYPE_COUNT) {
+                                if (n->ne[1] <= (int64_t)mul_mat_vec_max_cols) {
+                                    vk_mm_vec_counts[type].fetch_add(1, std::memory_order_relaxed);
+                                    vk_mm_vec_time_us[type].fetch_add(per_node_us, std::memory_order_relaxed);
+                                } else {
+                                    vk_mm_gemm_counts[type].fetch_add(1, std::memory_order_relaxed);
+                                    vk_mm_gemm_time_us[type].fetch_add(per_node_us, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        ctx->perf_logger->print_timings();
+        if (!vk_perf_op_stats_enabled) {
+            ctx->perf_logger->print_timings();
+        }
     }
 
     if (!ctx->device->support_async) {
@@ -15965,11 +16098,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_cpu_print_tensor_op_perf") == 0) {
+        return (void *)ggml_vk_print_tensor_op_perf;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

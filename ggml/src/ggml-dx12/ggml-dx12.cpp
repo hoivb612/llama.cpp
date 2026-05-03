@@ -37,6 +37,93 @@
 
 using Microsoft::WRL::ComPtr;
 
+// ---------------------------------------------------------------------------
+// Per-op perf stats (gated by GGML_DX12_PERF env var)
+// ---------------------------------------------------------------------------
+
+static std::atomic<int64_t> dx12_op_counts[GGML_OP_COUNT] = {};
+static std::atomic<int64_t> dx12_op_time_us[GGML_OP_COUNT] = {};
+
+// MUL_MAT breakdown by quant type: VEC (ne[1]==1) vs GEMM (ne[1]>1)
+static std::atomic<int64_t> dx12_mm_vec_counts[GGML_TYPE_COUNT] = {};
+static std::atomic<int64_t> dx12_mm_vec_time_us[GGML_TYPE_COUNT] = {};
+static std::atomic<int64_t> dx12_mm_gemm_counts[GGML_TYPE_COUNT] = {};
+static std::atomic<int64_t> dx12_mm_gemm_time_us[GGML_TYPE_COUNT] = {};
+
+static void ggml_dx12_print_tensor_op_perf() {
+    int64_t total_count = 0;
+    int64_t total_time  = 0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        total_count += dx12_op_counts[i].load();
+        total_time  += dx12_op_time_us[i].load();
+    }
+    if (total_count == 0) return;
+
+    printf("\n\n[DX12] Per-Op GPU Timing (GGML_DX12_PERF)\n");
+    printf("          Total     Total  Tensor\n");
+    printf("   Count Time(sec)   %%     Time(us) Tensor Op\n");
+
+    double total_percent = 0.0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        int64_t c = dx12_op_counts[i].load();
+        int64_t t = dx12_op_time_us[i].load();
+        if (c > 0) {
+            double percent = (double)t * 100.0 / (double)total_time;
+            total_percent += percent;
+            printf("%8lld %8.2f  %5.2f   %8.2f GGML_OP_%s\n",
+                   (long long)c,
+                   (double)t / 1e6,
+                   percent,
+                   (double)t / (double)c,
+                   ggml_op_name((enum ggml_op)i));
+        }
+    }
+    printf("\n%8lld %8.2f %6.2f\n",
+           (long long)total_count,
+           (double)total_time / 1e6,
+           total_percent);
+
+    // MUL_MAT breakdown by src0 quant type
+    int64_t mm_total_count = 0, mm_total_time = 0;
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        mm_total_count += dx12_mm_gemm_counts[i].load() + dx12_mm_vec_counts[i].load();
+        mm_total_time  += dx12_mm_gemm_time_us[i].load() + dx12_mm_vec_time_us[i].load();
+    }
+    if (mm_total_count > 0) {
+        printf("\nMUL_MAT Src0 Type Frequency\n");
+        printf("          Total     Total  Tensor\n");
+        printf("   Count Time(sec)   %%     Time(us) Shader / Src0 Type\n");
+
+        // GEMM rows (ne[1]>1, prompt eval)
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            int64_t c = dx12_mm_gemm_counts[i].load();
+            int64_t t = dx12_mm_gemm_time_us[i].load();
+            if (c > 0) {
+                printf("%8lld %8.2f  %5.2f   %8.2f MUL_MAT      %s\n",
+                       (long long)c, (double)t / 1e6,
+                       (double)t * 100.0 / (double)mm_total_time,
+                       (double)t / (double)c,
+                       ggml_type_name((enum ggml_type)i));
+            }
+        }
+        // VEC rows (ne[1]==1, decode)
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            int64_t c = dx12_mm_vec_counts[i].load();
+            int64_t t = dx12_mm_vec_time_us[i].load();
+            if (c > 0) {
+                printf("%8lld %8.2f  %5.2f   %8.2f MUL_MAT_VEC  %s\n",
+                       (long long)c, (double)t / 1e6,
+                       (double)t * 100.0 / (double)mm_total_time,
+                       (double)t / (double)c,
+                       ggml_type_name((enum ggml_type)i));
+            }
+        }
+        printf("\n%8lld %8.2f 100.00\n",
+               (long long)mm_total_count, (double)mm_total_time / 1e6);
+    }
+    printf("\n");
+}
+
 // Sentinel base address for non-host-accessible GPU buffers (matches Vulkan approach)
 static void * const DX12_PTR_BASE = (void *)(uintptr_t)0x1000;
 
@@ -1415,6 +1502,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
     // Profiling: profile only actual generation graphs (M=1 in MUL_MATs)
     static bool profiling = (getenv("DX12_PROFILE") != nullptr);
+    static bool dx12_perf = (getenv("GGML_DX12_PERF") != nullptr);
     static int profile_graph = 0;
     static int gen_graph = 0;
     profile_graph++;
@@ -2061,9 +2149,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
             bctx->cmd_list->SetComputeRoot32BitConstants(0, sizeof(params) / 4, &params, 0);
         }
+        // dx12_perf: no pre-flush needed — post-flush after prior dispatch already drained the GPU
 
         LARGE_INTEGER t0, t1, freq;
-        if (do_profile) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0); }
+        if (do_profile || dx12_perf) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0); }
 
         // Determine the effective destination tensor (accounting for fusion)
         struct ggml_tensor * dst_tensor = fused_rope_after_rms ? fused_rope_after_rms :
@@ -2368,6 +2457,29 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
             snprintf(key, sizeof(key), "%s(src0t=%d,grp=%u)", ggml_op_name(node->op), src0t, groups_x);
             op_times[key] += ms;
+        } else if (dx12_perf) {
+            bctx->close_and_execute();
+            bctx->wait_for_gpu();
+            bctx->ensure_cmd_list_open();
+            bctx->reset_binding_cache();
+            unsynced_writes.clear();
+            QueryPerformanceCounter(&t1);
+            int64_t elapsed_us = (int64_t)((double)(t1.QuadPart - t0.QuadPart) / freq.QuadPart * 1e6);
+            dx12_op_counts[node->op].fetch_add(1, std::memory_order_relaxed);
+            dx12_op_time_us[node->op].fetch_add(elapsed_us, std::memory_order_relaxed);
+            // MUL_MAT breakdown by src0 type
+            if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+                int type = node->src[0]->type;
+                if (type >= 0 && type < GGML_TYPE_COUNT) {
+                    if (node->ne[1] == 1) {
+                        dx12_mm_vec_counts[type].fetch_add(1, std::memory_order_relaxed);
+                        dx12_mm_vec_time_us[type].fetch_add(elapsed_us, std::memory_order_relaxed);
+                    } else {
+                        dx12_mm_gemm_counts[type].fetch_add(1, std::memory_order_relaxed);
+                        dx12_mm_gemm_time_us[type].fetch_add(elapsed_us, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
 
         // TDR prevention: flush during prompt processing
@@ -3073,11 +3185,19 @@ static ggml_backend_dev_t dx12_reg_get_device(ggml_backend_reg_t reg, size_t ind
     return &g_dx12.backend_devices[index];
 }
 
+static void * dx12_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_cpu_print_tensor_op_perf") == 0) {
+        return (void *)ggml_dx12_print_tensor_op_perf;
+    }
+    return nullptr;
+}
+
 static const ggml_backend_reg_i dx12_reg_interface = {
     /* .get_name         = */ dx12_reg_get_name,
     /* .get_device_count = */ dx12_reg_get_device_count,
     /* .get_device       = */ dx12_reg_get_device,
-    /* .get_proc_address = */ nullptr,
+    /* .get_proc_address = */ dx12_reg_get_proc_address,
 };
 
 // ---------------------------------------------------------------------------
