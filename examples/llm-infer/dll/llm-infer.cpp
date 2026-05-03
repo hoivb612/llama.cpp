@@ -15,6 +15,99 @@
 
 #include "json.hpp" // For JSON handling
 
+#include <cmath>
+#include <algorithm>
+
+// Per-op diagnostic: dumps top5 output values for every graph node
+// Enable by setting env var GGML_OP_DIAG=<output_file_path>
+struct op_diag_state {
+    int   node_count;
+    int   graph_count;  // incremented each time node_count resets (new graph)
+    FILE* out_file;
+    int   max_graphs;   // stop after this many graph computes (0=unlimited)
+    int   max_nodes;    // stop after this many nodes (0=unlimited)
+    bool  active;
+};
+
+static op_diag_state g_op_diag = {};
+
+static bool op_diag_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * state = (op_diag_state *)user_data;
+    if (!state->active) return false;
+    if (state->max_nodes > 0 && state->node_count >= state->max_nodes) {
+        state->active = false;
+        fprintf(state->out_file, "--- OP_DIAG: stopped after %d nodes ---\n", state->node_count);
+        fflush(state->out_file);
+        return false;
+    }
+
+    if (ask) {
+        // Request data for every node
+        return true;
+    }
+
+    // ask=false: tensor data is available after sync
+    int64_t n = ggml_nelements(t);
+    if (n == 0) {
+        fprintf(state->out_file, "G%d N%04d: %-12s %-40s type=%-4s ne=(%lld,%lld,%lld,%lld) [EMPTY]\n",
+            state->graph_count, state->node_count++, ggml_op_name(t->op), t->name,
+            ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+        return true;
+    }
+
+    // Read tensor data as FP32
+    std::vector<float> data;
+    if (t->type == GGML_TYPE_F32) {
+        data.resize(n);
+        ggml_backend_tensor_get(t, data.data(), 0, n * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<uint16_t> raw(n);
+        ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
+        data.resize(n);
+        for (int64_t i = 0; i < n; i++) {
+            data[i] = ggml_fp16_to_fp32(*(ggml_fp16_t*)&raw[i]);
+        }
+    } else {
+        fprintf(state->out_file, "G%d N%04d: %-12s %-40s type=%-4s ne=(%lld,%lld,%lld,%lld) [SKIP type]\n",
+            state->graph_count, state->node_count++, ggml_op_name(t->op), t->name,
+            ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+        return true;
+    }
+
+    // Find top 5 by value
+    int top_idx[5] = {}; float top_val[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+    for (int64_t v = 0; v < n; v++) {
+        if (data[v] > top_val[4]) {
+            for (int k = 0; k < 5; k++) {
+                if (data[v] > top_val[k]) {
+                    for (int s = 4; s > k; s--) { top_val[s] = top_val[s-1]; top_idx[s] = top_idx[s-1]; }
+                    top_val[k] = data[v]; top_idx[k] = (int)v;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Compute RMS and min
+    double sum_sq = 0; float vmin = data[0];
+    for (int64_t v = 0; v < n; v++) {
+        sum_sq += (double)data[v] * data[v];
+        if (data[v] < vmin) vmin = data[v];
+    }
+    float rms = (float)sqrt(sum_sq / n);
+
+    fprintf(state->out_file, "G%d N%04d: %-12s %-40s ne=(%lld,%lld,%lld,%lld) rms=%.6f min=%.4f top5: [%d]=%.4f [%d]=%.4f [%d]=%.4f [%d]=%.4f [%d]=%.4f  f4: %.4f %.4f %.4f %.4f\n",
+        state->graph_count, state->node_count++, ggml_op_name(t->op), t->name,
+        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+        rms, vmin,
+        top_idx[0], top_val[0], top_idx[1], top_val[1], top_idx[2], top_val[2],
+        top_idx[3], top_val[3], top_idx[4], top_val[4],
+        data[0], data[std::min((int64_t)1, n-1)], data[std::min((int64_t)2, n-1)], data[std::min((int64_t)3, n-1)]);
+    fflush(state->out_file);
+
+    return true;
+}
+
 // For SLM 
 llama_model *llm_model;
 llama_context *llm_ctx;
@@ -248,6 +341,24 @@ bool llm_initialize(
     llm_ctx_params.n_threads_batch = params.n_threads;
     llm_ctx_params.no_perf = false;
 
+    // Per-op diagnostic: set eval callback if GGML_OP_DIAG env var is set
+    const char * op_diag_path = getenv("GGML_OP_DIAG");
+    if (op_diag_path) {
+        g_op_diag.out_file = fopen(op_diag_path, "w");
+        if (g_op_diag.out_file) {
+            g_op_diag.node_count = 0;
+            g_op_diag.graph_count = 0;
+            g_op_diag.max_graphs = 0; // unlimited
+            g_op_diag.max_nodes = 0;  // unlimited by default
+            const char * max_nodes_str = getenv("GGML_OP_DIAG_MAX");
+            if (max_nodes_str) g_op_diag.max_nodes = atoi(max_nodes_str);
+            g_op_diag.active = true;
+            llm_ctx_params.cb_eval = op_diag_callback;
+            llm_ctx_params.cb_eval_user_data = &g_op_diag;
+            fprintf(stderr, "[OP_DIAG] Per-op diagnostic enabled, output: %s\n", op_diag_path);
+        }
+    }
+
     llm_ctx = llama_init_from_model(llm_model, llm_ctx_params);
 
     if (llm_ctx == NULL) {
@@ -424,6 +535,13 @@ bool llm_inference(
             n_eval = params.n_batch;
         }
 
+        // Per-op diag: mark graph boundary for prompt phase
+        if (g_op_diag.active && g_op_diag.out_file) {
+            fprintf(g_op_diag.out_file, "=== GRAPH %d: PROMPT DECODE (n_eval=%d, i=%d) ===\n", g_op_diag.graph_count, n_eval, i);
+            fflush(g_op_diag.out_file);
+            g_op_diag.node_count = 0;
+        }
+
         if (llama_decode(llm_ctx, llama_batch_get_one(&embd[i], n_eval))) {
             printf("%s : failed to eval\n", __func__);
             llama_sampler_free(smpl);
@@ -479,6 +597,36 @@ bool llm_inference(
 
     while (n_past <= max_len) {
 
+        // DIAG: Dump logits before sampling (first 3 tokens, gated by GGML_DX12_DIAG)
+        {
+            static bool diag_enabled = (getenv("GGML_DX12_DIAG") != nullptr);
+            static int logit_dump_count = 0;
+            if (diag_enabled && logit_dump_count < 3) {
+                float * logits = llama_get_logits(llm_ctx);
+                int n_vocab = llama_vocab_n_tokens(vocab);
+                // Find top 5
+                int top_idx[5] = {}; float top_val[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+                for (int v = 0; v < n_vocab; v++) {
+                    for (int t = 0; t < 5; t++) {
+                        if (logits[v] > top_val[t]) {
+                            for (int s = 4; s > t; s--) { top_val[s] = top_val[s-1]; top_idx[s] = top_idx[s-1]; }
+                            top_val[t] = logits[v]; top_idx[t] = v;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "  APP LOGITS #%d (n=%d): top5:", logit_dump_count, n_vocab);
+                for (int t = 0; t < 5; t++) fprintf(stderr, " [%d]=%.4f", top_idx[t], top_val[t]);
+                fprintf(stderr, "\n  first8:");
+                for (int v = 0; v < 8 && v < n_vocab; v++) fprintf(stderr, " %.4f", logits[v]);
+                fprintf(stderr, "\n  last8:");
+                for (int v = n_vocab - 8; v < n_vocab; v++) fprintf(stderr, " %.4f", logits[v]);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                logit_dump_count++;
+            }
+        }
+
         // sample the last token just received
         llama_token new_token_id = llama_sampler_sample(smpl, llm_ctx, -1);
 
@@ -514,6 +662,23 @@ bool llm_inference(
         n_past += 1;
 
         // decode the output for the new generated token
+        // Per-op diag: mark graph boundary for decode phase, stop after 1st decode
+        if (g_op_diag.active && g_op_diag.out_file) {
+            g_op_diag.graph_count++;
+            fprintf(g_op_diag.out_file, "=== GRAPH %d: DECODE STEP (token=%d) ===\n", g_op_diag.graph_count, embd[0]);
+            fflush(g_op_diag.out_file);
+            g_op_diag.node_count = 0;
+            if (g_op_diag.graph_count >= 2) {
+                // Stop diagnostic after prompt + 1 decode
+                g_op_diag.active = false;
+                fprintf(g_op_diag.out_file, "=== OP_DIAG COMPLETE (stopped after graph %d) ===\n", g_op_diag.graph_count);
+                fflush(g_op_diag.out_file);
+                fclose(g_op_diag.out_file);
+                g_op_diag.out_file = nullptr;
+                fprintf(stderr, "[OP_DIAG] Diagnostic complete, file closed.\n");
+            }
+        }
+
         if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1))) {
             printf("%s : failed to eval, return code %d\n", __func__, 1);
             llama_sampler_free(smpl);

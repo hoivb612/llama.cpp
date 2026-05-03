@@ -522,7 +522,7 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     // Create compute command queue
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
     qd.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
     hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_queue));
     DX12_CHECK(hr, "CreateCommandQueue(compute)");
@@ -756,6 +756,12 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
 void dx12_backend_context::wait_for_gpu() {
     if (fence_value == 0) return;
     wait_for_fence(fence_value);
+    // Verify GPU didn't TDR during execution — device removal signals all fences
+    HRESULT removed = dev->device->GetDeviceRemovedReason();
+    if (FAILED(removed)) {
+        fprintf(stderr, "ggml-dx12: Device removed detected in wait_for_gpu! HRESULT 0x%08lX\n", (unsigned long)removed);
+        fflush(stderr);
+    }
 }
 
 void dx12_backend_context::ensure_staging(size_t upload_size, size_t readback_size) {
@@ -957,13 +963,34 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             ctx->dev->xfer_wait(); // wait for any previous transfer
             ctx->dev->xfer_ensure_staging(0, size);
 
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // Always check if device is already dead before attempting copy
+            {
+                HRESULT removed = ctx->dev->device->GetDeviceRemovedReason();
+                if (FAILED(removed)) {
+                    fprintf(stderr, "ggml-dx12: get_tensor: device already removed (0x%08lX) before copy! offset=%zu size=%zu\n",
+                            (unsigned long)removed, tensor_offset, size);
+                    fflush(stderr);
+                }
+            }
+
+            // Diagnostic: log readback parameters
+            static bool dx12_diag_gt = (getenv("GGML_DX12_DIAG") != nullptr);
+            if (dx12_diag_gt && size > 100000) {
+                fprintf(stderr, "ggml-dx12: get_tensor: offset=%zu size=%zu buf_size=%zu ne=(%lld,%lld,%lld,%lld)\n",
+                        tensor_offset, size, ctx->size,
+                        (long long)tensor->ne[0], (long long)tensor->ne[1],
+                        (long long)tensor->ne[2], (long long)tensor->ne[3]);
+                fflush(stderr);
+            }
+
             // Reset and record copy command
             HRESULT hr = ctx->dev->xfer.cmd_alloc->Reset();
             DX12_CHECK(hr, "xfer cmd_alloc Reset(get)");
             hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
             DX12_CHECK(hr, "xfer cmd_list Reset(get)");
 
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
             ctx->dev->xfer.cmd_list->CopyBufferRegion(ctx->dev->xfer.readback_staging.Get(), 0,
                                                        ctx->resource.Get(), tensor_offset, size);
             ctx->dev->xfer.cmd_list->Close();
@@ -982,6 +1009,83 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             memcpy(data, mapped, size);
             D3D12_RANGE written = { 0, 0 };
             ctx->dev->xfer.readback_staging->Unmap(0, &written);
+
+            // NaN check: scan ALL readback tensors for NaN (early detection)
+            if (dx12_diag_gt && size >= 4) {
+                static int nan_report_count = 0;
+                if (nan_report_count < 5) {
+                    const float * fp = (const float *)data;
+                    size_t n_floats = size / 4;
+                    int nan_count = 0;
+                    size_t first_nan_idx = 0;
+                    for (size_t i = 0; i < n_floats; i++) {
+                        if (isnan(fp[i])) {
+                            if (nan_count == 0) first_nan_idx = i;
+                            nan_count++;
+                        }
+                    }
+                    if (nan_count > 0) {
+                        nan_report_count++;
+                        fprintf(stderr, "ggml-dx12: NaN DETECTED in get_tensor! offset=%zu size=%zu ne=(%lld,%lld,%lld,%lld) "
+                                "nan_count=%d/%zu first_nan@%zu val_at[0]=%.6g buf_size=%zu\n",
+                                tensor_offset, size,
+                                (long long)tensor->ne[0], (long long)tensor->ne[1],
+                                (long long)tensor->ne[2], (long long)tensor->ne[3],
+                                nan_count, n_floats, first_nan_idx,
+                                fp[0], ctx->size);
+                        // Print a few values around first NaN
+                        size_t start = first_nan_idx > 4 ? first_nan_idx - 4 : 0;
+                        fprintf(stderr, "  values around first NaN [%zu..%zu]: ", start, start+7);
+                        for (size_t i = start; i < start + 8 && i < n_floats; i++) {
+                            fprintf(stderr, "%.4g ", fp[i]);
+                        }
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                    }
+                }
+            }
+            if (dx12_diag_gt && tensor->ne[0] > 100000 && tensor->ne[1] == 1 && size == tensor->ne[0] * 4) {
+                static int logits_diag_count = 0;
+                if (logits_diag_count < 3) {
+                    logits_diag_count++;
+                    const float * logits = (const float *)data;
+                    int64_t n = tensor->ne[0];
+                    // Find top-5
+                    int top_ids[5] = {0,0,0,0,0};
+                    float top_vals[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+                    float sum = 0.0f;
+                    int nan_count = 0, inf_count = 0, zero_count = 0;
+                    for (int64_t i = 0; i < n; i++) {
+                        float v = logits[i];
+                        if (isnan(v)) { nan_count++; continue; }
+                        if (isinf(v)) { inf_count++; continue; }
+                        if (v == 0.0f) zero_count++;
+                        sum += v;
+                        for (int j = 0; j < 5; j++) {
+                            if (v > top_vals[j]) {
+                                for (int k = 4; k > j; k--) { top_ids[k] = top_ids[k-1]; top_vals[k] = top_vals[k-1]; }
+                                top_ids[j] = (int)i;
+                                top_vals[j] = v;
+                                break;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "ggml-dx12: LOGITS DIAG #%d: n=%lld sum=%.4f mean=%.6f zeros=%d nans=%d infs=%d\n",
+                            logits_diag_count, (long long)n, sum, sum/n, zero_count, nan_count, inf_count);
+                    fprintf(stderr, "  top5: [%d]=%.4f [%d]=%.4f [%d]=%.4f [%d]=%.4f [%d]=%.4f\n",
+                            top_ids[0], top_vals[0], top_ids[1], top_vals[1],
+                            top_ids[2], top_vals[2], top_ids[3], top_vals[3],
+                            top_ids[4], top_vals[4]);
+                    // Also print first 8 and last 8 values
+                    fprintf(stderr, "  first8: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                            logits[0], logits[1], logits[2], logits[3],
+                            logits[4], logits[5], logits[6], logits[7]);
+                    fprintf(stderr, "  last8:  %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                            logits[n-8], logits[n-7], logits[n-6], logits[n-5],
+                            logits[n-4], logits[n-3], logits[n-2], logits[n-1]);
+                    fflush(stderr);
+                }
+            }
         },
         /* .set_tensor_2d = */ nullptr,
         /* .get_tensor_2d = */ nullptr,
@@ -1140,6 +1244,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
                     if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
                         return true;
@@ -1178,10 +1283,12 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return true;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            if (op->src[0]->type != GGML_TYPE_F32) return false;
-            if (op->src[1]->type != GGML_TYPE_F32 && op->src[1]->type != GGML_TYPE_F16) return false;
-            if (op->src[2]->type != GGML_TYPE_F32 && op->src[2]->type != GGML_TYPE_F16) return false;
-            return true;
+            // Re-enabled: NaN was in model head (dispatches 1598-1608), not attention.
+            // FA is MQA-safe and handles attention softcapping internally.
+            if (op->type == GGML_TYPE_F32 && op->src[1] && op->src[1]->type == GGML_TYPE_F16) {
+                return true;
+            }
+            return false;
 
         default:
             return false;
@@ -1327,10 +1434,38 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     std::map<std::string, double> op_times;
 
     int dispatch_weight = 0;
-    static constexpr int TDR_FLUSH_THRESHOLD = 24;
+    // AMD RDNA 3 workaround: flush threshold for prompt phase.
+    // Lower values = more frequent CL splits = more correct but slower.
+    // Configurable via GGML_DX12_FLUSH_INTERVAL env var (default: 16).
+    static int TDR_FLUSH_THRESHOLD = 0;
+    if (TDR_FLUSH_THRESHOLD == 0) {
+        const char * env = getenv("GGML_DX12_FLUSH_INTERVAL");
+        TDR_FLUSH_THRESHOLD = env ? atoi(env) : 16;
+        if (TDR_FLUSH_THRESHOLD <= 0) TDR_FLUSH_THRESHOLD = 16;
+    }
 
     // Track unsynced tensor writes for smart barrier insertion
     std::unordered_set<uintptr_t> unsynced_writes;
+
+    static bool dx12_diag = (getenv("GGML_DX12_DIAG") != nullptr);
+
+    // Track wall time for TDR yield: GPU must periodically yield to DWM
+    // to prevent display-level TDR from cumulative compute monopolization.
+    LARGE_INTEGER tdr_t0, tdr_freq;
+    QueryPerformanceFrequency(&tdr_freq);
+    QueryPerformanceCounter(&tdr_t0);
+    static constexpr double TDR_YIELD_MS = 800.0;  // yield to DWM every 800ms
+
+    // Prompt diagnostics gated under GGML_DX12_DIAG
+    static int prompt_eval_count = 0;
+    bool trace_prompt = false;
+    if (is_prompt && dx12_diag) {
+        trace_prompt = true;
+        prompt_eval_count++;
+        fprintf(stderr, "ggml-dx12: PROMPT GRAPH #%d: n_nodes=%d, cl_open=%d\n",
+                prompt_eval_count, cgraph->n_nodes, (int)bctx->cmd_list_open);
+        fflush(stderr);
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -1362,7 +1497,24 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         struct ggml_tensor * fused_rms_node = nullptr;      // the RMS_NORM in triple fusion
 
         // Try ADD + RMS_NORM + MUL triple fusion first
-        if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        static bool no_fusion = (getenv("GGML_DX12_NO_FUSION") != nullptr);
+        bool skip_fusion = no_fusion || (is_prompt && getenv("GGML_DX12_NO_PROMPT_FUSION"));
+        // Per-fusion control: GGML_DX12_FUSION_MASK bitmask enables specific fusions:
+        //   bit 0 (1):  ADD+RMS_NORM+MUL
+        //   bit 1 (2):  RMS_NORM+MUL
+        //   bit 2 (4):  RMS_NORM+MUL+ROPE  (disabled by default — broken on AMD RDNA 3)
+        //   bit 3 (8):  ROPE+VIEW+SET_ROWS
+        //   bit 4 (16): MUL_MAT+ADD bias
+        // When set, only fusions with set bits are attempted. When not set, all fusions work.
+        static int fusion_mask = -1;
+        if (fusion_mask == -1) {
+            const char * env = getenv("GGML_DX12_FUSION_MASK");
+            fusion_mask = env ? atoi(env) : 0x1B;  // 27 = all except RMS+MUL+ROPE
+        }
+        if (!skip_fusion && !(fusion_mask & 1) && !(fusion_mask & 2) && !(fusion_mask & 4) && !(fusion_mask & 8) && !(fusion_mask & 16))
+            skip_fusion = true;
+
+        if (!skip_fusion && (fusion_mask & 1) && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
             struct ggml_tensor * rms = cgraph->nodes[i + 1];
             struct ggml_tensor * mul = cgraph->nodes[i + 2];
             if (rms->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL &&
@@ -1380,11 +1532,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // Fallback: try RMS_NORM + MUL + ROPE triple fusion, or RMS_NORM + MUL double fusion
         struct ggml_tensor * fused_rope_after_rms = nullptr;
-        if (!fused_add_rms_node && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+         if (!skip_fusion && (fusion_mask & 6) && !fused_add_rms_node && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
             struct ggml_tensor * next = cgraph->nodes[i + 1];
             if (next->op == GGML_OP_MUL && next->src[0] == node) {
                 // Check for RMS_NORM + MUL + ROPE triple fusion
-                if (i + 2 < cgraph->n_nodes) {
+                if ((fusion_mask & 4) && i + 2 < cgraph->n_nodes) {
                     struct ggml_tensor * rope = cgraph->nodes[i + 2];
                     int mode = rope->op == GGML_OP_ROPE ? ((const int32_t *)rope->op_params)[2] : -1;
                     if (rope->op == GGML_OP_ROPE && rope->src[0] == next &&
@@ -1398,7 +1550,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
                 }
                 // If triple fusion didn't trigger, use double fusion
-                if (!fused_rope_after_rms) {
+                if (!fused_rope_after_rms && (fusion_mask & 2)) {
                     fused_mul_node = next;
                     key.op = GGML_OP_RMS_NORM;
                     key.flags = 2;  // flags=2 means fused rms_norm_mul
@@ -1410,7 +1562,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Eliminates 2 dispatches per KV cache write
         struct ggml_tensor * fused_rope_set_rows = nullptr;  // the SET_ROWS node
         struct ggml_tensor * fused_rope_view = nullptr;       // the VIEW node
-        if (node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes && !fused_add_rms_node) {
+        if (!skip_fusion && (fusion_mask & 8) && node->op == GGML_OP_ROPE && i + 2 < cgraph->n_nodes && !fused_add_rms_node) {
             struct ggml_tensor * view = cgraph->nodes[i + 1];
             struct ggml_tensor * set_rows = cgraph->nodes[i + 2];
             if (view->op == GGML_OP_VIEW && set_rows->op == GGML_OP_SET_ROWS &&
@@ -1465,7 +1617,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Op fusion: MUL_MAT(M=1) + ADD → matvec with fused bias add
         struct ggml_tensor * fused_bias_add = nullptr;
         struct ggml_tensor * fused_bias_tensor = nullptr;
-        if (is_matvec_dispatch && i + 1 < cgraph->n_nodes) {
+        if (!skip_fusion && (fusion_mask & 16) && is_matvec_dispatch && i + 1 < cgraph->n_nodes) {
             struct ggml_tensor * next = cgraph->nodes[i + 1];
             if (next->op == GGML_OP_ADD) {
                 struct ggml_tensor * bias = nullptr;
@@ -1617,6 +1769,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             dst_res = dx12_get_resource(node);
         }
 
+        // Bind resources — cached for slots 1-3, always-bind fallback for slots 4/5
         if (src0_res) {
             D3D12_GPU_VIRTUAL_ADDRESS va = src0_res->GetGPUVirtualAddress();
             if (va != bctx->last_src0_va) {
@@ -1639,39 +1792,48 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
-        // Optional src2/src3 — only bind for ops that use them
-        bool needs_src2 = (node->op == GGML_OP_SOFT_MAX) || (fused_bias_tensor != nullptr) || (fused_add_rms_node != nullptr) || (fused_rope_after_rms != nullptr);
+        // Always bind slots 4/5: AMD RDNA 3 can hang if root descriptors point to
+        // stale/freed memory when switching PSOs, even if the new shader doesn't use them.
+        bool needs_src2 = (node->op == GGML_OP_FLASH_ATTN_EXT) || (node->op == GGML_OP_SOFT_MAX) || (fused_bias_tensor != nullptr) || (fused_add_rms_node != nullptr) || (fused_rope_after_rms != nullptr);
         bool needs_src3 = (node->op == GGML_OP_FLASH_ATTN_EXT) || (fused_rope_set_rows != nullptr);
 
-        if (needs_src2 || needs_src3) {
-            ID3D12Resource * src2_res;
-            if (fused_rope_after_rms) {
-                src2_res = dx12_get_resource(fused_rope_after_rms->src[1]);  // ROPE position indices
-            } else if (fused_add_rms_node) {
-                src2_res = dx12_get_resource(fused_mul_node->src[1]);  // weight tensor
-            } else if (fused_bias_tensor) {
-                src2_res = dx12_get_resource(fused_bias_tensor);
+        {
+            D3D12_GPU_VIRTUAL_ADDRESS src2_va;
+            if (needs_src2 || needs_src3) {
+                ID3D12Resource * src2_res;
+                if (fused_rope_after_rms) {
+                    src2_res = dx12_get_resource(fused_rope_after_rms->src[1]);
+                } else if (fused_add_rms_node) {
+                    src2_res = dx12_get_resource(fused_mul_node->src[1]);
+                } else if (fused_bias_tensor) {
+                    src2_res = dx12_get_resource(fused_bias_tensor);
+                } else {
+                    src2_res = dx12_get_resource(node->src[2]);
+                }
+                src2_va = (src2_res ? src2_res : src0_res)->GetGPUVirtualAddress();
             } else {
-                src2_res = dx12_get_resource(node->src[2]);
+                src2_va = src0_res ? src0_res->GetGPUVirtualAddress() : 0;
             }
-            D3D12_GPU_VIRTUAL_ADDRESS src2_va =
-                (src2_res ? src2_res : src0_res)->GetGPUVirtualAddress();
-            if (src2_va != bctx->last_src2_va) {
+            if (src2_va && src2_va != bctx->last_src2_va) {
                 bctx->cmd_list->SetComputeRootShaderResourceView(4, src2_va);
                 bctx->last_src2_va = src2_va;
             }
         }
 
-        if (needs_src3) {
-            ID3D12Resource * src3_res;
-            if (fused_rope_set_rows) {
-                src3_res = dx12_get_resource(fused_rope_set_rows->src[1]);  // SET_ROWS row indices
+        {
+            D3D12_GPU_VIRTUAL_ADDRESS src3_va;
+            if (needs_src3) {
+                ID3D12Resource * src3_res;
+                if (fused_rope_set_rows) {
+                    src3_res = dx12_get_resource(fused_rope_set_rows->src[1]);
+                } else {
+                    src3_res = dx12_get_resource(node->src[3]);
+                }
+                src3_va = (src3_res ? src3_res : src0_res)->GetGPUVirtualAddress();
             } else {
-                src3_res = dx12_get_resource(node->src[3]);
+                src3_va = src0_res ? src0_res->GetGPUVirtualAddress() : 0;
             }
-            D3D12_GPU_VIRTUAL_ADDRESS src3_va =
-                (src3_res ? src3_res : src0_res)->GetGPUVirtualAddress();
-            if (src3_va != bctx->last_src3_va) {
+            if (src3_va && src3_va != bctx->last_src3_va) {
                 bctx->cmd_list->SetComputeRootShaderResourceView(5, src3_va);
                 bctx->last_src3_va = src3_va;
             }
@@ -1690,13 +1852,94 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // Matvec dispatch
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
+
+                    // Chunked dispatch for very large N to prevent TDR
+                    // A single dispatch of 262K+ rows can exceed the Windows TDR timeout
+                    static constexpr uint32_t MATVEC_CHUNK = 32768;
+                    bool no_fusions = (!fused_bias_add && !fused_mul_node &&
+                                       !fused_add_rms_node && !fused_rope_after_rms && !fused_rope_set_rows);
+
+                    if (N > MATVEC_CHUNK && key.flags != 2 && no_fusions) {
+                        uint32_t saved_ne0      = params.ne0;
+                        uint32_t saved_ne01     = params.ne01;
+                        uint32_t saved_src0_off = params.src0_offset;
+                        uint32_t saved_dst_off  = params.dst_offset;
+
+                        for (uint32_t cs = 0; cs < N; cs += MATVEC_CHUNK) {
+                            uint32_t cr = std::min(MATVEC_CHUNK, N - cs);
+
+                            params.ne0         = cr;
+                            params.ne01        = cr;
+                            params.src0_offset = saved_src0_off + cs * params.nb01;
+                            params.dst_offset  = saved_dst_off  + cs * params.nb0;
+
+                            bctx->cmd_list->SetComputeRoot32BitConstants(0, BASE_PARAMS, &params, 0);
+
+                            if (dx12_diag && is_prompt) {
+                                int src0t = node->src[0] ? (int)node->src[0]->type : -1;
+                                fprintf(stderr, "ggml-dx12: dispatch #%d MUL_MAT(src0t=%d) chunk [%u..%u/%u] groups=(%u,1,%u)\n",
+                                        i, src0t, cs, cs + cr, N, cr, batches);
+                                fflush(stderr);
+                            }
+
+                            bctx->cmd_list->Dispatch(cr, 1, batches);
+
+                            // Flush between chunks for TDR safety
+                            if (cs + MATVEC_CHUNK < N) {
+                                bctx->close_and_execute();
+                                bctx->wait_for_gpu();
+                                if (dx12_diag) {
+                                    fprintf(stderr, "ggml-dx12: chunk flush OK after [%u..%u]\n", cs, cs + cr);
+                                    fflush(stderr);
+                                }
+                                bctx->ensure_cmd_list_open();
+                                // Re-bind on new command list
+                                bctx->cmd_list->SetComputeRootSignature(root_sig);
+                                bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+                                if (src0_res)
+                                    bctx->cmd_list->SetComputeRootShaderResourceView(1, src0_res->GetGPUVirtualAddress());
+                                if (src1_res)
+                                    bctx->cmd_list->SetComputeRootShaderResourceView(2, src1_res->GetGPUVirtualAddress());
+                                if (dst_res)
+                                    bctx->cmd_list->SetComputeRootUnorderedAccessView(3, dst_res->GetGPUVirtualAddress());
+                            }
+                        }
+
+                        // Restore params
+                        params.ne0         = saved_ne0;
+                        params.ne01        = saved_ne01;
+                        params.src0_offset = saved_src0_off;
+                        params.dst_offset  = saved_dst_off;
+
+                        // Flush after chunked dispatch for decode: the `continue` below
+                        // skips the periodic decode flush, so explicitly drain here.
+                        if (!is_prompt) {
+                            bctx->close_and_execute();
+                            bctx->wait_for_gpu();
+                            bctx->ensure_cmd_list_open();
+                            bctx->reset_binding_cache();
+                        }
+
+                        unsynced_writes.insert((uintptr_t)node);  // no fusions, dst = node
+                        dispatch_weight = 0;
+                        continue;  // skip normal dispatch path
+                    }
+
+                    // Normal matvec dispatch (N <= MATVEC_CHUNK)
                     if (key.flags == 2) {
                         // Multi-row: 2 rows per thread group
                         groups_x = (N + 1) / 2;
                     } else {
                         groups_x = N;
                     }
-                    groups_y = 1;
+                    // D3D12 dispatch limit: 65535 per axis
+                    // Linearize into 2D: shader computes row = gid.y * 65535 + gid.x
+                    if (groups_x > 65535) {
+                        groups_y = (groups_x + 65534) / 65535;
+                        groups_x = 65535;
+                    } else {
+                        groups_y = 1;
+                    }
                     groups_z = batches;
                 } else if (key.flags == 4) {
                     // Register-blocked tiled dispatch (32×32 tile) [numthreads(16,16,1)]
@@ -1853,9 +2096,128 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 bctx->cmd_list->ResourceBarrier(1, &barrier);
                 unsynced_writes.clear();
             }
+
+            // DEBUG: unconditional UAV barrier before every dispatch to test if
+            // the dependency-tracked barriers are missing a case.
+            static bool force_barriers = (getenv("GGML_DX12_BARRIER_ALL") != nullptr);
+            if (force_barriers) {
+                D3D12_RESOURCE_BARRIER barrier = {};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                barrier.UAV.pResource = nullptr;
+                bctx->cmd_list->ResourceBarrier(1, &barrier);
+                unsynced_writes.clear();
+            }
+        }
+
+        // TDR diagnostic: print every dispatch during first prompt
+        if (dx12_diag && is_prompt) {
+            int src0t = node->src[0] ? (int)node->src[0]->type : -1;
+            fprintf(stderr, "ggml-dx12: dispatch #%d %s(src0t=%d) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
+                    i, ggml_op_name(node->op), src0t, groups_x, groups_y, groups_z,
+                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            fflush(stderr);
+        }
+
+        // D3D12 dispatch limit: 65535 per axis
+        if (groups_x > 65535 || groups_y > 65535 || groups_z > 65535) {
+            fprintf(stderr, "ggml-dx12: SKIP dispatch #%d %s — groups (%u,%u,%u) exceeds D3D12 limit 65535\n",
+                    i, ggml_op_name(node->op), groups_x, groups_y, groups_z);
+            continue;
         }
 
         bctx->cmd_list->Dispatch(groups_x, groups_y, groups_z);
+
+        // GLU diagnostic: read back first few values of src0, src1, dst after first GLU dispatch
+        if (dx12_diag && node->op == GGML_OP_GLU) {
+            static bool glu_diag_done = false;
+            if (!glu_diag_done) {
+                glu_diag_done = true;
+                // Flush current work so GLU dispatch completes
+                bctx->close_and_execute();
+                bctx->wait_for_gpu();
+
+                fprintf(stderr, "ggml-dx12: GLU DIAG: src0 type=%d ne=(%lld,%lld) nb=(%lld,%lld) off=%u\n",
+                        (int)node->src[0]->type,
+                        (long long)node->src[0]->ne[0], (long long)node->src[0]->ne[1],
+                        (long long)node->src[0]->nb[0], (long long)node->src[0]->nb[1],
+                        params.src0_offset);
+                fprintf(stderr, "ggml-dx12: GLU DIAG: src1 type=%d ne=(%lld,%lld) nb=(%lld,%lld) off=%u\n",
+                        node->src[1] ? (int)node->src[1]->type : -1,
+                        node->src[1] ? (long long)node->src[1]->ne[0] : 0,
+                        node->src[1] ? (long long)node->src[1]->ne[1] : 0,
+                        node->src[1] ? (long long)node->src[1]->nb[0] : 0,
+                        node->src[1] ? (long long)node->src[1]->nb[1] : 0,
+                        params.src1_offset);
+                fprintf(stderr, "ggml-dx12: GLU DIAG: dst type=%d ne=(%lld,%lld) nb=(%lld,%lld) off=%u\n",
+                        (int)node->type,
+                        (long long)node->ne[0], (long long)node->ne[1],
+                        (long long)node->nb[0], (long long)node->nb[1],
+                        params.dst_offset);
+                fprintf(stderr, "ggml-dx12: GLU DIAG: op_params glu_op=%u swapped=%u\n",
+                        params.op_params[0], params.op_params[1]);
+
+                // Read back 8 floats from src0, src1, and dst
+                const uint32_t DIAG_BYTES = 32; // 8 floats
+                float src0_vals[8] = {}, src1_vals[8] = {}, dst_vals[8] = {};
+                auto * dev = bctx->dev;
+                dev->init_xfer();
+                dev->xfer_ensure_staging(0, DIAG_BYTES);
+
+                // Helper lambda to read from a resource at an offset
+                auto readback = [&](ID3D12Resource * res, uint32_t offset, float * out, const char* label) {
+                    if (!res) { fprintf(stderr, "ggml-dx12: GLU DIAG: %s res=NULL!\n", label); return; }
+                    dev->xfer_wait(); // ensure prior xfer is done
+                    HRESULT hr = dev->xfer.cmd_alloc->Reset();
+                    if (FAILED(hr)) { fprintf(stderr, "ggml-dx12: GLU DIAG: %s cmd_alloc Reset failed 0x%08lX\n", label, (unsigned long)hr); return; }
+                    hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                    if (FAILED(hr)) { fprintf(stderr, "ggml-dx12: GLU DIAG: %s cmd_list Reset failed 0x%08lX\n", label, (unsigned long)hr); return; }
+                    dev->xfer.cmd_list->CopyBufferRegion(
+                        dev->xfer.readback_staging.Get(), 0, res, offset, DIAG_BYTES);
+                    dev->xfer.cmd_list->Close();
+                    ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
+                    dev->compute_queue->ExecuteCommandLists(1, lists);
+                    dev->xfer.fence_value++;
+                    dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                    dev->xfer_wait();
+                    void * mapped = nullptr;
+                    D3D12_RANGE read_range = { 0, DIAG_BYTES };
+                    hr = dev->xfer.readback_staging->Map(0, &read_range, &mapped);
+                    if (FAILED(hr)) { fprintf(stderr, "ggml-dx12: GLU DIAG: %s Map failed 0x%08lX\n", label, (unsigned long)hr); return; }
+                    memcpy(out, mapped, DIAG_BYTES);
+                    D3D12_RANGE written = { 0, 0 };
+                    dev->xfer.readback_staging->Unmap(0, &written);
+                };
+
+                readback(src0_res, params.src0_offset, src0_vals, "src0");
+                readback(src1_res, params.src1_offset, src1_vals, "src1");
+                readback(dst_res, params.dst_offset, dst_vals, "dst");
+
+                fprintf(stderr, "ggml-dx12: GLU DIAG src0[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        src0_vals[0], src0_vals[1], src0_vals[2], src0_vals[3],
+                        src0_vals[4], src0_vals[5], src0_vals[6], src0_vals[7]);
+                fprintf(stderr, "ggml-dx12: GLU DIAG src1[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        src1_vals[0], src1_vals[1], src1_vals[2], src1_vals[3],
+                        src1_vals[4], src1_vals[5], src1_vals[6], src1_vals[7]);
+                fprintf(stderr, "ggml-dx12: GLU DIAG dst[0..7]:  %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        dst_vals[0], dst_vals[1], dst_vals[2], dst_vals[3],
+                        dst_vals[4], dst_vals[5], dst_vals[6], dst_vals[7]);
+
+                // Expected: dst[i] = silu(src0[i]) * src1[i]
+                fprintf(stderr, "ggml-dx12: GLU DIAG expected[0..3]: ");
+                for (int d = 0; d < 4; d++) {
+                    float g = src0_vals[d];
+                    float silu_g = g / (1.0f + expf(-g));
+                    fprintf(stderr, "%.6f ", silu_g * src1_vals[d]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+
+                // Re-open command list
+                bctx->ensure_cmd_list_open();
+                bctx->reset_binding_cache();
+                unsynced_writes.clear();
+            }
+        }
 
         // Track this dispatch's output as unsynced
         unsynced_writes.insert((uintptr_t)dst_tensor);
@@ -1879,6 +2241,111 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             i += 2;  // skip the VIEW and SET_ROWS nodes
         }
 
+        // Periodic CL flush for decode phase (M=1) to work around AMD RDNA 3
+        // stale cache issue.  UAV barriers alone are insufficient — full pipeline
+        // drains (close CL + execute + wait) are required.  The prompt path has
+        // its own weight-based TDR flushing.  For decode, flush every N dispatches
+        // throughout the graph body.  The model head CL splits below handle the
+        // tail.  Configurable via GGML_DX12_FLUSH_INTERVAL (default: 16).
+        if (!is_prompt && cgraph->n_nodes > 10) {
+            // AMD RDNA 3 requires full pipeline drains between EVERY decode dispatch.
+            // UAV barriers alone are insufficient for M=1 (small) dispatches.
+            // Default: flush after every dispatch (interval=1).
+            // Override via GGML_DX12_DECODE_FLUSH env var.
+            static int decode_flush_interval = 0;
+            if (decode_flush_interval == 0) {
+                const char * env = getenv("GGML_DX12_DECODE_FLUSH");
+                if (!env) env = getenv("GGML_DX12_FLUSH_INTERVAL");
+                decode_flush_interval = env ? atoi(env) : 1;
+                if (decode_flush_interval <= 0) decode_flush_interval = 1;
+            }
+            dispatch_weight++;
+            if (dispatch_weight >= decode_flush_interval) {
+                bctx->close_and_execute();
+                bctx->wait_for_gpu();
+                bctx->ensure_cmd_list_open();
+                bctx->reset_binding_cache();
+                unsynced_writes.clear();
+                dispatch_weight = 0;
+            }
+        }
+
+        // Force CL split at every dispatch in model head region to fix NaN and sync.
+        // AMD RDNA 3 requires full pipeline drains (not just UAV barriers) between
+        // the final FFN/norm layers and the vocab projection + logit softcapping.
+        // Without these splits, the model head produces NaN due to stale GPU caches.
+        if (cgraph->n_nodes > 1000 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
+            bctx->close_and_execute();
+            bctx->wait_for_gpu();
+            bctx->ensure_cmd_list_open();
+            bctx->reset_binding_cache();
+            unsynced_writes.clear();
+            dispatch_weight = 0;
+        }
+
+        // Per-dispatch NaN isolation: force flush + readback for target range
+        if (false && dx12_diag && cgraph->n_nodes > 1000 && i >= 1597 && i <= 1610) {
+            static int iso_count = 0;
+            if (iso_count < 15) {
+                // Force flush
+                bctx->close_and_execute();
+                bctx->wait_for_gpu();
+                // Read back destination tensor
+                auto * probe_node = cgraph->nodes[i];
+                if (probe_node && probe_node->buffer) {
+                    size_t elem_size = ggml_type_size(probe_node->type);
+                    size_t n_elem = probe_node->ne[0] * std::max((int64_t)1, probe_node->ne[1]);
+                    size_t probe_bytes = std::min(n_elem * elem_size, (size_t)(256 * 4));
+                    uint32_t poff = (uint32_t)dx12_tensor_offset(probe_node);
+                    auto * dev = bctx->dev;
+                    dev->init_xfer();
+                    dev->xfer_ensure_staging(0, probe_bytes);
+                    dev->xfer_wait();
+                    HRESULT hr3 = dev->xfer.cmd_alloc->Reset();
+                    if (SUCCEEDED(hr3)) {
+                        hr3 = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                        if (SUCCEEDED(hr3)) {
+                            auto * pbuf = (dx12_buffer_context *)probe_node->buffer->context;
+                            dev->xfer.cmd_list->CopyBufferRegion(
+                                dev->xfer.readback_staging.Get(), 0,
+                                pbuf->resource.Get(), poff, probe_bytes);
+                            dev->xfer.cmd_list->Close();
+                            ID3D12CommandList * plists[] = { dev->xfer.cmd_list.Get() };
+                            dev->compute_queue->ExecuteCommandLists(1, plists);
+                            dev->xfer.fence_value++;
+                            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                            dev->xfer_wait();
+                            void * pm = nullptr;
+                            D3D12_RANGE prr = { 0, probe_bytes };
+                            hr3 = dev->xfer.readback_staging->Map(0, &prr, &pm);
+                            if (SUCCEEDED(hr3)) {
+                                float * pf = (float *)pm;
+                                int n_check = (int)(probe_bytes / 4);
+                                int pnans = 0;
+                                for (int pi = 0; pi < n_check; pi++) if (isnan(pf[pi])) pnans++;
+                                int src0t = probe_node->src[0] ? (int)probe_node->src[0]->type : -1;
+                                fprintf(stderr, "ggml-dx12: ISO disp#%d %s(src0t=%d) ne=(%lld,%lld,%lld,%lld) off=%u: "
+                                        "nans=%d/%d val[0..3]=%.4g %.4g %.4g %.4g\n",
+                                        i, ggml_op_name(probe_node->op), src0t,
+                                        (long long)probe_node->ne[0], (long long)probe_node->ne[1],
+                                        (long long)probe_node->ne[2], (long long)probe_node->ne[3],
+                                        poff, pnans, n_check,
+                                        pf[0], n_check>1?pf[1]:0, n_check>2?pf[2]:0, n_check>3?pf[3]:0);
+                                fflush(stderr);
+                                D3D12_RANGE pwr = { 0, 0 };
+                                dev->xfer.readback_staging->Unmap(0, &pwr);
+                                iso_count++;
+                            }
+                        }
+                    }
+                }
+                bctx->ensure_cmd_list_open();
+                bctx->reset_binding_cache();
+                unsynced_writes.clear();
+                dispatch_weight = 0;
+            }
+        }
+
         if (do_profile) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
@@ -1897,19 +2364,232 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (is_prompt) {
             int weight = 1;
             if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_FLASH_ATTN_EXT) {
-                if (groups_x >= 8000) weight = 16;
-                else if (groups_x >= 1000) weight = 4;
+                // Use total thread groups — not just groups_x — because 2D dispatch
+                // (e.g., groups=(256,128,1) for prompt batches) hides the true
+                // GPU workload in the Y/Z axes.
+                uint64_t total_groups = (uint64_t)groups_x * groups_y * groups_z;
+                if (total_groups >= 8000) weight = 16;
+                else if (total_groups >= 1000) weight = 4;
                 else weight = 2;
             }
             dispatch_weight += weight;
             if (dispatch_weight >= TDR_FLUSH_THRESHOLD) {
+                static int flush_num = 0;
+                flush_num++;
+                if (trace_prompt) {
+                    LARGE_INTEGER tdr_now;
+                    QueryPerformanceCounter(&tdr_now);
+                    double elapsed_ms = (double)(tdr_now.QuadPart - tdr_t0.QuadPart) / tdr_freq.QuadPart * 1000.0;
+                    fprintf(stderr, "  F#%d @d%d w=%d t=%.0fms\n", flush_num, i, dispatch_weight, elapsed_ms);
+                    fflush(stderr);
+                }
                 bctx->close_and_execute();
+                bctx->wait_for_gpu();
+                bctx->ensure_cmd_list_open();
+                bctx->reset_binding_cache();
+                unsynced_writes.clear();
+                if (trace_prompt) {
+                    HRESULT dev_stat = bctx->dev->device->GetDeviceRemovedReason();
+                    if (FAILED(dev_stat)) {
+                        fprintf(stderr, "  F#%d TDR! dev=0x%08lX\n", flush_num, (unsigned long)dev_stat);
+                        fflush(stderr);
+                    }
+                }
+
+                // Yield to DWM periodically: continuous back-to-back compute CLs
+                // monopolize the GPU and prevent display compositing.  The Windows
+                // TDR timer covers the ENTIRE adapter — if DWM can't draw for ~2s,
+                // the OS resets the GPU even though individual CLs are fast.
+                {
+                    LARGE_INTEGER tdr_now;
+                    QueryPerformanceCounter(&tdr_now);
+                    double elapsed_ms = (double)(tdr_now.QuadPart - tdr_t0.QuadPart) / tdr_freq.QuadPart * 1000.0;
+                    if (elapsed_ms >= TDR_YIELD_MS) {
+                        Sleep(2);  // yield GPU time to display compositor
+                        QueryPerformanceCounter(&tdr_t0);  // reset yield timer
+                        if (trace_prompt) {
+                            fprintf(stderr, "  [yield at %.0fms]\n", elapsed_ms);
+                            fflush(stderr);
+                        }
+                    }
+                }
+
+                if (dx12_diag) {
+                    fprintf(stderr, "ggml-dx12: flush #%d OK after dispatch %d\n", flush_num, i);
+                    fflush(stderr);
+                }
+
+                // NaN probe: after first few flushes of large graph, check last dst for NaN
+                if (dx12_diag && cgraph->n_nodes > 1000) {
+                    static int nan_probe_count = 0;
+                    // Binary search: probe at specific dispatch thresholds
+                    static int probe_targets[] = {1598, 1599, 1600, 1601, 1603, 1604, 1605, 1606, 1607, 1608};
+                    static int next_target_idx = 0;
+                    bool should_probe = false;
+                    if (next_target_idx < 10 && i >= probe_targets[next_target_idx]) {
+                        should_probe = true;
+                        next_target_idx++;
+                    }
+                    if (should_probe && nan_probe_count < 15) {
+                        // Read back last dispatched dst tensor
+                        auto * last_node = cgraph->nodes[i];
+                        if (last_node) {
+                            size_t elem_size = ggml_type_size(last_node->type);
+                            size_t elem_count = last_node->ne[0] * std::max((int64_t)1, last_node->ne[1]);
+                            size_t probe_bytes = std::min(elem_count * elem_size, (size_t)(256 * 4));
+                            uint32_t dst_off = (uint32_t)dx12_tensor_offset(last_node);
+                            auto * dev = bctx->dev;
+                            dev->init_xfer();
+                            dev->xfer_ensure_staging(0, probe_bytes);
+                            dev->xfer_wait();
+                            HRESULT hr2 = dev->xfer.cmd_alloc->Reset();
+                            if (SUCCEEDED(hr2)) {
+                                hr2 = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                                if (SUCCEEDED(hr2)) {
+                                    auto * buf_ctx = (dx12_buffer_context *)last_node->buffer->context;
+                                    dev->xfer.cmd_list->CopyBufferRegion(
+                                        dev->xfer.readback_staging.Get(), 0,
+                                        buf_ctx->resource.Get(), dst_off, probe_bytes);
+                                    dev->xfer.cmd_list->Close();
+                                    ID3D12CommandList * xlists[] = { dev->xfer.cmd_list.Get() };
+                                    dev->compute_queue->ExecuteCommandLists(1, xlists);
+                                    dev->xfer.fence_value++;
+                                    dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                                    dev->xfer_wait();
+                                    void * mapped2 = nullptr;
+                                    D3D12_RANGE rr = { 0, probe_bytes };
+                                    hr2 = dev->xfer.readback_staging->Map(0, &rr, &mapped2);
+                                    if (SUCCEEDED(hr2)) {
+                                        // Check for NaN — handle both F32 and F16
+                                        int n_probe = (int)(probe_bytes / elem_size);
+                                        int nans = 0, infs = 0;
+                                        float v0=0, v1=0, v2=0, v3=0;
+                                        if (last_node->type == GGML_TYPE_F32) {
+                                            float * fvals = (float *)mapped2;
+                                            for (int pi = 0; pi < n_probe && pi < 256; pi++) {
+                                                if (isnan(fvals[pi])) nans++;
+                                                if (isinf(fvals[pi])) infs++;
+                                            }
+                                            v0 = fvals[0]; v1 = n_probe>1?fvals[1]:0;
+                                            v2 = n_probe>2?fvals[2]:0; v3 = n_probe>3?fvals[3]:0;
+                                        } else if (last_node->type == GGML_TYPE_F16) {
+                                            uint16_t * hvals = (uint16_t *)mapped2;
+                                            for (int pi = 0; pi < n_probe && pi < 256; pi++) {
+                                                uint16_t h = hvals[pi];
+                                                if ((h & 0x7C00) == 0x7C00 && (h & 0x03FF) != 0) nans++;
+                                                if ((h & 0x7FFF) == 0x7C00) infs++;
+                                            }
+                                            // Convert first 4 to float for display
+                                            auto h2f = [](uint16_t h) -> float {
+                                                uint32_t sign = (uint32_t)(h >> 15) << 31;
+                                                uint32_t exp = (h >> 10) & 0x1F;
+                                                uint32_t mant = h & 0x3FF;
+                                                if (exp == 0) { if (mant == 0) { uint32_t r = sign; float f; memcpy(&f,&r,4); return f; } exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF; }
+                                                else if (exp == 31) { uint32_t r = sign | 0x7F800000 | (mant << 13); float f; memcpy(&f,&r,4); return f; }
+                                                uint32_t r = sign | ((exp + 112) << 23) | (mant << 13);
+                                                float f; memcpy(&f, &r, 4); return f;
+                                            };
+                                            v0 = h2f(hvals[0]); v1 = n_probe>1?h2f(hvals[1]):0;
+                                            v2 = n_probe>2?h2f(hvals[2]):0; v3 = n_probe>3?h2f(hvals[3]):0;
+                                        }
+                                        fprintf(stderr, "ggml-dx12: NaN PROBE @disp#%d op=%d type=%d ne=(%lld,%lld,%lld,%lld) "
+                                                "off=%u: nans=%d infs=%d/%d val[0..3]=%.4g %.4g %.4g %.4g\n",
+                                                i, (int)last_node->op, (int)last_node->type,
+                                                (long long)last_node->ne[0], (long long)last_node->ne[1],
+                                                (long long)last_node->ne[2], (long long)last_node->ne[3],
+                                                dst_off, nans, infs, n_probe,
+                                                v0, v1, v2, v3);
+                                        fflush(stderr);
+                                        D3D12_RANGE wr = { 0, 0 };
+                                        dev->xfer.readback_staging->Unmap(0, &wr);
+                                        nan_probe_count++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 bctx->ensure_cmd_list_open();
                 bctx->reset_binding_cache();
                 dispatch_weight = 0;
             }
         }
 
+    }
+
+    // Diagnostic: sync all remaining work before returning
+    if (dx12_diag && is_prompt && bctx->cmd_list_open) {
+        bctx->close_and_execute();
+        bctx->wait_for_gpu();
+        fprintf(stderr, "ggml-dx12: final flush OK (all %d dispatches completed)\n", cgraph->n_nodes);
+        fflush(stderr);
+
+        // Read back the hidden state (src[1] of the vocab projection MUL_MAT)
+        // to compare with CPU reference. Find last MUL_MAT with large output.
+        static int hidden_diag_count = 0;
+        if (hidden_diag_count < 2 && cgraph->n_nodes > 1000) {
+            hidden_diag_count++;
+            struct ggml_tensor * vocab_mm = nullptr;
+            for (int ni = cgraph->n_nodes - 1; ni >= cgraph->n_nodes - 10; ni--) {
+                auto * nd = cgraph->nodes[ni];
+                if (nd->op == GGML_OP_MUL_MAT && nd->ne[0] >= 100000) {
+                    vocab_mm = nd;
+                    break;
+                }
+            }
+            if (vocab_mm && vocab_mm->src[1] && vocab_mm->src[1]->buffer &&
+                vocab_mm->src[1]->type == GGML_TYPE_F32) {
+                auto * hs = vocab_mm->src[1];  // hidden state
+                size_t hs_bytes = hs->ne[0] * sizeof(float);
+                uint32_t hs_off = (uint32_t)dx12_tensor_offset(hs);
+                auto * dev = bctx->dev;
+                dev->init_xfer();
+                dev->xfer_ensure_staging(0, hs_bytes);
+                dev->xfer_wait();
+                HRESULT hr_hs = dev->xfer.cmd_alloc->Reset();
+                if (SUCCEEDED(hr_hs)) hr_hs = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                if (SUCCEEDED(hr_hs)) {
+                    auto * hsbuf = (dx12_buffer_context *)hs->buffer->context;
+                    dev->xfer.cmd_list->CopyBufferRegion(
+                        dev->xfer.readback_staging.Get(), 0,
+                        hsbuf->resource.Get(), hs_off, hs_bytes);
+                    dev->xfer.cmd_list->Close();
+                    ID3D12CommandList * hlists[] = { dev->xfer.cmd_list.Get() };
+                    dev->compute_queue->ExecuteCommandLists(1, hlists);
+                    dev->xfer.fence_value++;
+                    dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                    dev->xfer_wait();
+                    void * hm = nullptr;
+                    D3D12_RANGE hrr = { 0, hs_bytes };
+                    hr_hs = dev->xfer.readback_staging->Map(0, &hrr, &hm);
+                    if (SUCCEEDED(hr_hs)) {
+                        float * hf = (float *)hm;
+                        int n = (int)(hs->ne[0]);
+                        double sum_sq = 0, sum = 0;
+                        int nans = 0;
+                        for (int j = 0; j < n; j++) {
+                            if (isnan(hf[j])) { nans++; continue; }
+                            sum += hf[j];
+                            sum_sq += (double)hf[j] * hf[j];
+                        }
+                        double rms = sqrt(sum_sq / n);
+                        fprintf(stderr, "ggml-dx12: HIDDEN STATE (vocab_mm src[1]) ne=(%lld,%lld) off=%u:\n",
+                                (long long)hs->ne[0], (long long)hs->ne[1], hs_off);
+                        fprintf(stderr, "  rms=%.6f mean=%.6f nans=%d\n", rms, sum/n, nans);
+                        fprintf(stderr, "  first16: ");
+                        for (int j = 0; j < 16 && j < n; j++) fprintf(stderr, "%.4f ", hf[j]);
+                        fprintf(stderr, "\n  last8: ");
+                        for (int j = n-8; j < n; j++) fprintf(stderr, "%.4f ", hf[j]);
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                        D3D12_RANGE hwr = { 0, 0 };
+                        dev->xfer.readback_staging->Unmap(0, &hwr);
+                    }
+                }
+            }
+        }
+
+        bctx->ensure_cmd_list_open();  // leave CL open as expected
     }
 
     // Keep the command list open — UAV barriers between dispatches ensure

@@ -2,6 +2,7 @@
 
 #include "llm-infer.h"
 #include "b612-cpu.h"
+#include "llama.h"
 
 #include "log.h"
 
@@ -220,6 +221,201 @@ void print_system_info(int32_t n_threads, int32_t n_batch) {
     printf("\n%s: %s\n\n", __func__, os.str().c_str());
 }
 
+// ─── Chat Template Auto-Detection ────────────────────────────────────────────
+// Same logic as minslm-multi-og.cpp: auto-detect the model's chat template from
+// GGUF metadata and construct system prefix + turn template.
+
+static std::string custom_turn_template;
+
+static std::string apply_chat_template(
+    const char * tmpl,
+    const std::vector<llama_chat_message> & msgs,
+    bool add_generation_prompt)
+{
+    int32_t len = llama_chat_apply_template(
+        tmpl, msgs.data(), msgs.size(), add_generation_prompt, nullptr, 0);
+    if (len < 0) return "";
+
+    std::vector<char> buf(len + 2, 0);
+    llama_chat_apply_template(
+        tmpl, msgs.data(), msgs.size(), add_generation_prompt, buf.data(), (int32_t)buf.size());
+    return std::string(buf.data(), len);
+}
+
+static bool try_build_chat_templates(
+    const char * tmpl,
+    const char * label,
+    const std::string & system_prompt,
+    std::string & out_sys_prefix,
+    std::string & out_turn_tmpl)
+{
+    std::vector<llama_chat_message> sys_msgs = {{ "system", system_prompt.c_str() }};
+    std::string sys_prefix = apply_chat_template(tmpl, sys_msgs, false);
+    if (sys_prefix.empty()) {
+        printf("[chat_template]: %s — system prefix format failed\n", label);
+        return false;
+    }
+
+    std::vector<llama_chat_message> full_msgs = {
+        { "system", system_prompt.c_str() },
+        { "user",   "{message}" }
+    };
+    std::string full_text = apply_chat_template(tmpl, full_msgs, true);
+    if (full_text.empty()) {
+        printf("[chat_template]: %s — full turn format failed\n", label);
+        return false;
+    }
+
+    std::string turn_tmpl;
+    if (full_text.size() > sys_prefix.size() &&
+        full_text.substr(0, sys_prefix.size()) == sys_prefix) {
+        turn_tmpl = full_text.substr(sys_prefix.size());
+    } else {
+        std::vector<llama_chat_message> user_msgs = {{ "user", "{message}" }};
+        turn_tmpl = apply_chat_template(tmpl, user_msgs, true);
+    }
+
+    if (turn_tmpl.find("{message}") == std::string::npos) {
+        printf("[chat_template]: %s — turn template missing {{message}} placeholder\n", label);
+        return false;
+    }
+
+    out_sys_prefix = std::move(sys_prefix);
+    out_turn_tmpl  = std::move(turn_tmpl);
+    return true;
+}
+
+static bool detect_chat_format_from_jinja(
+    const char * jinja,
+    const std::string & system_prompt,
+    std::string & out_sys_prefix,
+    std::string & out_turn_tmpl,
+    const char ** out_label)
+{
+    std::string t(jinja);
+
+    // Phi-3 / Phi-3.5 / Phi-4
+    if (t.find("<|user|>") != std::string::npos &&
+        t.find("<|assistant|>") != std::string::npos &&
+        t.find("<|end|>") != std::string::npos) {
+        *out_label = "Phi-3/4";
+        out_sys_prefix = "<|system|>\n" + system_prompt + "<|end|>\n";
+        out_turn_tmpl  = "<|user|>\n{message}<|end|>\n<|assistant|>\n";
+        return true;
+    }
+
+    // Llama-3 / Llama-3.1
+    if (t.find("<|start_header_id|>") != std::string::npos &&
+        t.find("<|end_header_id|>")   != std::string::npos) {
+        *out_label = "Llama-3";
+        out_sys_prefix = "<|start_header_id|>system<|end_header_id|>\n\n"
+                         + system_prompt + "<|eot_id|>";
+        out_turn_tmpl  = "<|start_header_id|>user<|end_header_id|>\n\n"
+                         "{message}<|eot_id|>"
+                         "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        return true;
+    }
+
+    // Gemma-4
+    if (t.find("<|turn>") != std::string::npos &&
+        t.find("<turn|>") != std::string::npos) {
+        *out_label = "Gemma-4";
+        out_sys_prefix = "<|turn>system\n" + system_prompt + "<turn|>\n";
+        out_turn_tmpl  = "<|turn>user\n{message}<turn|>\n<|turn>model\n";
+        return true;
+    }
+
+    // Gemma / Gemma-2
+    if (t.find("<start_of_turn>") != std::string::npos &&
+        t.find("<end_of_turn>")   != std::string::npos) {
+        *out_label = "Gemma";
+        out_sys_prefix = "<start_of_turn>user\n" + system_prompt + "\n";
+        out_turn_tmpl  = "{message}<end_of_turn>\n<start_of_turn>model\n";
+        return true;
+    }
+
+    // ChatML
+    if (t.find("<|im_start|>") != std::string::npos &&
+        t.find("<|im_end|>")   != std::string::npos) {
+        *out_label = "ChatML";
+        out_sys_prefix = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+        out_turn_tmpl  = "<|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n";
+        return true;
+    }
+
+    // Mistral / Llama-2
+    if (t.find("[INST]") != std::string::npos &&
+        t.find("[/INST]") != std::string::npos) {
+        *out_label = "Mistral/Llama-2";
+        out_sys_prefix = "[INST] <<SYS>>\n" + system_prompt + "\n<</SYS>>\n\n";
+        out_turn_tmpl  = "{message} [/INST] ";
+        return true;
+    }
+
+    // Command-R
+    if (t.find("<|START_OF_TURN_TOKEN|>") != std::string::npos) {
+        *out_label = "Command-R";
+        out_sys_prefix = "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
+                         + system_prompt + "<|END_OF_TURN_TOKEN|>";
+        out_turn_tmpl  = "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+                         "{message}<|END_OF_TURN_TOKEN|>"
+                         "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>";
+        return true;
+    }
+
+    return false;
+}
+
+static bool apply_model_chat_template(
+    const std::string & system_prompt,
+    model_params & params)
+{
+    std::string sys_prefix, turn_tmpl;
+
+    const char * model_tmpl = llm_get_chat_template();
+    if (model_tmpl) {
+        printf("[chat_template]: model template found (%zu chars)\n", strlen(model_tmpl));
+        if (try_build_chat_templates(model_tmpl, "model template",
+                                     system_prompt, sys_prefix, turn_tmpl)) {
+            printf("[chat_template]: OK — using model's built-in chat template\n");
+            goto apply;
+        }
+        printf("[chat_template]: model template not recognized by llama_chat_apply_template()\n");
+
+        const char * family = nullptr;
+        if (detect_chat_format_from_jinja(model_tmpl, system_prompt,
+                                          sys_prefix, turn_tmpl, &family)) {
+            printf("[chat_template]: OK — detected %s format from jinja template\n", family);
+            goto apply;
+        }
+        printf("[chat_template]: no known token patterns found in jinja template\n");
+    } else {
+        printf("[chat_template]: model has no built-in chat template in GGUF metadata\n");
+    }
+
+    printf("[chat_template]: falling back to ChatML default\n");
+    if (try_build_chat_templates(nullptr, "ChatML fallback",
+                                 system_prompt, sys_prefix, turn_tmpl)) {
+        printf("[chat_template]: OK — using ChatML default template\n");
+        goto apply;
+    }
+
+    printf("[chat_template]: ERROR — all template strategies failed\n");
+    return false;
+
+apply:
+    params.custom_template_prompt = sys_prefix;
+    custom_turn_template = turn_tmpl;
+    params.turn_template = custom_turn_template;
+
+    printf("[chat_template]: system prefix (%zu chars):\n  [%s]\n",
+           sys_prefix.size(), sys_prefix.c_str());
+    printf("[chat_template]: turn template (%zu chars):\n  [%s]\n",
+           turn_tmpl.size(), turn_tmpl.c_str());
+
+    return true;
+}
+
 int main(int argc, char** argv) {
     model_params params = {0};
 
@@ -253,6 +449,9 @@ int main(int argc, char** argv) {
     if (argc >= 4) {
         params.custom_p_file = argv[3];
     }
+
+    bool use_auto_chat_template = false;
+    std::string system_prompt_override;
 
     while (argc >= 5) {
         if (!strcmp(argv[4], "verbose")) {
@@ -297,6 +496,9 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[4], "cpu")) {
             // only meaningful for GGML_CUDA or GGML_VULKAN builds
             params.force_cpu_mode = true;
+
+        } else if (!strcmp(argv[4], "chat-auto")) {
+            use_auto_chat_template = true;
         }
 
         argv += 1;
@@ -330,6 +532,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Auto-detect chat template from model metadata when "chat-auto" is specified,
+    // or when the prompt file doesn't provide a CUSTOM_TEMPLATE_PROMPT section.
+    if (use_auto_chat_template || params.custom_template_prompt.empty()) {
+        std::string sys_prompt = "You are a helpful assistant.";
+        if (apply_model_chat_template(sys_prompt, params)) {
+            printf("[%s]: using auto-detected chat template from model\n", __func__);
+            // Auto-detected templates include special tokens that need parsing,
+            // and models like Gemma require BOS token
+            params.add_special = true;
+        } else {
+            printf("[%s]: WARNING: chat template auto-detection failed, using raw prompt\n", __func__);
+        }
+    }
+
     int prompt_index = 1;
     while (custom_prompts_it != custom_prompts.end())
     {
@@ -339,20 +555,30 @@ int main(int argc, char** argv) {
             std::remove(custom_prompt.begin(), custom_prompt.end(), '\"'),
             custom_prompt.end());
 
-        std::string full_prompt = ::trim(params.custom_template_prompt);
-        size_t pos = full_prompt.find("{message}");
-        if (pos != std::string::npos) {
-            full_prompt.replace(pos, std::string("{message}").length(), custom_prompt);
-        }
-        else {
-            pos = 0;
+        std::string full_prompt;
+        if (!params.turn_template.empty()) {
+            // Auto-detected template: system prefix + turn template with {message}
+            std::string turn = params.turn_template;
+            size_t pos = turn.find("{message}");
+            if (pos != std::string::npos) {
+                turn.replace(pos, 9, custom_prompt);
+            }
+            full_prompt = params.custom_template_prompt + turn;
+        } else {
+            // Legacy: single template with {message} placeholder
+            full_prompt = ::trim(params.custom_template_prompt);
+            size_t pos = full_prompt.find("{message}");
+            if (pos != std::string::npos) {
+                full_prompt.replace(pos, 9, custom_prompt);
+            }
         }
 
         if (params.pfc_mode && !params.pfx_shared.empty()) {
-            params.prompt = full_prompt.substr(pos);
+            // In PFC mode, strip the shared prefix
+            size_t pos = full_prompt.find(custom_prompt);
+            params.prompt = (pos != std::string::npos) ? full_prompt.substr(pos) : full_prompt;
         }
         else {
-            // non pfc mode 
             params.prompt = full_prompt;
         }
 

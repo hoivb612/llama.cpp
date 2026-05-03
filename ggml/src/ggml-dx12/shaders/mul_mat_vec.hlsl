@@ -16,7 +16,7 @@ groupshared float partial[GROUP_SIZE];
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tid = gtid.x;
-    uint row = gid.x;
+    uint row = gid.y * 65535u + gid.x;  // linearized 2D for large N (>65535)
 
     uint i2 = gid.z % ne2;
     uint i3 = gid.z / ne2;

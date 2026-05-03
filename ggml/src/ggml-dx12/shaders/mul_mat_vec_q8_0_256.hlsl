@@ -22,7 +22,7 @@ int read_sbyte_v(ByteAddressBuffer buf, uint byte_off) {
 
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
-    uint i0 = group_id.x;
+    uint i0 = group_id.y * 65535u + group_id.x;  // linearized 2D for large N (>65535)
     uint flat_batch = group_id.z;
     uint i2 = flat_batch % ne2;
     uint i3 = flat_batch / ne2;
