@@ -35,6 +35,13 @@ else()
         target_link_libraries(ggml-dx12 PRIVATE ${DXCORE_LIBRARY})
     endif()
 
+    # DirectX GUIDs library (provides DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE etc.)
+    find_library(DX_GUIDS_LIBRARY DirectX-Guids HINTS /usr/local/lib /usr/lib)
+    if (DX_GUIDS_LIBRARY)
+        target_link_libraries(ggml-dx12 PRIVATE ${DX_GUIDS_LIBRARY})
+        message(STATUS "ggml-dx12: Found DirectX-Guids at ${DX_GUIDS_LIBRARY}")
+    endif()
+
     # DirectX-Headers for Linux (provides d3d12.h, dxgi1_6.h, wrl/client.h stubs)
     find_package(DirectX-Headers QUIET)
     if (DirectX-Headers_FOUND)
