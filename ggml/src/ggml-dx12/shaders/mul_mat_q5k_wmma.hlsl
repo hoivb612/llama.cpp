@@ -89,8 +89,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint K = ne00;
     uint num_k_tiles = (K + BK - 1) / BK;
 
-    precise float acc00 = 0.0f, acc01 = 0.0f;
-    precise float acc10 = 0.0f, acc11 = 0.0f;
+    float acc00 = 0.0f, acc01 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f;
 
     for (uint kt = 0; kt < num_k_tiles; kt++) {
         uint k_start = kt * BK;

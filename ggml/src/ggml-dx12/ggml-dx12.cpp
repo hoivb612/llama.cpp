@@ -296,12 +296,12 @@ struct dx12_buffer_context {
 // Backend context (stream)
 // ---------------------------------------------------------------------------
 
-static const int CMD_RING_SIZE = 3;
+static const int CMD_RING_SIZE = 16;
 
 struct dx12_backend_context {
     dx12_device * dev = nullptr;
 
-    // Command allocator ring — 3 allocators so CPU can record while GPU executes
+    // Command allocator ring — multiple allocators so CPU can record while GPU executes
     ComPtr<ID3D12CommandAllocator>    cmd_allocs[CMD_RING_SIZE];
     uint64_t                          cmd_alloc_fence[CMD_RING_SIZE] = {}; // fence value when submitted
     int                               cmd_ring_head = 0; // next allocator to use
@@ -2004,6 +2004,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 groups_z = (uint32_t)node->src[0]->ne[3]; // batch
                 break;
             }
+            case GGML_OP_SET_ROWS: {
+                // 2D dispatch to handle tensors exceeding 65535 groups in X
+                uint32_t total_elements = (uint32_t)(ggml_nelements(node));
+                uint32_t total_groups = (total_elements + 255) / 256;
+                if (total_groups <= 65535) {
+                    groups_x = total_groups;
+                } else {
+                    groups_x = 65535;
+                    groups_y = (total_groups + 65534) / 65535;
+                }
+                break;
+            }
             default: {
                 // Element-wise: one thread per element
                 uint32_t total_elements = (uint32_t)(ggml_nelements(node));
@@ -2120,8 +2132,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // D3D12 dispatch limit: 65535 per axis
         if (groups_x > 65535 || groups_y > 65535 || groups_z > 65535) {
-            fprintf(stderr, "ggml-dx12: SKIP dispatch #%d %s — groups (%u,%u,%u) exceeds D3D12 limit 65535\n",
-                    i, ggml_op_name(node->op), groups_x, groups_y, groups_z);
+            if (dx12_diag) {
+                fprintf(stderr, "ggml-dx12: SKIP dispatch #%d %s — groups (%u,%u,%u) exceeds D3D12 limit 65535\n",
+                        i, ggml_op_name(node->op), groups_x, groups_y, groups_z);
+            }
             continue;
         }
 
@@ -2241,17 +2255,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             i += 2;  // skip the VIEW and SET_ROWS nodes
         }
 
-        // Periodic CL flush for decode phase (M=1) to work around AMD RDNA 3
-        // stale cache issue.  UAV barriers alone are insufficient — full pipeline
-        // drains (close CL + execute + wait) are required.  The prompt path has
-        // its own weight-based TDR flushing.  For decode, flush every N dispatches
-        // throughout the graph body.  The model head CL splits below handle the
-        // tail.  Configurable via GGML_DX12_FLUSH_INTERVAL (default: 16).
+        // Periodic CL flush for decode phase (M=1) to prevent stale GPU caches
+        // on AMD RDNA 3.  CL boundaries provide GPU pipeline drains (separate
+        // ExecuteCommandLists calls are implicitly ordered).  No CPU-side wait
+        // is needed — the cmd allocator ring handles CPU-GPU pipelining.
+        // Default: flush after every dispatch (interval=1).
+        // Override via GGML_DX12_DECODE_FLUSH env var.
         if (!is_prompt && cgraph->n_nodes > 10) {
-            // AMD RDNA 3 requires full pipeline drains between EVERY decode dispatch.
-            // UAV barriers alone are insufficient for M=1 (small) dispatches.
-            // Default: flush after every dispatch (interval=1).
-            // Override via GGML_DX12_DECODE_FLUSH env var.
             static int decode_flush_interval = 0;
             if (decode_flush_interval == 0) {
                 const char * env = getenv("GGML_DX12_DECODE_FLUSH");
@@ -2262,9 +2272,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             dispatch_weight++;
             if (dispatch_weight >= decode_flush_interval) {
                 bctx->close_and_execute();
-                bctx->wait_for_gpu();
+                // No wait_for_gpu() — CL boundary is the GPU pipeline drain.
+                // The ring of CMD_RING_SIZE allocators handles CPU pipelining.
                 bctx->ensure_cmd_list_open();
-                bctx->reset_binding_cache();
                 unsynced_writes.clear();
                 dispatch_weight = 0;
             }
@@ -2930,6 +2940,19 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
 
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     auto * d = (dx12_device *)dev->context;
+    // Query fresh memory info from DXGI to reflect current allocations
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (SUCCEEDED(d->adapter.As(&adapter3))) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO mem_info = {};
+        if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mem_info))
+            && mem_info.Budget > 0) {
+            if (total) *total = (size_t)mem_info.Budget;
+            if (free)  *free  = mem_info.Budget > mem_info.CurrentUsage
+                              ? (size_t)(mem_info.Budget - mem_info.CurrentUsage) : 0;
+            return;
+        }
+    }
+    // Fallback to cached values
     if (free)  *free  = d->vram_free;
     if (total) *total = d->vram_total;
 }

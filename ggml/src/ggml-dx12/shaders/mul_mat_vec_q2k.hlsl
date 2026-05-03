@@ -148,16 +148,11 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
                      mad(sc6, mad(q12, by12, q13 * by13),
                          sc7 * mad(q14, by14, q15 * by15))))))));
 
-        // Min compensation: sum2 = sum(min_i * (act_pair_sum))
-        float sum2 = mad(mn0, by0 + by1,
-                     mad(mn1, by2 + by3,
-                     mad(mn2, by4 + by5,
-                     mad(mn3, by6 + by7,
-                     mad(mn4, by8 + by9,
-                     mad(mn5, by10 + by11,
-                     mad(mn6, by12 + by13,
-                         mn7 * (by14 + by15))))))));
-
+        // Min compensation: interleaved per-element mad() to match Vulkan precision
+        float sum2 = mad(by0,  mn0, mad(by2,  mn1, mad(by4,  mn2, mad(by6,  mn3,
+                     mad(by8,  mn4, mad(by10, mn5, mad(by12, mn6, mad(by14, mn7,
+                     mad(by1,  mn0, mad(by3,  mn1, mad(by5,  mn2, mad(by7,  mn3,
+                     mad(by9,  mn4, mad(by11, mn5, mad(by13, mn6, by15 * mn7)))))))))))))));
         acc += d * sum1 - dmin * sum2;
     }
 

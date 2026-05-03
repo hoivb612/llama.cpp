@@ -3,11 +3,15 @@
 // src1: [ne10] indices (I32 or I64)
 // dst:  target tensor where rows are written (F32 or F16)
 // dst[src1[i1], :] = src0[i1, :]
+//
+// Uses 2D dispatch (groups_y > 1) when total groups exceed D3D12's 65535 limit.
+// group_flat = gid.x + gid.y * 65535, idx = group_flat * 256 + local_tid.
 #include "ggml_common.hlsli"
 
 [numthreads(256, 1, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+void main(uint3 gid : SV_GroupID, uint local_tid : SV_GroupIndex) {
+    uint group_flat = gid.x + gid.y * 65535u;
+    uint idx = group_flat * 256u + local_tid;
     uint total = ne00 * ne01 * ne02 * ne03;
     if (idx >= total) return;
 

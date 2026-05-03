@@ -204,8 +204,11 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         float sz = mad(q8, by8, mad(q9, by9, mad(q10, by10, q11*by11)));
         float sw = mad(q12, by12, mad(q13, by13, mad(q14, by14, q15*by15)));
 
-        float smin = mad(sc2, by0+by1+by2+by3, mad(sc3, by4+by5+by6+by7,
-                     mad(sc6, by8+by9+by10+by11, sc7*(by12+by13+by14+by15))));
+        // Min compensation: interleaved per-element mad() to match Vulkan precision
+        float smin = mad(by0,  sc2, mad(by4,  sc3, mad(by8,  sc6, mad(by12, sc7,
+                     mad(by1,  sc2, mad(by5,  sc3, mad(by9,  sc6, mad(by13, sc7,
+                     mad(by2,  sc2, mad(by6,  sc3, mad(by10, sc6, mad(by14, sc7,
+                     mad(by3,  sc2, mad(by7,  sc3, mad(by11, sc6, by15*sc7)))))))))))))));
 
         acc += dall * mad(sx, sc0, mad(sy, sc1, mad(sz, sc4, sw*sc5))) - dmin * smin;
     }
