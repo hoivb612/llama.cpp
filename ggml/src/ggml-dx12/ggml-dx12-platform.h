@@ -20,11 +20,14 @@
 #else
 #include <winadapter.h>
 #include <directx/d3d12.h>
-#include <directx/dxgi1_6.h>
+#include <directx/dxcore.h>
+#include <directx/dxcore_interface.h>
+#include <directx/dxgiformat.h>
 #endif
 #include <wrl/client.h>
 #include <vector>
 #include <cstring>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
@@ -42,6 +45,7 @@ struct dx12_adapter_filter {
     std::vector<adapter_key> seen;
 };
 
+#ifdef _WIN32
 // Returns true if this adapter should be skipped (duplicate or software).
 // Caller should declare one dx12_adapter_filter instance per enumeration pass.
 static inline bool dx12_platform_filter_adapter(dx12_adapter_filter & filter,
@@ -70,6 +74,46 @@ static inline bool dx12_platform_filter_adapter(dx12_adapter_filter & filter,
     filter.seen.push_back({ desc.AdapterLuid, desc.VendorId, desc.DeviceId });
     return false; // keep this adapter
 }
+#else
+// WSL2: DXCore-based adapter filtering — uses IDXCoreAdapter properties
+static inline bool dx12_platform_filter_adapter(dx12_adapter_filter & filter,
+                                                IDXCoreAdapter * adapter) {
+    // Skip software adapters
+    bool is_software = false;
+    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsSoftwareAdapter,
+                                       sizeof(is_software), &is_software)) && is_software) {
+        return true;
+    }
+
+    // Get adapter description for name-based filtering
+    size_t desc_size = 0;
+    adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription, &desc_size);
+    std::string name(desc_size, '\0');
+    adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, desc_size, name.data());
+    if (!name.empty() && name.back() == '\0') name.pop_back();
+
+    if (name.find("Basic Render") != std::string::npos ||
+        name.find("Microsoft Basic") != std::string::npos) {
+        return true;
+    }
+
+    // Deduplicate by LUID + hardware IDs
+    DXCoreHardwareID hw_id = {};
+    adapter->GetProperty(DXCoreAdapterProperty::HardwareID, sizeof(hw_id), &hw_id);
+    LUID luid = {};
+    adapter->GetProperty(DXCoreAdapterProperty::InstanceLuid, sizeof(luid), &luid);
+
+    for (const auto & key : filter.seen) {
+        bool luid_match = (key.luid.LowPart == luid.LowPart &&
+                           key.luid.HighPart == luid.HighPart);
+        bool hw_match   = (key.vendor_id == hw_id.vendorID &&
+                           key.device_id == hw_id.deviceID);
+        if (luid_match || hw_match) return true;
+    }
+    filter.seen.push_back({ luid, hw_id.vendorID, hw_id.deviceID });
+    return false;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Buffer allocation — wraps CreateCommittedResource.

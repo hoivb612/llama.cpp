@@ -12,11 +12,15 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #else
-// WSL2: use DirectX-Headers and WSL stubs
+// WSL2: use DirectX-Headers and DXCore (no DXGI on Linux)
 #include <winadapter.h>
 #include <directx/d3d12.h>
-#include <directx/dxgi1_6.h>
+#include <directx/dxcore.h>
+#include <directx/dxcore_interface.h>
+#include <directx/dxgiformat.h>
 #include <dxguids/dxguids.h>
+#include <thread>
+#include <chrono>
 #endif
 #include <wrl/client.h>
 
@@ -43,6 +47,40 @@
 #endif
 
 using Microsoft::WRL::ComPtr;
+
+// ---------------------------------------------------------------------------
+// WSL2 compatibility shims
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+
+// DXGI error codes (raw HRESULT values) used in D3D12 error checking
+#ifndef DXGI_ERROR_NOT_FOUND
+#define DXGI_ERROR_NOT_FOUND      ((HRESULT)0x887A0002L)
+#endif
+#ifndef DXGI_ERROR_DEVICE_REMOVED
+#define DXGI_ERROR_DEVICE_REMOVED ((HRESULT)0x887A0005L)
+#endif
+
+// Win32 sync shims: fence wait uses polling on WSL2
+static inline HANDLE dx12_create_event() { return nullptr; }
+static inline void   dx12_close_event(HANDLE) {}
+static inline void   dx12_wait_event(HANDLE, DWORD) {}
+
+// WideCharToMultiByte replacement for DXCore (provides UTF-8 natively)
+static inline void dx12_wide_to_utf8(const wchar_t * src, char * dst, int dst_size) {
+    int i = 0;
+    while (src[i] && i < dst_size - 1) { dst[i] = (char)src[i]; i++; }
+    dst[i] = '\0';
+}
+
+#else // _WIN32
+
+static inline HANDLE dx12_create_event() { return CreateEvent(nullptr, FALSE, FALSE, nullptr); }
+static inline void   dx12_close_event(HANDLE h) { CloseHandle(h); }
+static inline void   dx12_wait_event(HANDLE h, DWORD ms) { WaitForSingleObject(h, ms); }
+#define dx12_wide_to_utf8(src, dst, sz) WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, sz, nullptr, nullptr)
+
+#endif // _WIN32
 
 // Sentinel base address for non-host-accessible GPU buffers (matches Vulkan approach)
 static void * const DX12_PTR_BASE = (void *)(uintptr_t)0x1000;
@@ -169,11 +207,15 @@ static_assert(sizeof(dx12_shader_params) / 4 <= 64, "must fit in root constants"
 // ---------------------------------------------------------------------------
 
 struct dx12_device {
+#ifdef _WIN32
     ComPtr<IDXGIAdapter1>     adapter;
+    DXGI_ADAPTER_DESC1        adapter_desc = {};
+#else
+    ComPtr<IDXCoreAdapter>    adapter;
+#endif
     ComPtr<ID3D12Device>      device;
     ComPtr<ID3D12CommandQueue> compute_queue;
 
-    DXGI_ADAPTER_DESC1        adapter_desc = {};
     size_t                    vram_total   = 0;
     size_t                    vram_free    = 0;
 
@@ -233,15 +275,21 @@ struct dx12_device {
         xfer.cmd_list->Close(); // start in closed state
         hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&xfer.fence));
         DX12_CHECK(hr, "CreateFence(xfer)");
-        xfer.fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        xfer.fence_event = dx12_create_event();
         xfer.initialized = true;
     }
 
     void xfer_wait() {
         if (xfer.fence_value == 0) return;
         if (xfer.fence->GetCompletedValue() >= xfer.fence_value) return;
+#ifdef _WIN32
         xfer.fence->SetEventOnCompletion(xfer.fence_value, xfer.fence_event);
-        WaitForSingleObject(xfer.fence_event, INFINITE);
+        dx12_wait_event(xfer.fence_event, INFINITE);
+#else
+        while (xfer.fence->GetCompletedValue() < xfer.fence_value) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+#endif
     }
 
     void xfer_ensure_staging(size_t up_size, size_t rb_size) {
@@ -278,11 +326,15 @@ struct dx12_device {
     ~dx12_device() {
         if (xfer.fence_event) {
             xfer_wait();
-            CloseHandle(xfer.fence_event);
+            dx12_close_event(xfer.fence_event);
         }
     }
 
+#ifdef _WIN32
     void init(ComPtr<IDXGIAdapter1> adapter_, size_t idx);
+#else
+    void init(ComPtr<IDXCoreAdapter> adapter_, size_t idx);
+#endif
     void create_common_root_signature();
     dx12_pipeline * get_or_create_pipeline(const dx12_pipeline_key & key);
 };
@@ -354,7 +406,7 @@ struct dx12_backend_context {
             wait_for_gpu();
         }
         if (fence_event) {
-            CloseHandle(fence_event);
+            dx12_close_event(fence_event);
             fence_event = nullptr;
         }
     }
@@ -372,7 +424,11 @@ struct dx12_backend_context {
 
 static struct {
     bool                                        initialized = false;
+#ifdef _WIN32
     ComPtr<IDXGIFactory4>                       factory;
+#else
+    ComPtr<IDXCoreAdapterFactory>               factory;
+#endif
     std::vector<std::unique_ptr<dx12_device>>   devices;
     std::mutex                                  init_mutex;
 
@@ -407,6 +463,8 @@ static void dx12_ensure_initialized() {
         }
     }
 
+#ifdef _WIN32
+    // --- Windows: DXGI-based adapter enumeration ---
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&g_dx12.factory));
     DX12_CHECK(hr, "CreateDXGIFactory1");
 
@@ -436,7 +494,7 @@ static void dx12_ensure_initialized() {
         // Skip Microsoft Basic Render Driver (WARP) — not always flagged as software
         {
             char name_buf[256];
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+            dx12_wide_to_utf8(desc.Description, name_buf, sizeof(name_buf));
             if (strstr(name_buf, "Basic Render") || strstr(name_buf, "Microsoft Basic")) {
                 DX12_LOG_DEBUG("Skipping software adapter: %s\n", name_buf);
                 continue;
@@ -458,7 +516,7 @@ static void dx12_ensure_initialized() {
             }
             if (duplicate) {
                 char name_buf[256];
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                dx12_wide_to_utf8(desc.Description, name_buf, sizeof(name_buf));
                 DX12_LOG_DEBUG("Skipping duplicate adapter: %s\n", name_buf);
                 continue;
             }
@@ -490,7 +548,7 @@ static void dx12_ensure_initialized() {
                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&test_buf));
             if (FAILED(hr)) {
                 char name_buf[128];
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                dx12_wide_to_utf8(desc.Description, name_buf, sizeof(name_buf));
                 DX12_LOG_WARN("Skipping %s: UAV allocation failed (HRESULT 0x%08X)\n", name_buf, (unsigned)hr);
                 continue;
             }
@@ -503,6 +561,82 @@ static void dx12_ensure_initialized() {
         g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
     }
 
+#else
+    // --- WSL2: DXCore-based adapter enumeration ---
+    HRESULT hr = DXCoreCreateAdapterFactory(IID_PPV_ARGS(&g_dx12.factory));
+    DX12_CHECK(hr, "DXCoreCreateAdapterFactory");
+
+    const GUID filter_attrs[] = { DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE };
+    ComPtr<IDXCoreAdapterList> adapter_list;
+    hr = g_dx12.factory->CreateAdapterList(1, filter_attrs, IID_PPV_ARGS(&adapter_list));
+    DX12_CHECK(hr, "CreateAdapterList");
+
+    const uint32_t adapter_count = adapter_list->GetAdapterCount();
+    for (uint32_t i = 0; i < adapter_count; ++i) {
+        ComPtr<IDXCoreAdapter> adapter;
+        hr = adapter_list->GetAdapter(i, IID_PPV_ARGS(&adapter));
+        if (FAILED(hr)) continue;
+
+        // Skip software adapters
+        bool is_software = false;
+        if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsSoftwareAdapter,
+                                           sizeof(is_software), &is_software)) && is_software) {
+            continue;
+        }
+
+        // Get adapter description (UTF-8 natively from DXCore)
+        size_t desc_size = 0;
+        adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription, &desc_size);
+        std::string adapter_name(desc_size, '\0');
+        adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, desc_size, adapter_name.data());
+        if (!adapter_name.empty() && adapter_name.back() == '\0') adapter_name.pop_back();
+
+        // Skip WARP / Basic Render
+        if (adapter_name.find("Basic Render") != std::string::npos ||
+            adapter_name.find("Microsoft Basic") != std::string::npos) {
+            DX12_LOG_DEBUG("Skipping software adapter: %s\n", adapter_name.c_str());
+            continue;
+        }
+
+        // Try to create a D3D12 device
+        ComPtr<ID3D12Device> test_device;
+        hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device));
+        if (FAILED(hr)) {
+            DX12_LOG_DEBUG("Skipping %s: D3D12CreateDevice failed (0x%08X)\n", adapter_name.c_str(), (unsigned)hr);
+            continue;
+        }
+
+        // Validate compute capability with UAV allocation test
+        {
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width            = 4096;
+            rd.Height           = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            ComPtr<ID3D12Resource> test_buf;
+            hr = test_device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&test_buf));
+            if (FAILED(hr)) {
+                DX12_LOG_WARN("Skipping %s: UAV allocation failed (0x%08X)\n", adapter_name.c_str(), (unsigned)hr);
+                continue;
+            }
+        }
+        test_device.Reset();
+
+        if (g_dx12.devices.size() >= GGML_DX12_MAX_DEVICES) break;
+
+        g_dx12.devices.push_back(std::make_unique<dx12_device>());
+        g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
+    }
+#endif // _WIN32
+
     DX12_LOG_INFO("Found %zu D3D12 device(s)\n", g_dx12.devices.size());
     g_dx12.initialized = true;
 }
@@ -511,6 +645,7 @@ static void dx12_ensure_initialized() {
 // dx12_device implementation
 // ---------------------------------------------------------------------------
 
+#ifdef _WIN32
 void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     adapter   = std::move(adapter_);
     dev_index = idx;
@@ -519,7 +654,7 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
 
     // Convert wide name to narrow
     char narrow[256];
-    WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, narrow, sizeof(narrow), nullptr, nullptr);
+    dx12_wide_to_utf8(adapter_desc.Description, narrow, sizeof(narrow));
     description = narrow;
     name = std::string(GGML_DX12_NAME) + std::to_string(idx);
 
@@ -563,6 +698,46 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     } else {
         vram_free = vram_total;
     }
+#else
+void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
+    adapter   = std::move(adapter_);
+    dev_index = idx;
+
+    // Get adapter description (UTF-8 from DXCore)
+    size_t desc_size = 0;
+    adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription, &desc_size);
+    description.resize(desc_size);
+    adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, desc_size, description.data());
+    if (!description.empty() && description.back() == '\0') description.pop_back();
+    name = std::string(GGML_DX12_NAME) + std::to_string(idx);
+
+    HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    DX12_CHECK(hr, "D3D12CreateDevice");
+
+    // Create compute command queue
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    qd.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_queue));
+    DX12_CHECK(hr, "CreateCommandQueue(compute)");
+
+    // VRAM: query dedicated memory from DXCore
+    size_t dedicated_mem = 0;
+    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DedicatedAdapterMemory,
+                                       sizeof(dedicated_mem), &dedicated_mem))) {
+        vram_total = dedicated_mem;
+    }
+    if (vram_total == 0) {
+        // Fallback: use shared memory estimate
+        size_t shared_mem = 0;
+        if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::SharedSystemMemory,
+                                           sizeof(shared_mem), &shared_mem))) {
+            vram_total = shared_mem / 4;
+        }
+    }
+    vram_free = vram_total;
+#endif
 
     // Check Cooperative Vector support
     cooperative_vector_supported = false;
@@ -757,7 +932,13 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
 
     HRESULT hr = fence->SetEventOnCompletion(value, fence_event);
     DX12_CHECK(hr, "SetEventOnCompletion");
-    WaitForSingleObject(fence_event, INFINITE);
+#ifdef _WIN32
+    dx12_wait_event(fence_event, INFINITE);
+#else
+    while (fence->GetCompletedValue() < value) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+#endif
 }
 
 void dx12_backend_context::wait_for_gpu() {
@@ -2730,16 +2911,29 @@ void dx12_device::run_autotune() {
         ComPtr<ID3D12Fence> fence;
         device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
         // Wait with timeout — GPU hangs should not block indefinitely
-        HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        HANDLE event = dx12_create_event();
         fence->SetEventOnCompletion(1, event);
         compute_queue->Signal(fence.Get(), 1);
+#ifdef _WIN32
         DWORD wait_result = WaitForSingleObject(event, 5000);
-        CloseHandle(event);
+        dx12_close_event(event);
 
         if (wait_result == WAIT_TIMEOUT) {
             DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
             return UINT64_MAX;
         }
+#else
+        // WSL2: poll with timeout
+        auto start = std::chrono::steady_clock::now();
+        while (fence->GetCompletedValue() < 1) {
+            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(5000)) {
+                DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
+                return UINT64_MAX;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        dx12_close_event(event);
+#endif
 
         // Read timestamps
         uint64_t * ts = nullptr;
@@ -2942,7 +3136,7 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
 
     HRESULT hr = d->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence));
     DX12_CHECK(hr, "CreateFence");
-    ctx->fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    ctx->fence_event = dx12_create_event();
 
     auto * backend = new ggml_backend();
     backend->guid    = dx12_backend_get_guid();
