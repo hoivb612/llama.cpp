@@ -3181,6 +3181,7 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
 
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     auto * d = (dx12_device *)dev->context;
+#ifdef _WIN32
     // Query fresh memory info from DXGI to reflect current allocations
     ComPtr<IDXGIAdapter3> adapter3;
     if (SUCCEEDED(d->adapter.As(&adapter3))) {
@@ -3193,7 +3194,8 @@ static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * 
             return;
         }
     }
-    // Fallback to cached values
+#endif
+    // Fallback to cached values (always used on WSL2)
     if (free)  *free  = d->vram_free;
     if (total) *total = d->vram_total;
 }
