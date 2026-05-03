@@ -405,7 +405,7 @@ struct dx12_backend_context {
 
     ~dx12_backend_context() {
         // RAII cleanup: wait for ALL GPU work and close event handle
-        if (fence && fence_event && dev) {
+        if (fence && dev) {
             wait_for_gpu();
         }
         if (fence_event) {
@@ -425,7 +425,7 @@ struct dx12_backend_context {
 // Global state
 // ---------------------------------------------------------------------------
 
-static struct {
+static struct dx12_global_state {
     bool                                        initialized = false;
 #ifdef _WIN32
     ComPtr<IDXGIFactory4>                       factory;
@@ -438,6 +438,17 @@ static struct {
     // Backend device & registry objects
     std::vector<ggml_backend_device> backend_devices;
     ggml_backend_reg               backend_reg_obj = {};
+
+#ifndef _WIN32
+    // WSL2: D3D12 runtime (libd3d12core.so) calls abort() if COM objects are
+    // released during __cxa_finalize. Leak intentionally — OS reclaims at exit.
+    ~dx12_global_state() {
+        for (auto & dev : devices) {
+            dev.release(); // release unique_ptr ownership without calling destructor
+        }
+        factory.Detach(); // release ComPtr ownership without calling Release()
+    }
+#endif
 } g_dx12;
 
 // ---------------------------------------------------------------------------
