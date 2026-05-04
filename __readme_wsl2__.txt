@@ -1,5 +1,5 @@
 ==== REM getting all the tools and gdb
- sudo apt-get install build-essential gdb cmake
+ sudo apt install build-essential gdb cmake
 
 ==== REM For the directx headers (preferred)
  git clone https://github.com/microsoft/DirectX-Headers
