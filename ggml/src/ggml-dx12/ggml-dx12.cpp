@@ -229,6 +229,23 @@ struct dx12_device {
     bool cooperative_vector_supported = false;
 
     // UMA (Unified Memory Architecture) — APU/integrated GPU
+    /* 
+    UMA indicates that the GPU shares system memory with the CPU (integrated GPU / APU),
+    which allows zero-copy access to buffers allocated in shared memory. On UMA systems,
+    if the GPU cache is coherent with the CPU cache (CC-UMA), then writes from the CPU
+    are immediately visible to the GPU and vice versa without explicit flushes.
+
+    On non-CacheCoherentUMA (AMD 8060S reports UMA: yes but NOT CC), using WRITE_COMBINE + L0 
+    custom heap for UAV buffers causes data corruption. The GPU's L2 cache writes back through 
+    write-combine pages inconsistently — coherent for CPU→GPU loads, but not for GPU UAV read-modify-write 
+    patterns (KV cache, intermediate compute).
+
+    Caution: Only use D3D12_HEAP_TYPE_CUSTOM (zero-copy) on CacheCoherentUMA systems where hardware 
+    guarantees coherency. For plain UMA (like this 8060S), use D3D12_HEAP_TYPE_DEFAULT — the driver 
+    still allocates from shared system memory (you still get the 15.2 GB), just without the zero-copy CPU path.
+
+    The VRAM expansion (Dedicated → Shared VRAM) still works — that's separate from the heap type.
+    */
     bool is_uma = false;
     bool is_cache_coherent_uma = false;
 
@@ -1540,11 +1557,12 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
         case GGML_OP_SUM_ROWS:
         case GGML_OP_DIAG_MASK_INF:
             // Only support F32 output and F32 sources
-            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
-                // Check source types too — our shaders only handle F32 data
+            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
+                // Check source types too — our shaders handle F32/F16/BF16 via load_auto
                 for (int s = 0; s < GGML_MAX_SRC; s++) {
                     if (op->src[s] && op->src[s]->type != GGML_TYPE_F32 &&
                         op->src[s]->type != GGML_TYPE_F16 &&
+                        op->src[s]->type != GGML_TYPE_BF16 &&
                         op->src[s]->type != GGML_TYPE_I32) {
                         return false;
                     }
@@ -1554,8 +1572,8 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return false;
 
         case GGML_OP_SET_ROWS:
-            // KV cache writes: src0 is F32, dst can be F16 or F32
-            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
+            // KV cache writes: src0 is F32, dst can be F16, BF16, or F32
+            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                 return true;
             }
             return false;
@@ -1570,13 +1588,15 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
-                        // src0 must be F32 or F16
+                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
+                        // src0 must be F32, F16, or BF16
                         if (op->src[0] && op->src[0]->type != GGML_TYPE_F32 &&
-                            op->src[0]->type != GGML_TYPE_F16) return false;
-                        // src1 (if present) must be F32 or F16
+                            op->src[0]->type != GGML_TYPE_F16 &&
+                            op->src[0]->type != GGML_TYPE_BF16) return false;
+                        // src1 (if present) must be F32, F16, or BF16
                         if (op->src[1] && op->src[1]->type != GGML_TYPE_F32 &&
-                            op->src[1]->type != GGML_TYPE_F16) return false;
+                            op->src[1]->type != GGML_TYPE_F16 &&
+                            op->src[1]->type != GGML_TYPE_BF16) return false;
                         return true;
                     }
                     return false;
@@ -1595,7 +1615,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
-                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
+                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                         return true;
                     }
                     return false;
@@ -1608,7 +1628,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             if (op->type != GGML_TYPE_F32) return false;
             if (op->src[0]) {
                 ggml_type t = op->src[0]->type;
-                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
                     t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
                     t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
                     t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q4_1 &&
@@ -1622,7 +1642,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             if (op->type != GGML_TYPE_F32) return false;
             if (op->src[0]) {
                 ggml_type t = op->src[0]->type;
-                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
                     t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
                     t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
                     t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q4_1 &&
@@ -1634,7 +1654,8 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
         case GGML_OP_FLASH_ATTN_EXT:
             // Re-enabled: NaN was in model head (dispatches 1598-1608), not attention.
             // FA is MQA-safe and handles attention softcapping internally.
-            if (op->type == GGML_TYPE_F32 && op->src[1] && op->src[1]->type == GGML_TYPE_F16) {
+            if (op->type == GGML_TYPE_F32 && op->src[1] &&
+                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16)) {
                 return true;
             }
             return false;
@@ -1647,6 +1668,13 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
 // ---------------------------------------------------------------------------
 // Graph compute: dispatch shaders for a compute graph
 // ---------------------------------------------------------------------------
+
+// Map ggml type to shader esize: 2=F16, 3=BF16 (sentinel), 4=F32
+// BF16 uses 3 as dispatch sentinel so shaders can distinguish from F16.
+static uint32_t dx12_esize(ggml_type t) {
+    if (t == GGML_TYPE_BF16) return 3;
+    return (uint32_t)ggml_type_size(t);
+}
 
 static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_params & p) {
     memset(&p, 0, sizeof(p));
@@ -1665,7 +1693,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         uint64_t off = dx12_tensor_offset(src0);
         GGML_ASSERT(off <= UINT32_MAX && "src0 offset exceeds 4GB");
         p.src0_offset = (uint32_t)off;
-        p.src0_esize  = (uint32_t)ggml_type_size(src0->type);
+        p.src0_esize  = dx12_esize(src0->type);
     }
     if (src1) {
         p.ne10 = (uint32_t)src1->ne[0]; p.ne11 = (uint32_t)src1->ne[1];
@@ -1675,7 +1703,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         uint64_t off = dx12_tensor_offset(src1);
         GGML_ASSERT(off <= UINT32_MAX && "src1 offset exceeds 4GB");
         p.src1_offset = (uint32_t)off;
-        p.src1_esize  = (uint32_t)ggml_type_size(src1->type);
+        p.src1_esize  = dx12_esize(src1->type);
     }
 
     uint64_t dst_off = dx12_tensor_offset(tensor);
@@ -1685,7 +1713,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
     p.nb0 = (uint32_t)tensor->nb[0]; p.nb1 = (uint32_t)tensor->nb[1];
     p.nb2 = (uint32_t)tensor->nb[2]; p.nb3 = (uint32_t)tensor->nb[3];
     p.dst_offset = (uint32_t)dst_off;
-    p.dst_esize  = (uint32_t)ggml_type_size(tensor->type);
+    p.dst_esize  = dx12_esize(tensor->type);
 
     // Copy op_params — for FLASH_ATTN_EXT, repurpose to carry src2 + mask info
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -2013,7 +2041,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.nb0 = (uint32_t)fused_mul_node->nb[0]; params.nb1 = (uint32_t)fused_mul_node->nb[1];
             params.nb2 = (uint32_t)fused_mul_node->nb[2]; params.nb3 = (uint32_t)fused_mul_node->nb[3];
             params.dst_offset = (uint32_t)dx12_tensor_offset(fused_mul_node);
-            params.dst_esize = (uint32_t)ggml_type_size(fused_mul_node->type);
+            params.dst_esize = dx12_esize(fused_mul_node->type);
             // op_params: ADD dst offset, weight offset, epsilon, ADD dst esize
             params.op_params[0] = (uint32_t)dx12_tensor_offset(node);  // ADD's output offset
             params.op_params[1] = (uint32_t)dx12_tensor_offset(fused_mul_node->src[1]);  // weight offset
@@ -2032,7 +2060,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 params.nb10 = (uint32_t)wt->nb[0]; params.nb11 = (uint32_t)wt->nb[1];
                 params.nb12 = (uint32_t)wt->nb[2]; params.nb13 = (uint32_t)wt->nb[3];
                 params.src1_offset = (uint32_t)dx12_tensor_offset(wt);
-                params.src1_esize = (uint32_t)ggml_type_size(wt->type);
+                params.src1_esize = dx12_esize(wt->type);
             }
             if (fused_rope_after_rms) {
                 // RMS_NORM + MUL + ROPE: dst is ROPE's output
@@ -2041,7 +2069,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 params.nb0 = (uint32_t)fused_rope_after_rms->nb[0]; params.nb1 = (uint32_t)fused_rope_after_rms->nb[1];
                 params.nb2 = (uint32_t)fused_rope_after_rms->nb[2]; params.nb3 = (uint32_t)fused_rope_after_rms->nb[3];
                 params.dst_offset = (uint32_t)dx12_tensor_offset(fused_rope_after_rms);
-                params.dst_esize = (uint32_t)ggml_type_size(fused_rope_after_rms->type);
+                params.dst_esize = dx12_esize(fused_rope_after_rms->type);
                 // Copy ROPE's op_params (n_dims, mode, freq_base, etc.) into our op_params
                 // op_params[0] = epsilon (already set by fill_params from RMS_NORM node)
                 // op_params[1..7] = ROPE params
@@ -2053,9 +2081,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 params.nb0 = (uint32_t)fused_mul_node->nb[0]; params.nb1 = (uint32_t)fused_mul_node->nb[1];
                 params.nb2 = (uint32_t)fused_mul_node->nb[2]; params.nb3 = (uint32_t)fused_mul_node->nb[3];
                 params.dst_offset = (uint32_t)dx12_tensor_offset(fused_mul_node);
-                params.dst_esize = (uint32_t)ggml_type_size(fused_mul_node->type);
+                params.dst_esize = dx12_esize(fused_mul_node->type);
             }
-            params.dst_esize = (uint32_t)ggml_type_size(fused_mul_node->type);
+            params.dst_esize = dx12_esize(fused_mul_node->type);
         } else {
             dx12_fill_params(node, params);
         }
@@ -2080,7 +2108,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.nb0 = (uint32_t)fused_rope_set_rows->nb[0]; params.nb1 = (uint32_t)fused_rope_set_rows->nb[1];
             params.nb2 = (uint32_t)fused_rope_set_rows->nb[2]; params.nb3 = (uint32_t)fused_rope_set_rows->nb[3];
             params.dst_offset = (uint32_t)dx12_tensor_offset(fused_rope_set_rows);
-            params.dst_esize = (uint32_t)ggml_type_size(fused_rope_set_rows->type);
+            params.dst_esize = dx12_esize(fused_rope_set_rows->type);
         }
 
         // Split-KV flash attention: precompute split_k before params are pushed
