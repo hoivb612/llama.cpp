@@ -866,6 +866,13 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
         }
     }
 
+    // Environment override: GGML_DX12_NO_UMA=1 disables UMA optimizations for testing
+    if (is_uma && getenv("GGML_DX12_NO_UMA")) {
+        DX12_LOG_INFO("GGML_DX12_NO_UMA set: disabling UMA/CC-UMA optimizations\n");
+        is_uma = false;
+        is_cache_coherent_uma = false;
+    }
+
     // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
     // Report SharedSystemMemory so the model loader puts all layers on GPU.
     if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
@@ -1097,15 +1104,17 @@ static ComPtr<ID3D12Resource> dx12_create_buffer(dx12_device * dev, size_t size,
                                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     D3D12_HEAP_PROPERTIES hp = {};
 
-    if (dev->is_uma) {
-        // UMA: use custom heap that is both CPU-writable and GPU-accessible with UAV.
-        // This avoids the upload→copy pipeline entirely — zero-copy for weights.
+    if (dev->is_cache_coherent_uma) {
+        // CacheCoherentUMA: CUSTOM heap with WRITE_BACK is zero-copy for both CPU and GPU.
+        // GPU UAV + CPU Map/Unmap with full cache coherency guaranteed.
         hp.Type                 = D3D12_HEAP_TYPE_CUSTOM;
         hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-        hp.CPUPageProperty      = dev->is_cache_coherent_uma
-                                    ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
-                                    : D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+        hp.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
     } else {
+        // Non-CC UMA or discrete: use DEFAULT heap. On UMA systems, DEFAULT still
+        // allocates from shared system memory (driver manages coherency internally).
+        // WRITE_COMBINE + L0 caused data corruption on AMD APUs (non-coherent GPU
+        // cache writeback through write-combine pages produces stale UAV data).
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     }
 
@@ -1157,7 +1166,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     auto * ctx = new dx12_buffer_context();
     ctx->dev       = dev;
     ctx->size      = size;
-    ctx->heap_type = dev->is_uma ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
+    ctx->heap_type = dev->is_cache_coherent_uma ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
 
     if (size > 0) {
         ctx->resource = dx12_create_buffer(dev, size);
