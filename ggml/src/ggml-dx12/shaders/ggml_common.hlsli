@@ -18,7 +18,8 @@ cbuffer ShaderParams : register(b0) {
     uint src0_offset;
     uint src1_offset;
     uint dst_offset;
-    // Element sizes in bytes (2=F16, 4=F32) — NOT inferred from stride
+    // Element sizes in bytes (2=F16, 3=BF16 sentinel, 4=F32)
+    // BF16 uses esize=3 as dispatch sentinel; actual byte size is 2.
     uint src0_esize;
     uint src1_esize;
     uint dst_esize;
@@ -75,49 +76,61 @@ uint f32_to_f16(float f) {
     return f32tof16(f);
 }
 
-// Helper: load a float value, auto-detecting F16 (stride=2) vs F32 (stride=4)
-// Uses the element stride (nb0) to distinguish format
-float load_auto(ByteAddressBuffer buf, uint byte_offset, uint elem_stride) {
-    if (elem_stride == 2) {
-        // F16: load containing 32-bit word, extract the right 16-bit half
-        uint word = buf.Load(byte_offset & ~3u);
-        uint shift = (byte_offset & 2u) * 8u;
-        return f16_to_f32((word >> shift) & 0xFFFFu);
-    } else {
+// Helper: convert bfloat16 bits to float32
+// BF16 is the upper 16 bits of IEEE 754 float32 — just shift left
+float bf16_to_f32(uint h) {
+    return asfloat(h << 16);
+}
+
+// Helper: convert float32 to bfloat16 bits (truncation, no rounding)
+uint f32_to_bf16(float f) {
+    return (asuint(f) >> 16) & 0xFFFFu;
+}
+
+// Helper: load a float value by element size
+//   esize=2: F16,  esize=3: BF16 (sentinel),  esize=4: F32
+float load_auto(ByteAddressBuffer buf, uint byte_offset, uint esize) {
+    if (esize == 4) {
         return asfloat(buf.Load(byte_offset));
     }
+    // F16 or BF16: both 2-byte, packed into 32-bit words
+    uint word = buf.Load(byte_offset & ~3u);
+    uint shift = (byte_offset & 2u) * 8u;
+    uint bits = (word >> shift) & 0xFFFFu;
+    return (esize == 3) ? bf16_to_f32(bits) : f16_to_f32(bits);
 }
 
 // Same for RWByteAddressBuffer
-float load_auto_rw(RWByteAddressBuffer buf, uint byte_offset, uint elem_stride) {
-    if (elem_stride == 2) {
-        uint word = buf.Load(byte_offset & ~3u);
-        uint shift = (byte_offset & 2u) * 8u;
-        return f16_to_f32((word >> shift) & 0xFFFFu);
-    } else {
+float load_auto_rw(RWByteAddressBuffer buf, uint byte_offset, uint esize) {
+    if (esize == 4) {
         return asfloat(buf.Load(byte_offset));
     }
+    uint word = buf.Load(byte_offset & ~3u);
+    uint shift = (byte_offset & 2u) * 8u;
+    uint bits = (word >> shift) & 0xFFFFu;
+    return (esize == 3) ? bf16_to_f32(bits) : f16_to_f32(bits);
 }
 
-// Helper: store a float value, auto-detecting F16 vs F32 destination
-void store_auto(RWByteAddressBuffer buf, uint byte_offset, float val, uint elem_stride) {
-    if (elem_stride == 2) {
-        // F16 destination: use atomic CAS to avoid races on shared 32-bit words
-        uint f16_val = f32_to_f16(val);
-        uint word_addr = byte_offset & ~3u;
-        uint shift = (byte_offset & 2u) * 8u;
-        uint mask = (uint)0xFFFFu << shift;
-        uint new_bits = (f16_val & (uint)0xFFFFu) << shift;
-
-        uint expected, original;
-        [allow_uav_condition] do {
-            buf.InterlockedOr(word_addr, 0, expected); // atomic read
-            uint desired = (expected & ~mask) | new_bits;
-            buf.InterlockedCompareExchange(word_addr, expected, desired, original);
-        } while (original != expected);
-    } else {
+// Helper: store a float value by element size
+//   esize=2: F16,  esize=3: BF16 (sentinel),  esize=4: F32
+void store_auto(RWByteAddressBuffer buf, uint byte_offset, float val, uint esize) {
+    if (esize == 4) {
         buf.Store(byte_offset, asuint(val));
+        return;
     }
+    // F16 or BF16: atomic CAS to avoid races on shared 32-bit words
+    uint half_val = (esize == 3) ? f32_to_bf16(val) : f32_to_f16(val);
+    uint word_addr = byte_offset & ~3u;
+    uint shift = (byte_offset & 2u) * 8u;
+    uint mask = (uint)0xFFFFu << shift;
+    uint new_bits = (half_val & (uint)0xFFFFu) << shift;
+
+    uint expected, original;
+    [allow_uav_condition] do {
+        buf.InterlockedOr(word_addr, 0, expected); // atomic read
+        uint desired = (expected & ~mask) | new_bits;
+        buf.InterlockedCompareExchange(word_addr, expected, desired, original);
+    } while (original != expected);
 }
 
 // op_params accessors — individual scalars to match cbuffer packing

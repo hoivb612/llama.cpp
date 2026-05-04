@@ -259,6 +259,27 @@ struct dx12_device {
 
     bool cooperative_vector_supported = false;
 
+    // UMA (Unified Memory Architecture) — APU/integrated GPU
+    /*
+    UMA indicates that the GPU shares system memory with the CPU (integrated GPU / APU),
+    which allows zero-copy access to buffers allocated in shared memory. On UMA systems,
+    if the GPU cache is coherent with the CPU cache (CC-UMA), then writes from the CPU
+    are immediately visible to the GPU and vice versa without explicit flushes.
+
+    On non-CacheCoherentUMA (AMD 8060S reports UMA: yes but NOT CC), using WRITE_COMBINE + L0
+    custom heap for UAV buffers causes data corruption. The GPU's L2 cache writes back through
+    write-combine pages inconsistently — coherent for CPU→GPU loads, but not for GPU UAV read-modify-write
+    patterns (KV cache, intermediate compute).
+
+    Caution: Only use D3D12_HEAP_TYPE_CUSTOM (zero-copy) on CacheCoherentUMA systems where hardware
+    guarantees coherency. For plain UMA (like this 8060S), use D3D12_HEAP_TYPE_DEFAULT — the driver
+    still allocates from shared system memory (you still get the 15.2 GB), just without the zero-copy CPU path.
+
+    The VRAM expansion (Dedicated → Shared VRAM) still works — that's separate from the heap type.
+    */
+    bool is_uma = false;
+    bool is_cache_coherent_uma = false;
+
     // WaveMMA (SM 6.9 Wave Matrix) support
     bool wave_mma_supported = false;
     uint32_t wave_mma_K      = 0;     // hardware K dimension (even multiple of 16)
@@ -402,6 +423,10 @@ struct dx12_backend_context {
     size_t                 upload_staging_size   = 0;
     ComPtr<ID3D12Resource> readback_staging;
     size_t                 readback_staging_size = 0;
+
+    // Split-KV temp buffer for flash attention partials
+    ComPtr<ID3D12Resource> splitkv_temp;
+    size_t                 splitkv_temp_size = 0;
 
     bool cmd_list_open = false;
 
@@ -659,6 +684,47 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
         }
     }
 
+    // Query UMA (Unified Memory Architecture) — APU/integrated GPU zero-copy path
+    {
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch1 = {};
+        HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch1, sizeof(arch1));
+        if (SUCCEEDED(hr2)) {
+            is_uma = (arch1.UMA != FALSE);
+            is_cache_coherent_uma = (arch1.CacheCoherentUMA != FALSE);
+        } else {
+            D3D12_FEATURE_DATA_ARCHITECTURE arch0 = {};
+            hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch0, sizeof(arch0));
+            if (SUCCEEDED(hr2)) {
+                is_uma = (arch0.UMA != FALSE);
+                is_cache_coherent_uma = (arch0.CacheCoherentUMA != FALSE);
+            }
+        }
+    }
+
+    // Environment override: GGML_DX12_NO_UMA=1 disables UMA optimizations for testing
+    if (is_uma && getenv("GGML_DX12_NO_UMA")) {
+        DX12_LOG_INFO("GGML_DX12_NO_UMA set: disabling UMA/CC-UMA optimizations\n");
+        is_uma = false;
+        is_cache_coherent_uma = false;
+    }
+
+    // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
+    // Expand VRAM to shared memory if dedicated VRAM is small (< 2 GB).
+    if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
+        MEMORYSTATUSEX mem_status = {};
+        mem_status.dwLength = sizeof(mem_status);
+        if (GlobalMemoryStatusEx(&mem_status)) {
+            size_t sys_ram = (size_t)mem_status.ullTotalPhys;
+            if (sys_ram > vram_total) {
+                DX12_LOG_INFO("UMA detected: expanding VRAM from %.1f GB to %.1f GB (shared system memory)\n",
+                              (double)vram_total / (1024.0 * 1024.0 * 1024.0),
+                              (double)sys_ram / (1024.0 * 1024.0 * 1024.0));
+                vram_total = sys_ram;
+                vram_free  = sys_ram > (size_t)(512 * 1024 * 1024) ? sys_ram - (size_t)(512 * 1024 * 1024) : sys_ram;
+            }
+        }
+    }
+
     // Check WaveMMA (SM 6.9 Wave Matrix) support
     // D3D12_FEATURE_WAVE_MMA queries hardware matrix multiply-accumulate capability
     wave_mma_supported = false;
@@ -698,14 +764,15 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
 
     create_common_root_signature();
 
-    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, CV: %s, WaveMMA: %s%s)\n",
+    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, CV: %s, WaveMMA: %s%s, UMA: %s)\n",
                   idx, name.c_str(), description.c_str(),
                   (double)vram_total / (1024.0 * 1024.0 * 1024.0),
                   cooperative_vector_supported ? "yes" : "no",
                   wave_mma_supported ? "yes" : "no",
                   wave_mma_supported ? (std::string(" K=") + std::to_string(wave_mma_K) +
                                         " wave=" + std::to_string(wave_mma_wave_size) +
-                                        (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "");
+                                        (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "",
+                  is_uma ? (is_cache_coherent_uma ? "CC" : "yes") : "no");
 }
 
 void dx12_device::create_common_root_signature() {
@@ -893,7 +960,20 @@ void dx12_backend_context::ensure_staging(size_t upload_size, size_t readback_si
 static ComPtr<ID3D12Resource> dx12_create_buffer(dx12_device * dev, size_t size,
                                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    if (dev->is_cache_coherent_uma) {
+        // CacheCoherentUMA: CUSTOM heap with WRITE_BACK is zero-copy for both CPU and GPU.
+        // GPU UAV + CPU Map/Unmap with full cache coherency guaranteed.
+        hp.Type                 = D3D12_HEAP_TYPE_CUSTOM;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        hp.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    } else {
+        // Non-CC UMA or discrete: use DEFAULT heap. On UMA systems, DEFAULT still
+        // allocates from shared system memory (driver manages coherency internally).
+        // WRITE_COMBINE + L0 caused data corruption on AMD APUs (non-coherent GPU
+        // cache writeback through write-combine pages produces stale UAV data).
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    }
 
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -943,7 +1023,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     auto * ctx = new dx12_buffer_context();
     ctx->dev       = dev;
     ctx->size      = size;
-    ctx->heap_type = D3D12_HEAP_TYPE_DEFAULT;
+    ctx->heap_type = dev->is_cache_coherent_uma ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
 
     if (size > 0) {
         ctx->resource = dx12_create_buffer(dev, size);
@@ -973,6 +1053,20 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             auto * ctx = (dx12_buffer_context *)buffer->context;
             if (size == 0) return;
 
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // UMA zero-copy: direct memset
+            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                void * mapped = nullptr;
+                D3D12_RANGE read_range = { 0, 0 };
+                HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
+                DX12_CHECK(hr, "Map(UMA memset)");
+                memset((uint8_t *)mapped + tensor_offset, value, size);
+                D3D12_RANGE written = { tensor_offset, tensor_offset + size };
+                ctx->resource->Unmap(0, &written);
+                return;
+            }
+
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait();
             ctx->dev->xfer_ensure_staging(size, 0);
@@ -989,7 +1083,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
             DX12_CHECK(hr, "xfer cmd_list Reset(memset)");
 
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
             ctx->dev->xfer.cmd_list->CopyBufferRegion(ctx->resource.Get(), tensor_offset,
                                                        ctx->dev->xfer.upload_staging.Get(), 0, size);
             ctx->dev->xfer.cmd_list->Close();
@@ -1006,6 +1099,20 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             if (size == 0) return;
 
             g_tls_device = ctx->dev->device.Get();
+
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // UMA zero-copy: buffer is CPU-writable, write directly
+            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                void * mapped = nullptr;
+                D3D12_RANGE read_range = { 0, 0 };
+                HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
+                DX12_CHECK(hr, "Map(UMA set_tensor)");
+                memcpy((uint8_t *)mapped + tensor_offset, data, size);
+                D3D12_RANGE written = { tensor_offset, tensor_offset + size };
+                ctx->resource->Unmap(0, &written);
+                return;
+            }
             
             // CRITICAL: Ensure compute command list is closed before transfer
             // The scheduler may call set_tensor between graph splits
@@ -1029,7 +1136,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
             DX12_CHECK(hr, "xfer cmd_list Reset");
 
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
             ctx->dev->xfer.cmd_list->CopyBufferRegion(ctx->resource.Get(), tensor_offset,
                                                        ctx->dev->xfer.upload_staging.Get(), 0, size);
             ctx->dev->xfer.cmd_list->Close();
@@ -1046,11 +1152,24 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             if (size == 0) return;
 
             g_tls_device = ctx->dev->device.Get();
+
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // UMA zero-copy: buffer is CPU-readable (WRITE_BACK cache-coherent)
+            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                void * mapped = nullptr;
+                D3D12_RANGE read_range = { tensor_offset, tensor_offset + size };
+                HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
+                DX12_CHECK(hr, "Map(UMA get_tensor)");
+                memcpy(data, (const uint8_t *)mapped + tensor_offset, size);
+                D3D12_RANGE written = { 0, 0 };
+                ctx->resource->Unmap(0, &written);
+                return;
+            }
+
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait(); // wait for any previous transfer
             ctx->dev->xfer_ensure_staging(0, size);
-
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
 
             // Always check if device is already dead before attempting copy
             {
@@ -1277,12 +1396,12 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
         case GGML_OP_ROPE:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_DIAG_MASK_INF:
-            // Only support F32 output and F32 sources
-            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
-                // Check source types too — our shaders only handle F32 data
+            // Support F32, F16, and BF16 output; sources must be F32/F16/BF16/I32
+            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                 for (int s = 0; s < GGML_MAX_SRC; s++) {
                     if (op->src[s] && op->src[s]->type != GGML_TYPE_F32 &&
                         op->src[s]->type != GGML_TYPE_F16 &&
+                        op->src[s]->type != GGML_TYPE_BF16 &&
                         op->src[s]->type != GGML_TYPE_I32) {
                         return false;
                     }
@@ -1292,8 +1411,8 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return false;
 
         case GGML_OP_SET_ROWS:
-            // KV cache writes: src0 is F32, dst can be F16 or F32
-            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
+            // KV cache writes: src0 is F32, dst can be F16, BF16, or F32
+            if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                 return true;
             }
             return false;
@@ -1308,13 +1427,15 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
-                        // src0 must be F32 or F16
+                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
+                        // src0 must be F32, F16, or BF16
                         if (op->src[0] && op->src[0]->type != GGML_TYPE_F32 &&
-                            op->src[0]->type != GGML_TYPE_F16) return false;
-                        // src1 (if present) must be F32 or F16
+                            op->src[0]->type != GGML_TYPE_F16 &&
+                            op->src[0]->type != GGML_TYPE_BF16) return false;
+                        // src1 (if present) must be F32, F16, or BF16
                         if (op->src[1] && op->src[1]->type != GGML_TYPE_F32 &&
-                            op->src[1]->type != GGML_TYPE_F16) return false;
+                            op->src[1]->type != GGML_TYPE_F16 &&
+                            op->src[1]->type != GGML_TYPE_BF16) return false;
                         return true;
                     }
                     return false;
@@ -1333,7 +1454,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
-                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
+                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                         return true;
                     }
                     return false;
@@ -1346,7 +1467,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             if (op->type != GGML_TYPE_F32) return false;
             if (op->src[0]) {
                 ggml_type t = op->src[0]->type;
-                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
                     t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
                     t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
                     t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q4_1 &&
@@ -1360,7 +1481,7 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             if (op->type != GGML_TYPE_F32) return false;
             if (op->src[0]) {
                 ggml_type t = op->src[0]->type;
-                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 &&
+                if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16 &&
                     t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
                     t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q5_K && t != GGML_TYPE_Q6_K &&
                     t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q4_1 &&
@@ -1370,9 +1491,9 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return true;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            // Re-enabled: NaN was in model head (dispatches 1598-1608), not attention.
-            // FA is MQA-safe and handles attention softcapping internally.
-            if (op->type == GGML_TYPE_F32 && op->src[1] && op->src[1]->type == GGML_TYPE_F16) {
+            // FA supports F16 or BF16 KV cache values
+            if (op->type == GGML_TYPE_F32 && op->src[1] &&
+                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16)) {
                 return true;
             }
             return false;
@@ -1385,6 +1506,15 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
 // ---------------------------------------------------------------------------
 // Graph compute: dispatch shaders for a compute graph
 // ---------------------------------------------------------------------------
+
+// Map ggml_type to shader element size sentinel.
+// BF16 uses esize=3 as a sentinel (actual byte size is 2) so shaders
+// can distinguish BF16 from F16 in load_auto/store_auto.
+static uint32_t dx12_esize(enum ggml_type type) {
+    if (type == GGML_TYPE_BF16) return 3;
+    if (type == GGML_TYPE_F16)  return 2;
+    return (uint32_t)ggml_type_size(type);
+}
 
 static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_params & p) {
     memset(&p, 0, sizeof(p));
@@ -1403,7 +1533,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         uint64_t off = dx12_tensor_offset(src0);
         GGML_ASSERT(off <= UINT32_MAX && "src0 offset exceeds 4GB");
         p.src0_offset = (uint32_t)off;
-        p.src0_esize  = (uint32_t)ggml_type_size(src0->type);
+        p.src0_esize  = dx12_esize(src0->type);
     }
     if (src1) {
         p.ne10 = (uint32_t)src1->ne[0]; p.ne11 = (uint32_t)src1->ne[1];
@@ -1413,7 +1543,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         uint64_t off = dx12_tensor_offset(src1);
         GGML_ASSERT(off <= UINT32_MAX && "src1 offset exceeds 4GB");
         p.src1_offset = (uint32_t)off;
-        p.src1_esize  = (uint32_t)ggml_type_size(src1->type);
+        p.src1_esize  = dx12_esize(src1->type);
     }
 
     uint64_t dst_off = dx12_tensor_offset(tensor);
@@ -1423,7 +1553,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
     p.nb0 = (uint32_t)tensor->nb[0]; p.nb1 = (uint32_t)tensor->nb[1];
     p.nb2 = (uint32_t)tensor->nb[2]; p.nb3 = (uint32_t)tensor->nb[3];
     p.dst_offset = (uint32_t)dst_off;
-    p.dst_esize  = (uint32_t)ggml_type_size(tensor->type);
+    p.dst_esize  = dx12_esize(tensor->type);
 
     // Copy op_params — for FLASH_ATTN_EXT, repurpose to carry src2 + mask info
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -1437,7 +1567,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         p.op_params[2] = src2 ? (uint32_t)src2->nb[1] : 0;             // src2_nb1
         p.op_params[3] = src2 ? (uint32_t)src2->nb[2] : 0;             // src2_nb2
         p.op_params[4] = src2 ? (uint32_t)src2->nb[3] : 0;             // src2_nb3
-        p.op_params[5] = src2 ? (uint32_t)ggml_type_size(src2->type) : 4; // src2_esize
+        p.op_params[5] = src2 ? dx12_esize(src2->type) : 4; // src2_esize
         memcpy(&p.op_params[6], &scale, sizeof(float));                 // scale
         p.op_params[7] = (uint32_t)src1->ne[2];                        // n_kv_heads
 
@@ -1749,14 +1879,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.nb0 = (uint32_t)fused_mul_node->nb[0]; params.nb1 = (uint32_t)fused_mul_node->nb[1];
             params.nb2 = (uint32_t)fused_mul_node->nb[2]; params.nb3 = (uint32_t)fused_mul_node->nb[3];
             params.dst_offset = (uint32_t)dx12_tensor_offset(fused_mul_node);
-            params.dst_esize = (uint32_t)ggml_type_size(fused_mul_node->type);
+            params.dst_esize = dx12_esize(fused_mul_node->type);
             // op_params: ADD dst offset, weight offset, epsilon, ADD dst esize
             params.op_params[0] = (uint32_t)dx12_tensor_offset(node);  // ADD's output offset
             params.op_params[1] = (uint32_t)dx12_tensor_offset(fused_mul_node->src[1]);  // weight offset
             float eps = 0.0f;
             memcpy(&eps, fused_rms_node->op_params, sizeof(float));
             memcpy(&params.op_params[2], &eps, sizeof(uint32_t));
-            params.op_params[3] = (uint32_t)ggml_type_size(node->type);  // ADD dst esize
+            params.op_params[3] = dx12_esize(node->type);  // ADD dst esize
         } else if (fused_mul_node) {
             // For fused rms_norm_mul or rms_norm_mul_rope
             dx12_fill_params(node, params);
@@ -1768,7 +1898,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 params.nb10 = (uint32_t)wt->nb[0]; params.nb11 = (uint32_t)wt->nb[1];
                 params.nb12 = (uint32_t)wt->nb[2]; params.nb13 = (uint32_t)wt->nb[3];
                 params.src1_offset = (uint32_t)dx12_tensor_offset(wt);
-                params.src1_esize = (uint32_t)ggml_type_size(wt->type);
+                params.src1_esize = dx12_esize(wt->type);
             }
             if (fused_rope_after_rms) {
                 // RMS_NORM + MUL + ROPE: dst is ROPE's output
@@ -1777,7 +1907,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 params.nb0 = (uint32_t)fused_rope_after_rms->nb[0]; params.nb1 = (uint32_t)fused_rope_after_rms->nb[1];
                 params.nb2 = (uint32_t)fused_rope_after_rms->nb[2]; params.nb3 = (uint32_t)fused_rope_after_rms->nb[3];
                 params.dst_offset = (uint32_t)dx12_tensor_offset(fused_rope_after_rms);
-                params.dst_esize = (uint32_t)ggml_type_size(fused_rope_after_rms->type);
+                params.dst_esize = dx12_esize(fused_rope_after_rms->type);
                 // Copy ROPE's op_params (n_dims, mode, freq_base, etc.) into our op_params
                 // op_params[0] = epsilon (already set by fill_params from RMS_NORM node)
                 // op_params[1..7] = ROPE params
@@ -1789,9 +1919,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 params.nb0 = (uint32_t)fused_mul_node->nb[0]; params.nb1 = (uint32_t)fused_mul_node->nb[1];
                 params.nb2 = (uint32_t)fused_mul_node->nb[2]; params.nb3 = (uint32_t)fused_mul_node->nb[3];
                 params.dst_offset = (uint32_t)dx12_tensor_offset(fused_mul_node);
-                params.dst_esize = (uint32_t)ggml_type_size(fused_mul_node->type);
+                params.dst_esize = dx12_esize(fused_mul_node->type);
             }
-            params.dst_esize = (uint32_t)ggml_type_size(fused_mul_node->type);
+            params.dst_esize = dx12_esize(fused_mul_node->type);
         } else {
             dx12_fill_params(node, params);
         }
@@ -1816,7 +1946,80 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.nb0 = (uint32_t)fused_rope_set_rows->nb[0]; params.nb1 = (uint32_t)fused_rope_set_rows->nb[1];
             params.nb2 = (uint32_t)fused_rope_set_rows->nb[2]; params.nb3 = (uint32_t)fused_rope_set_rows->nb[3];
             params.dst_offset = (uint32_t)dx12_tensor_offset(fused_rope_set_rows);
-            params.dst_esize = (uint32_t)ggml_type_size(fused_rope_set_rows->type);
+            params.dst_esize = dx12_esize(fused_rope_set_rows->type);
+        }
+
+        // Split-KV flash attention: precompute split_k before params are pushed
+        uint32_t fa_split_k = 1;
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            static int splitk_env = -1;
+            if (splitk_env == -1) {
+                const char * env = getenv("GGML_DX12_SPLIT_K");
+                splitk_env = env ? atoi(env) : 0;  // 0 = auto
+            }
+
+            uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
+            uint32_t N_kv      = (uint32_t)node->src[1]->ne[1];
+            uint32_t n_heads   = (uint32_t)node->src[0]->ne[2];
+            uint32_t batch     = (uint32_t)node->src[0]->ne[3];
+
+            if (N_queries == 1 && N_kv >= 512) {
+                if (splitk_env > 1) {
+                    fa_split_k = (uint32_t)splitk_env;
+                    uint32_t max_split = (N_kv + 255) / 256;
+                    if (fa_split_k > max_split) fa_split_k = max_split;
+                    if (fa_split_k < 2) fa_split_k = 1;
+                } else {
+                    // Auto: target ~64 total thread groups for good CU occupancy
+                    uint32_t total_wgs = N_queries * n_heads * batch;
+                    if (total_wgs < 64) {
+                        fa_split_k = (64 + total_wgs - 1) / total_wgs;
+                        uint32_t max_split = (N_kv + 255) / 256;
+                        if (fa_split_k > max_split) fa_split_k = max_split;
+                        if (fa_split_k < 2) fa_split_k = 1;
+                    }
+                }
+            }
+
+            if (fa_split_k > 1) {
+                // Allocate/grow temp buffer for partial results
+                uint32_t D    = (uint32_t)node->src[0]->ne[0];
+                uint32_t ne01 = N_queries;
+                uint32_t ne02 = n_heads;
+                uint32_t ne03 = batch;
+                size_t o_size  = (size_t)D * ne01 * fa_split_k * ne02 * ne03 * sizeof(float);
+                size_t ml_size = (size_t)ne01 * fa_split_k * ne02 * ne03 * sizeof(float);
+                size_t temp_size = o_size + 2 * ml_size;
+                temp_size = (temp_size + 255) & ~255;
+
+                if (temp_size > bctx->splitkv_temp_size) {
+                    D3D12_HEAP_PROPERTIES hp = {};
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = {};
+                    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    rd.Width     = temp_size;
+                    rd.Height    = 1;
+                    rd.DepthOrArraySize = 1;
+                    rd.MipLevels = 1;
+                    rd.SampleDesc.Count = 1;
+                    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    rd.Flags  = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+                    bctx->splitkv_temp.Reset();
+                    HRESULT hr = bctx->dev->device->CreateCommittedResource(
+                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                        IID_PPV_ARGS(&bctx->splitkv_temp));
+                    if (FAILED(hr)) {
+                        DX12_LOG_WARN("Failed to allocate split-KV temp buffer (%zu bytes)\n", temp_size);
+                        fa_split_k = 1;
+                    } else {
+                        bctx->splitkv_temp_size = temp_size;
+                    }
+                }
+            }
+
+            params.op_params[15] = fa_split_k;
         }
 
         // Upload root constants — only upload op_params for ops that need them
@@ -1845,6 +2048,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             src1_res = dx12_get_resource(node->src[1]);
         }
         ID3D12Resource * dst_res;
+        ID3D12Resource * fa_real_dst_res = nullptr;  // saved for split-KV reduce pass
         if (fused_rope_after_rms) {
             dst_res = dx12_get_resource(fused_rope_after_rms);
         } else if (fused_mul_node) {
@@ -1855,6 +2059,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             dst_res = dx12_get_resource(fused_rope_set_rows);
         } else {
             dst_res = dx12_get_resource(node);
+        }
+
+        // Split-KV: redirect main FA dispatch to write partials to temp buffer
+        if (fa_split_k > 1 && bctx->splitkv_temp) {
+            fa_real_dst_res = dst_res;
+            dst_res = bctx->splitkv_temp.Get();
         }
 
         // Bind resources — cached for slots 1-3, always-bind fallback for slots 4/5
@@ -2086,8 +2296,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             case GGML_OP_FLASH_ATTN_EXT: {
-                // One thread group per query row per head per batch
-                groups_x = (uint32_t)node->src[0]->ne[1]; // N_queries
+                // One thread group per query row per head per batch, multiplied by split_k
+                groups_x = (uint32_t)node->src[0]->ne[1] * fa_split_k; // N_queries * split_k
                 groups_y = (uint32_t)node->src[0]->ne[2]; // n_heads
                 groups_z = (uint32_t)node->src[0]->ne[3]; // batch
                 break;
@@ -2213,9 +2423,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // TDR diagnostic: print every dispatch during first prompt
         if (dx12_diag && is_prompt) {
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
-            fprintf(stderr, "ggml-dx12: dispatch #%d %s(src0t=%d) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
-                    i, ggml_op_name(node->op), src0t, groups_x, groups_y, groups_z,
-                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && fa_split_k > 1) {
+                fprintf(stderr, "ggml-dx12: dispatch #%d FA(split_k=%u) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
+                        i, fa_split_k, groups_x, groups_y, groups_z,
+                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            } else {
+                fprintf(stderr, "ggml-dx12: dispatch #%d %s(src0t=%d) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
+                        i, ggml_op_name(node->op), src0t, groups_x, groups_y, groups_z,
+                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            }
             fflush(stderr);
         }
 
@@ -2229,6 +2445,62 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         bctx->cmd_list->Dispatch(groups_x, groups_y, groups_z);
+
+        // Split-KV reduce pass: merge partial O, M, L into final output
+        if (fa_split_k > 1 && fa_real_dst_res) {
+            // UAV barrier between main FA and reduce
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = nullptr;
+            bctx->cmd_list->ResourceBarrier(1, &barrier);
+
+            // Get/create reduce pipeline
+            dx12_pipeline_key reduce_key = {};
+            reduce_key.op    = GGML_OP_FLASH_ATTN_EXT;
+            reduce_key.flags = 1; // reduce variant
+            dx12_pipeline * reduce_pipeline = bctx->dev->get_or_create_pipeline(reduce_key);
+            if (reduce_pipeline && reduce_pipeline->pso) {
+                bctx->cmd_list->SetPipelineState(reduce_pipeline->pso.Get());
+                bctx->last_pso = reduce_pipeline->pso.Get();
+
+                // Bind temp buffer as src0 (SRV) for reduce shader
+                D3D12_GPU_VIRTUAL_ADDRESS temp_va = bctx->splitkv_temp->GetGPUVirtualAddress();
+                bctx->cmd_list->SetComputeRootShaderResourceView(1, temp_va);
+                bctx->last_src0_va = temp_va;
+
+                // Bind real destination as UAV for reduce output
+                D3D12_GPU_VIRTUAL_ADDRESS real_dst_va = fa_real_dst_res->GetGPUVirtualAddress();
+                bctx->cmd_list->SetComputeRootUnorderedAccessView(3, real_dst_va);
+                bctx->last_dst_va = real_dst_va;
+
+                // Build reduce params: op0=D, op1=ne01, op2=split_k, op3=ne02, op4=ne03, op5=dst_esize
+                dx12_shader_params reduce_params = {};
+                uint32_t D    = (uint32_t)node->src[0]->ne[0];
+                uint32_t ne01 = (uint32_t)node->src[0]->ne[1];
+                uint32_t ne02 = (uint32_t)node->src[0]->ne[2];
+                uint32_t ne03 = (uint32_t)node->src[0]->ne[3];
+
+                // Copy dst layout from original params for final output addressing
+                reduce_params.ne0 = params.ne0; reduce_params.ne1 = params.ne1;
+                reduce_params.ne2 = params.ne2; reduce_params.ne3 = params.ne3;
+                reduce_params.nb0 = params.nb0; reduce_params.nb1 = params.nb1;
+                reduce_params.nb2 = params.nb2; reduce_params.nb3 = params.nb3;
+                reduce_params.dst_offset = params.dst_offset;
+                reduce_params.dst_esize  = params.dst_esize;
+
+                reduce_params.op_params[0] = D;
+                reduce_params.op_params[1] = ne01;
+                reduce_params.op_params[2] = fa_split_k;
+                reduce_params.op_params[3] = ne02;
+                reduce_params.op_params[4] = ne03;
+                reduce_params.op_params[5] = params.dst_esize;
+
+                bctx->cmd_list->SetComputeRoot32BitConstants(0, (uint32_t)(sizeof(reduce_params) / 4), &reduce_params, 0);
+
+                // Dispatch reduce: one group per (query, head, batch)
+                bctx->cmd_list->Dispatch(ne01, ne02, ne03);
+            }
+        }
 
         // GLU diagnostic: read back first few values of src0, src1, dst after first GLU dispatch
         if (dx12_diag && node->op == GGML_OP_GLU) {
@@ -3421,6 +3693,10 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     } else if (key.op == GGML_OP_GET_ROWS && key.src0_type == GGML_TYPE_Q8_1) {
         static const dx12_shader_blob q81_gr_blob = { g_get_rows_q8_1_dxil, sizeof(g_get_rows_q8_1_dxil) };
         blob = &q81_gr_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 1) {
+        // Split-KV reduce shader
+        static const dx12_shader_blob reduce_blob = { g_flash_attn_reduce_dxil, sizeof(g_flash_attn_reduce_dxil) };
+        blob = &reduce_blob;
     } else {
         auto sit = g_shader_blobs.find((int)key.op);
         if (sit != g_shader_blobs.end()) {
