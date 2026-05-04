@@ -213,6 +213,12 @@ bool llm_initialize(
 
 #endif // GGML_USE_CUDA
 
+    // GPU adapter and split mode selection
+    model_params.main_gpu = params.main_gpu;
+    if (params.split_mode >= 0) {
+        model_params.split_mode = (enum llama_split_mode)params.split_mode;
+    }
+
     llm_model = llama_model_load_from_file(params.model_name.c_str(), model_params);
     if (llm_model == NULL) {
         printf("%s: error: unable to load model\n" , __func__);
@@ -921,6 +927,12 @@ bool embed_initialize(
     model_params.n_gpu_layers = 0;
 
 #endif // GGML_USE_CUDA
+
+    // GPU adapter and split mode selection
+    model_params.main_gpu = params.main_gpu;
+    if (params.split_mode >= 0) {
+        model_params.split_mode = (enum llama_split_mode)params.split_mode;
+    }
 
     embed_model = llama_model_load_from_file(params.model_name.c_str(), model_params);
     if (embed_model == NULL) {

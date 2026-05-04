@@ -830,6 +830,7 @@ int main(int argc, char** argv) {
         printf("\n");
         printf("  Options: verbose|v1|v2  pfc  paffin  stream  cpu\n");
         printf("           add-special  parse-special  template=<file>\n");
+        printf("           -d N (GPU device index)  -sm none|layer|row\n");
         return 1;
     }
 
@@ -879,6 +880,13 @@ int main(int argc, char** argv) {
             params.parse_special = true;
         } else if (arg == "cpu") {
             params.force_cpu_mode = true;
+        } else if (arg == "-d" && i + 1 < argc) {
+            params.main_gpu = std::stoi(argv[++i]);
+        } else if (arg == "-sm" && i + 1 < argc) {
+            std::string sm = argv[++i];
+            if (sm == "none")       params.split_mode = 0;
+            else if (sm == "layer") params.split_mode = 1;
+            else if (sm == "row")   params.split_mode = 2;
         } else if (arg.substr(0, 9) == "template=") {
             template_file = arg.substr(9);
         }

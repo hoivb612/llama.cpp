@@ -50,6 +50,8 @@ struct model_params {
     int verbose                        = 0;
     int streaming_reply                = 0; // streaming mode instead of full reply at once
     int force_cpu_mode                 = 0; // true to force CPU mode even when GPU is available
+    int32_t main_gpu                   = 0; // GPU device index (0, 1, ...) — selects adapter
+    int32_t split_mode                 = -1; // -1=default, 0=none (single GPU), 1=layer, 2=row
 
     std::string custom_p_file          = "custom_prompts.txt";  // custom prompts input file
     std::string custom_template_prompt = "";
