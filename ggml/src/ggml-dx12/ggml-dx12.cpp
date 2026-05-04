@@ -228,6 +228,10 @@ struct dx12_device {
 
     bool cooperative_vector_supported = false;
 
+    // UMA (Unified Memory Architecture) — APU/integrated GPU
+    bool is_uma = false;
+    bool is_cache_coherent_uma = false;
+
     // WaveMMA (SM 6.9 Wave Matrix) support
     bool wave_mma_supported = false;
     uint32_t wave_mma_K      = 0;     // hardware K dimension (even multiple of 16)
@@ -381,6 +385,10 @@ struct dx12_backend_context {
     size_t                 upload_staging_size   = 0;
     ComPtr<ID3D12Resource> readback_staging;
     size_t                 readback_staging_size = 0;
+
+    // Split-KV flash attention temp buffer
+    ComPtr<ID3D12Resource> splitkv_temp;
+    size_t                 splitkv_temp_size = 0;
 
     bool cmd_list_open = false;
 
@@ -840,9 +848,45 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
         }
     }
 
+    // Query UMA (Unified Memory Architecture) — APU/integrated GPU zero-copy path
+    {
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch1 = {};
+        HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch1, sizeof(arch1));
+        if (SUCCEEDED(hr2)) {
+            is_uma = (arch1.UMA != FALSE);
+            is_cache_coherent_uma = (arch1.CacheCoherentUMA != FALSE);
+        } else {
+            // Fallback: D3D12_FEATURE_ARCHITECTURE (no CacheCoherent field)
+            D3D12_FEATURE_DATA_ARCHITECTURE arch0 = {};
+            hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch0, sizeof(arch0));
+            if (SUCCEEDED(hr2)) {
+                is_uma = (arch0.UMA != FALSE);
+                is_cache_coherent_uma = (arch0.CacheCoherentUMA != FALSE);
+            }
+        }
+    }
+
+    // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
+    // Report SharedSystemMemory so the model loader puts all layers on GPU.
+    if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
+#ifdef _WIN32
+        size_t shared = adapter_desc.SharedSystemMemory;
+#else
+        size_t shared = 0;
+        adapter->GetProperty(DXCoreAdapterProperty::SharedSystemMemory, sizeof(shared), &shared);
+#endif
+        if (shared > vram_total) {
+            DX12_LOG_INFO("UMA detected: expanding VRAM from %.1f GB to %.1f GB (shared system memory)\n",
+                          (double)vram_total / (1024.0 * 1024.0 * 1024.0),
+                          (double)shared / (1024.0 * 1024.0 * 1024.0));
+            vram_total = shared;
+            vram_free  = shared;
+        }
+    }
+
     create_common_root_signature();
 
-    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, Wave: %u-%u, CV: %s, WaveMMA: %s%s)\n",
+    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, Wave: %u-%u, CV: %s, WaveMMA: %s%s, UMA: %s)\n",
                   idx, name.c_str(), description.c_str(),
                   (double)vram_total / (1024.0 * 1024.0 * 1024.0),
                   wave_lane_min, wave_lane_max,
@@ -850,7 +894,8 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
                   wave_mma_supported ? "yes" : "no",
                   wave_mma_supported ? (std::string(" K=") + std::to_string(wave_mma_K) +
                                         " wave=" + std::to_string(wave_mma_wave_size) +
-                                        (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "");
+                                        (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "",
+                  is_uma ? (is_cache_coherent_uma ? "CC" : "yes") : "no");
 }
 
 void dx12_device::create_common_root_signature() {
@@ -1051,7 +1096,18 @@ void dx12_backend_context::ensure_staging(size_t upload_size, size_t readback_si
 static ComPtr<ID3D12Resource> dx12_create_buffer(dx12_device * dev, size_t size,
                                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    if (dev->is_uma) {
+        // UMA: use custom heap that is both CPU-writable and GPU-accessible with UAV.
+        // This avoids the upload→copy pipeline entirely — zero-copy for weights.
+        hp.Type                 = D3D12_HEAP_TYPE_CUSTOM;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        hp.CPUPageProperty      = dev->is_cache_coherent_uma
+                                    ? D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+                                    : D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+    } else {
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    }
 
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1101,7 +1157,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     auto * ctx = new dx12_buffer_context();
     ctx->dev       = dev;
     ctx->size      = size;
-    ctx->heap_type = D3D12_HEAP_TYPE_DEFAULT;
+    ctx->heap_type = dev->is_uma ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
 
     if (size > 0) {
         ctx->resource = dx12_create_buffer(dev, size);
@@ -1131,6 +1187,20 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             auto * ctx = (dx12_buffer_context *)buffer->context;
             if (size == 0) return;
 
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // UMA zero-copy: direct memset
+            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                void * mapped = nullptr;
+                D3D12_RANGE read_range = { 0, 0 };
+                HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
+                DX12_CHECK(hr, "Map(UMA memset)");
+                memset((uint8_t *)mapped + tensor_offset, value, size);
+                D3D12_RANGE written = { tensor_offset, tensor_offset + size };
+                ctx->resource->Unmap(0, &written);
+                return;
+            }
+
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait();
             ctx->dev->xfer_ensure_staging(size, 0);
@@ -1147,7 +1217,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
             DX12_CHECK(hr, "xfer cmd_list Reset(memset)");
 
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
             ctx->dev->xfer.cmd_list->CopyBufferRegion(ctx->resource.Get(), tensor_offset,
                                                        ctx->dev->xfer.upload_staging.Get(), 0, size);
             ctx->dev->xfer.cmd_list->Close();
@@ -1164,6 +1233,20 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             if (size == 0) return;
 
             g_tls_device = ctx->dev->device.Get();
+
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // UMA zero-copy: buffer is CPU-writable, write directly
+            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                void * mapped = nullptr;
+                D3D12_RANGE read_range = { 0, 0 };
+                HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
+                DX12_CHECK(hr, "Map(UMA set_tensor)");
+                memcpy((uint8_t *)mapped + tensor_offset, data, size);
+                D3D12_RANGE written = { tensor_offset, tensor_offset + size };
+                ctx->resource->Unmap(0, &written);
+                return;
+            }
             
             // CRITICAL: Ensure compute command list is closed before transfer
             // The scheduler may call set_tensor between graph splits
@@ -1187,7 +1270,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
             DX12_CHECK(hr, "xfer cmd_list Reset");
 
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
             ctx->dev->xfer.cmd_list->CopyBufferRegion(ctx->resource.Get(), tensor_offset,
                                                        ctx->dev->xfer.upload_staging.Get(), 0, size);
             ctx->dev->xfer.cmd_list->Close();
@@ -1204,11 +1286,24 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             if (size == 0) return;
 
             g_tls_device = ctx->dev->device.Get();
+
+            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+            // UMA zero-copy: buffer is CPU-readable (WRITE_BACK) or slow-read (WRITE_COMBINE)
+            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                void * mapped = nullptr;
+                D3D12_RANGE read_range = { tensor_offset, tensor_offset + size };
+                HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
+                DX12_CHECK(hr, "Map(UMA get_tensor)");
+                memcpy(data, (const uint8_t *)mapped + tensor_offset, size);
+                D3D12_RANGE written = { 0, 0 };
+                ctx->resource->Unmap(0, &written);
+                return;
+            }
+
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait(); // wait for any previous transfer
             ctx->dev->xfer_ensure_staging(0, size);
-
-            size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
 
             // Always check if device is already dead before attempting copy
             {
@@ -1979,6 +2074,111 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.dst_esize = (uint32_t)ggml_type_size(fused_rope_set_rows->type);
         }
 
+        // Split-KV flash attention: precompute split_k before params are pushed
+        uint32_t fa_split_k = 1;
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            static int splitk_env = -1;
+            if (splitk_env == -1) {
+                const char * env = getenv("GGML_DX12_SPLIT_K");
+                splitk_env = env ? atoi(env) : 0;  // 0 = auto
+            }
+
+            uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
+            uint32_t N_kv      = (uint32_t)node->src[1]->ne[1];
+            uint32_t n_heads   = (uint32_t)node->src[0]->ne[2];
+            uint32_t batch     = (uint32_t)node->src[0]->ne[3];
+
+            if (N_queries == 1 && N_kv >= 512) {
+                if (splitk_env > 1) {
+                    fa_split_k = (uint32_t)splitk_env;
+                    // Still cap to avoid too many empty splits (wastes temp memory)
+                    uint32_t max_split = (N_kv + 255) / 256;
+                    if (fa_split_k > max_split) fa_split_k = max_split;
+                    if (fa_split_k < 2) fa_split_k = 1;
+                } else {
+                    // Auto split-KV heuristic: target ~64 total thread groups.
+                    //
+                    // Why 64: DX12 has no standard API to query CU/SM count (unlike
+                    // Vulkan which uses shader_core_count * 2 / total_workgroups).
+                    // 64 is a conservative target that provides good occupancy across:
+                    //   - APU/iGPU (16 CUs): 64 groups ≈ 4 waves/CU → near-full occupancy
+                    //   - Mid-range (32-48 CUs): reasonable saturation
+                    //   - High-end (96+ CUs): still helpful, could benefit from higher target
+                    //
+                    // Future optimization: derive target from GPU CU count via
+                    // DXGI_ADAPTER_DESC3, DXCore properties, or autotune probing.
+                    //
+                    // Formula: split_k = ceil(64 / (n_heads * batch)), capped so each
+                    // split processes at least 256 KV tokens (one TILE_KV).
+                    /*
+                      Auto selects based on: split_k = ceil(64 / (n_heads × batch)) then capped by ceil(N_kv / 256).
+
+                      For decode (N_queries=1) and for example with a 540-token prompt (max_split = ceil(540/256) = 3):
+
+                      ┌────────────────────┬─────────┬───────────────┬──────────┬──────────────┐
+                      │ Model              │ Q Heads │ Formula       │ Capped   │ Auto split_k │
+                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
+                      │ Phi-3              │ 32      │ ceil(64/32)=2 │ min(2,3) │ 2            │
+                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
+                      │ Gemma-4 (8 heads)  │ 8       │ ceil(64/8)=8  │ min(8,3) │ 3            │
+                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
+                      │ Gemma-4 (16 heads) │ 16      │ ceil(64/16)=4 │ min(4,3) │ 3            │
+                      └────────────────────┴─────────┴───────────────┴──────────┴──────────────┘
+
+                      The goal is ~64 total thread groups to fill the GPU. As context grows (N_kv increases), 
+                      the cap loosens — e.g., at 2048 tokens, max_split=8.
+                    */
+                    uint32_t total_wgs = N_queries * n_heads * batch;
+                    if (total_wgs < 64) {
+                        fa_split_k = (64 + total_wgs - 1) / total_wgs;
+                        uint32_t max_split = (N_kv + 255) / 256;
+                        if (fa_split_k > max_split) fa_split_k = max_split;
+                        if (fa_split_k < 2) fa_split_k = 1;
+                    }
+                }
+            }
+
+            if (fa_split_k > 1) {
+                // Allocate/grow temp buffer for partial results
+                uint32_t D    = (uint32_t)node->src[0]->ne[0];
+                uint32_t ne01 = N_queries;
+                uint32_t ne02 = n_heads;
+                uint32_t ne03 = batch;
+                size_t o_size  = (size_t)D * ne01 * fa_split_k * ne02 * ne03 * sizeof(float);
+                size_t ml_size = (size_t)ne01 * fa_split_k * ne02 * ne03 * sizeof(float);
+                size_t temp_size = o_size + 2 * ml_size;
+                temp_size = (temp_size + 255) & ~255;
+
+                if (temp_size > bctx->splitkv_temp_size) {
+                    D3D12_HEAP_PROPERTIES hp = {};
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = {};
+                    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    rd.Width     = temp_size;
+                    rd.Height    = 1;
+                    rd.DepthOrArraySize = 1;
+                    rd.MipLevels = 1;
+                    rd.SampleDesc.Count = 1;
+                    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    rd.Flags  = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+                    bctx->splitkv_temp.Reset();
+                    HRESULT hr = bctx->dev->device->CreateCommittedResource(
+                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                        IID_PPV_ARGS(&bctx->splitkv_temp));
+                    if (FAILED(hr)) {
+                        DX12_LOG_WARN("Failed to allocate split-KV temp buffer (%zu bytes)\n", temp_size);
+                        fa_split_k = 1;
+                    } else {
+                        bctx->splitkv_temp_size = temp_size;
+                    }
+                }
+            }
+
+            params.op_params[15] = fa_split_k;
+        }
+
         // Upload root constants — only upload op_params for ops that need them
         static constexpr uint32_t BASE_PARAMS = 30;  // ne/nb/offsets/esizes = 30 DWORDs
         bool needs_op_params = (node->op == GGML_OP_SOFT_MAX || 
@@ -2005,6 +2205,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             src1_res = dx12_get_resource(node->src[1]);
         }
         ID3D12Resource * dst_res;
+        ID3D12Resource * fa_real_dst_res = nullptr;  // saved for split-KV reduce pass
         if (fused_rope_after_rms) {
             dst_res = dx12_get_resource(fused_rope_after_rms);
         } else if (fused_mul_node) {
@@ -2015,6 +2216,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             dst_res = dx12_get_resource(fused_rope_set_rows);
         } else {
             dst_res = dx12_get_resource(node);
+        }
+
+        // Split-KV: redirect main FA dispatch to write partials to temp buffer
+        if (fa_split_k > 1 && bctx->splitkv_temp) {
+            fa_real_dst_res = dst_res;
+            dst_res = bctx->splitkv_temp.Get();
         }
 
         // Bind resources — cached for slots 1-3, always-bind fallback for slots 4/5
@@ -2246,8 +2453,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             case GGML_OP_FLASH_ATTN_EXT: {
-                // One thread group per query row per head per batch
-                groups_x = (uint32_t)node->src[0]->ne[1]; // N_queries
+                // groups_x encodes query_idx * split_k + split_k_index (split_k precomputed above)
+                uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
+                groups_x = N_queries * fa_split_k;
                 groups_y = (uint32_t)node->src[0]->ne[2]; // n_heads
                 groups_z = (uint32_t)node->src[0]->ne[3]; // batch
                 break;
@@ -2377,9 +2585,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // TDR diagnostic: print every dispatch during first prompt
         if (dx12_diag && is_prompt) {
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
-            fprintf(stderr, "ggml-dx12: dispatch #%d %s(src0t=%d) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
-                    i, ggml_op_name(node->op), src0t, groups_x, groups_y, groups_z,
-                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && fa_split_k > 1) {
+                fprintf(stderr, "ggml-dx12: dispatch #%d FA(split_k=%u) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
+                        i, fa_split_k, groups_x, groups_y, groups_z,
+                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            } else {
+                fprintf(stderr, "ggml-dx12: dispatch #%d %s(src0t=%d) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
+                        i, ggml_op_name(node->op), src0t, groups_x, groups_y, groups_z,
+                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
+            }
             fflush(stderr);
         }
 
@@ -2393,6 +2607,63 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         bctx->cmd_list->Dispatch(groups_x, groups_y, groups_z);
+
+        // Split-KV reduce pass: merge partial O, M, L into final output
+        if (fa_split_k > 1 && fa_real_dst_res) {
+            // UAV barrier between main FA and reduce
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = nullptr;
+            bctx->cmd_list->ResourceBarrier(1, &barrier);
+
+            // Get/create reduce pipeline
+            dx12_pipeline_key reduce_key = {};
+            reduce_key.op    = GGML_OP_FLASH_ATTN_EXT;
+            reduce_key.flags = 1; // reduce variant
+            dx12_pipeline * reduce_pipeline = bctx->dev->get_or_create_pipeline(reduce_key);
+            if (reduce_pipeline && reduce_pipeline->pso) {
+                bctx->cmd_list->SetPipelineState(reduce_pipeline->pso.Get());
+                bctx->last_pso = reduce_pipeline->pso.Get();
+
+                // Bind temp buffer as src0 (SRV) for reduce shader
+                D3D12_GPU_VIRTUAL_ADDRESS temp_va = bctx->splitkv_temp->GetGPUVirtualAddress();
+                bctx->cmd_list->SetComputeRootShaderResourceView(1, temp_va);
+                bctx->last_src0_va = temp_va;
+
+                // Bind real destination as UAV for reduce output
+                D3D12_GPU_VIRTUAL_ADDRESS real_dst_va = fa_real_dst_res->GetGPUVirtualAddress();
+                bctx->cmd_list->SetComputeRootUnorderedAccessView(3, real_dst_va);
+                bctx->last_dst_va = real_dst_va;
+
+                // Build reduce params: op0=D, op1=ne01, op2=split_k, op3=ne02, op4=ne03, op5=dst_esize
+                dx12_shader_params reduce_params = {};
+                uint32_t D    = (uint32_t)node->src[0]->ne[0];
+                uint32_t ne01 = (uint32_t)node->src[0]->ne[1];
+                uint32_t ne02 = (uint32_t)node->src[0]->ne[2];
+                uint32_t ne03 = (uint32_t)node->src[0]->ne[3];
+
+                // Copy dst layout from original params for final output addressing
+                reduce_params.ne0 = params.ne0; reduce_params.ne1 = params.ne1;
+                reduce_params.ne2 = params.ne2; reduce_params.ne3 = params.ne3;
+                reduce_params.nb0 = params.nb0; reduce_params.nb1 = params.nb1;
+                reduce_params.nb2 = params.nb2; reduce_params.nb3 = params.nb3;
+                reduce_params.dst_offset = params.dst_offset;
+                reduce_params.dst_esize  = params.dst_esize;
+
+                reduce_params.op_params[0] = D;
+                reduce_params.op_params[1] = ne01;
+                reduce_params.op_params[2] = fa_split_k;
+                reduce_params.op_params[3] = ne02;
+                reduce_params.op_params[4] = ne03;
+                reduce_params.op_params[5] = params.dst_esize;
+
+                bctx->cmd_list->SetComputeRoot32BitConstants(0, (uint32_t)(sizeof(reduce_params) / 4), &reduce_params, 0);
+
+                // Dispatch reduce: one group per (query, head, batch)
+                // REDUCE_GROUP_SIZE=256, each thread handles D/256 dimensions
+                bctx->cmd_list->Dispatch(ne01, ne02, ne03);
+            }
+        }
 
         // GLU diagnostic: read back first few values of src0, src1, dst after first GLU dispatch
         if (dx12_diag && node->op == GGML_OP_GLU) {
@@ -3458,6 +3729,10 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         // Fused ROPE + VIEW + SET_ROWS
         static const dx12_shader_blob fused_blob = { g_rope_set_rows_dxil, sizeof(g_rope_set_rows_dxil) };
         blob = &fused_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 1) {
+        // Split-KV reduce shader
+        static const dx12_shader_blob reduce_blob = { g_flash_attn_reduce_dxil, sizeof(g_flash_attn_reduce_dxil) };
+        blob = &reduce_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 4) {
         // Register-blocked tiled batch MUL_MAT (M > 1)
         if (key.src0_type == GGML_TYPE_Q4_K) {

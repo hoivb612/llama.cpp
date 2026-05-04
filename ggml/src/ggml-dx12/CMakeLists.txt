@@ -144,6 +144,7 @@ set(DX12_SHADERS
     sum_rows
     dequant_q4_k
     flash_attn
+    flash_attn_reduce
     set_rows
     rope_set_rows
     mul_mat_q2k

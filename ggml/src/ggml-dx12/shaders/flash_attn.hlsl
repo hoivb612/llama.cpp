@@ -7,6 +7,7 @@
 //   op4: src2_nb3       op5: src2_esize  op6: scale(f32)  op7: n_kv_heads
 //   op8: has_mask       op9: mask_offset op10: mask_nb1   op11: mask_nb2
 //   op12: mask_nb3      op13: mask_ne2   op14: mask_ne3
+//   op15: split_k (0 or 1 = no split, >1 = number of KV splits)
 
 #include "ggml_common.hlsli"
 
@@ -25,7 +26,19 @@ float load_f16_mask(uint byte_offset) {
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint local_id = gtid.x;
-    uint query_idx = gid.x;
+
+    uint  split_k = op15;
+    uint  split_k_index = 0;
+    uint  query_idx;
+
+    if (split_k > 1) {
+        // X dimension encodes: query_idx * split_k + split_k_index
+        query_idx     = gid.x / split_k;
+        split_k_index = gid.x % split_k;
+    } else {
+        query_idx = gid.x;
+    }
+
     uint head_idx  = gid.y;
     uint batch_idx = gid.z;
 
@@ -52,6 +65,40 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint N_kv = ne11;
     uint kv_head = head_idx * n_kv_heads / ne02;
 
+    // Split-KV: compute this split's KV range
+    uint kv_start = 0;
+    uint kv_end   = N_kv;
+    if (split_k > 1) {
+        uint split_kv = (N_kv + split_k - 1) / split_k;
+        // Align to TILE_KV for efficient tiling
+        split_kv = ((split_kv + TILE_KV - 1) / TILE_KV) * TILE_KV;
+        kv_start = split_k_index * split_kv;
+        kv_end   = min(kv_start + split_kv, N_kv);
+        if (kv_start >= N_kv) {
+            // Empty split: write sentinel values so reduce shader sees valid data
+            // (exp(-FLT_MAX - m_max) ≈ 0, so this split contributes nothing)
+            uint hb_index = head_idx + ne02 * batch_idx;
+            uint o_stride = D * ne01;
+            uint total_o  = o_stride * split_k * ne02 * ne03;
+            uint ml_stride_val = ne01;
+
+            for (uint ai = 0; ai < 4; ai++) {
+                uint d_out = local_id + ai * GROUP_SIZE;
+                if (d_out < D) {
+                    uint o_off = (hb_index * split_k * o_stride + split_k_index * o_stride + query_idx * D + d_out) * 4;
+                    dst.Store(o_off, asuint(0.0f));
+                }
+            }
+            if (local_id == 0) {
+                uint m_off = (total_o + hb_index * split_k * ml_stride_val + split_k_index * ml_stride_val + query_idx) * 4;
+                uint l_off = (total_o + (ne02 * ne03 + hb_index) * split_k * ml_stride_val + split_k_index * ml_stride_val + query_idx) * 4;
+                dst.Store(m_off, asuint(-3.402823466e+38f)); // M = -FLT_MAX
+                dst.Store(l_off, asuint(0.0f));              // L = 0
+            }
+            return;
+        }
+    }
+
     uint mask_base = 0;
     if (has_mask) {
         mask_base = mask_off
@@ -70,8 +117,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     // Use array for flexibility with different D values
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
-    for (uint tile_start = 0; tile_start < N_kv; tile_start += TILE_KV) {
-        uint tile_end = min(tile_start + TILE_KV, N_kv);
+    for (uint tile_start = kv_start; tile_start < kv_end; tile_start += TILE_KV) {
+        uint tile_end = min(tile_start + TILE_KV, kv_end);
         uint tile_size = tile_end - tile_start;
 
         // Pass 1: Each thread computes one Q·K dot product
@@ -172,7 +219,34 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Write output
+    if (split_k > 1) {
+        // Split-KV: write partial results to temp buffer (dst)
+        // Layout: [O: D × ne01 × split_k × ne02 × ne03] [M: ne01 × split_k × ne02 × ne03] [L: same]
+        uint hb_index = head_idx + ne02 * batch_idx;
+        uint o_stride = D * ne01;
+        uint total_o  = o_stride * split_k * ne02 * ne03;
+        uint ml_stride_val = ne01;
+
+        // Write O partial (un-normalized: acc contains sum of exp(s-m)*v)
+        for (uint ai = 0; ai < 4; ai++) {
+            uint d_out = local_id + ai * GROUP_SIZE;
+            if (d_out < D) {
+                uint o_off = (hb_index * split_k * o_stride + split_k_index * o_stride + query_idx * D + d_out) * 4;
+                dst.Store(o_off, asuint(acc[ai]));
+            }
+        }
+
+        // Write M and L (one per query row per split) — only thread 0
+        if (local_id == 0) {
+            uint m_off = (total_o + hb_index * split_k * ml_stride_val + split_k_index * ml_stride_val + query_idx) * 4;
+            uint l_off = (total_o + (ne02 * ne03 + hb_index) * split_k * ml_stride_val + split_k_index * ml_stride_val + query_idx) * 4;
+            dst.Store(m_off, asuint(global_max));
+            dst.Store(l_off, asuint(global_sum));
+        }
+        return;
+    }
+
+    // Write final output (no split)
     float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
     for (uint ai = 0; ai < 4; ai++) {
         uint d_out = local_id + ai * GROUP_SIZE;
