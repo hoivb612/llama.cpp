@@ -2899,6 +2899,13 @@ void dx12_device::run_autotune() {
     if (tuning_done) return;
     tuning_done = true;
 
+#ifndef _WIN32
+    // WSL2: timestamp queries and benchmark dispatches can hang on some
+    // GPU-PV configurations.  Use safe defaults instead of benchmarking.
+    DX12_LOG_INFO("Auto-tune: skipped on WSL2 (using defaults)\n");
+    return;
+#endif
+
     // Check for cache file first
     char cache_path[512];
 #ifdef _WIN32
