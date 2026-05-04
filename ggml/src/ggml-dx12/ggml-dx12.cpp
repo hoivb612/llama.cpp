@@ -86,6 +86,10 @@ static inline void   dx12_wait_event(HANDLE h, DWORD ms) { WaitForSingleObject(h
 // Sentinel base address for non-host-accessible GPU buffers (matches Vulkan approach)
 static void * const DX12_PTR_BASE = (void *)(uintptr_t)0x1000;
 
+// Safe mode: single allocator, sync after every CL, no binding cache.
+// Enabled via GGML_DX12_SAFE_MODE=1 env var. Useful for debugging WSL2 issues.
+static bool dx12_safe_mode = false;
+
 static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
     return (uint8_t *)tensor->data - (uint8_t *)DX12_PTR_BASE;
 }
@@ -459,6 +463,12 @@ static void dx12_ensure_initialized() {
     std::lock_guard<std::mutex> lock(g_dx12.init_mutex);
     if (g_dx12.initialized) return;
 
+    // Check safe mode
+    dx12_safe_mode = (getenv("GGML_DX12_SAFE_MODE") != nullptr);
+    if (dx12_safe_mode) {
+        DX12_LOG_INFO("Safe mode enabled (single allocator, sync after every CL)\n");
+    }
+
     // Enable debug layer when DX12_DEBUG env var is set
     if (getenv("DX12_DEBUG")) {
         ComPtr<ID3D12Debug> debug;
@@ -814,11 +824,28 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
         }
     }
 
+    // Query wave lane count (D3D12_FEATURE_D3D12_OPTIONS1)
+    uint32_t wave_lane_min = 0, wave_lane_max = 0;
+    {
+        struct {
+            BOOL WaveOps;
+            UINT WaveLaneCountMin;
+            UINT WaveLaneCountMax;
+            UINT TotalLaneCount;
+        } opts1 = {};
+        HRESULT hr2 = device->CheckFeatureSupport((D3D12_FEATURE)8, &opts1, sizeof(opts1));
+        if (SUCCEEDED(hr2)) {
+            wave_lane_min = opts1.WaveLaneCountMin;
+            wave_lane_max = opts1.WaveLaneCountMax;
+        }
+    }
+
     create_common_root_signature();
 
-    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, CV: %s, WaveMMA: %s%s)\n",
+    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, Wave: %u-%u, CV: %s, WaveMMA: %s%s)\n",
                   idx, name.c_str(), description.c_str(),
                   (double)vram_total / (1024.0 * 1024.0 * 1024.0),
+                  wave_lane_min, wave_lane_max,
                   cooperative_vector_supported ? "yes" : "no",
                   wave_mma_supported ? "yes" : "no",
                   wave_mma_supported ? (std::string(" K=") + std::to_string(wave_mma_K) +
@@ -900,9 +927,11 @@ void dx12_device::create_common_root_signature() {
 void dx12_backend_context::ensure_cmd_list_open() {
     if (cmd_list_open) return;
 
-    // Pick the next allocator in the ring
-    int slot = cmd_ring_head;
-    cmd_ring_head = (cmd_ring_head + 1) % CMD_RING_SIZE;
+    // Pick the next allocator in the ring (safe mode: always use slot 0)
+    int slot = dx12_safe_mode ? 0 : cmd_ring_head;
+    if (!dx12_safe_mode) {
+        cmd_ring_head = (cmd_ring_head + 1) % CMD_RING_SIZE;
+    }
 
     // Only wait if THIS allocator's previous submission hasn't finished
     // Other allocators may still be in-flight — that's fine
@@ -943,10 +972,15 @@ void dx12_backend_context::close_and_execute() {
     DX12_CHECK(hr, "Signal fence");
 
     // Record which fence value this allocator was submitted with
-    int submitted_slot = (cmd_ring_head + CMD_RING_SIZE - 1) % CMD_RING_SIZE;
+    int submitted_slot = dx12_safe_mode ? 0 : (cmd_ring_head + CMD_RING_SIZE - 1) % CMD_RING_SIZE;
     cmd_alloc_fence[submitted_slot] = fence_value;
 
     cmd_list_open = false;
+
+    // Safe mode: force full GPU sync after every submission
+    if (dx12_safe_mode) {
+        wait_for_gpu();
+    }
 }
 
 void dx12_backend_context::wait_for_fence(uint64_t value) {
