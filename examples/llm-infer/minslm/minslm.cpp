@@ -497,6 +497,16 @@ int main(int argc, char** argv) {
             // only meaningful for GGML_CUDA or GGML_VULKAN builds
             params.force_cpu_mode = true;
 
+        } else if (!strcmp(argv[4], "-d") && argc >= 6) {
+            params.main_gpu = atoi(argv[5]);
+            argv += 1; argc -= 1;
+
+        } else if (!strcmp(argv[4], "-sm") && argc >= 6) {
+            if (!strcmp(argv[5], "none"))       params.split_mode = 0;
+            else if (!strcmp(argv[5], "layer")) params.split_mode = 1;
+            else if (!strcmp(argv[5], "row"))   params.split_mode = 2;
+            argv += 1; argc -= 1;
+
         } else if (!strcmp(argv[4], "chat-auto")) {
             use_auto_chat_template = true;
         }
