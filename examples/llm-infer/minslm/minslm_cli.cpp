@@ -7,6 +7,7 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -209,7 +210,15 @@ int main(int argc, char ** argv) {
 
     printf("\n[%s]: n_ctx = %d, n_threads = %d, gpu_layers = %d\n",
            __func__, llama_n_ctx(ctx), p.n_threads, model_params.n_gpu_layers);
-    printf("[%s]: system_info: %s\n\n", __func__, llama_print_system_info());
+    printf("[%s]: system_info: %s\n", __func__, llama_print_system_info());
+
+    // Re-enable logging briefly for memory breakdown, then suppress again
+    llama_log_set(nullptr, nullptr);
+    llama_memory_breakdown_print(ctx);
+    if (p.verbose < 2) {
+        llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+    }
+    printf("\n");
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
