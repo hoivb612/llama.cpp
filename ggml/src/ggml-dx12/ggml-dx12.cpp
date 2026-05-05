@@ -266,6 +266,9 @@ struct dx12_device {
     bool q8_0_use_256 = false;  // Q8_0 matvec: true=256 threads, false=32 threads
     bool q6k_use_32   = false;  // Q6_K matvec: true=32 threads, false=256 threads (default=256)
     bool f16_use_load4 = false; // F16 matvec: true=Load4 variant, false=Load2 (default)
+    bool q4k_use_32   = false;  // Q4_K matvec: true=32t wave-only, false=256t (UMA optimization)
+    bool q5k_use_mr   = false;  // Q5_K matvec: true=multi-row (2 rows/group), false=single-row
+    bool q6k_use_mr   = false;  // Q6_K matvec: true=multi-row (2 rows/group), false=single-row
 
     void run_autotune();
 
@@ -1983,8 +1986,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q5_0 ||
                 t == GGML_TYPE_Q8_0) {
                 key.flags = 1;
-                // Multi-row matvec for Q4_K (2 rows per group, halves activation traffic)
-                if (t == GGML_TYPE_Q4_K) key.flags = 2;
+                // Multi-row matvec (2 rows per group, halves activation traffic)
+                if (t == GGML_TYPE_Q4_K) {
+                    if (bctx->dev->q4k_use_32) key.flags = 6;  // 32t wave-only
+                    else key.flags = 2;  // multi-row 256t (default)
+                }
+                if (t == GGML_TYPE_Q5_K && bctx->dev->q5k_use_mr) key.flags = 2;
+                if (t == GGML_TYPE_Q6_K && bctx->dev->q6k_use_mr) key.flags = 2;
                 // Auto-tuning: use alternate variant if benchmarked as faster
                 if (t == GGML_TYPE_Q5_0 && bctx->dev->q5_0_use_256) key.flags = 5;
                 if (t == GGML_TYPE_Q8_0 && bctx->dev->q8_0_use_256) key.flags = 5;
@@ -2432,6 +2440,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         // Multi-row: 2 rows per thread group
                         groups_x = (N + 1) / 2;
                     } else {
+                        // flags==1 (standard), flags==5 (auto-tune alt), flags==6 (32t wave-only)
                         groups_x = N;
                     }
                     // D3D12 dispatch limit: 65535 per axis
@@ -3224,28 +3233,10 @@ void dx12_device::run_autotune() {
     return;
 #endif
 
-    // UMA fast-path: wave-only (32t) variants are universally better on UMA systems.
-    // No barriers, higher occupancy (51.2 vs 6.4 groups/CU), matches LPDDR bandwidth profile.
-    if (is_uma) {
-        q5_0_use_256  = false;   // 32t wave-only reduction
-        q8_0_use_256  = false;   // 32t wave-only reduction
-        q6k_use_32    = true;    // 32t wave-only reduction
-        f16_use_load4 = false;   // load2 sufficient for shared-memory bandwidth
-        DX12_LOG_INFO("Auto-tune v%d UMA: Q5_0=32t Q8_0=32t Q6_K=32t F16=load2 (skip benchmark)\n", TUNE_VERSION);
-        return;
-    }
-
-    // Check for cache file first
+    // Check for cache file in current directory (easy to verify/delete)
     char cache_path[512];
-#ifdef _WIN32
-    snprintf(cache_path, sizeof(cache_path), "%s/.ggml_dx12_tune_%04X_%04X.txt",
-             getenv("LOCALAPPDATA") ? getenv("LOCALAPPDATA") : ".",
+    snprintf(cache_path, sizeof(cache_path), ".ggml_dx12_tune_%04X_%04X.txt",
              vendor_id, device_id);
-#else
-    snprintf(cache_path, sizeof(cache_path), "%s/.ggml_dx12_tune_%04X_%04X.txt",
-             getenv("HOME") ? getenv("HOME") : "/tmp",
-             vendor_id, device_id);
-#endif
 
     FILE * f = fopen(cache_path, "r");
     if (f) {
@@ -3257,13 +3248,35 @@ void dx12_device::run_autotune() {
             q6k_use_32   = (q6 != 0);
             f16_use_load4 = (f16l4 != 0);
             fclose(f);
-            DX12_LOG_INFO("Auto-tune v%d loaded: Q5_0=%s Q8_0=%s Q6_K=%s F16=%s\n", ver,
+            // On UMA, also enable multi-row variants (activation sharing)
+            if (is_uma) {
+                q5k_use_mr = true;
+                q6k_use_mr = true;
+            }
+            DX12_LOG_INFO("Auto-tune v%d loaded from cache '%s': Q5_0=%s Q8_0=%s Q6_K=%s F16=%s%s\n", ver,
+                          cache_path,
                           q5_0_use_256 ? "256t" : "32t", q8_0_use_256 ? "256t" : "32t",
-                          q6k_use_32 ? "32t" : "256t", f16_use_load4 ? "load4" : "load2");
+                          q6k_use_32 ? "32t" : "256t", f16_use_load4 ? "load4" : "load2",
+                          is_uma ? " +UMA(Q5_K=mr Q6_K=mr)" : "");
             return;
         }
         fclose(f);
-        // Version mismatch or parse failure — re-benchmark
+        DX12_LOG_INFO("Auto-tune cache '%s' version mismatch or corrupt — regenerating\n", cache_path);
+    }
+
+    // UMA fallback (no cache available): use conservative defaults that skip
+    // the expensive GPU benchmark. Only override settings where 32t is safe.
+    // Note: Q6_K 32t uses per-element scalar access — slower for large K on
+    // some UMA iGPUs. Leave q6k_use_32=false (use 256t cooperative variant).
+    if (is_uma) {
+        q5_0_use_256  = false;   // 32t wave-only (proven better on all UMA)
+        q8_0_use_256  = false;   // 32t wave-only (proven better on all UMA)
+        q6k_use_32    = false;   // keep 256t cooperative (faster for large K)
+        f16_use_load4 = false;   // load2 sufficient for shared-memory bandwidth
+        q5k_use_mr    = true;    // multi-row Q5_K (halves activation traffic)
+        q6k_use_mr    = true;    // multi-row Q6_K (halves activation traffic)
+        DX12_LOG_INFO("Auto-tune v%d UMA defaults: Q5_0=32t Q8_0=32t Q6_K=256t Q5_K=mr Q6_K=mr F16=load2\n", TUNE_VERSION);
+        return;
     }
 
     DX12_LOG_INFO("Running auto-tune benchmark...\n");
@@ -3492,6 +3505,7 @@ void dx12_device::run_autotune() {
                 q5_0_use_256 ? 1 : 0, q8_0_use_256 ? 1 : 0,
                 q6k_use_32 ? 1 : 0, f16_use_load4 ? 1 : 0);
         fclose(f);
+        DX12_LOG_INFO("Auto-tune cache written to '%s'\n", cache_path);
     }
 }
 
@@ -3813,6 +3827,18 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         if (key.src0_type == GGML_TYPE_Q4_K) {
             static const dx12_shader_blob mr_q4k_blob = { g_mul_mat_vec_q4k_mr_dxil, sizeof(g_mul_mat_vec_q4k_mr_dxil) };
             blob = &mr_q4k_blob;
+        } else if (key.src0_type == GGML_TYPE_Q5_K) {
+            static const dx12_shader_blob mr_q5k_blob = { g_mul_mat_vec_q5k_mr_dxil, sizeof(g_mul_mat_vec_q5k_mr_dxil) };
+            blob = &mr_q5k_blob;
+        } else if (key.src0_type == GGML_TYPE_Q6_K) {
+            static const dx12_shader_blob mr_q6k_blob = { g_mul_mat_vec_q6k_mr_dxil, sizeof(g_mul_mat_vec_q6k_mr_dxil) };
+            blob = &mr_q6k_blob;
+        }
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 6) {
+        // 32-thread wave-only Q4_K matvec (UMA optimized, no barriers)
+        if (key.src0_type == GGML_TYPE_Q4_K) {
+            static const dx12_shader_blob mv_q4k_32_blob = { g_mul_mat_vec_q4k_32_dxil, sizeof(g_mul_mat_vec_q4k_32_dxil) };
+            blob = &mv_q4k_32_blob;
         }
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 1) {
         // Matvec path (M=1 single-token generation)
