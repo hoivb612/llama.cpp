@@ -290,3 +290,42 @@ could hide memory latency
 
 In short: the HLSL/DXIL portability guarantees correctness across GPUs, but performance requires GPU-aware shader design — tile sizes,
 wave sizes, memory patterns, and hardware intrinsics all need to match the target architecture.
+
+--------------------------------------------------------------------------------------------------------------------------------------
+
+Gemma-4 TDR Root Cause Summary
+
+Symptom: GPU hang (TDR / DEVICE_HUNG 0x887A0006) during first prompt processing with Gemma-4 on DX12 + AMD RDNA 3. Phi-3 worked
+fine.
+
+There were actually TWO separate TDR issues:
+
+Issue 1: D3D12 Dispatch Limit Overflow (Checkpoints 18–19)
+
+Gemma-4's vocabulary is 262,144 tokens (vs Phi-3's 32,000). The lm_head MUL_MAT projection dispatches groups_x = vocab_size =
+262144, which exceeds D3D12's per-axis limit of 65535. The GPU silently hangs.
+
+Fix: 2D dispatch linearization — when groups_x > 65535, split into (65535, ceil(N/65535), batches) and the shader reconstructs row
+= gid.y * 65535 + gid.x.
+
+Issue 2: Stale Root Descriptors (Checkpoints 20–22) — The Hard One
+
+After fixing the dispatch limit, TDR persisted. This took extensive isolation:
+
+ - Unconditional UAV barriers → didn't help
+ - Aggressive flush thresholds → BSOD (too many fence ops)
+ - Full binding reset every dispatch → finally fixed it
+
+Root cause: AMD RDNA 3 hardware prefetches/validates ALL bound root descriptor slots when a PSO (Pipeline State Object) is
+switched, even if the new shader doesn't use those slots. Flash attention had previously bound KV cache addresses to slots 4/5
+(src2/src3). After those buffers were released or reused, later dispatches (GLU, MUL_MAT) that don't use slots 4/5 would still
+trigger a GPU hang because the hardware tried to validate the stale addresses.
+
+Fix: Always bind a valid fallback address (src0's VA) to slots 4 and 5 before every dispatch. Negligible perf cost due to VA
+caching.
+
+Why Phi-3 Never Hit This
+
+ - Phi-3 vocab = 32K → never exceeds 65535 dispatch limit  
+ - Phi-3 has 32 attention heads → after FA, the next PSO switch still had "live" addresses in slots 4/5 by coincidence (more graph 
+nodes between FA and the problematic ops)
