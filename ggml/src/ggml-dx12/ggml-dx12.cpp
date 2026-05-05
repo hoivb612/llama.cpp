@@ -1417,6 +1417,16 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             }
             return false;
 
+        case GGML_OP_SET:
+            // Recurrent state overlay: all tensors must be same type (F32 or I32)
+            if (op->src[0] && op->src[1] &&
+                op->src[0]->type == op->src[1]->type &&
+                op->src[0]->type == op->type &&
+                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32)) {
+                return true;
+            }
+            return false;
+
         case GGML_OP_GLU: {
             // Gated Linear Unit: supports SWIGLU, REGLU, GEGLU etc.
             enum ggml_glu_op glu_op = (enum ggml_glu_op)op->op_params[0];
@@ -3504,6 +3514,7 @@ static const std::unordered_map<int, dx12_shader_blob> g_shader_blobs = {
     { GGML_OP_SUM_ROWS,      { g_sum_rows_dxil,      sizeof(g_sum_rows_dxil)      } },
     { GGML_OP_FLASH_ATTN_EXT,{ g_flash_attn_dxil,    sizeof(g_flash_attn_dxil)    } },
     { GGML_OP_SET_ROWS,      { g_set_rows_dxil,      sizeof(g_set_rows_dxil)      } },
+    { GGML_OP_SET,           { g_set_dxil,           sizeof(g_set_dxil)           } },
     { GGML_OP_GLU,           { g_glu_dxil,           sizeof(g_glu_dxil)           } },
 };
 

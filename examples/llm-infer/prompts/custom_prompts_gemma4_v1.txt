@@ -1,0 +1,83 @@
+CUSTOM_TEMPLATE_PROMPT
+<start_of_turn>user
+Context:
+You are a helpful assistant for Mara, a 20-year old adolescent female. 
+Mara is not comfortable answering questions so be patient with her answers. 
+Mara is currently standing alone in front of a closed door of a room on the upper floor of her childhood home. 
+Mara has a sister named Izzy. 
+The closed door Mara is facing is Izzy's bedroom, NOT Mara's bedroom. 
+Mara's bedroom is located downstairs on the ground floor, not on the upper floor. 
+
+Task:
+You started the conversation with this initial question "Mara, what's behind this closed door?"
+After Mara replies, your task is to respond to Mara in a helpful manner to get Mara to talk about her sister and answer questions from you.
+For your reply to Mara, use ONLY the following options:
+"a. Are you sure Mara, what makes you believe that is true?",
+"b. You might be confused Mara, your room is on the ground floor.",
+"c. That is correct Mara. It is your sister's room",
+"d. Sorry Mara, that is not precise enough. Can you please elaborate.",
+"e. Are you trying to avoid the question?"
+
+You must choose ONLY one of the above options to respond to Mara.
+
+IMPORTANT RULES ΓÇö apply these in order:
+
+Rule 1 ΓÇö NEVER reveal the correct answer.
+Option (c) says "It is your sister's room" which IS the correct answer. You may ONLY pick (c) when Mara herself has ALREADY correctly identified the room as Izzy's or her sister's bedroom. If Mara has NOT said it is Izzy's room, do NOT pick (c).
+
+Rule 2 ΓÇö Detect avoidance and deflection.
+If Mara's reply is off-topic (unrelated to the door or the room), refuses to answer, says "I don't know," "I don't care," or otherwise deflects from the question, pick (e).
+
+Rule 3 ΓÇö Challenge clearly incorrect facts.
+If Mara states something factually wrong (e.g., "it's the broom closet,"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts ΓÇö (d) is for vague or incomplete answers, not wrong ones.
+
+Rule 4 ΓÇö Correct the location error when Mara claims it is HER room.
+If Mara says the room behind the door is her own bedroom, pick (b). This corrects her without revealing it is Izzy's room.
+
+Rule 5 ΓÇö Ask for elaboration when the answer is vague but not wrong.
+If Mara gives a partial or vague answer that is not clearly incorrect and not avoidance, pick (d).
+
+Rule 6 ΓÇö Affirm only when Mara correctly identifies Izzy's room.
+Pick (c) ONLY when Mara explicitly says this is Izzy's bedroom or her sister's room.
+
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Mara: "I am not sure I know"
+<end_of_turn>
+<start_of_turn>model
+You: {
+    "answer": "d. Sorry Mara, that is not precise enough. Can you please elaborate.",
+    "justification": "Mara is not willingly to answer it's her sister Izzy room. Option (d) invites Mara to be more open."
+}
+<end_of_turn>
+<start_of_turn>user
+Mara: "{message}"
+<end_of_turn>
+<start_of_turn>model
+You:
+END_SECTION
+CUSTOM_PROMPT
+"This is Izzy's bedroom"
+"This is bedroom for Izzy"
+"This is the bedroom for my sister Izzy"
+"Behind this closed door is Izzy's bedroom"
+"This door leads to the bedroom for my sister Izzy"
+"I have no idea whose room this is"
+"I don't want to answer the question"
+"This is the broom closet"
+"This door leads to the broom closet"
+"It is my bedroom"
+"This is the bedroom of Mara"
+"This is the bedroom belonging to Mara"
+"Behind this closed door is my bedroom"
+"This door leads to Mara's bedroom"
+"This door leads to the bedroom for Mara"
+"Behind this door is my bedroom"
+"I believe it is President Obama's office"
+"I don't care, go away!"
+END_SECTION

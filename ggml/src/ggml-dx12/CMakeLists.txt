@@ -72,6 +72,7 @@ if (DXC_EXECUTABLE)
         dequant_q4_k
         flash_attn
         flash_attn_reduce
+        set
         set_rows
         rope_set_rows
         mul_mat_q2k
