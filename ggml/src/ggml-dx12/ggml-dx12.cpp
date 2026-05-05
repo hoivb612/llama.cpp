@@ -3026,6 +3026,17 @@ void dx12_device::run_autotune() {
     if (tuning_done) return;
     tuning_done = true;
 
+    // UMA fast-path: wave-only (32t) variants are universally better on UMA systems.
+    // No barriers, higher occupancy (51.2 vs 6.4 groups/CU), matches LPDDR bandwidth profile.
+    if (is_uma) {
+        q5_0_use_256  = false;   // 32t wave-only reduction
+        q8_0_use_256  = false;   // 32t wave-only reduction
+        q6k_use_32    = true;    // 32t wave-only reduction
+        f16_use_load4 = false;   // load2 sufficient for shared-memory bandwidth
+        DX12_LOG_INFO("Auto-tune v%d UMA: Q5_0=32t Q8_0=32t Q6_K=32t F16=load2 (skip benchmark)\n", TUNE_VERSION);
+        return;
+    }
+
     // Check for cache file first
     char cache_path[512];
     snprintf(cache_path, sizeof(cache_path), "%s/.ggml_dx12_tune_%04X_%04X.txt",
