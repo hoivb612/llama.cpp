@@ -3237,7 +3237,18 @@ void dx12_device::run_autotune() {
 #ifndef _WIN32
     // WSL2: timestamp queries and benchmark dispatches can hang on some
     // GPU-PV configurations.  Use safe defaults instead of benchmarking.
-    DX12_LOG_INFO("Auto-tune: skipped on WSL2 (using defaults)\n");
+    if (is_uma) {
+        q5_0_use_256  = false;
+        q8_0_use_256  = false;
+        q6k_use_32    = false;
+        f16_use_load4 = false;
+        q5k_use_mr    = true;    // multi-row Q5_K: 14% faster than standard 256t
+        q6k_use_mr    = false;   // disabled: q6k_mr shader 2.1x slower than standard 256t
+        fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D≤128)
+        DX12_LOG_INFO("Auto-tune: skipped on WSL2 (UMA defaults: Q5_K=mr FA=uma)\n");
+    } else {
+        DX12_LOG_INFO("Auto-tune: skipped on WSL2 (using defaults)\n");
+    }
     return;
 #endif
 
