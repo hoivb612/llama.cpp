@@ -6,6 +6,7 @@
 // Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [stream] [-d N] [-sm none|layer|row]
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -352,6 +353,16 @@ int main(int argc, char ** argv) {
     // Re-enable llama logging for perf report
     llama_log_set(nullptr, nullptr);
     llama_perf_context_print(ctx);
+
+    // Print DX12 per-op perf stats if GGML_DX12_PERF was set
+    {
+        typedef void (*perf_fn_t)();
+        for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto fn = (perf_fn_t)ggml_backend_reg_get_proc_address(reg, "ggml_cpu_print_tensor_op_perf");
+            if (fn) { fn(); break; }
+        }
+    }
 
 cleanup:
     llama_free(ctx);
