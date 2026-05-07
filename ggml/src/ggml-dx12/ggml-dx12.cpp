@@ -2032,10 +2032,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
-        // Flash Attention: use UMA-optimized variant for decode (D≤128)
+        // Flash Attention: use UMA-optimized variant for decode only (D≤128, single query)
+        // Prefill (N_queries > 1) keeps the standard 256t shader for better batch throughput
         if (node->op == GGML_OP_FLASH_ATTN_EXT && bctx->dev->fa_use_uma) {
             uint32_t D = (uint32_t)node->src[0]->ne[0];
-            if (D <= 128) key.flags = 2;  // UMA FA (128t, smaller tile)
+            uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
+            if (D <= 128 && N_queries == 1) key.flags = 2;  // UMA FA (128t, smaller tile)
         }
 
         // Look up or create pipeline
