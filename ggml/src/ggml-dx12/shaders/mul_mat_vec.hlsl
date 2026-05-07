@@ -31,19 +31,28 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
     precise float acc = 0.0f;
 
-    if (src0_esize == 2) {
-        // F16 weights: vectorized 4-element loads with mad() FMA chains
+    if (src0_esize == 2 || src0_esize == 3) {
+        // F16/BF16 weights: 2 bytes per element, vectorized 4-element loads
+        // BF16 conversion is just a shift (asfloat(bits<<16)), even cheaper than f16tof32
         // Input is always contiguous F32 during generation (nb10=4)
         uint k = tid * 4;
         if (nb10 == 4) {
-            // Fast path: Load4 for contiguous F32 input, paired F16 loads
+            // Fast path: Load4 for contiguous F32 input, paired half-precision loads
             for (; k + 3 < K; k += GROUP_SIZE * 4) {
                 uint w01 = src0.Load(src0_base + k * 2);
                 uint w23 = src0.Load(src0_base + k * 2 + 4);
-                float w0 = f16tof32(w01 & 0xFFFFu);
-                float w1 = f16tof32(w01 >> 16);
-                float w2 = f16tof32(w23 & 0xFFFFu);
-                float w3 = f16tof32(w23 >> 16);
+                float w0, w1, w2, w3;
+                if (src0_esize == 3) {
+                    w0 = asfloat((w01 & 0xFFFFu) << 16);
+                    w1 = asfloat(w01 & 0xFFFF0000u);
+                    w2 = asfloat((w23 & 0xFFFFu) << 16);
+                    w3 = asfloat(w23 & 0xFFFF0000u);
+                } else {
+                    w0 = f16tof32(w01 & 0xFFFFu);
+                    w1 = f16tof32(w01 >> 16);
+                    w2 = f16tof32(w23 & 0xFFFFu);
+                    w3 = f16tof32(w23 >> 16);
+                }
                 uint4 xp = src1.Load4(src1_base + k * 4);
                 acc = mad(w0, asfloat(xp.x), mad(w1, asfloat(xp.y),
                       mad(w2, asfloat(xp.z), mad(w3, asfloat(xp.w), acc))));
@@ -58,8 +67,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             k = tid * 2;
             for (; k + 1 < K; k += GROUP_SIZE * 2) {
                 uint w2 = src0.Load(src0_base + k * 2);
-                float w0 = f16tof32(w2 & 0xFFFFu);
-                float w1 = f16tof32(w2 >> 16);
+                float w0, w1;
+                if (src0_esize == 3) {
+                    w0 = asfloat((w2 & 0xFFFFu) << 16);
+                    w1 = asfloat(w2 & 0xFFFF0000u);
+                } else {
+                    w0 = f16tof32(w2 & 0xFFFFu);
+                    w1 = f16tof32(w2 >> 16);
+                }
                 float x0 = load_auto(src1, src1_base + k * nb10, src1_esize);
                 float x1 = load_auto(src1, src1_base + (k + 1) * nb10, src1_esize);
                 acc = mad(w0, x0, mad(w1, x1, acc));

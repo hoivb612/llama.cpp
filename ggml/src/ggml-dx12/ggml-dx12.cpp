@@ -300,6 +300,7 @@ struct dx12_device {
     bool q4k_use_32   = false;  // Q4_K matvec: true=32t wave-only, false=256t (UMA optimization)
     bool q5k_use_mr   = false;  // Q5_K matvec: true=multi-row (2 rows/group), false=single-row
     bool q6k_use_mr   = false;  // Q6_K matvec: true=multi-row (2 rows/group), false=single-row
+    bool fa_use_uma   = false;  // Flash Attention: true=UMA variant (128t, D≤128), false=standard (256t)
 
     void run_autotune();
 
@@ -1819,6 +1820,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->src[0]) {
             ggml_type t = node->src[0]->type;
             if (t == GGML_TYPE_F16 || t == GGML_TYPE_F32 ||
+                t == GGML_TYPE_BF16 ||
                 t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
                 t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
                 t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q5_0 ||
@@ -1866,6 +1868,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     fused_bias_tensor = bias;
                 }
             }
+        }
+
+        // Flash Attention: use UMA-optimized variant for decode only (D≤128, single query)
+        // Prefill (N_queries > 1) keeps the standard 256t shader for better batch throughput
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && bctx->dev->fa_use_uma) {
+            uint32_t D = (uint32_t)node->src[0]->ne[0];
+            uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
+            if (D <= 128 && N_queries == 1) key.flags = 2;  // UMA FA (128t, smaller tile)
         }
 
         // Look up or create pipeline
@@ -3050,16 +3060,17 @@ void dx12_device::run_autotune() {
             q6k_use_32   = (q6 != 0);
             f16_use_load4 = (f16l4 != 0);
             fclose(f);
-            // On UMA, also enable multi-row variants (activation sharing)
+            // On UMA, also enable UMA-optimized variants
             if (is_uma) {
-                q5k_use_mr = true;
-                q6k_use_mr = true;
+                q5k_use_mr = true;   // multi-row Q5_K: 14% faster than standard 256t
+                q6k_use_mr = false;  // disabled: q6k_mr shader 2.1x slower than standard 256t
+                fa_use_uma = true;   // UMA FA: 128t, fewer barriers, no idle threads
             }
             DX12_LOG_INFO("Auto-tune v%d loaded from cache '%s': Q5_0=%s Q8_0=%s Q6_K=%s F16=%s%s\n", ver,
                           cache_path,
                           q5_0_use_256 ? "256t" : "32t", q8_0_use_256 ? "256t" : "32t",
                           q6k_use_32 ? "32t" : "256t", f16_use_load4 ? "load4" : "load2",
-                          is_uma ? " +UMA(Q5_K=mr Q6_K=mr)" : "");
+                          is_uma ? " +UMA(Q5_K=mr FA=uma)" : "");
             return;
         }
         fclose(f);
@@ -3075,9 +3086,10 @@ void dx12_device::run_autotune() {
         q8_0_use_256  = false;   // 32t wave-only (proven better on all UMA)
         q6k_use_32    = false;   // keep 256t cooperative (faster for large K)
         f16_use_load4 = false;   // load2 sufficient for shared-memory bandwidth
-        q5k_use_mr    = true;    // multi-row Q5_K (halves activation traffic)
-        q6k_use_mr    = true;    // multi-row Q6_K (halves activation traffic)
-        DX12_LOG_INFO("Auto-tune v%d UMA defaults: Q5_0=32t Q8_0=32t Q6_K=256t Q5_K=mr Q6_K=mr F16=load2\n", TUNE_VERSION);
+        q5k_use_mr    = true;    // multi-row Q5_K: 14% faster than standard 256t
+        q6k_use_mr    = false;   // disabled: q6k_mr shader 2.1x slower than standard 256t
+        fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D≤128)
+        DX12_LOG_INFO("Auto-tune v%d UMA defaults: Q5_0=32t Q8_0=32t Q6_K=256t Q5_K=mr FA=uma F16=load2\n", TUNE_VERSION);
         return;
     }
 
@@ -3751,6 +3763,10 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         // Split-KV reduce shader
         static const dx12_shader_blob reduce_blob = { g_flash_attn_reduce_dxil, sizeof(g_flash_attn_reduce_dxil) };
         blob = &reduce_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 2) {
+        // UMA-optimized FA (GROUP_SIZE=128, TILE_KV=128, D≤128)
+        static const dx12_shader_blob uma_blob = { g_flash_attn_uma_dxil, sizeof(g_flash_attn_uma_dxil) };
+        blob = &uma_blob;
     } else {
         auto sit = g_shader_blobs.find((int)key.op);
         if (sit != g_shader_blobs.end()) {
