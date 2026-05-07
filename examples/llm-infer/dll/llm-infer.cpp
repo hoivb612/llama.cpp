@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "common.h"
 #include "log.h"
+#include "ggml-backend.h"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -133,7 +134,13 @@ const char * llm_system_info() {
 
 LLM_INFER_API
 void llm_print_tensor_op_perf_stats() {
-    // llama_print_tensor_op_perf() removed from current API
+    // Query all registered backends for a perf print function
+    typedef void (*perf_fn_t)();
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto fn = (perf_fn_t)ggml_backend_reg_get_proc_address(reg, "ggml_cpu_print_tensor_op_perf");
+        if (fn) { fn(); return; }
+    }
 }
 
 LLM_INFER_API
