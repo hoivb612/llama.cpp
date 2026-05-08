@@ -3,6 +3,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
+#include "llama-layer-window.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
@@ -2976,6 +2977,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     bool use_mmap_buffer = true;
+    bool mmap_used_for_host_ptr = false; // true if any buffer_from_host_ptr succeeded (mmaps must stay alive)
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
@@ -8199,6 +8201,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    // On UMA, if GPU buffer_from_host_ptr fails, skip it for CPU too — otherwise the entire
+    // mmap stays alive just for tiny CPU tensors, wasting ~2GB of shared memory.
+    bool skip_buffer_from_host_ptr = false;
+
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
 
@@ -8221,10 +8227,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+        // On UMA, skip buffer_from_host_ptr for CPU devices — the 52 MiB copy is trivial,
+        // but keeping the entire mmap alive (just for CPU tensors) wastes ~2 GB of shared memory.
+        bool is_cpu_dev = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr && !is_cpu_dev;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+        bool buffer_from_host_ptr_failed = false;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -8239,14 +8249,31 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+                // Pass file mapping handle as hint for DX12 UMA zero-copy
+                if (idx < ml.mappings.size()) {
+                    ggml_backend_host_ptr_set_hint(ml.mappings[idx]->mapping_handle());
+                }
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                ggml_backend_host_ptr_set_hint(nullptr);
                 if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    // buffer_from_host_ptr failed (e.g., DX12 UMA where OpenExistingHeapFromFileMapping
+                    // is not available) — fall back to normal allocation
+                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s, falling back to normal allocation\n",
+                                  __func__, ggml_backend_buft_name(buft));
+                    bufs.clear();
+                    buf_map.clear();
+                    buffer_from_host_ptr_failed = true;
+                    skip_buffer_from_host_ptr = true; // prevent other devices from keeping mmap alive
+                    break;
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        } else {
+            if (!buffer_from_host_ptr_failed) {
+                mmap_used_for_host_ptr = true;
+            }
+        }
+        if ((!ml.use_mmap || !use_mmap_buffer || !buffer_from_host_ptr_supported || !is_default_buft) || buffer_from_host_ptr_failed) {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
@@ -8318,8 +8345,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        // Store mmap base addresses in layer window manager for on-demand reload
+        layer_window_manager * lwm = llama_get_layer_window_manager();
+        if (lwm && lwm->budget_bytes > 0) {
+            lwm->use_mmap = true;
+            lwm->mmap_bases.resize(ml.mappings.size());
+            for (size_t i = 0; i < ml.mappings.size(); i++) {
+                lwm->mmap_bases[i] = (const uint8_t *)ml.mappings[i]->addr();
+            }
+            // Mark initially loaded layers as resident
+            for (int i = 0; i < lwm->total_layers; i++) {
+                if (lwm->should_load_layer(i)) {
+                    lwm->entries[i].resident = true;
+                    lwm->resident_bytes += lwm->entries[i].memory_size;
+                }
+            }
+        }
+        // Only keep mmaps alive if buffer_from_host_ptr succeeded (tensor->data points into mmap)
+        // or layer windowing needs them for on-demand reload.
+        // Otherwise, the data was copied to GPU buffers and mmaps waste memory on UMA.
+        bool need_mmaps = mmap_used_for_host_ptr || (lwm && lwm->budget_bytes > 0);
+        if (need_mmaps) {
+            LLAMA_LOG_INFO("%s: keeping mmaps alive (host_ptr=%d, layer_window=%d)\n",
+                           __func__, (int)mmap_used_for_host_ptr, (int)(lwm && lwm->budget_bytes > 0));
+            for (auto & mapping : ml.mappings) {
+                pimpl->mappings.emplace_back(std::move(mapping));
+            }
+        } else {
+            LLAMA_LOG_INFO("%s: releasing mmaps (not needed after tensor copy)\n", __func__);
         }
     }
 

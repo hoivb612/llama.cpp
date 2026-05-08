@@ -187,6 +187,11 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 
+    // Optional hint for buffer_from_host_ptr: set before calling to pass platform-specific context
+    // (e.g., Windows file mapping HANDLE for DX12 UMA zero-copy)
+    GGML_API void   ggml_backend_host_ptr_set_hint(void * hint);
+    GGML_API void * ggml_backend_host_ptr_get_hint(void);
+
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);

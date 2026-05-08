@@ -620,6 +620,16 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
     return device->iface.buffer_from_host_ptr(device, ptr, size, max_tensor_size);
 }
 
+static thread_local void * g_host_ptr_hint = nullptr;
+
+void ggml_backend_host_ptr_set_hint(void * hint) {
+    g_host_ptr_hint = hint;
+}
+
+void * ggml_backend_host_ptr_get_hint(void) {
+    return g_host_ptr_hint;
+}
+
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
     return device->iface.supports_op(device, op);

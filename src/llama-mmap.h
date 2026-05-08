@@ -48,6 +48,10 @@ struct llama_mmap {
     size_t size() const;
     void * addr() const;
 
+    // Windows: returns the file mapping HANDLE for DX12 UMA zero-copy
+    // Other platforms: returns nullptr
+    void * mapping_handle() const;
+
     void unmap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
