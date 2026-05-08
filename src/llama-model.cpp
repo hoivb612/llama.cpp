@@ -8157,7 +8157,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr;
+        // On UMA, skip buffer_from_host_ptr for CPU devices — the 52 MiB copy is trivial,
+        // but keeping the entire mmap alive (just for CPU tensors) wastes ~2 GB of shared memory.
+        bool is_cpu_dev = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr && !is_cpu_dev;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
