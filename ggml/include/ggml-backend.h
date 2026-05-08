@@ -188,7 +188,11 @@ extern "C" {
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 
     // Optional hint for buffer_from_host_ptr: set before calling to pass platform-specific context
-    // (e.g., Windows file mapping HANDLE for DX12 UMA zero-copy)
+    // (e.g., Windows file mapping HANDLE + base address for DX12 UMA zero-copy)
+    struct ggml_backend_host_ptr_hint {
+        void * mapping_handle; // platform file mapping handle (Windows HANDLE)
+        void * mapping_base;   // base address of the mapping (from MapViewOfFile)
+    };
     GGML_API void   ggml_backend_host_ptr_set_hint(void * hint);
     GGML_API void * ggml_backend_host_ptr_get_hint(void);
 

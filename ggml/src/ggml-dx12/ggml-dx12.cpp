@@ -3820,11 +3820,20 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     // Try OpenExistingHeapFromFileMapping first (works with MapViewOfFile),
     // fall back to OpenExistingHeapFromAddress (works with VirtualAlloc)
     ComPtr<ID3D12Heap> heap;
-    void * file_mapping_handle = ggml_backend_host_ptr_get_hint();
-    if (file_mapping_handle) {
-        hr = device3->OpenExistingHeapFromFileMapping((HANDLE)file_mapping_handle, IID_PPV_ARGS(&heap));
+    size_t heap_offset = 0; // offset within heap for CreatePlacedResource
+    auto * hint = (ggml_backend_host_ptr_hint *)ggml_backend_host_ptr_get_hint();
+    if (hint && hint->mapping_handle) {
+        hr = device3->OpenExistingHeapFromFileMapping((HANDLE)hint->mapping_handle, IID_PPV_ARGS(&heap));
         if (FAILED(hr)) {
             DX12_LOG_WARN("buffer_from_host_ptr: OpenExistingHeapFromFileMapping failed (hr=0x%08X)\n", (unsigned)hr);
+        } else if (hint->mapping_base) {
+            // The heap wraps the ENTIRE file mapping. Compute offset from mapping base
+            // to our aligned address so CreatePlacedResource starts at the right location.
+            uintptr_t mapping_base = (uintptr_t)hint->mapping_base;
+            heap_offset = aligned_addr - mapping_base;
+            // heap_offset must be 64KB-aligned (guaranteed since both are 64KB-aligned)
+            DX12_LOG_INFO("buffer_from_host_ptr: file mapping heap offset = %zu (0x%zX)\n",
+                          heap_offset, heap_offset);
         }
     }
     if (!heap) {
@@ -3834,9 +3843,11 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
                           (unsigned)hr, (void *)aligned_addr, aligned_size);
             return nullptr;
         }
+        heap_offset = 0; // OpenExistingHeapFromAddress starts at aligned_addr
     }
 
-    // Create placed resource in the heap (read-only model weights, but UAV for shader access)
+    // Create placed resource — model weights are read-only (SRV), no UAV needed.
+    // Removing UAV is required for PAGE_READONLY file mappings.
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
     rd.Alignment        = 0;
@@ -3847,10 +3858,10 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     rd.Format           = DXGI_FORMAT_UNKNOWN;
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
 
     ComPtr<ID3D12Resource> resource;
-    hr = d->device->CreatePlacedResource(heap.Get(), 0, &rd,
+    hr = d->device->CreatePlacedResource(heap.Get(), heap_offset, &rd,
                                           D3D12_RESOURCE_STATE_COMMON,
                                           nullptr, IID_PPV_ARGS(&resource));
     if (FAILED(hr)) {

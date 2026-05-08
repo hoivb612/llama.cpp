@@ -8157,10 +8157,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        // On UMA, skip buffer_from_host_ptr for CPU devices — the 52 MiB copy is trivial,
-        // but keeping the entire mmap alive (just for CPU tensors) wastes ~2 GB of shared memory.
+        // Skip buffer_from_host_ptr for CPU devices when the copy is small relative to
+        // the mmap — releasing mmap pages saves far more than the copy costs.
+        // If CPU tensors are >= 75% of mmap, the savings are marginal and peak memory spikes.
         bool is_cpu_dev = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr && !is_cpu_dev;
+        bool skip_cpu_for_mmap_release = false;
+        if (is_cpu_dev && !skip_buffer_from_host_ptr) {
+            size_t ctx_tensor_bytes = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                ctx_tensor_bytes += ggml_nbytes(t);
+            }
+            size_t total_mmap = 0;
+            for (auto & m : ml.mappings) {
+                total_mmap += m->size();
+            }
+            if (total_mmap > 0 && ctx_tensor_bytes * 4 < total_mmap * 3) { // < 75%
+                skip_cpu_for_mmap_release = true;
+                LLAMA_LOG_INFO("%s: CPU tensors %.1f MiB < 75%% of mmap %.1f MiB, will copy to release mmap\n",
+                               __func__, ctx_tensor_bytes / (1024.0 * 1024.0), total_mmap / (1024.0 * 1024.0));
+            }
+        }
+        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr && !skip_cpu_for_mmap_release;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
@@ -8179,9 +8196,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                // Pass file mapping handle as hint for DX12 UMA zero-copy
+                // Pass file mapping hint for DX12 UMA zero-copy
+                ggml_backend_host_ptr_hint hint = { nullptr, nullptr };
                 if (idx < ml.mappings.size()) {
-                    ggml_backend_host_ptr_set_hint(ml.mappings[idx]->mapping_handle());
+                    hint.mapping_handle = ml.mappings[idx]->mapping_handle();
+                    hint.mapping_base   = ml.mappings[idx]->addr();
+                    ggml_backend_host_ptr_set_hint(&hint);
                 }
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 ggml_backend_host_ptr_set_hint(nullptr);
