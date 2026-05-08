@@ -8288,9 +8288,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         // Otherwise, the data was copied to GPU buffers and mmaps waste memory on UMA.
         bool need_mmaps = mmap_used_for_host_ptr || (lwm && lwm->budget_bytes > 0);
         if (need_mmaps) {
+            LLAMA_LOG_INFO("%s: keeping mmaps alive (host_ptr=%d, layer_window=%d)\n",
+                           __func__, (int)mmap_used_for_host_ptr, (int)(lwm && lwm->budget_bytes > 0));
             for (auto & mapping : ml.mappings) {
                 pimpl->mappings.emplace_back(std::move(mapping));
             }
+        } else {
+            LLAMA_LOG_INFO("%s: releasing mmaps (not needed after tensor copy)\n", __func__);
         }
     }
 
