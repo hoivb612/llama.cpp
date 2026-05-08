@@ -8131,6 +8131,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    // On UMA, if GPU buffer_from_host_ptr fails, skip it for CPU too — otherwise the entire
+    // mmap stays alive just for tiny CPU tensors, wasting ~2GB of shared memory.
+    bool skip_buffer_from_host_ptr = false;
+
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
 
@@ -8153,7 +8157,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
@@ -8186,6 +8190,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     bufs.clear();
                     buf_map.clear();
                     buffer_from_host_ptr_failed = true;
+                    skip_buffer_from_host_ptr = true; // prevent other devices from keeping mmap alive
                     break;
                 }
                 bufs.emplace_back(buf);
