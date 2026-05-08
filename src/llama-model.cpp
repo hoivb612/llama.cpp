@@ -2966,6 +2966,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+    bool mmap_used_for_host_ptr = false; // true if any buffer_from_host_ptr succeeded (mmaps must stay alive)
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
@@ -8190,6 +8191,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
+            if (!buffer_from_host_ptr_failed) {
+                mmap_used_for_host_ptr = true;
+            }
         }
         if ((!ml.use_mmap || !use_mmap_buffer || !buffer_from_host_ptr_supported || !is_default_buft) || buffer_from_host_ptr_failed) {
             ggml_backend_buffer_t buf;
@@ -8279,8 +8283,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
             }
         }
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        // Only keep mmaps alive if buffer_from_host_ptr succeeded (tensor->data points into mmap)
+        // or layer windowing needs them for on-demand reload.
+        // Otherwise, the data was copied to GPU buffers and mmaps waste memory on UMA.
+        bool need_mmaps = mmap_used_for_host_ptr || (lwm && lwm->budget_bytes > 0);
+        if (need_mmaps) {
+            for (auto & mapping : ml.mappings) {
+                pimpl->mappings.emplace_back(std::move(mapping));
+            }
         }
     }
 
