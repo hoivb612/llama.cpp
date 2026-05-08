@@ -8156,6 +8156,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+        bool buffer_from_host_ptr_failed = false;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -8170,14 +8171,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+                // Pass file mapping handle as hint for DX12 UMA zero-copy
+                if (idx < ml.mappings.size()) {
+                    ggml_backend_host_ptr_set_hint(ml.mappings[idx]->mapping_handle());
+                }
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                ggml_backend_host_ptr_set_hint(nullptr);
                 if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    // buffer_from_host_ptr failed (e.g., DX12 UMA where OpenExistingHeapFromFileMapping
+                    // is not available) — fall back to normal allocation
+                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s, falling back to normal allocation\n",
+                                  __func__, ggml_backend_buft_name(buft));
+                    bufs.clear();
+                    buf_map.clear();
+                    buffer_from_host_ptr_failed = true;
+                    break;
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        } else {
+        }
+        if ((!ml.use_mmap || !use_mmap_buffer || !buffer_from_host_ptr_supported || !is_default_buft) || buffer_from_host_ptr_failed) {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer

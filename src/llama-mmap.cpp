@@ -615,6 +615,12 @@ llama_mmap::~llama_mmap() = default;
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
+#ifdef _WIN32
+void * llama_mmap::mapping_handle() const { return pimpl->hMapping; }
+#else
+void * llama_mmap::mapping_handle() const { return nullptr; }
+#endif
+
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
