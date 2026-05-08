@@ -2057,6 +2057,7 @@ struct vk_instance_t {
 
     std::vector<size_t> device_indices;
     std::vector<bool>   device_supports_membudget;
+    std::vector<bool>   device_supports_ext_mem_host;
     vk_device devices[GGML_VK_MAX_DEVICES];
 };
 
@@ -5982,14 +5983,18 @@ static void ggml_vk_instance_init() {
         std::vector<vk::ExtensionProperties> extensionprops = vkdev.enumerateDeviceExtensionProperties();
 
         bool membudget_supported = false;
+        bool ext_mem_host_supported = false;
         for (const auto & ext : extensionprops) {
             if (strcmp(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, ext.extensionName) == 0) {
                 membudget_supported = true;
-                break;
+            }
+            if (strcmp("VK_EXT_external_memory_host", ext.extensionName) == 0) {
+                ext_mem_host_supported = true;
             }
         }
 
         vk_instance.device_supports_membudget.push_back(membudget_supported);
+        vk_instance.device_supports_ext_mem_host.push_back(ext_mem_host_supported);
 
         ggml_vk_print_gpu_info(i);
     }
@@ -15151,6 +15156,7 @@ struct ggml_backend_vk_device_context {
     std::string name;
     std::string description;
     bool is_integrated_gpu;
+    bool external_memory_host;
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
@@ -15197,7 +15203,7 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ ctx->is_integrated_gpu,  // UMA: zero-copy mmap for layer windowing
+        /* .buffer_from_host_ptr  = */ ctx->is_integrated_gpu && ctx->external_memory_host,  // UMA: zero-copy mmap for layer windowing
         /* .events                = */ true,
     };
 }
@@ -15949,6 +15955,7 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
                 ctx->name = GGML_VK_NAME + std::to_string(i);
                 ctx->description = desc;
                 ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
+                ctx->external_memory_host = vk_instance.device_supports_ext_mem_host[i];
                 ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
                 ctx->op_offload_min_batch_size = min_batch_size;
                 devices.push_back(new ggml_backend_device {
