@@ -175,7 +175,9 @@ static void * const DX12_PTR_BASE = (void *)(uintptr_t)0x1000;
 // Enabled via GGML_DX12_SAFE_MODE=1 env var. Useful for debugging WSL2 issues.
 static bool dx12_safe_mode = false;
 
-// dx12_tensor_offset defined after dx12_buffer_context (see below)
+static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
+    return (uint8_t *)tensor->data - (uint8_t *)DX12_PTR_BASE;
+}
 
 // ---------------------------------------------------------------------------
 // Debug logging
@@ -464,19 +466,7 @@ struct dx12_buffer_context {
     size_t                 size      = 0;
     D3D12_HEAP_TYPE        heap_type = D3D12_HEAP_TYPE_DEFAULT;
     void *                 mapped    = nullptr; // non-null for upload/readback heaps
-    void *                 host_base = nullptr; // non-null for buffer_from_host_ptr (mmap base)
-    size_t                 host_prefix = 0;     // bytes from resource start to host_base (alignment padding)
-    ComPtr<ID3D12Heap>     placed_heap;         // heap for buffer_from_host_ptr
 };
-
-static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
-    auto * ctx = (dx12_buffer_context *)tensor->buffer->context;
-    if (ctx->host_base) {
-        // host_prefix accounts for 64KB alignment padding at resource start
-        return ctx->host_prefix + ((uint8_t *)tensor->data - (uint8_t *)ctx->host_base);
-    }
-    return (uint8_t *)tensor->data - (uint8_t *)DX12_PTR_BASE;
-}
 
 // ---------------------------------------------------------------------------
 // Backend context (stream)
@@ -1297,12 +1287,9 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             delete (dx12_buffer_context *)buffer->context;
         },
         /* .get_base      = */ [](ggml_backend_buffer_t buffer) -> void * {
-            auto * ctx = (dx12_buffer_context *)buffer->context;
-            if (ctx->host_base) {
-                return ctx->host_base;
-            }
             // D3D12 buffers aren't host-accessible; return a sentinel for offset math
             // tensor->data will be set to base + offset by the allocator
+            GGML_UNUSED(buffer);
             return (void *)(uintptr_t)0x1000;
         },
         /* .init_tensor   = */ [](ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) -> ggml_status {
@@ -1316,12 +1303,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             if (size == 0) return;
 
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
-
-            // buffer_from_host_ptr (UMA mmap): direct memset
-            if (ctx->host_base) {
-                memset((uint8_t *)tensor->data + offset, value, size);
-                return;
-            }
 
             // UMA zero-copy: direct memset
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
@@ -1369,12 +1350,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             g_tls_device = ctx->dev->device.Get();
 
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
-
-            // buffer_from_host_ptr (UMA mmap): data is in the same memory — direct memcpy
-            if (ctx->host_base) {
-                memcpy((uint8_t *)tensor->data + offset, data, size);
-                return;
-            }
 
             // UMA zero-copy: buffer is CPU-writable, write directly
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
@@ -1428,12 +1403,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             g_tls_device = ctx->dev->device.Get();
 
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
-
-            // buffer_from_host_ptr (UMA mmap): read directly from host memory
-            if (ctx->host_base) {
-                memcpy(data, (const uint8_t *)tensor->data + offset, size);
-                return;
-            }
 
             // UMA zero-copy: buffer is CPU-readable (WRITE_BACK) or slow-read (WRITE_COMBINE)
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
@@ -1579,12 +1548,6 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
         /* .clear         = */ [](ggml_backend_buffer_t buffer, uint8_t value) {
             auto * ctx = (dx12_buffer_context *)buffer->context;
             if (!ctx->resource || ctx->size == 0) return;
-
-            // buffer_from_host_ptr: direct memset
-            if (ctx->host_base) {
-                memset(ctx->host_base, value, ctx->size);
-                return;
-            }
 
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait();
@@ -3785,138 +3748,9 @@ static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
     props->caps = {
         /* .async             = */ false,
         /* .host_buffer       = */ false,
-        /* .buffer_from_host_ptr = */ d->is_uma,
+        /* .buffer_from_host_ptr = */ false,
         /* .events            = */ false,
     };
-}
-
-// Forward declaration
-static ggml_backend_buffer_type_t dx12_dev_get_buffer_type(ggml_backend_dev_t dev);
-
-// UMA zero-copy: wrap mmap'd host memory as a D3D12 placed resource
-// so the GPU reads directly from the mmap — no separate buffer allocation.
-static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    GGML_UNUSED(max_tensor_size);
-    auto * d = (dx12_device *)dev->context;
-
-    if (!d->is_uma) return nullptr;
-
-    // OpenExistingHeapFromAddress requires 64KB alignment
-    const size_t ALIGNMENT = 64 * 1024;
-    uintptr_t addr = (uintptr_t)ptr;
-    uintptr_t aligned_addr = addr & ~(ALIGNMENT - 1);
-    size_t prefix = addr - aligned_addr;
-    size_t aligned_size = (size + prefix + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-
-    // Need ID3D12Device3 for OpenExistingHeapFromAddress
-    ComPtr<ID3D12Device3> device3;
-    HRESULT hr = d->device.As(&device3);
-    if (FAILED(hr)) {
-        DX12_LOG_WARN("buffer_from_host_ptr: ID3D12Device3 not available (hr=0x%08X)\n", (unsigned)hr);
-        return nullptr;
-    }
-
-    // Create D3D12 heap wrapping the mmap'd memory
-    ComPtr<ID3D12Heap> heap;
-    hr = device3->OpenExistingHeapFromAddress((void *)aligned_addr, IID_PPV_ARGS(&heap));
-    if (FAILED(hr)) {
-        DX12_LOG_WARN("buffer_from_host_ptr: OpenExistingHeapFromAddress failed (hr=0x%08X, ptr=%p, size=%zu)\n",
-                      (unsigned)hr, (void *)aligned_addr, aligned_size);
-        return nullptr;
-    }
-
-    // Create placed resource in the heap (read-only model weights, but UAV for shader access)
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Alignment        = 0;
-    rd.Width            = aligned_size;
-    rd.Height           = 1;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels        = 1;
-    rd.Format           = DXGI_FORMAT_UNKNOWN;
-    rd.SampleDesc.Count = 1;
-    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-
-    ComPtr<ID3D12Resource> resource;
-    hr = d->device->CreatePlacedResource(heap.Get(), 0, &rd,
-                                          D3D12_RESOURCE_STATE_COMMON,
-                                          nullptr, IID_PPV_ARGS(&resource));
-    if (FAILED(hr)) {
-        DX12_LOG_WARN("buffer_from_host_ptr: CreatePlacedResource failed (hr=0x%08X, size=%zu)\n",
-                      (unsigned)hr, aligned_size);
-        return nullptr;
-    }
-
-    // Create buffer context — host_base points to the original (unaligned) ptr
-    // so tensor offsets are computed relative to ptr, matching the mmap layout.
-    // host_prefix accounts for the 64KB alignment padding at the start of the resource.
-    auto * ctx = new dx12_buffer_context();
-    ctx->dev         = d;
-    ctx->resource    = resource;
-    ctx->size        = size;
-    ctx->heap_type   = D3D12_HEAP_TYPE_DEFAULT;
-    ctx->host_base   = ptr;
-    ctx->host_prefix = prefix;
-    ctx->placed_heap = heap;
-
-    DX12_LOG_INFO("buffer_from_host_ptr: created UMA zero-copy buffer (size=%.1f MiB, ptr=%p)\n",
-                  size / (1024.0 * 1024.0), ptr);
-
-    // Use the same buffer interface as dx12_buft_alloc_buffer — all the lambda
-    // implementations already check ctx->host_base for the fast path.
-    // We need to get the iface from an existing buffer allocation... but since
-    // it's a static local in dx12_buft_alloc_buffer, we replicate the reference here.
-
-    // Get buffer type for this device
-    ggml_backend_buffer_type_t buft = dx12_dev_get_buffer_type(dev);
-
-    // Allocate a dummy 0-size buffer to get the interface, then replace context
-    // Actually, easier: just use the buft's alloc to get a temporary buffer for the iface.
-    // But that's wasteful. Instead, declare the iface inline:
-    static const ggml_backend_buffer_i host_ptr_iface = {
-        /* .free_buffer   = */ [](ggml_backend_buffer_t buffer) {
-            delete (dx12_buffer_context *)buffer->context;
-        },
-        /* .get_base      = */ [](ggml_backend_buffer_t buffer) -> void * {
-            auto * ctx = (dx12_buffer_context *)buffer->context;
-            return ctx->host_base;
-        },
-        /* .init_tensor   = */ [](ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) -> ggml_status {
-            GGML_UNUSED(buffer); GGML_UNUSED(tensor);
-            return GGML_STATUS_SUCCESS;
-        },
-        /* .memset_tensor = */ [](ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
-                                  uint8_t value, size_t offset, size_t size) {
-            GGML_UNUSED(buffer);
-            if (size == 0) return;
-            memset((uint8_t *)tensor->data + offset, value, size);
-        },
-        /* .set_tensor    = */ [](ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
-                                  const void * data, size_t offset, size_t size) {
-            GGML_UNUSED(buffer);
-            if (size == 0) return;
-            memcpy((uint8_t *)tensor->data + offset, data, size);
-        },
-        /* .get_tensor    = */ [](ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
-                                  void * data, size_t offset, size_t size) {
-            GGML_UNUSED(buffer);
-            if (size == 0) return;
-            memcpy(data, (const uint8_t *)tensor->data + offset, size);
-        },
-        /* .set_tensor_2d = */ nullptr,
-        /* .get_tensor_2d = */ nullptr,
-        /* .cpy_tensor    = */ nullptr,
-        /* .clear         = */ [](ggml_backend_buffer_t buffer, uint8_t value) {
-            auto * ctx = (dx12_buffer_context *)buffer->context;
-            if (ctx->host_base && ctx->size > 0) {
-                memset(ctx->host_base, value, ctx->size);
-            }
-        },
-        /* .reset         = */ nullptr,
-    };
-
-    return ggml_backend_buffer_init(buft, host_ptr_iface, ctx, size);
 }
 
 static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
@@ -3973,7 +3807,7 @@ static const ggml_backend_device_i dx12_device_interface = {
     /* .init_backend          = */ dx12_dev_init_backend,
     /* .get_buffer_type       = */ dx12_dev_get_buffer_type,
     /* .get_host_buffer_type  = */ nullptr,
-    /* .buffer_from_host_ptr  = */ dx12_dev_buffer_from_host_ptr,
+    /* .buffer_from_host_ptr  = */ nullptr,
     /* .supports_op           = */ dx12_dev_supports_op,
     /* .supports_buft         = */ dx12_dev_supports_buft,
     /* .offload_op            = */ nullptr,
