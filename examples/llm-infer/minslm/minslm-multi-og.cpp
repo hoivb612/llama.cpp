@@ -831,6 +831,7 @@ int main(int argc, char** argv) {
         printf("  Options: verbose|v1|v2  pfc  paffin  stream  cpu\n");
         printf("           add-special  parse-special  template=<file>\n");
         printf("           -d N (GPU device index)  -sm none|layer|row\n");
+        printf("           --weight-budget MB (layer windowing budget)\n");
         return 1;
     }
 
@@ -887,6 +888,8 @@ int main(int argc, char** argv) {
             if (sm == "none")       params.split_mode = 0;
             else if (sm == "layer") params.split_mode = 1;
             else if (sm == "row")   params.split_mode = 2;
+        } else if (arg == "--weight-budget" && i + 1 < argc) {
+            params.weight_budget_mb = std::stoi(argv[++i]);
         } else if (arg.substr(0, 9) == "template=") {
             template_file = arg.substr(9);
         }
@@ -920,6 +923,14 @@ int main(int argc, char** argv) {
     if (params.process_affinity) {
         int64_t cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(params.n_threads, params.verbose);
         printf("[%s]: Setting process affinity mask 0x%016llX\n", __func__, cpu_affinity_mask);
+    }
+
+    // Set weight budget env var if specified (picked up by load_all_data)
+    if (params.weight_budget_mb > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", params.weight_budget_mb);
+        _putenv_s("GGML_WEIGHT_BUDGET_MB", buf);
+        printf("[%s]: weight budget = %d MiB (layer windowing enabled)\n", __func__, params.weight_budget_mb);
     }
 
     // Initialize the model

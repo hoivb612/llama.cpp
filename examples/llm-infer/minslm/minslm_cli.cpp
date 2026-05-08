@@ -114,6 +114,7 @@ struct cli_params {
     int32_t n_len        = 1532;
     int32_t main_gpu     = 0;
     int32_t split_mode   = -1;  // -1=default, 0=none, 1=layer, 2=row
+    int32_t weight_budget_mb = 0;  // 0=unlimited (all layers resident)
     int     verbose      = 0;
     bool    streaming    = false;
     bool    force_cpu    = false;
@@ -127,7 +128,7 @@ int main(int argc, char ** argv) {
     cli_params p;
 
     if (argc < 2 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row]\n", argv[0]);
+        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB]\n", argv[0]);
         return 1;
     }
 
@@ -161,6 +162,9 @@ int main(int argc, char ** argv) {
             else if (!strcmp(argv[i], "layer")) p.split_mode = 1;
             else if (!strcmp(argv[i], "row"))   p.split_mode = 2;
         }
+        else if (!strcmp(argv[i], "--weight-budget") && i + 1 < argc) {
+            p.weight_budget_mb = atoi(argv[++i]);
+        }
     }
 
     // --- Parse prompt file ---
@@ -177,6 +181,18 @@ int main(int argc, char ** argv) {
     }
 
     // --- Load model ---
+    // Set weight budget env var if specified (picked up by load_all_data)
+    if (p.weight_budget_mb > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", p.weight_budget_mb);
+#ifdef _WIN32
+        _putenv_s("GGML_WEIGHT_BUDGET_MB", buf);
+#else
+        setenv("GGML_WEIGHT_BUDGET_MB", buf, 1);
+#endif
+        printf("[%s]: weight budget = %d MiB (layer windowing enabled)\n", __func__, p.weight_budget_mb);
+    }
+
     llama_model_params model_params = llama_model_default_params();
     if (p.force_cpu) {
         model_params.n_gpu_layers = 0;

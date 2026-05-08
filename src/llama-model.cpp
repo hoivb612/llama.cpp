@@ -6,6 +6,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-layer-window.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -8247,7 +8248,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Store mmap base addresses in layer window manager for on-demand reload
     if (use_mmap_buffer) {
+        layer_window_manager * lwm = llama_get_layer_window_manager();
+        if (lwm && lwm->budget_bytes > 0) {
+            lwm->use_mmap = true;
+            lwm->mmap_bases.resize(ml.mappings.size());
+            for (size_t i = 0; i < ml.mappings.size(); i++) {
+                lwm->mmap_bases[i] = (const uint8_t *)ml.mappings[i]->addr();
+            }
+            // Mark initially loaded layers as resident
+            for (int i = 0; i < lwm->total_layers; i++) {
+                if (lwm->should_load_layer(i)) {
+                    lwm->entries[i].resident = true;
+                    lwm->resident_bytes += lwm->entries[i].memory_size;
+                }
+            }
+        }
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }

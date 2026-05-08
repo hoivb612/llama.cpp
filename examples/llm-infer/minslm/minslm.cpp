@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
     int64_t t0 = timer_us(); 
 
     if (argc == 1 || argv[1][0] == '-') {
-        printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [omp] [paffin] [stream] [verbose] [repack-xbox | repack-ggml]\n", argv[0]);
+        printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [omp] [paffin] [stream] [verbose] [repack-xbox | repack-ggml] [--weight-budget MB]\n", argv[0]);
         return 1;
     }
 
@@ -307,6 +307,10 @@ int main(int argc, char** argv) {
             else if (!strcmp(argv[5], "layer")) params.split_mode = 1;
             else if (!strcmp(argv[5], "row"))   params.split_mode = 2;
             argv += 1; argc -= 1;
+
+        } else if (!strcmp(argv[4], "--weight-budget") && argc >= 6) {
+            params.weight_budget_mb = atoi(argv[5]);
+            argv += 1; argc -= 1;
         }
 
         argv += 1;
@@ -332,6 +336,14 @@ int main(int argc, char** argv) {
     if (params.process_affinity) {
         int64_t cpu_affinity_mask = ggml_b612::xb_set_optimal_process_affinity(params.n_threads, params.verbose);
         printf("[%s]: Setting process affinity mask 0x%016llX\n", __func__, cpu_affinity_mask);
+    }
+
+    // Set weight budget env var if specified (picked up by load_all_data)
+    if (params.weight_budget_mb > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", params.weight_budget_mb);
+        _putenv_s("GGML_WEIGHT_BUDGET_MB", buf);
+        printf("[%s]: weight budget = %d MiB (layer windowing enabled)\n", __func__, params.weight_budget_mb);
     }
 
     // initialize the model
