@@ -1675,6 +1675,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
 
             // UMA zero-copy: buffer is CPU-writable, write directly
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                // Commit tiles for reserved resources before writing
+                if (ctx->is_reserved) {
+                    ctx->commit_range(tensor_offset, size);
+                }
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { 0, 0 };
                 HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
