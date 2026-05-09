@@ -8231,7 +8231,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                // Set weight budget hint for DX12 reserved resources:
+                // non-CPU devices use CreateReservedResource to only commit
+                // physical memory for the layer window instead of the full model
+                if (!is_cpu_dev) {
+                    static const char * budget_env_str = getenv("GGML_WEIGHT_BUDGET_MB");
+                    size_t budget_mb = budget_env_str ? (size_t)atoi(budget_env_str) : 0;
+                    if (budget_mb > 0) {
+                        ggml_backend_set_weight_budget_hint(budget_mb * 1024ULL * 1024ULL);
+                    }
+                }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                ggml_backend_set_weight_budget_hint(0); // clear hint
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -8298,18 +8309,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         layer_window_manager * lwm = llama_get_layer_window_manager();
         if (lwm && lwm->budget_bytes > 0) {
-            lwm->use_mmap = true;
+            // use_mmap means tensor->data points directly into the mmap (buffer_from_host_ptr).
+            // When buffer_from_host_ptr failed, tensors are in GPU VRAM — need ggml_backend_tensor_set.
+            lwm->use_mmap = mmap_used_for_host_ptr;
             lwm->mmap_bases.resize(ml.mappings.size());
             for (size_t i = 0; i < ml.mappings.size(); i++) {
                 lwm->mmap_bases[i] = (const uint8_t *)ml.mappings[i]->addr();
+                // Register mmap for OEHA direct GPU copy (skip staging memcpy)
+                ggml_backend_register_mmap(
+                    ml.mappings[i]->addr(), ml.mappings[i]->size(),
+                    ml.mappings[i]->mapping_handle());
             }
-            // Mark initially loaded layers as resident
-            for (int i = 0; i < lwm->total_layers; i++) {
-                if (lwm->should_load_layer(i)) {
-                    lwm->entries[i].resident = true;
-                    lwm->resident_bytes += lwm->entries[i].memory_size;
-                }
-            }
+            // mark_initially_resident() was already called from load_all_data
         }
         // Only keep mmaps alive if buffer_from_host_ptr succeeded (tensor->data points into mmap)
         // or layer windowing needs them for on-demand reload.

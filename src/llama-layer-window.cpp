@@ -33,6 +33,7 @@ void layer_window_manager::init(int n_layers, size_t budget_mb) {
     access_counter = 0;
     all_resident = false;
     current_layer = -1;
+    window_size = 0;
 
     entries.resize(n_layers);
     for (int i = 0; i < n_layers; i++) {
@@ -106,6 +107,9 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx) {
         return false;
     }
 
+    // Evict BEFORE committing tiles — make room for the incoming layer
+    evict_to_budget(layer_idx);
+
     // For mmap: the data pointer is already valid (points into mmap).
     // We just need to "touch" the pages to ensure they're paged in.
     // On Windows: VirtualLock pins pages in physical RAM.
@@ -121,13 +125,30 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx) {
 #endif
         }
     } else {
-        // Non-mmap: copy data from file mapping into GPU buffer
+        // Non-mmap: batch upload all tensors for this layer to GPU in one submission
+        std::vector<ggml_tensor *> batch_tensors;
+        std::vector<const void *>  batch_data;
+        std::vector<size_t>        batch_sizes;
+        for (const auto & loc : it->second) {
+            if (!loc.tensor) continue;
+            if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
+            batch_tensors.push_back(loc.tensor);
+            batch_data.push_back(mmap_bases[loc.file_idx] + loc.file_offset);
+            batch_sizes.push_back(loc.n_bytes);
+        }
+        if (!batch_tensors.empty()) {
+            ggml_backend_batch_tensor_set(
+                batch_tensors.data(), batch_data.data(), batch_sizes.data(), (int)batch_tensors.size());
+        }
+#ifdef _WIN32
+        // Release mmap pages after copy
         for (const auto & loc : it->second) {
             if (!loc.tensor) continue;
             if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
             const uint8_t * data = mmap_bases[loc.file_idx] + loc.file_offset;
-            ggml_backend_tensor_set(loc.tensor, data, 0, loc.n_bytes);
+            DiscardVirtualMemory((void *)data, loc.n_bytes);
         }
+#endif
     }
 
     entries[layer_idx].resident = true;
@@ -141,7 +162,7 @@ void layer_window_manager::evict_layer(int layer_idx) {
     if (!entries[layer_idx].resident) return;
 
     auto it = layer_tensors.find(layer_idx);
-    if (it == layer_tensors.end()) return;  // initially loaded layer — don't evict
+    if (it == layer_tensors.end()) return;  // no recorded tensors — can't reload
 
     // For mmap: release physical pages back to OS
     if (use_mmap) {
@@ -156,7 +177,13 @@ void layer_window_manager::evict_layer(int layer_idx) {
 #endif
         }
     }
-    // For non-mmap: we'd free the GPU buffer (Phase 5)
+    // For non-mmap: decommit GPU tiles (reserved resource) to free physical memory
+    if (!use_mmap) {
+        for (const auto & loc : it->second) {
+            if (!loc.tensor) continue;
+            ggml_backend_tensor_decommit(loc.tensor);
+        }
+    }
 
     entries[layer_idx].resident = false;
     if (resident_bytes >= entries[layer_idx].memory_size) {
@@ -167,17 +194,27 @@ void layer_window_manager::evict_layer(int layer_idx) {
 void layer_window_manager::evict_to_budget(int protected_layer) {
     if (budget_bytes == 0) return;
 
-    while (resident_bytes > budget_bytes) {
-        // Find LRU layer (oldest access, not protected)
+    // Target: ensure room for the incoming layer (protected_layer).
+    // resident_bytes tracks only LAYER memory, but the backing heap also holds
+    // non-layer data (embed/output). We must keep resident_bytes low enough that
+    // resident + incoming_layer + non_layer fits in the heap.
+    size_t incoming = (protected_layer >= 0 && protected_layer < total_layers &&
+                       !entries[protected_layer].resident)
+                    ? entries[protected_layer].memory_size : 0;
+    size_t target = (budget_bytes > incoming) ? budget_bytes - incoming : 0;
+
+    while (resident_bytes > target) {
+        // MRU eviction: for sequential access (0→N), evict the most recently used
+        // layer (excluding current). This is provably optimal for sequential scan —
+        // the just-finished layer won't be needed until the next full pass.
         int victim = -1;
-        uint64_t oldest = UINT64_MAX;
+        uint64_t newest = 0;
         for (int i = 0; i < total_layers; i++) {
             if (!entries[i].resident) continue;
             if (i == protected_layer) continue;
-            // Don't evict layers that were loaded initially (no recorded tensors = no way to reload)
             if (layer_tensors.find(i) == layer_tensors.end()) continue;
-            if (entries[i].last_access < oldest) {
-                oldest = entries[i].last_access;
+            if (entries[i].last_access > newest) {
+                newest = entries[i].last_access;
                 victim = i;
             }
         }
@@ -186,6 +223,95 @@ void layer_window_manager::evict_to_budget(int protected_layer) {
         evicts_this_pass++;
         bytes_evicted += entries[victim].memory_size;
     }
+}
+
+bool layer_window_manager::batch_load_ahead(int start_layer) {
+    if (start_layer < 0 || start_layer >= total_layers) return false;
+    if (window_size <= 0) return false;
+    if (entries[start_layer].resident) return false;
+
+    // Find contiguous non-resident layers, capped at window_size
+    int end = start_layer + 1;
+    while (end < total_layers && !entries[end].resident && (end - start_layer) < window_size) {
+        end++;
+    }
+    int batch_count = end - start_layer;
+
+    // Calculate how much space we need
+    size_t batch_bytes = 0;
+    for (int i = start_layer; i < end; i++) {
+        batch_bytes += entries[i].memory_size;
+    }
+
+    // MRU-evict only enough to fit the incoming batch
+    size_t target = (budget_bytes > batch_bytes) ? budget_bytes - batch_bytes : 0;
+    while (resident_bytes > target) {
+        int victim = -1;
+        uint64_t newest = 0;
+        for (int i = 0; i < total_layers; i++) {
+            if (!entries[i].resident) continue;
+            if (i >= start_layer && i < end) continue;  // protect incoming batch
+            if (layer_tensors.find(i) == layer_tensors.end()) continue;
+            if (entries[i].last_access > newest) {
+                newest = entries[i].last_access;
+                victim = i;
+            }
+        }
+        if (victim < 0) break;
+        size_t sz = entries[victim].memory_size;
+        evict_layer(victim);
+        evicts_this_pass++;
+        bytes_evicted += sz;
+    }
+
+    // Batch-load all layers in [start_layer, end)
+    std::vector<ggml_tensor *> batch_tensors;
+    std::vector<const void *>  batch_data;
+    std::vector<size_t>        batch_sizes;
+
+    for (int i = start_layer; i < end; i++) {
+        auto it = layer_tensors.find(i);
+        if (it == layer_tensors.end()) continue;
+
+        if (use_mmap) {
+            for (const auto & loc : it->second) {
+                if (!loc.tensor || !loc.tensor->data) continue;
+#ifdef _WIN32
+                VirtualLock(loc.tensor->data, loc.n_bytes);
+#else
+                madvise(loc.tensor->data, loc.n_bytes, MADV_WILLNEED);
+                mlock(loc.tensor->data, loc.n_bytes);
+#endif
+            }
+        } else {
+            for (const auto & loc : it->second) {
+                if (!loc.tensor) continue;
+                if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
+                batch_tensors.push_back(loc.tensor);
+                batch_data.push_back(mmap_bases[loc.file_idx] + loc.file_offset);
+                batch_sizes.push_back(loc.n_bytes);
+            }
+        }
+
+        entries[i].resident = true;
+        entries[i].last_access = ++access_counter;
+        resident_bytes += entries[i].memory_size;
+        loads_this_pass++;
+        bytes_loaded += entries[i].memory_size;
+    }
+
+    // Submit all uploads in one batch (single fence for entire batch)
+    if (!use_mmap && !batch_tensors.empty()) {
+        ggml_backend_batch_tensor_set(
+            batch_tensors.data(), batch_data.data(), batch_sizes.data(), (int)batch_tensors.size());
+#ifdef _WIN32
+        for (size_t j = 0; j < batch_data.size(); j++) {
+            DiscardVirtualMemory((void *)batch_data[j], batch_sizes[j]);
+        }
+#endif
+    }
+
+    return batch_count > 0;
 }
 
 void layer_window_manager::ensure_all_layers_resident() {
@@ -225,12 +351,6 @@ void layer_window_manager::begin_pass() {
 }
 
 void layer_window_manager::end_pass() {
-    if (loads_this_pass > 0 || evicts_this_pass > 0) {
-        printf("layer_window: pass done — loaded %d layers (%.1f MiB), evicted %d layers (%.1f MiB)\n",
-               loads_this_pass, bytes_loaded / (1024.0 * 1024.0),
-               evicts_this_pass, bytes_evicted / (1024.0 * 1024.0));
-        fflush(stdout);
-    }
 }
 
 int layer_window_manager::get_layer_from_tensor(const ggml_tensor * t) {
@@ -255,39 +375,42 @@ int layer_window_manager::get_layer_from_tensor(const ggml_tensor * t) {
 }
 
 // Eval callback: called by the scheduler for each graph node
-// When ask==true: we check if this node touches a new layer and ensure it's resident
-// When ask==false: we observe (no action needed for windowing)
-// Returns true to "observe" the node (causes sync), false to let it batch
+// When ask==true: detect non-resident layer, return true to sync previous subgraph.
+// When ask==false: previous subgraph computed, batch-load ahead from current layer.
+// Key invariant: never evict data the GPU hasn't computed yet.
 bool layer_window_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     layer_window_manager * lwm = (layer_window_manager *)user_data;
     if (!lwm || lwm->budget_bytes == 0) return false;
 
-    if (ask) {
-        int layer = layer_window_manager::get_layer_from_tensor(t);
-        if (layer >= 0 && layer != lwm->current_layer) {
-            // New layer boundary — we need to intercept
-            return true;
-        }
-        return false;  // same layer or non-layer node: batch together
-    }
-
-    // ask == false: the node just computed (or is about to in a synced sub-graph)
     int layer = layer_window_manager::get_layer_from_tensor(t);
-    if (layer >= 0 && layer != lwm->current_layer) {
-        // Transition to a new layer
-        lwm->current_layer = layer;
 
-        // Ensure this layer is resident
-        if (lwm->ensure_layer_resident(layer)) {
-            lwm->loads_this_pass++;
-            lwm->bytes_loaded += lwm->entries[layer].memory_size;
+    if (ask) {
+        if (layer >= 0 && layer != lwm->current_layer) {
+            lwm->current_layer = layer;
+            if (!lwm->entries[layer].resident) {
+                return true;  // sync: compute previous layers first, then load
+            }
+            lwm->entries[layer].last_access = ++lwm->access_counter;
         }
-
-        // Evict layers to stay within budget
-        lwm->evict_to_budget(layer);
+        return false;  // resident or same layer — batch together
     }
 
-    return true;  // continue computation
+    // ask == false: previous subgraph computed — safe to evict and batch-load
+    lwm->batch_load_ahead(lwm->current_layer);
+    return true;
+}
+
+void layer_window_manager::mark_initially_resident() {
+    if (budget_bytes == 0) return;
+    window_size = get_initial_resident_count();
+    if (window_size < 1) window_size = 1;
+    for (int i = 0; i < total_layers; i++) {
+        if (should_load_layer(i)) {
+            entries[i].resident    = true;
+            entries[i].last_access = ++access_counter;
+            resident_bytes += entries[i].memory_size;
+        }
+    }
 }
 
 void layer_window_manager::print_config() const {
@@ -312,8 +435,12 @@ void layer_window_manager::print_config() const {
            (non_layer_bytes + resident_total) / (1024.0 * 1024.0), resident);
 
     if (resident < total_layers) {
-        printf("layer_window: %d layers deferred (will stream on demand during compute)\n",
-               total_layers - resident);
+        int n_windows = (total_layers + resident - 1) / resident;
+        int last_win  = total_layers - (n_windows - 1) * resident;
+        printf("layer_window: %d layers deferred, batch window = %d layers (%d windows, last = %d)\n",
+               total_layers - resident, resident, n_windows, last_win);
+        printf("layer_window: %d sync points per pass (vs %d with single-layer streaming)\n",
+               n_windows - 1, total_layers - resident);
     }
     printf("\n");
     fflush(stdout);

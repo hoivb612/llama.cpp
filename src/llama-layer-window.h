@@ -36,6 +36,9 @@ struct layer_window_manager {
     bool     use_mmap        = false; // true if weight data is memory-mapped
     int      current_layer   = -1;   // layer currently being computed (Phase 4)
 
+    // Batch windowing: process layers in batches to minimize GPU syncs
+    int      window_size          = 0;   // max layers per batch (= initial_resident_count)
+
     // Stats for Phase 4 per-pass tracking
     int      loads_this_pass  = 0;
     int      evicts_this_pass = 0;
@@ -85,6 +88,11 @@ struct layer_window_manager {
     // Evict layers to bring resident_bytes under budget, skipping protected layer
     void evict_to_budget(int protected_layer);
 
+    // Look-ahead batch load: starting from layer_idx, find contiguous non-resident
+    // layers (capped at window_size), MRU-evict to make room, batch-load all.
+    // Returns true if any data was loaded (caller should sync).
+    bool batch_load_ahead(int layer_idx);
+
     // Ensure all deferred layers are loaded (Phase 3 convenience)
     void ensure_all_layers_resident();
 
@@ -100,6 +108,9 @@ struct layer_window_manager {
 
     // Print summary of windowing configuration
     void print_config() const;
+
+    // Mark initially loaded layers as resident (call after model loading completes)
+    void mark_initially_resident();
 };
 
 // Eval callback for Phase 4 layer windowing

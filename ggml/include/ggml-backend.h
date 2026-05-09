@@ -196,6 +196,34 @@ extern "C" {
     GGML_API void   ggml_backend_host_ptr_set_hint(void * hint);
     GGML_API void * ggml_backend_host_ptr_get_hint(void);
 
+    // Weight budget hint: set before buffer allocation to request a reserved (tiled) resource
+    // with a backing heap of budget_bytes. 0 = no budget (normal committed resource).
+    GGML_API void   ggml_backend_set_weight_budget_hint(size_t budget_bytes);
+    GGML_API size_t ggml_backend_get_weight_budget_hint(void);
+
+    // Tensor decommit: release physical backing for a tensor's region in a reserved resource.
+    // No-op if the buffer doesn't support reserved resources.
+    typedef void (*ggml_backend_tensor_decommit_fn)(struct ggml_tensor * tensor);
+    GGML_API void ggml_backend_set_tensor_decommit_fn(ggml_backend_tensor_decommit_fn fn);
+    GGML_API void ggml_backend_tensor_decommit(struct ggml_tensor * tensor);
+
+    // Batch tensor set: upload multiple tensors in a single GPU submission.
+    // Reduces per-tensor sync overhead for layer windowing.
+    // Falls back to individual ggml_backend_tensor_set calls if no handler registered.
+    typedef void (*ggml_backend_batch_tensor_set_fn)(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
+    GGML_API void ggml_backend_set_batch_tensor_set_fn(ggml_backend_batch_tensor_set_fn fn);
+    GGML_API void ggml_backend_batch_tensor_set(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
+
+    // Register mmap region for direct GPU copy (OEHA: OpenExistingHeapFromAddress).
+    // When registered, batch_tensor_set can CopyBufferRegion directly from mmap
+    // instead of going through staging (eliminates WC memcpy bottleneck).
+    typedef bool (*ggml_backend_register_mmap_fn)(
+        const void * base, size_t size, void * mapping_handle, void * dev_ctx);
+    GGML_API void ggml_backend_set_register_mmap_fn(ggml_backend_register_mmap_fn fn, void * dev_ctx);
+    GGML_API bool ggml_backend_register_mmap(const void * base, size_t size, void * mapping_handle);
+
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
