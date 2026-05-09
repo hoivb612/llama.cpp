@@ -13,6 +13,12 @@ llama_add_compile_flags()
 # examples
 
 if (EMSCRIPTEN)
+elseif (GGML_XBOX)
+    # Xbox (Scarlett / GDKX) cross-compile: descend only into examples that
+    # don't depend on the common/ library. Today that's just minslm-cli under
+    # llm-infer/ -- the llm-infer CMakeLists.txt itself filters down to that
+    # one target when GGML_XBOX is ON.
+    add_subdirectory(llm-infer)
 else()
     add_subdirectory(batched)
     add_subdirectory(debug)

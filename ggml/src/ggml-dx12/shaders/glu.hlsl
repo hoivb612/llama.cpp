@@ -13,8 +13,11 @@ float glu_activation(float x, uint glu_op, float alpha, float limit) {
         case 3: { float cx = min(x, limit); return cx / (1.0f + exp(alpha * (-cx))); }  // SWIGLU_OAI
         case 5: return x / (1.0f + exp(-1.702f * x));  // GEGLU_QUICK
         case 1: {  // GEGLU
+            // Use sigmoid identity for tanh to avoid inf/inf -> NaN on RDNA2.
+            // 1 + tanh(v) == 2 - 2/(exp(2v) + 1). Matches Vulkan geglu.comp.
             float x3 = x * x * x;
-            return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x3)));
+            float val = 0.7978845608f * (x + 0.044715f * x3);
+            return 0.5f * x * (2.0f - 2.0f / (exp(2.0f * val) + 1.0f));
         }
         case 4: {  // GEGLU_ERF
             float a = abs(x * 0.7071067811865f);

@@ -25,7 +25,9 @@
 #endif
 
 #if defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
+    #endif // WIN32_LEAN_AND_MEAN
     #ifndef NOMINMAX
         #define NOMINMAX
     #endif
@@ -548,7 +550,7 @@ struct llama_mmap::impl {
         }
 
         if (prefetch > 0) {
-#if _WIN32_WINNT >= 0x602
+#if (_WIN32_WINNT >= 0x602) && !defined(_GAMING_XBOX)
             BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
             HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
 
@@ -671,7 +673,7 @@ struct llama_mlock::impl {
             LLAMA_LOG_WARN("warning: failed to munlock buffer: %s\n", std::strerror(errno));
         }
     }
-#elif defined(_WIN32)
+#elif defined(_WIN32) && !defined(_GAMING_XBOX)
     static size_t lock_granularity() {
         SYSTEM_INFO si;
         GetSystemInfo(&si);

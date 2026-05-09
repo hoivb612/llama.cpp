@@ -209,6 +209,12 @@ endif()
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
     add_subdirectory(pocs)
+elseif (LLAMA_BUILD_EXAMPLES AND GGML_XBOX)
+    # Xbox cross-compile: allow a *very* narrow examples descent without the
+    # common library (which pulls in cpp-httplib, jinja, etc. that don't
+    # cross-compile to Gaming.Xbox.Scarlett.x64). examples/CMakeLists.txt
+    # filters itself down to just the minslm-cli target when GGML_XBOX is ON.
+    add_subdirectory(examples)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)

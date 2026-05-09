@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 
 if (NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(WARNING "ggml-dx12: DirectX 12 backend is only supported on Windows and WSL2")
+    message(WARNING "ggml-dx12: DirectX 12 backend is only supported on Windows, WSL2, and Xbox Scarlett (GDKX)")
     return()
 endif()
 
@@ -14,7 +14,84 @@ ggml_add_backend_library(ggml-dx12
     ../../include/ggml-dx12.h
 )
 
-if (WIN32)
+if (GGML_XBOX)
+    # ---- Xbox Series X (Scarlett, GDKX) cross-compile branch ----
+    #
+    # Output DLL is renamed to ggml-xbox.dll so it's obvious in the deploy
+    # package that this build is the Scarlett-targeted variant.
+    set_target_properties(ggml-dx12 PROPERTIES OUTPUT_NAME "ggml-xbox")
+
+    target_compile_definitions(ggml-dx12 PRIVATE
+        GGML_DX12_XBOX_GDKX
+        # Mirrors the toolchain file -- harmless if redundantly defined.
+        _GAMING_XBOX
+        _GAMING_XBOX_SCARLETT
+    )
+
+    # GameCore Scarlett system libs. The Gaming.Xbox.Scarlett.x64 MSBuild
+    # platform normally injects these via its .props files; list them
+    # explicitly so a non-VS generator (Ninja) also links cleanly.
+    target_link_libraries(ggml-dx12 PRIVATE
+        d3d12_xs
+        xg_xs
+        xgameruntime
+    )
+
+    # GDKX include / lib paths. Honor the toolchain hint first, then the
+    # GameDK environment variable, then a manual GGML_XBOX_GDK_EDITION pin.
+    set(_xbox_gdk_root "")
+    if (DEFINED GGML_XBOX_GDK_ROOT AND GGML_XBOX_GDK_ROOT)
+        set(_xbox_gdk_root "${GGML_XBOX_GDK_ROOT}")
+    elseif (DEFINED ENV{GameDK})
+        set(_xbox_gdk_root "$ENV{GameDK}")
+    endif()
+
+    # Normalize: the GameDK env var from the installer is Windows-style and
+    # has a trailing backslash, which breaks file(GLOB ${root}/*).
+    if (_xbox_gdk_root)
+        file(TO_CMAKE_PATH "${_xbox_gdk_root}" _xbox_gdk_root)
+        string(REGEX REPLACE "/+$" "" _xbox_gdk_root "${_xbox_gdk_root}")
+    endif()
+
+    if (_xbox_gdk_root)
+        if (GGML_XBOX_GDK_EDITION)
+            set(_xbox_gdk_dir "${_xbox_gdk_root}/${GGML_XBOX_GDK_EDITION}")
+        else()
+            # Pick the highest-numbered edition subdirectory under %GameDK%.
+            # Filter out non-edition entries like bin/, toolKit/, redist/.
+            file(GLOB _xbox_gdk_eds RELATIVE "${_xbox_gdk_root}" "${_xbox_gdk_root}/*")
+            set(_xbox_gdk_versions "")
+            foreach (_d ${_xbox_gdk_eds})
+                if (_d MATCHES "^[0-9]+$" AND IS_DIRECTORY "${_xbox_gdk_root}/${_d}")
+                    list(APPEND _xbox_gdk_versions ${_d})
+                endif()
+            endforeach()
+            if (_xbox_gdk_versions)
+                list(SORT _xbox_gdk_versions COMPARE NATURAL ORDER DESCENDING)
+                list(GET _xbox_gdk_versions 0 _xbox_gdk_latest)
+                set(_xbox_gdk_dir "${_xbox_gdk_root}/${_xbox_gdk_latest}")
+            else()
+                message(FATAL_ERROR "ggml-dx12 (Xbox): no numeric GDKX edition found under ${_xbox_gdk_root}. Pass -DGGML_XBOX_GDK_EDITION=<edition>.")
+            endif()
+        endif()
+        message(STATUS "ggml-dx12 (Xbox): using GDKX at ${_xbox_gdk_dir}")
+        # The Gaming.Xbox.Scarlett.x64 platform normally adds these include
+        # and lib paths automatically. Adding them PRIVATE is a no-op when
+        # MSBuild already injected them, but keeps Ninja honest.
+        target_include_directories(ggml-dx12 PRIVATE
+            "${_xbox_gdk_dir}/GXDK/gameKit/Include"
+            "${_xbox_gdk_dir}/GXDK/gameKit/Include/Scarlett"
+        )
+        target_link_directories(ggml-dx12 PRIVATE
+            "${_xbox_gdk_dir}/GXDK/gameKit/Lib/amd64/Scarlett"
+            "${_xbox_gdk_dir}/GXDK/gameKit/Lib/amd64"
+        )
+        set(_xbox_gdk_dir_cached "${_xbox_gdk_dir}" CACHE INTERNAL "Resolved GDKX directory")
+    else()
+        message(WARNING "ggml-dx12 (Xbox): no GDKX root found. Set %GameDK% or pass -DGGML_XBOX_GDK_EDITION.")
+    endif()
+
+elseif (WIN32)
     # Native Windows: link D3D12 and DXGI system libraries
     target_link_libraries(ggml-dx12 PRIVATE
         d3d12
@@ -93,28 +170,64 @@ endif()
 
 # HLSL Shader Compilation
 # Find DXC (DirectX Shader Compiler)
-find_program(DXC_EXECUTABLE dxc
-    HINTS
-        "$ENV{WindowsSdkDir}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
-        "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
-        "$ENV{VULKAN_SDK}/Bin"
-        "$ENV{VULKAN_SDK}/bin"
-        "/usr/bin"
-)
+if (GGML_XBOX)
+    # ---- Scarlett shader compiler discovery ----
+    # User override wins.
+    if (GGML_XBOX_SHADER_COMPILER)
+        set(DXC_EXECUTABLE "${GGML_XBOX_SHADER_COMPILER}" CACHE FILEPATH "" FORCE)
+    else()
+        # Search the GDKX install for the Scarlett-targeted compiler.
+        # Across GDKX revisions the binary has lived under a few names; try
+        # the most likely ones in order of preference.
+        set(_xbox_dxc_hints "")
+        if (DEFINED _xbox_gdk_dir_cached AND _xbox_gdk_dir_cached)
+            list(APPEND _xbox_dxc_hints
+                "${_xbox_gdk_dir_cached}/GXDK/bin/Scarlett"
+                "${_xbox_gdk_dir_cached}/GXDK/bin")
+        endif()
+        find_program(DXC_EXECUTABLE
+            NAMES XboxScarlettShaderCompiler.exe XSCDxc.exe dxc-xs.exe dxc.exe
+            HINTS ${_xbox_dxc_hints}
+            NO_DEFAULT_PATH)
+    endif()
 
-if (NOT DXC_EXECUTABLE)
-    message(FATAL_ERROR
-        "ggml-dx12: DXC (DirectX Shader Compiler) not found!\n"
-        "  GPU compute will produce garbage without compiled shaders.\n"
-        "  Install dxc or set -DDXC_EXECUTABLE=/path/to/dxc\n"
-        "  On Ubuntu/WSL2: download stable release from\n"
-        "  https://github.com/microsoft/DirectXShaderCompiler/releases")
+    if (NOT DXC_EXECUTABLE)
+        message(FATAL_ERROR
+            "ggml-dx12 (Xbox): Scarlett HLSL compiler not found.\n"
+            "  Pass -DGGML_XBOX_SHADER_COMPILER=<path-to-compiler.exe>\n"
+            "  or run from a GDKX command prompt so %GameDK% is set.")
+    endif()
+    message(STATUS "ggml-dx12 (Xbox): Found Scarlett shader compiler: ${DXC_EXECUTABLE}")
+else()
+    find_program(DXC_EXECUTABLE dxc
+        HINTS
+            "$ENV{WindowsSdkDir}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+            "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+            "$ENV{VULKAN_SDK}/Bin"
+            "$ENV{VULKAN_SDK}/bin"
+            "/usr/bin"
+    )
+
+    if (NOT DXC_EXECUTABLE)
+        message(FATAL_ERROR
+            "ggml-dx12: DXC (DirectX Shader Compiler) not found!\n"
+            "  GPU compute will produce garbage without compiled shaders.\n"
+            "  Install dxc or set -DDXC_EXECUTABLE=/path/to/dxc\n"
+            "  On Ubuntu/WSL2: download stable release from\n"
+            "  https://github.com/microsoft/DirectXShaderCompiler/releases")
+    endif()
+
+    message(STATUS "ggml-dx12: Found DXC: ${DXC_EXECUTABLE}")
 endif()
 
-message(STATUS "ggml-dx12: Found DXC: ${DXC_EXECUTABLE}")
-
 set(SHADER_INPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+if (GGML_XBOX)
+    # Keep Scarlett bytecode in a sibling directory so a later desktop
+    # rebuild from the same source tree does not collide with it.
+    set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders_scarlett")
+else()
+    set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+endif()
 file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 
 # List of shaders to compile
@@ -194,10 +307,37 @@ set(DX12_SHADERS
     mul_mat_wmma
     mul_mat_q4k_wmma
     mul_mat_q5k_wmma
+    mul_mat_q5_0_wmma
     mul_mat_q6k_wmma
 )
 
 set(DX12_SHADER_HEADERS "")
+
+# Per-platform extra args for the shader compiler. Most GDKX builds accept
+# stock dxc flags + cs_6_0; if your revision needs Scarlett-specific switches
+# (e.g. -HV, microarch hints), pass them via -DGGML_XBOX_SHADER_FLAGS="...".
+set(_dx12_shader_flags "")
+if (GGML_XBOX)
+    # The Scarlett dxc adds a "precompilation" pass after the normal DXIL
+    # compile that tries to pre-build a Scarlett PSO from the container.
+    # That PSO build requires a root signature embedded in the DXIL, e.g.
+    # via [RootSignature("...")] on the entry point or -rootsig-define.
+    # ggml-dx12 doesn't embed one -- ggml-dx12.cpp creates a single shared
+    # common_root_sig at runtime via D3D12SerializeVersionedRootSignature +
+    # CreateRootSignature, and binds it before every dispatch with
+    # SetComputeRootSignature. Without an embedded sig, the precompile
+    # aborts with:
+    #   "; Precompilation failed - Could not find root signature in dxil container"
+    # which the build treats as a fatal error.
+    #
+    # -noprecompile disables only the Scarlett PSO precompile pass; the
+    # DXIL container is still produced and is fully usable at runtime.
+    list(APPEND _dx12_shader_flags -noprecompile)
+endif()
+if (GGML_XBOX AND DEFINED GGML_XBOX_SHADER_FLAGS)
+    separate_arguments(_extra_xbox_flags NATIVE_COMMAND "${GGML_XBOX_SHADER_FLAGS}")
+    list(APPEND _dx12_shader_flags ${_extra_xbox_flags})
+endif()
 
 foreach(shader_name ${DX12_SHADERS})
     set(shader_src "${SHADER_INPUT_DIR}/${shader_name}.hlsl")
@@ -212,6 +352,7 @@ foreach(shader_name ${DX12_SHADERS})
             -Vn g_${shader_name}_dxil
             -I ${SHADER_INPUT_DIR}
             -O3
+            ${_dx12_shader_flags}
             ${shader_src}
         DEPENDS ${shader_src} ${SHADER_INPUT_DIR}/ggml_common.hlsli
         COMMENT "Compiling HLSL shader: ${shader_name}"

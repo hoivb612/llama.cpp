@@ -271,10 +271,14 @@ int main(int argc, char ** argv) {
             int max_gen = std::min(p.n_len - n_past, 128);
             std::string output;
             int n_gen = 0;
+            size_t empty_pieces = 0;
+            std::vector<llama_token> empty_ids; empty_ids.reserve(16);
+            std::vector<llama_token> all_ids;   all_ids.reserve((size_t)max_gen);
 
             auto sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
             llama_sampler * smpl = llama_sampler_chain_init(sparams);
+#if 1 
             llama_sampler_chain_add(smpl, llama_sampler_init_penalties(128, 1.3f, 0.1f, 0.1f));
             // DRY: penalizes repeated n-gram sequences
             const char * dry_breakers[] = { "\n", ":", "\"", "*" };
@@ -284,7 +288,10 @@ int main(int argc, char ** argv) {
             llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1.0f));
             llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.3f));
             llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
-
+#else
+            // @TODO_SDM: remove optional greedy sampling for testing
+            llama_sampler_chain_add(smpl, llama_sampler_init_greedy());           
+#endif
             int64_t t3 = timer_us();
 
             while (n_gen < max_gen) {
@@ -296,6 +303,11 @@ int main(int argc, char ** argv) {
                 }
 
                 std::string piece = token_to_piece(ctx, id);
+                all_ids.push_back(id);
+                if (piece.empty()) {
+                    ++empty_pieces;
+                    if (empty_ids.size() < 16) empty_ids.push_back(id);
+                }
                 if (p.streaming) {
                     printf("%s", piece.c_str());
                     fflush(stdout);
@@ -326,8 +338,69 @@ int main(int argc, char ** argv) {
 
             llama_sampler_free(smpl);
 
-            if (!p.streaming && !output.empty()) {
-                printf("%s\n", output.c_str());
+            if (!p.streaming) {
+                if (!output.empty()) {
+                    // Use fwrite to handle embedded NUL bytes from byte-fallback tokens.
+                    // Also escape unprintable control chars so log viewers don't truncate.
+                    std::string esc;
+                    esc.reserve(output.size() + 16);
+                    size_t nuls = 0;
+                    size_t ctrl = 0;
+                    for (unsigned char c : output) {
+                        if (c == 0) {
+                            esc += "\\x00";
+                            ++nuls;
+                        } else if (c < 0x20 && c != '\n' && c != '\t' && c != '\r') {
+                            char buf[5];
+                            snprintf(buf, sizeof(buf), "\\x%02X", c);
+                            esc += buf;
+                            ++ctrl;
+                        } else {
+                            esc += (char)c;
+                        }
+                    }
+                    fwrite(esc.data(), 1, esc.size(), stdout);
+                    putchar('\n');
+                    fflush(stdout);
+                    if (p.verbose >= 2 && (nuls || ctrl || empty_pieces)) {
+                        printf("  [output diag: bytes=%zu nuls=%zu other_ctrl=%zu empty_pieces=%zu/%d]\n",
+                               output.size(), nuls, ctrl, empty_pieces, n_gen);
+                        if (empty_pieces) {
+                            printf("  [empty piece token ids (first %zu):",
+                                   empty_ids.size());
+                            for (auto t : empty_ids) printf(" %d", t);
+                            printf("]\n");
+                        }
+                    }
+                } else if (p.verbose >= 2 && !all_ids.empty()) {
+                    printf("  [output diag: empty output, %zu tokens all produced empty pieces]\n",
+                           all_ids.size());
+                }
+                // Print full token-id sequence for off-line decoding/inspection
+                if (p.verbose >= 2 && !all_ids.empty()) {
+                    printf("  [all token ids (%zu):", all_ids.size());
+                    for (auto t : all_ids) printf(" %d", t);
+                    printf("]\n");
+                }
+                // Hex dump of the raw output bytes (16 bytes/line)
+                if (p.verbose >= 2 && !output.empty()) {
+                    printf("  [output hex (%zu bytes):]\n", output.size());
+                    for (size_t off = 0; off < output.size(); off += 16) {
+                        printf("    %04zx:", off);
+                        size_t end = std::min(off + 16, output.size());
+                        for (size_t i = off; i < end; ++i) {
+                            printf(" %02x", (unsigned char)output[i]);
+                        }
+                        // pad alignment for partial lines
+                        for (size_t i = end - off; i < 16; ++i) printf("   ");
+                        printf("  |");
+                        for (size_t i = off; i < end; ++i) {
+                            unsigned char c = (unsigned char)output[i];
+                            putchar((c >= 0x20 && c < 0x7f) ? (char)c : '.');
+                        }
+                        printf("|\n");
+                    }
+                }
             }
 
             if (p.verbose >= 2 && n_gen > 0) {

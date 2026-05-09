@@ -3,12 +3,30 @@
 // Implements a GPU compute backend using D3D12, with optional Cooperative Vector
 // acceleration for matrix-vector operations (SM 6.9 / Agility SDK 1.717+).
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
-#ifdef _WIN32
+#if defined(GGML_DX12_XBOX_GDKX)
+// Xbox Series X (Scarlett, GDKX). The Gaming.Xbox.Scarlett.x64 platform
+// supplies a Scarlett-specific d3d12_xs.h instead of the desktop d3d12.h.
+// There is no DXGI on this partition -- adapter enumeration is replaced
+// by a single D3D12XboxCreateDevice call.
+#include <windows.h>
+#include <d3d12_xs.h>
+#include <XGameRuntime.h>
+// d3d12_xs.h doesn't define D3D12_HEAP_FLAG_CREATE_NOT_ZEROED -- that flag
+// is a desktop D3D12 addition (Win10 19H1) that never made it to the
+// Scarlett D3D12 partition because the Scarlett runtime already does not
+// zero-init committed resources by default. Alias it to NONE so call sites
+// compile; the result is identical (no zero-init) on Xbox.
+#ifndef D3D12_HEAP_FLAG_CREATE_NOT_ZEROED
+#define D3D12_HEAP_FLAG_CREATE_NOT_ZEROED D3D12_HEAP_FLAG_NONE
+#endif
+#elif defined(_WIN32)
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -24,6 +42,30 @@
 #include <chrono>
 #endif
 #include <wrl/client.h>
+
+#if defined(GGML_DX12_XBOX_GDKX)
+// On the GDKX, D3D12 interfaces inherit from IGraphicsUnknown rather than
+// IUnknown. WRL's <wrl/client.h> still works (Microsoft::WRL::ComPtr<T> only
+// calls AddRef()/Release() by name and IGraphicsUnknown supplies both), but
+// its IID_PPV_ARGS_Helper overload for ComPtrRef static_asserts that
+// T::InterfaceType derives from IUnknown:
+//   client.h(915,19): error C2338: T has to derive from IUnknown
+// d3d12_xs.h provides IID_GRAPHICS_PPV_ARGS as the GDKX equivalent, but it's
+// designed for raw T** pointers and doesn't compose with WRL's ComPtrRef
+// (which is what `&comptr` produces).
+//
+// Override IID_PPV_ARGS to a definition that does NOT route through the
+// WRL helper. ComPtrRef has its own non-asserting `operator void**() const`
+// which returns reinterpret_cast<void**>(ptr_->ReleaseAndGetAddressOf()), so
+// a static_cast triggers that conversion and produces a usable void** for
+// CreateXxx(... IID, void**). __uuidof(**(ppType)) still resolves correctly
+// because ComPtrRef has operator*() returning InterfaceType*.
+//
+// This only affects the ggml-dx12 TU; we don't poison the macro for any
+// other code in the build.
+#undef IID_PPV_ARGS
+#define IID_PPV_ARGS(ppType) __uuidof(**(ppType)), static_cast<void**>(ppType)
+#endif
 
 #include <algorithm>
 #include <array>
@@ -46,6 +88,40 @@
 #ifdef GGML_DX12_SHADERS_COMPILED
 #include "ggml_dx12_shaders.h"
 #endif
+
+// On Xbox GDKX we force is_uma + is_cache_coherent_uma to true so that
+// dx12_create_buffer routes large allocations through D3D12_HEAP_TYPE_CUSTOM
+// + L0 + WRITE_BACK (the title-memory pool). That's required to avoid
+// HRESULT 0x8007000E on the KV cache, since the GDKX driver mis-reports
+// UMA=false and the DEFAULT-heap (L1) pool is only ~10 GB out of the 13.5
+// GB title budget.
+//
+// However, the CCUMA contract for `Map(read_range)` / `Unmap(written_range)`
+// (driver auto-flushes GPU caches and invalidates CPU caches around the
+// access) has not been verified to hold for the GDKX driver, given that the
+// driver itself reported the device as non-UMA. Trusting the zero-copy
+// fast paths on `Map()` produces correctness failures in decode (stale
+// reads of logits / stale GPU view of just-written input token ids) even
+// while one-shot prefill happens to work due to wall-clock cache turnover.
+//
+// Force all set_tensor / get_tensor / memset_tensor I/O on Xbox through the
+// CopyBufferRegion + UPLOAD/READBACK staging path. Standard heap types have
+// well-defined cache management on every D3D12 platform including GDKX, and
+// queue ordering against pending compute work guarantees correctness.
+#if defined(GGML_DX12_XBOX_GDKX)
+#  define DX12_USE_ZEROCOPY_IO 0
+#else
+#  define DX12_USE_ZEROCOPY_IO 1
+#endif
+
+// Skip leading single/double quotes -- on Windows cmd.exe, `set FOO="1"` stores
+// the literal 3-char string `"1"`, which atoi/strtoull parse as 0. Used for all
+// numeric GGML_DX12_* env-var reads.
+static inline const char * dx12_env_unquote(const char * s) {
+    if (!s) return nullptr;
+    while (*s == '"' || *s == '\'') ++s;
+    return s;
+}
 
 using Microsoft::WRL::ComPtr;
 
@@ -297,7 +373,9 @@ static_assert(sizeof(dx12_shader_params) / 4 <= 64, "must fit in root constants"
 // ---------------------------------------------------------------------------
 
 struct dx12_device {
-#ifdef _WIN32
+#if defined(GGML_DX12_XBOX_GDKX)
+    // No adapter object on Scarlett -- single device per console partition.
+#elif defined(_WIN32)
     ComPtr<IDXGIAdapter1>     adapter;
     DXGI_ADAPTER_DESC1        adapter_desc = {};
 #else
@@ -447,7 +525,9 @@ struct dx12_device {
         }
     }
 
-#ifdef _WIN32
+#if defined(GGML_DX12_XBOX_GDKX)
+    void init(size_t idx);
+#elif defined(_WIN32)
     void init(ComPtr<IDXGIAdapter1> adapter_, size_t idx);
 #else
     void init(ComPtr<IDXCoreAdapter> adapter_, size_t idx);
@@ -495,6 +575,11 @@ struct dx12_backend_context {
     // Split-KV flash attention temp buffer
     ComPtr<ID3D12Resource> splitkv_temp;
     size_t                 splitkv_temp_size = 0;
+
+    // FA mask staging buffer -- protects against compute buffer aliasing
+    // where a prior FA output overwrites a later FA's mask input.
+    ComPtr<ID3D12Resource> fa_mask_staging;
+    size_t                 fa_mask_staging_size = 0;
 
     bool cmd_list_open = false;
 
@@ -545,7 +630,9 @@ struct dx12_backend_context {
 
 static struct dx12_global_state {
     bool                                        initialized = false;
-#ifdef _WIN32
+#if defined(GGML_DX12_XBOX_GDKX)
+    // No factory on Scarlett -- D3D12XboxCreateDevice is called directly.
+#elif defined(_WIN32)
     ComPtr<IDXGIFactory4>                       factory;
 #else
     ComPtr<IDXCoreAdapterFactory>               factory;
@@ -583,6 +670,57 @@ static void dx12_ensure_initialized() {
         DX12_LOG_INFO("Safe mode enabled (single allocator, sync after every CL)\n");
     }
 
+#if defined(GGML_DX12_XBOX_GDKX)
+    // ---- Xbox Series X (Scarlett) single-device init ----
+    //
+    // No DXGI / DXCore enumeration on this partition. The platform exposes
+    // exactly one D3D12 device per title, created directly via
+    // D3D12XboxCreateDevice.
+    //
+    // The debug layer and experimental-feature surfaces don't exist here --
+    // use PIX-on-Xbox for capture and validation instead.
+    {
+        // XGameRuntime services (XSystem, XUser, XStore, XGameSave, XLaunch,
+        // XClosedCaptions, XGameInvite, ...) require XGameRuntimeInitialize()
+        // to be called once before any other XGame* API. None of these are
+        // currently used by the dx12 backend itself, but a real Scarlett
+        // package deploy needs the runtime initialized for the OS to treat
+        // the process as a game title (HDMI handoff, suspend/resume, QoS
+        // scheduling on the title cores). Calling it here makes the backend
+        // self-sufficient instead of pushing the requirement up to every
+        // host (minslm-cli, server, etc.).
+        //
+        // Failure is non-fatal: when the process runs as a plain desktop
+        // .exe against the GDKX runtime (no MicrosoftGame.config, no game
+        // manifest), XGameRuntimeInitialize returns an error and we just
+        // continue without it -- D3D12 device creation still works.
+        HRESULT hr_xg = XGameRuntimeInitialize();
+        if (SUCCEEDED(hr_xg)) {
+            DX12_LOG_INFO("XGameRuntimeInitialize: ok\n");
+        } else {
+            DX12_LOG_WARN("XGameRuntimeInitialize failed (HRESULT 0x%08X) -- continuing without XGame* services (desktop .exe mode)\n",
+                          (unsigned)hr_xg);
+        }
+
+        D3D12XBOX_CREATE_DEVICE_PARAMETERS params = {};
+        params.Version             = D3D12_SDK_VERSION;
+        params.GraphicsCommandQueueRingSizeBytes = D3D12XBOX_DEFAULT_SIZE_BYTES;
+        params.GraphicsScratchMemorySizeBytes    = D3D12XBOX_DEFAULT_SIZE_BYTES;
+        params.ComputeScratchMemorySizeBytes     = D3D12XBOX_DEFAULT_SIZE_BYTES;
+        if (getenv("DX12_DEBUG")) {
+            params.ProcessDebugFlags = D3D12_PROCESS_DEBUG_FLAG_DEBUG_LAYER_ENABLED;
+            DX12_LOG_INFO("D3D12 debug layer requested (DX12_DEBUG)\n");
+        }
+
+        ComPtr<ID3D12Device> probe_device;
+        HRESULT hr = D3D12XboxCreateDevice(nullptr, &params, IID_PPV_ARGS(&probe_device));
+        DX12_CHECK(hr, "D3D12XboxCreateDevice");
+        probe_device.Reset(); // dx12_device::init() will create its own
+
+        g_dx12.devices.push_back(std::make_unique<dx12_device>());
+        g_dx12.devices.back()->init(0);
+    }
+#else
     // Enable debug layer when DX12_DEBUG env var is set
     if (getenv("DX12_DEBUG")) {
         ComPtr<ID3D12Debug> debug;
@@ -774,6 +912,7 @@ static void dx12_ensure_initialized() {
         g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
     }
 #endif // _WIN32
+#endif // GGML_DX12_XBOX_GDKX
 
     DX12_LOG_INFO("Found %zu D3D12 device(s)\n", g_dx12.devices.size());
     g_dx12.initialized = true;
@@ -783,7 +922,52 @@ static void dx12_ensure_initialized() {
 // dx12_device implementation
 // ---------------------------------------------------------------------------
 
-#ifdef _WIN32
+#if defined(GGML_DX12_XBOX_GDKX)
+void dx12_device::init(size_t idx) {
+    dev_index   = idx;
+    description = "Xbox Series X";
+    name        = std::string(GGML_DX12_NAME) + std::to_string(idx);
+
+    // Single device per partition. Re-create here -- the probe in
+    // dx12_ensure_initialized() was discarded after success.
+    D3D12XBOX_CREATE_DEVICE_PARAMETERS params = {};
+    params.Version             = D3D12_SDK_VERSION;
+    params.GraphicsCommandQueueRingSizeBytes = D3D12XBOX_DEFAULT_SIZE_BYTES;
+    params.GraphicsScratchMemorySizeBytes    = D3D12XBOX_DEFAULT_SIZE_BYTES;
+    params.ComputeScratchMemorySizeBytes     = D3D12XBOX_DEFAULT_SIZE_BYTES;
+    if (getenv("DX12_DEBUG")) {
+        params.ProcessDebugFlags = D3D12_PROCESS_DEBUG_FLAG_DEBUG_LAYER_ENABLED;
+    }
+    HRESULT hr = D3D12XboxCreateDevice(nullptr, &params, IID_PPV_ARGS(&device));
+    DX12_CHECK(hr, "D3D12XboxCreateDevice");
+
+    // Compute command queue
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    qd.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_queue));
+    DX12_CHECK(hr, "CreateCommandQueue(compute)");
+
+    // VRAM: Series X reports ~13.5 GB of game-available memory (16 GB physical
+    // minus OS reservation). The actual budget can be queried via
+    // XGameRuntime title-memory APIs; for the prototype we use a fixed budget
+    // and let the caller override via GGML_DX12_VRAM_OVERRIDE_MB.
+    vram_total = (size_t)13ull * 1024 * 1024 * 1024 + (size_t)512 * 1024 * 1024; // 13.5 GiB
+    if (const char * ovr = getenv("GGML_DX12_VRAM_OVERRIDE_MB")) {
+        size_t mb = (size_t)strtoull(dx12_env_unquote(ovr), nullptr, 10);
+        if (mb > 0) {
+            vram_total = mb * 1024ull * 1024ull;
+            DX12_LOG_INFO("VRAM override: %zu MiB\n", mb);
+        }
+    }
+    vram_free = vram_total;
+
+    // AMD Scarlett (RDNA 2 custom). Vendor 0x1002, device id is custom and
+    // doesn't matter for our purposes.
+    vendor_id = 0x1002;
+    device_id = 0;
+#elif defined(_WIN32)
 void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     adapter   = std::move(adapter_);
     dev_index = idx;
@@ -888,6 +1072,7 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
 
     // Check Cooperative Vector support
     cooperative_vector_supported = false;
+#ifndef GGML_DX12_XBOX_GDKX
     {
         // Try to query CV support — requires preview Agility SDK headers
         // For now, try the feature check and see if the driver supports it
@@ -900,10 +1085,12 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
             cooperative_vector_supported = true;
         }
     }
+#endif // !GGML_DX12_XBOX_GDKX
 
     // Check WaveMMA (SM 6.9 Wave Matrix) support
     // D3D12_FEATURE_WAVE_MMA queries hardware matrix multiply-accumulate capability
     wave_mma_supported = false;
+#ifndef GGML_DX12_XBOX_GDKX
     {
         // D3D12_FEATURE_WAVE_MMA — feature enum value TBD (not yet in public headers)
         // Structure matches the spec: input DataType + M + N, output Supported + K + AccumPrecision + RequiredWaveSize
@@ -937,6 +1124,7 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
             }
         }
     }
+#endif // !GGML_DX12_XBOX_GDKX
 
     // Query wave lane count (D3D12_FEATURE_D3D12_OPTIONS1)
     uint32_t wave_lane_min = 0, wave_lane_max = 0;
@@ -972,6 +1160,28 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
         }
     }
 
+#if defined(GGML_DX12_XBOX_GDKX)
+    // Scarlett is architecturally UMA + cache-coherent UMA: a single chip with
+    // a single GDDR6 pool shared between the Zen 2 CPU cores and the RDNA 2
+    // GPU, fully cache-coherent. The GDKX driver, however, presents two memory
+    // pools (L0/L1) to mimic the desktop "VRAM + system RAM" split, and
+    // CheckFeatureSupport(ARCHITECTURE1) often (mis)reports UMA=false on it.
+    //
+    // When UMA=false, dx12_create_buffer() routes through D3D12_HEAP_TYPE_DEFAULT,
+    // which on Scarlett maps to the ~10 GB L1 ("GPU-optimal") segment only --
+    // not the full ~13.5 GB title-memory budget. Once the model + D3D12XBOX
+    // scratch + system reservations consume enough of L1, large contiguous
+    // allocations (e.g. the KV cache, hundreds of MiB) fail with
+    // E_OUTOFMEMORY (HRESULT 0x8007000E) even though plenty of title memory
+    // is free.
+    //
+    // Forcing the (correct) UMA + CC-UMA values here makes dx12_create_buffer
+    // use D3D12_HEAP_TYPE_CUSTOM + L0 + WRITE_BACK, which sees the full title
+    // budget and is also the zero-copy fast path.
+    is_uma = true;
+    is_cache_coherent_uma = true;
+#endif
+
     // Environment override: GGML_DX12_NO_UMA=1 disables UMA optimizations for testing
     if (is_uma && getenv("GGML_DX12_NO_UMA")) {
         DX12_LOG_INFO("GGML_DX12_NO_UMA set: disabling UMA/CC-UMA optimizations\n");
@@ -981,8 +1191,12 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
 
     // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
     // Report SharedSystemMemory so the model loader puts all layers on GPU.
+    // Xbox already reports the correct game-available budget directly, so
+    // the desktop-style expansion is skipped there.
     if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
-#ifdef _WIN32
+#if defined(GGML_DX12_XBOX_GDKX)
+        size_t shared = vram_total;
+#elif defined(_WIN32)
         size_t shared = adapter_desc.SharedSystemMemory;
 #else
         size_t shared = 0;
@@ -1305,7 +1519,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
 
             // UMA zero-copy: direct memset
-            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+            if (DX12_USE_ZEROCOPY_IO && ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { 0, 0 };
                 HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
@@ -1352,7 +1566,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
 
             // UMA zero-copy: buffer is CPU-writable, write directly
-            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+            if (DX12_USE_ZEROCOPY_IO && ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { 0, 0 };
                 HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
@@ -1405,7 +1619,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
 
             // UMA zero-copy: buffer is CPU-readable (WRITE_BACK) or slow-read (WRITE_COMBINE)
-            if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+            if (DX12_USE_ZEROCOPY_IO && ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { tensor_offset, tensor_offset + size };
                 HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
@@ -1501,7 +1715,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             }
             if (dx12_diag_gt && tensor->ne[0] > 100000 && tensor->ne[1] == 1 && size == tensor->ne[0] * 4) {
                 static int logits_diag_count = 0;
-                if (logits_diag_count < 3) {
+                if (logits_diag_count < 30) {
                     logits_diag_count++;
                     const float * logits = (const float *)data;
                     int64_t n = tensor->ne[0];
@@ -1531,6 +1745,11 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
                             top_ids[0], top_vals[0], top_ids[1], top_vals[1],
                             top_ids[2], top_vals[2], top_ids[3], top_vals[3],
                             top_ids[4], top_vals[4]);
+                    // Spotlight: token 30 (the empty-piece token the model gets stuck on)
+                    if (n > 30) {
+                        fprintf(stderr, "  token30=%.4f  (top1 - token30 = %.4f)\n",
+                                logits[30], top_vals[0] - logits[30]);
+                    }
                     // Also print first 8 and last 8 values
                     fprintf(stderr, "  first8: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
                             logits[0], logits[1], logits[2], logits[3],
@@ -1751,13 +1970,22 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return true;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            // Re-enabled: NaN was in model head (dispatches 1598-1608), not attention.
-            // FA is MQA-safe and handles attention softcapping internally.
+#if defined(GGML_DX12_XBOX_GDKX)
+            // Disabled on Xbox: the ggml allocator reuses memory from earlier
+            // FA outputs for the ISWA mask cast tensor (same compute buffer).
+            // On GPU, all dispatches run asynchronously so the mask data is
+            // overwritten before global-attention layers read it, producing NaN.
+            // The Vulkan backend avoids this via byte-range overlap barriers;
+            // a similar fix is needed here before FA can be re-enabled.
+            // @TODO_SDM: implement pre-graph mask snapshot or allocator pinning.
+            return false;
+#else
             if (op->type == GGML_TYPE_F32 && op->src[1] &&
                 (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16)) {
                 return true;
             }
             return false;
+#endif
 
         default:
             return false;
@@ -1889,9 +2117,111 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
     bctx->ensure_cmd_list_open();
 
+    // @TODO_SDM: Detect compute buffer aliasing between INPUT tensors and
+    // computed outputs. The ggml allocator reuses buffer offsets, so an INPUT
+    // tensor (uploaded via set_tensor before graph execution) may share its
+    // byte range with a computed tensor that gets written during execution,
+    // destroying the input data before a later dispatch reads it.
+    // This scan runs once per graph and logs overlaps for diagnosis.
+#if defined(GGML_DX12_XBOX_GDKX)
+    {
+        static bool overlap_scan_done = false;  // only log once to avoid spam
+        if (!overlap_scan_done) {
+            overlap_scan_done = true;
+
+            struct tensor_range {
+                size_t off;
+                size_t size;
+                const char * name;
+                int node_idx;
+                bool is_input;
+            };
+            std::vector<tensor_range> ranges;
+
+            // Collect all tensor byte ranges in the compute buffer
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                struct ggml_tensor * node = cgraph->nodes[i];
+                if (ggml_is_empty(node)) continue;
+
+                // Collect output tensor (the node itself, if it writes to compute buffer)
+                if (node->buffer && !node->view_src &&
+                    node->op != GGML_OP_NONE && node->op != GGML_OP_RESHAPE &&
+                    node->op != GGML_OP_VIEW && node->op != GGML_OP_PERMUTE &&
+                    node->op != GGML_OP_TRANSPOSE) {
+                    auto * bctx_buf = (dx12_buffer_context *)node->buffer->context;
+                    if (bctx_buf && bctx_buf->dev == bctx->dev) {
+                        size_t off = (size_t)dx12_tensor_offset(node);
+                        size_t sz  = ggml_nbytes(node);
+                        ranges.push_back({ off, sz, node->name, i, false });
+                    }
+                }
+
+                // Collect INPUT source tensors
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    struct ggml_tensor * src = node->src[s];
+                    if (!src || !src->buffer) continue;
+                    if (!(src->flags & GGML_TENSOR_FLAG_INPUT)) continue;
+                    if (src->view_src) continue;
+                    auto * src_bctx = (dx12_buffer_context *)src->buffer->context;
+                    if (!src_bctx || src_bctx->dev != bctx->dev) continue;
+                    size_t off = (size_t)dx12_tensor_offset(src);
+                    size_t sz  = ggml_nbytes(src);
+                    // Avoid duplicates (same tensor may be src of multiple nodes)
+                    bool dup = false;
+                    for (auto & r : ranges) {
+                        if (r.is_input && r.off == off && r.size == sz) { dup = true; break; }
+                    }
+                    if (!dup) {
+                        ranges.push_back({ off, sz, src->name, i, true });
+                    }
+                }
+            }
+
+            // Check for overlaps between INPUT ranges and computed output ranges
+            int overlap_count = 0;
+            for (auto & inp : ranges) {
+                if (!inp.is_input) continue;
+                for (auto & out : ranges) {
+                    if (out.is_input) continue;
+                    // Check byte-range overlap
+                    if (inp.off < out.off + out.size && inp.off + inp.size > out.off) {
+                        overlap_count++;
+                        if (overlap_count <= 20) {
+                            fprintf(stderr, "ggml-dx12: OVERLAP #%d: INPUT '%s' [%zu..%zu] vs OUTPUT '%s' @node#%d [%zu..%zu]\n",
+                                    overlap_count,
+                                    inp.name, inp.off, inp.off + inp.size,
+                                    out.name, out.node_idx, out.off, out.off + out.size);
+                        }
+                    }
+                }
+            }
+            if (overlap_count > 0) {
+                fprintf(stderr, "ggml-dx12: OVERLAP SCAN: %d INPUT/OUTPUT overlaps detected in %d ranges (%d nodes)\n",
+                        overlap_count, (int)ranges.size(), cgraph->n_nodes);
+            } else {
+                fprintf(stderr, "ggml-dx12: OVERLAP SCAN: no INPUT/OUTPUT overlaps detected (%d ranges, %d nodes)\n",
+                        (int)ranges.size(), cgraph->n_nodes);
+            }
+            fflush(stderr);
+        }
+    }
+#endif
+
     // Profiling: profile only actual generation graphs (M=1 in MUL_MATs)
     static bool profiling = (getenv("DX12_PROFILE") != nullptr);
     static bool dx12_perf = (getenv("GGML_DX12_PERF") != nullptr);
+
+    // Per-dispatch tensor dump: GGML_DX12_DUMP_DISPATCH=<dir> dumps each node's
+    // output immediately after its dispatch completes (with full GPU sync).
+    // This captures the true output before aliased memory gets overwritten.
+    // GGML_DX12_DUMP_DISPATCH_GRAPH=N selects which graph_compute call to dump (default: 4).
+    static const char * dump_dispatch_dir = getenv("GGML_DX12_DUMP_DISPATCH");
+    static int dump_dispatch_graph_target = []() {
+        const char * e = getenv("GGML_DX12_DUMP_DISPATCH_GRAPH");
+        return (e && atoi(e) > 0) ? atoi(e) : 4;
+    }();
+    static int dump_dispatch_graph_count = 0;
+    static bool dump_dispatch_done = false;
     static int profile_graph = 0;
     static int gen_graph = 0;
     profile_graph++;
@@ -1910,6 +2240,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     bool do_profile = profiling && !is_prompt && gen_graph >= 3 && gen_graph <= 5;
     std::map<std::string, double> op_times;
 
+    // Per-dispatch dump activation
+    bool dump_this_dispatch_graph = false;
+    if (dump_dispatch_dir && !dump_dispatch_done) {
+        dump_dispatch_graph_count++;
+        if (dump_dispatch_graph_count == dump_dispatch_graph_target) {
+            dump_this_dispatch_graph = true;
+            dump_dispatch_done = true;
+            fprintf(stderr, "ggml-dx12: DUMP_DISPATCH: dumping graph #%d (%d nodes) to '%s'\n",
+                    dump_dispatch_graph_count, cgraph->n_nodes, dump_dispatch_dir);
+            fflush(stderr);
+        }
+    }
+
     int dispatch_weight = 0;
     // AMD RDNA 3 workaround: flush threshold for prompt phase.
     // Lower values = more frequent CL splits = more correct but slower.
@@ -1917,7 +2260,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     static int TDR_FLUSH_THRESHOLD = 0;
     if (TDR_FLUSH_THRESHOLD == 0) {
         const char * env = getenv("GGML_DX12_FLUSH_INTERVAL");
-        TDR_FLUSH_THRESHOLD = env ? atoi(env) : 16;
+        TDR_FLUSH_THRESHOLD = env ? atoi(dx12_env_unquote(env)) : 16;
         if (TDR_FLUSH_THRESHOLD <= 0) TDR_FLUSH_THRESHOLD = 16;
     }
 
@@ -1936,8 +2279,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     static constexpr double TDR_YIELD_MS = 800.0;  // yield to DWM every 800ms
 #endif
 
-    // Prompt diagnostics gated under GGML_DX12_DIAG
+    // Prompt diagnostics gated under GGML_DX12_DIAG.
+    // Also trace the first decode graph so we can see SET_ROWS / FA dispatch
+    // shapes when output is broken (n_tokens=1 path).
     static int prompt_eval_count = 0;
+    static int decode_eval_count = 0;
     bool trace_prompt = false;
     if (is_prompt && dx12_diag) {
         trace_prompt = true;
@@ -1945,6 +2291,129 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         fprintf(stderr, "ggml-dx12: PROMPT GRAPH #%d: n_nodes=%d, cl_open=%d\n",
                 prompt_eval_count, cgraph->n_nodes, (int)bctx->cmd_list_open);
         fflush(stderr);
+    } else if (!is_prompt && dx12_diag) {
+        decode_eval_count++;
+        // Default: trace decode #1. Override via GGML_DX12_TRACE_DECODE=N to
+        // trace the Nth decode iteration instead (e.g. N=15 catches the
+        // KV-corruption point where logits flip from sane to all-NaN).
+        static int trace_decode_target = []() {
+            const char * env = getenv("GGML_DX12_TRACE_DECODE");
+            int v = env ? atoi(dx12_env_unquote(env)) : 1;
+            if (v <= 0) v = 1;
+            return v;
+        }();
+        if (decode_eval_count == trace_decode_target) {
+            trace_prompt = true;  // reuse the same trace switch
+            fprintf(stderr, "ggml-dx12: DECODE GRAPH #%d (TRACED): n_nodes=%d, cl_open=%d\n",
+                    decode_eval_count, cgraph->n_nodes, (int)bctx->cmd_list_open);
+            fflush(stderr);
+
+            // Probe the first F32 leaf input tensor (inp_embd) before any
+            // dispatches run -- this tells us if set_tensor delivered correct
+            // data into the decode input, or if the embedding itself is NaN.
+            // Also probe inp_pos (I32) for ROPE position correctness.
+            struct ggml_tensor * probe_embd = nullptr;
+            struct ggml_tensor * probe_pos  = nullptr;
+            for (int ni = 0; ni < cgraph->n_nodes && (!probe_embd || !probe_pos); ni++) {
+                auto * nd = cgraph->nodes[ni];
+                for (int si = 0; si < GGML_MAX_SRC; si++) {
+                    auto * sr = nd->src[si];
+                    if (!sr || !sr->buffer) continue;
+                    if (sr->op != GGML_OP_NONE) continue;  // not a leaf
+                    if (sr->view_src) continue;             // not a base tensor
+                    if (!probe_embd && sr->type == GGML_TYPE_F32 && sr->ne[0] >= 256 && sr->ne[0] <= 8192) {
+                        probe_embd = sr;
+                    }
+                    if (!probe_pos && sr->type == GGML_TYPE_I32 && sr->ne[0] >= 1 && sr->ne[0] <= 16) {
+                        probe_pos = sr;
+                    }
+                }
+            }
+            auto * dev = bctx->dev;
+            dev->init_xfer();
+            dev->xfer_wait();  // ensure any pending set_tensor xfer landed
+            // Probe inp_embd (F32)
+            if (probe_embd) {
+                size_t bytes = (size_t)ggml_nelements(probe_embd) * sizeof(float);
+                if (bytes > 0 && bytes <= 64*1024) {
+                    uint32_t off = (uint32_t)dx12_tensor_offset(probe_embd);
+                    auto * sbuf = (dx12_buffer_context *)probe_embd->buffer->context;
+                    dev->xfer_ensure_staging(0, bytes);
+                    HRESULT hr = dev->xfer.cmd_alloc->Reset();
+                    if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                    if (SUCCEEDED(hr)) {
+                        dev->xfer.cmd_list->CopyBufferRegion(
+                            dev->xfer.readback_staging.Get(), 0, sbuf->resource.Get(), off, bytes);
+                        dev->xfer.cmd_list->Close();
+                        ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
+                        dev->compute_queue->ExecuteCommandLists(1, lists);
+                        dev->xfer.fence_value++;
+                        dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                        dev->xfer_wait();
+                        void * mp = nullptr;
+                        D3D12_RANGE rr = { 0, bytes };
+                        if (SUCCEEDED(dev->xfer.readback_staging->Map(0, &rr, &mp))) {
+                            float * f = (float *)mp;
+                            int n = (int)ggml_nelements(probe_embd);
+                            int nans = 0;
+                            double sum = 0, sum_sq = 0;
+                            for (int j = 0; j < n; j++) {
+                                if (isnan(f[j])) { nans++; continue; }
+                                sum += f[j];
+                                sum_sq += (double)f[j] * f[j];
+                            }
+                            double rms = sqrt(sum_sq / n);
+                            fprintf(stderr, "ggml-dx12: INPUT EMBD ne=(%lld,%lld) off=%u: rms=%.6f mean=%.6f nans=%d/%d  first8:",
+                                    (long long)probe_embd->ne[0], (long long)probe_embd->ne[1],
+                                    off, rms, sum/n, nans, n);
+                            for (int j = 0; j < 8 && j < n; j++) fprintf(stderr, " %.4f", f[j]);
+                            fprintf(stderr, "\n");
+                            fflush(stderr);
+                            D3D12_RANGE wr = { 0, 0 };
+                            dev->xfer.readback_staging->Unmap(0, &wr);
+                        }
+                    }
+                }
+            }
+            // Probe inp_pos (I32) — first 8 positions
+            if (probe_pos) {
+                size_t bytes = (size_t)ggml_nelements(probe_pos) * sizeof(int32_t);
+                if (bytes > 0 && bytes <= 4096) {
+                    uint32_t off = (uint32_t)dx12_tensor_offset(probe_pos);
+                    auto * sbuf = (dx12_buffer_context *)probe_pos->buffer->context;
+                    dev->xfer_ensure_staging(0, bytes);
+                    HRESULT hr = dev->xfer.cmd_alloc->Reset();
+                    if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                    if (SUCCEEDED(hr)) {
+                        dev->xfer.cmd_list->CopyBufferRegion(
+                            dev->xfer.readback_staging.Get(), 0, sbuf->resource.Get(), off, bytes);
+                        dev->xfer.cmd_list->Close();
+                        ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
+                        dev->compute_queue->ExecuteCommandLists(1, lists);
+                        dev->xfer.fence_value++;
+                        dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                        dev->xfer_wait();
+                        void * mp = nullptr;
+                        D3D12_RANGE rr = { 0, bytes };
+                        if (SUCCEEDED(dev->xfer.readback_staging->Map(0, &rr, &mp))) {
+                            int32_t * ip = (int32_t *)mp;
+                            int n = (int)ggml_nelements(probe_pos);
+                            fprintf(stderr, "ggml-dx12: INPUT POS  ne=(%lld) off=%u: vals[0..%d]:",
+                                    (long long)probe_pos->ne[0], off, std::min(n,8)-1);
+                            for (int j = 0; j < 8 && j < n; j++) fprintf(stderr, " %d", ip[j]);
+                            fprintf(stderr, "\n");
+                            fflush(stderr);
+                            D3D12_RANGE wr = { 0, 0 };
+                            dev->xfer.readback_staging->Unmap(0, &wr);
+                        }
+                    }
+                }
+            }
+            // Re-open compute CL so dispatch loop has a recording surface.
+            // (xfer cmd lists are separate from compute CL, but ensure_cmd_list_open
+            // is idempotent if already open.)
+            bctx->ensure_cmd_list_open();
+        }
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -1977,8 +2446,17 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         struct ggml_tensor * fused_rms_node = nullptr;      // the RMS_NORM in triple fusion
 
         // Try ADD + RMS_NORM + MUL triple fusion first
-        static bool no_fusion = (getenv("GGML_DX12_NO_FUSION") != nullptr);
-        bool skip_fusion = no_fusion || (is_prompt && getenv("GGML_DX12_NO_PROMPT_FUSION"));
+        static bool no_fusion = []() {
+            bool v = (getenv("GGML_DX12_NO_FUSION") != nullptr);
+            if (v) DX12_LOG_INFO("GGML_DX12_NO_FUSION set: disabling all op fusion\n");
+            return v;
+        }();
+        static bool no_prompt_fusion = []() {
+            bool v = (getenv("GGML_DX12_NO_PROMPT_FUSION") != nullptr);
+            if (v) DX12_LOG_INFO("GGML_DX12_NO_PROMPT_FUSION set: disabling op fusion during prompt eval\n");
+            return v;
+        }();
+        bool skip_fusion = no_fusion || (is_prompt && no_prompt_fusion);
         // Per-fusion control: GGML_DX12_FUSION_MASK bitmask enables specific fusions:
         //   bit 0 (1):  ADD+RMS_NORM+MUL
         //   bit 1 (2):  RMS_NORM+MUL
@@ -1989,7 +2467,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         static int fusion_mask = -1;
         if (fusion_mask == -1) {
             const char * env = getenv("GGML_DX12_FUSION_MASK");
-            fusion_mask = env ? atoi(env) : 0x1B;  // 27 = all except RMS+MUL+ROPE
+            fusion_mask = env ? atoi(dx12_env_unquote(env)) : 0x1B;  // 27 = all except RMS+MUL+ROPE
         }
         if (!skip_fusion && !(fusion_mask & 1) && !(fusion_mask & 2) && !(fusion_mask & 4) && !(fusion_mask & 8) && !(fusion_mask & 16))
             skip_fusion = true;
@@ -2095,12 +2573,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             ggml_type t = node->src[0]->type;
             if (t == GGML_TYPE_F16 || t == GGML_TYPE_F32 ||
                 t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
-                t == GGML_TYPE_Q6_K) {
+                t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q5_0) {
                 key.flags = 4;
             }
         }
 
-        // Op fusion: MUL_MAT(M=1) + ADD → matvec with fused bias add
+        // Op fusion: MUL_MAT(M=1) + ADD -> matvec with fused bias add
         struct ggml_tensor * fused_bias_add = nullptr;
         struct ggml_tensor * fused_bias_tensor = nullptr;
         if (!skip_fusion && (fusion_mask & 16) && is_matvec_dispatch && i + 1 < cgraph->n_nodes) {
@@ -2109,8 +2587,17 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 struct ggml_tensor * bias = nullptr;
                 if (next->src[0] == node) bias = next->src[1];
                 else if (next->src[1] == node) bias = next->src[0];
-                // Bias must be F32, same shape as output, contiguous
-                if (bias && bias->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                // Bias must be:
+                //   - F32, same ne[0] as output, contiguous
+                //   - a LEAF model weight (op == NONE) NOT a computed tensor.
+                //     Without this check the residual stream (which has the
+                //     same shape as a bias for matvec rows) gets mis-fused as
+                //     a bias on every layer. Mathematically equivalent in
+                //     theory, but the in-place read/write on the residual
+                //     buffer corrupts FFN-down output on UMA -- residual mean
+                //     drifts to +40 by layer 9 and decoder NaNs by layer 11.
+                bool bias_is_leaf = bias && bias->op == GGML_OP_NONE && bias->view_src == nullptr;
+                if (bias && bias_is_leaf && bias->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
                     bias->ne[0] == node->ne[0] && ggml_is_contiguous(bias)) {
                     fused_bias_add = next;
                     fused_bias_tensor = bias;
@@ -2228,11 +2715,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Split-KV flash attention: precompute split_k before params are pushed
         uint32_t fa_split_k = 1;
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            static int splitk_env = -1;
-            if (splitk_env == -1) {
+            static int splitk_env = []() {
                 const char * env = getenv("GGML_DX12_SPLIT_K");
-                splitk_env = env ? atoi(env) : 0;  // 0 = auto
-            }
+                if (!env) return 0;
+                int v = atoi(dx12_env_unquote(env));
+                DX12_LOG_INFO("GGML_DX12_SPLIT_K env=\"%s\" parsed=%d (0=auto, 1=disabled, >=2=force)\n", env, v);
+                return v;
+            }();
 
             uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
             uint32_t N_kv      = (uint32_t)node->src[1]->ne[1];
@@ -2240,7 +2729,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             uint32_t batch     = (uint32_t)node->src[0]->ne[3];
 
             if (N_queries == 1 && N_kv >= 512) {
-                if (splitk_env > 1) {
+                if (splitk_env == 1) {
+                    // Explicit disable: force fa_split_k = 1 (no split)
+                    fa_split_k = 1;
+                } else if (splitk_env > 1) {
                     fa_split_k = (uint32_t)splitk_env;
                     // Still cap to avoid too many empty splits (wastes temp memory)
                     uint32_t max_split = (N_kv + 255) / 256;
@@ -2330,7 +2822,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.op_params[15] = fa_split_k;
         }
 
-        // Upload root constants — only upload op_params for ops that need them
+        // Upload root constants -- only upload op_params for ops that need them
         static constexpr uint32_t BASE_PARAMS = 30;  // ne/nb/offsets/esizes = 30 DWORDs
         bool needs_op_params = (node->op == GGML_OP_SOFT_MAX || 
                                  node->op == GGML_OP_FLASH_ATTN_EXT || 
@@ -2339,6 +2831,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  node->op == GGML_OP_NORM ||
                                  node->op == GGML_OP_GLU ||
                                  node->op == GGML_OP_SCALE ||
+                                 node->op == GGML_OP_MUL_MAT ||  // matvec shaders read op0/op1 for bias fusion
                                  fused_bias_tensor ||
                                  fused_add_rms_node);
         uint32_t num_constants = needs_op_params ? (uint32_t)(sizeof(params) / 4) : BASE_PARAMS;
@@ -2481,7 +2974,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
                             bctx->cmd_list->SetComputeRoot32BitConstants(0, BASE_PARAMS, &params, 0);
 
-                            if (dx12_diag && is_prompt) {
+                            if (trace_prompt) {
                                 int src0t = node->src[0] ? (int)node->src[0]->type : -1;
                                 fprintf(stderr, "ggml-dx12: dispatch #%d MUL_MAT(src0t=%d) chunk [%u..%u/%u] groups=(%u,1,%u)\n",
                                         i, src0t, cs, cs + cr, N, cr, batches);
@@ -2722,9 +3215,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 unsynced_writes.clear();
             }
 
-            // DEBUG: unconditional UAV barrier before every dispatch to test if
-            // the dependency-tracked barriers are missing a case.
-            static bool force_barriers = (getenv("GGML_DX12_BARRIER_ALL") != nullptr);
+            // @TODO_SDM: the dependency-tracked barrier logic (unsynced_writes)
+            // tracks by tensor pointer, not byte range. On Xbox, the ggml
+            // allocator reuses buffer offsets so two different tensor pointers
+            // can reference overlapping memory, causing the tracker to miss
+            // dependencies. Force unconditional barriers on Xbox until
+            // byte-range overlap detection is implemented (like Vulkan does).
+            static bool force_barriers = []() {
+#if defined(GGML_DX12_XBOX_GDKX)
+                bool v = true;  // default ON for Xbox
+                if (getenv("GGML_DX12_BARRIER_ALL") && atoi(dx12_env_unquote(getenv("GGML_DX12_BARRIER_ALL"))) == 0) {
+                    v = false;  // allow explicit disable for testing
+                    DX12_LOG_INFO("GGML_DX12_BARRIER_ALL=0: forced barriers disabled on Xbox\n");
+                }
+#else
+                bool v = (getenv("GGML_DX12_BARRIER_ALL") != nullptr);
+#endif
+                if (v) DX12_LOG_INFO("GGML_DX12_BARRIER_ALL: forcing UAV barrier before every dispatch\n");
+                return v;
+            }();
             if (force_barriers) {
                 D3D12_RESOURCE_BARRIER barrier = {};
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -2734,8 +3243,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
-        // TDR diagnostic: print every dispatch during first prompt
-        if (dx12_diag && is_prompt) {
+        // TDR diagnostic: print every dispatch during traced graphs (prompt + first decode)
+        if (trace_prompt) {
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
             if (node->op == GGML_OP_FLASH_ATTN_EXT && fa_split_k > 1) {
                 fprintf(stderr, "ggml-dx12: dispatch #%d FA(split_k=%u) groups=(%u,%u,%u) ne=(%lld,%lld,%lld,%lld)\n",
@@ -2756,6 +3265,107 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         i, ggml_op_name(node->op), groups_x, groups_y, groups_z);
             }
             continue;
+        }
+
+        // FA input probe: when tracing decode, read the first 32 elements of
+        // each FA source (Q/K/V/mask) and report NaN counts. This isolates
+        // whether the FA shader is generating NaN from clean inputs (bug in
+        // shader/op_params) or whether the K/V cache contains NaN (upstream
+        // SET_ROWS or projection bug).
+        if (dx12_diag && trace_prompt && !is_prompt && node->op == GGML_OP_FLASH_ATTN_EXT) {
+            auto probe_src = [&](const char * label, struct ggml_tensor * src) {
+                if (!src || !src->buffer) return;
+                size_t off = (size_t)dx12_tensor_offset(src);
+                size_t esz = ggml_type_size(src->type);
+                size_t n_to_read = 32;
+                size_t bytes = n_to_read * esz;
+                bool is_f16 = (src->type == GGML_TYPE_F16);
+                bool is_f32 = (src->type == GGML_TYPE_F32);
+                if (!is_f16 && !is_f32) {
+                    fprintf(stderr, "ggml-dx12: FA INPUT d#%d %s type=%d off=%zu (skipped, not F16/F32)\n",
+                            i, label, (int)src->type, off);
+                    fflush(stderr);
+                    return;
+                }
+                bctx->close_and_execute();
+                bctx->wait_for_gpu();
+                auto * dev = bctx->dev;
+                dev->init_xfer();
+                dev->xfer_ensure_staging(0, bytes);
+                dev->xfer_wait();
+                HRESULT hrp = dev->xfer.cmd_alloc->Reset();
+                if (SUCCEEDED(hrp)) hrp = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                if (SUCCEEDED(hrp)) {
+                    auto * pbuf = (dx12_buffer_context *)src->buffer->context;
+                    dev->xfer.cmd_list->CopyBufferRegion(
+                        dev->xfer.readback_staging.Get(), 0, pbuf->resource.Get(), off, bytes);
+                    dev->xfer.cmd_list->Close();
+                    ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
+                    dev->compute_queue->ExecuteCommandLists(1, lists);
+                    dev->xfer.fence_value++;
+                    dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                    dev->xfer_wait();
+                    void * mp = nullptr;
+                    D3D12_RANGE rr = { 0, bytes };
+                    if (SUCCEEDED(dev->xfer.readback_staging->Map(0, &rr, &mp))) {
+                        int nans = 0, infs = 0;
+                        float v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+                        if (is_f32) {
+                            const float * f = (const float *)mp;
+                            for (size_t j = 0; j < n_to_read; ++j) {
+                                if (isnan(f[j])) nans++;
+                                else if (isinf(f[j])) infs++;
+                            }
+                            v0 = f[0]; v1 = f[1]; v2 = f[2]; v3 = f[3];
+                        } else { // F16
+                            const uint16_t * h = (const uint16_t *)mp;
+                            auto h2f = [](uint16_t x) -> float {
+                                uint32_t s = (uint32_t)(x & 0x8000) << 16;
+                                uint32_t e = (x >> 10) & 0x1f;
+                                uint32_t m = x & 0x3ff;
+                                uint32_t r;
+                                if (e == 0) {
+                                    if (m == 0) r = s;
+                                    else { while (!(m & 0x400)) { m <<= 1; e--; } e++; m &= 0x3ff;
+                                           r = s | ((e + 112) << 23) | (m << 13); }
+                                } else if (e == 31) {
+                                    r = s | 0x7f800000 | (m << 13);
+                                } else {
+                                    r = s | ((e + 112) << 23) | (m << 13);
+                                }
+                                float f; memcpy(&f, &r, 4); return f;
+                            };
+                            for (size_t j = 0; j < n_to_read; ++j) {
+                                float fv = h2f(h[j]);
+                                if (isnan(fv)) nans++;
+                                else if (isinf(fv)) infs++;
+                            }
+                            v0 = h2f(h[0]); v1 = h2f(h[1]); v2 = h2f(h[2]); v3 = h2f(h[3]);
+                        }
+                        fprintf(stderr, "ggml-dx12: FA INPUT d#%d %s type=%d off=%zu ne=(%lld,%lld,%lld,%lld) nb=(%zu,%zu,%zu,%zu) nans=%d/%zu infs=%d v[0..3]=%.4g %.4g %.4g %.4g\n",
+                                i, label, (int)src->type, off,
+                                (long long)src->ne[0], (long long)src->ne[1], (long long)src->ne[2], (long long)src->ne[3],
+                                src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+                                nans, n_to_read, infs, v0, v1, v2, v3);
+                        fflush(stderr);
+                        D3D12_RANGE wr = { 0, 0 };
+                        dev->xfer.readback_staging->Unmap(0, &wr);
+                    }
+                }
+                bctx->ensure_cmd_list_open();
+                bctx->reset_binding_cache();
+                unsynced_writes.clear();
+            };
+            probe_src("Q   (src0)", node->src[0]);
+            probe_src("K   (src1)", node->src[1]);
+            probe_src("V   (src2)", node->src[2]);
+            probe_src("Mask(src3)", node->src[3]);
+            // Print dst offset and nb for FA to check for buffer aliasing
+            fprintf(stderr, "ggml-dx12: FA DST  d#%d off=%u nb=(%u,%u,%u,%u) ne=(%lld,%lld,%lld,%lld) esize=%u\n",
+                    i, params.dst_offset, params.nb0, params.nb1, params.nb2, params.nb3,
+                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3],
+                    params.dst_esize);
+            fflush(stderr);
         }
 
         bctx->cmd_list->Dispatch(groups_x, groups_y, groups_z);
@@ -2942,18 +3552,122 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (decode_flush_interval == 0) {
                 const char * env = getenv("GGML_DX12_DECODE_FLUSH");
                 if (!env) env = getenv("GGML_DX12_FLUSH_INTERVAL");
-                decode_flush_interval = env ? atoi(env) : 1;
+                decode_flush_interval = env ? atoi(dx12_env_unquote(env)) : 1;
                 if (decode_flush_interval <= 0) decode_flush_interval = 1;
             }
             dispatch_weight++;
             if (dispatch_weight >= decode_flush_interval) {
                 bctx->close_and_execute();
-                // No wait_for_gpu() — CL boundary is the GPU pipeline drain.
+                // No wait_for_gpu() -- CL boundary is the GPU pipeline drain.
                 // The ring of CMD_RING_SIZE allocators handles CPU pipelining.
                 bctx->ensure_cmd_list_open();
                 unsynced_writes.clear();
                 dispatch_weight = 0;
             }
+
+#if 0 // debug diagnostic code -- // @TODO_SDM: removeme when things are more stable
+            // Per-dispatch NaN bisection on first decode graph.
+            // Decode tensors are tiny (1152, 256, 1024, 4096 floats), so readback
+            // is cheap. Fires only on decode_eval_count==1, only for F32 outputs,
+            // and only on "checkpoint" ops (RMS_NORM, MUL_MAT, FA, ROPE, ADD, MUL,
+            // GLU, SOFT_MAX). Stops 8 dispatches after first NaN. Prints only
+            // first 4 baseline + last 4 trailing + every probe with nans>0, so
+            // the log stays small while still bisecting all 27 layers.
+            if (dx12_diag && !is_prompt && trace_prompt && node->type == GGML_TYPE_F32 &&
+                node->buffer && node->ne[1] <= 4 && node->ne[2] <= 16 && node->ne[3] <= 1) {
+                ggml_op op = node->op;
+                bool is_checkpoint =
+                    op == GGML_OP_RMS_NORM || op == GGML_OP_NORM ||
+                    op == GGML_OP_MUL_MAT  || op == GGML_OP_FLASH_ATTN_EXT ||
+                    op == GGML_OP_ROPE     || op == GGML_OP_ADD ||
+                    op == GGML_OP_MUL      || op == GGML_OP_GLU ||
+                    op == GGML_OP_SOFT_MAX || op == GGML_OP_SCALE;
+                static int dec_probe_count = 0;
+                static int dec_first_nan_disp = -1;
+                static int dec_trailing_after_nan = 0;
+                bool stop = (dec_first_nan_disp >= 0 && dec_trailing_after_nan >= 8);
+                if (is_checkpoint && !stop && dec_probe_count < 1500) {
+                    size_t n_elem = (size_t)node->ne[0] * (size_t)std::max((int64_t)1, node->ne[1]) *
+                                    (size_t)std::max((int64_t)1, node->ne[2]);
+                    size_t bytes = n_elem * sizeof(float);
+                    if (bytes > 0 && bytes <= 32 * 1024) {
+                        // Flush so dispatch is complete on GPU
+                        bctx->close_and_execute();
+                        bctx->wait_for_gpu();
+                        uint32_t off = (uint32_t)dx12_tensor_offset(node);
+                        auto * dev = bctx->dev;
+                        dev->init_xfer();
+                        dev->xfer_ensure_staging(0, bytes);
+                        dev->xfer_wait();
+                        HRESULT hrp = dev->xfer.cmd_alloc->Reset();
+                        if (SUCCEEDED(hrp)) hrp = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                        if (SUCCEEDED(hrp)) {
+                            auto * pbuf = (dx12_buffer_context *)node->buffer->context;
+                            dev->xfer.cmd_list->CopyBufferRegion(
+                                dev->xfer.readback_staging.Get(), 0, pbuf->resource.Get(), off, bytes);
+                            dev->xfer.cmd_list->Close();
+                            ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
+                            dev->compute_queue->ExecuteCommandLists(1, lists);
+                            dev->xfer.fence_value++;
+                            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                            dev->xfer_wait();
+                            void * mp = nullptr;
+                            D3D12_RANGE rr = { 0, bytes };
+                            if (SUCCEEDED(dev->xfer.readback_staging->Map(0, &rr, &mp))) {
+                                float * f = (float *)mp;
+                                int n = (int)n_elem;
+                                int nans = 0, infs = 0;
+                                double sum = 0, sum_sq = 0;
+                                for (int j = 0; j < n; j++) {
+                                    if (isnan(f[j])) { nans++; continue; }
+                                    if (isinf(f[j])) { infs++; continue; }
+                                    sum += f[j];
+                                    sum_sq += (double)f[j] * f[j];
+                                }
+                                int n_finite = n - nans - infs;
+                                double rms = n_finite > 0 ? sqrt(sum_sq / n_finite) : 0.0;
+                                double mean = n_finite > 0 ? sum / n_finite : 0.0;
+                                // Print every checkpoint -- previous sparse
+                                // strategy hid the residual growth pattern
+                                // between layers 1 and 11. ~25 checkpoints/layer
+                                // x 27 layers ~= 675 lines, manageable.
+                                bool any_bad = (nans > 0) || (infs > 0);
+                                int src0t = node->src[0] ? (int)node->src[0]->type : -1;
+                                int src1t = node->src[1] ? (int)node->src[1]->type : -1;
+                                fprintf(stderr, "ggml-dx12: DEC PROBE d#%4d %-14s s0t=%d s1t=%d ne=(%lld,%lld,%lld) "
+                                        "rms=%.4g mean=%.4g nans=%d/%d infs=%d  v[0..3]=%.4g %.4g %.4g %.4g\n",
+                                        i, ggml_op_name(op), src0t, src1t,
+                                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2],
+                                        rms, mean, nans, n, infs,
+                                        f[0], n>1?f[1]:0, n>2?f[2]:0, n>3?f[3]:0);
+                                fflush(stderr);
+                                if (infs > 0 && op == GGML_OP_FLASH_ATTN_EXT) {
+                                    fprintf(stderr, "ggml-dx12: FA OUTPUT DUMP d#%d (%d values, %d infs):\n", i, n, infs);
+                                    for (int j = 0; j < n; j += 16) {
+                                        fprintf(stderr, "  out[%4d..%4d]:", j, std::min(j + 15, n - 1));
+                                        for (int k = j; k < std::min(j + 16, n); ++k) {
+                                            if (isinf(f[k])) fprintf(stderr, " %cinf", f[k] < 0 ? '-' : '+');
+                                            else if (isnan(f[k])) fprintf(stderr, " nan");
+                                            else fprintf(stderr, " %.4g", f[k]);
+                                        }
+                                        fprintf(stderr, "\n");
+                                    }
+                                    fflush(stderr);
+                                }
+                                if (any_bad && dec_first_nan_disp < 0) dec_first_nan_disp = i;
+                                if (dec_first_nan_disp >= 0) dec_trailing_after_nan++;
+                                D3D12_RANGE wr = { 0, 0 };
+                                dev->xfer.readback_staging->Unmap(0, &wr);
+                                dec_probe_count++;
+                            }
+                        }
+                        bctx->ensure_cmd_list_open();
+                        bctx->reset_binding_cache();
+                        unsynced_writes.clear();
+                    }
+                }
+            }
+#endif // debug diagnostic code
         }
 
         // Force CL split at every dispatch in model head region to fix NaN and sync.
@@ -3074,6 +3788,120 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     } else {
                         dx12_mm_gemm_counts[type].fetch_add(1, std::memory_order_relaxed);
                         dx12_mm_gemm_time_us[type].fetch_add(elapsed_us, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+
+        // Per-dispatch tensor dump: sync GPU, read back output, write to file
+        if (dump_this_dispatch_graph) {
+            // Determine the effective output tensor (accounting for fusion)
+            struct ggml_tensor * dump_tensor = fused_rope_after_rms ? fused_rope_after_rms :
+                                               (fused_mul_node ? fused_mul_node :
+                                               (fused_bias_add ? fused_bias_add :
+                                               (fused_rope_set_rows ? fused_rope_set_rows : node)));
+
+            // GPU sync (if not already synced by dx12_perf)
+            if (!dx12_perf && !do_profile) {
+                bctx->close_and_execute();
+                bctx->wait_for_gpu();
+                bctx->ensure_cmd_list_open();
+                bctx->reset_binding_cache();
+                unsynced_writes.clear();
+            }
+
+            auto * dump_buf_ctx = (dx12_buffer_context *)(dump_tensor->buffer ? dump_tensor->buffer->context : nullptr);
+            if (dump_buf_ctx && dump_buf_ctx->resource) {
+                size_t offset = (size_t)dx12_tensor_offset(dump_tensor);
+                size_t nbytes = ggml_nbytes(dump_tensor);
+                int64_t nelements = ggml_nelements(dump_tensor);
+                auto * dev = bctx->dev;
+
+                dev->init_xfer();
+                dev->xfer_ensure_staging(0, nbytes);
+                dev->xfer_wait();
+
+                HRESULT hr_dd = dev->xfer.cmd_alloc->Reset();
+                if (SUCCEEDED(hr_dd)) hr_dd = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+                if (SUCCEEDED(hr_dd)) {
+                    dev->xfer.cmd_list->CopyBufferRegion(
+                        dev->xfer.readback_staging.Get(), 0,
+                        dump_buf_ctx->resource.Get(), offset, nbytes);
+                    dev->xfer.cmd_list->Close();
+                    ID3D12CommandList * dlists[] = { dev->xfer.cmd_list.Get() };
+                    dev->compute_queue->ExecuteCommandLists(1, dlists);
+                    dev->xfer.fence_value++;
+                    dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                    dev->xfer_wait();
+
+                    void * mapped = nullptr;
+                    D3D12_RANGE rr = { 0, nbytes };
+                    hr_dd = dev->xfer.readback_staging->Map(0, &rr, &mapped);
+                    if (SUCCEEDED(hr_dd)) {
+                        // Convert to F32
+                        std::vector<float> f32_data;
+                        uint32_t n_floats = 0;
+
+                        if (dump_tensor->type == GGML_TYPE_F32) {
+                            n_floats = (uint32_t)nelements;
+                            f32_data.assign((float *)mapped, (float *)mapped + nelements);
+                        } else if (dump_tensor->type == GGML_TYPE_F16) {
+                            n_floats = (uint32_t)nelements;
+                            f32_data.resize(nelements);
+                            uint16_t * hp = (uint16_t *)mapped;
+                            for (int64_t j = 0; j < nelements; j++) {
+                                uint16_t h = hp[j];
+                                uint32_t sign = (uint32_t)(h >> 15) << 31;
+                                uint32_t exp = (h >> 10) & 0x1F;
+                                uint32_t mant = h & 0x3FF;
+                                if (exp == 0) {
+                                    if (mant == 0) { f32_data[j] = (h & 0x8000) ? -0.0f : 0.0f; continue; }
+                                    exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF;
+                                } else if (exp == 31) {
+                                    uint32_t r = sign | 0x7F800000 | (mant << 13);
+                                    memcpy(&f32_data[j], &r, 4); continue;
+                                }
+                                uint32_t r = sign | ((exp + 112) << 23) | (mant << 13);
+                                memcpy(&f32_data[j], &r, 4);
+                            }
+                        } else if (dump_tensor->type == GGML_TYPE_I32) {
+                            n_floats = (uint32_t)nelements;
+                            f32_data.resize(nelements);
+                            int32_t * ip = (int32_t *)mapped;
+                            for (int64_t j = 0; j < nelements; j++) f32_data[j] = (float)ip[j];
+                        }
+
+                        char filepath[1024];
+                        snprintf(filepath, sizeof(filepath), "%s/node_%04d_%s.bin",
+                                 dump_dispatch_dir, i, ggml_op_name(dump_tensor->op));
+                        FILE * df = fopen(filepath, "wb");
+                        if (df) {
+                            uint32_t magic = 0x31444747; // "GGD1"
+                            uint32_t version = 1;
+                            uint32_t nidx = (uint32_t)i;
+                            uint32_t op_id = (uint32_t)dump_tensor->op;
+                            uint32_t type_id = (uint32_t)dump_tensor->type;
+                            uint32_t nlen = (uint32_t)strlen(dump_tensor->name);
+                            uint32_t nf = n_floats;
+                            fwrite(&magic, 4, 1, df);
+                            fwrite(&version, 4, 1, df);
+                            fwrite(&nidx, 4, 1, df);
+                            fwrite(&op_id, 4, 1, df);
+                            fwrite(&type_id, 4, 1, df);
+                            fwrite(dump_tensor->ne, sizeof(int64_t), 4, df);
+                            fwrite(&nlen, 4, 1, df);
+                            fwrite(&nf, 4, 1, df);
+                            fwrite(dump_tensor->name, 1, nlen, df);
+                            if (n_floats > 0) {
+                                fwrite(f32_data.data(), sizeof(float), n_floats, df);
+                            } else {
+                                fwrite(mapped, 1, nbytes, df);
+                            }
+                            fclose(df);
+                        }
+
+                        D3D12_RANGE wr_dd = { 0, 0 };
+                        dev->xfer.readback_staging->Unmap(0, &wr_dd);
                     }
                 }
             }
@@ -3246,19 +4074,22 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     }
 
     // Diagnostic: sync all remaining work before returning
-    if (dx12_diag && is_prompt && bctx->cmd_list_open) {
+    if (dx12_diag && bctx->cmd_list_open) {
         bctx->close_and_execute();
         bctx->wait_for_gpu();
-        fprintf(stderr, "ggml-dx12: final flush OK (all %d dispatches completed)\n", cgraph->n_nodes);
+        fprintf(stderr, "ggml-dx12: final flush OK (all %d dispatches completed, %s)\n",
+                cgraph->n_nodes, is_prompt ? "prompt" : "decode");
         fflush(stderr);
 
         // Read back the hidden state (src[1] of the vocab projection MUL_MAT)
         // to compare with CPU reference. Find last MUL_MAT with large output.
+        // Fires for both prompt and decode graphs so we can compare the two.
         static int hidden_diag_count = 0;
-        if (hidden_diag_count < 2 && cgraph->n_nodes > 1000) {
+        if (hidden_diag_count < 4) {
             hidden_diag_count++;
             struct ggml_tensor * vocab_mm = nullptr;
-            for (int ni = cgraph->n_nodes - 1; ni >= cgraph->n_nodes - 10; ni--) {
+            int search_lo = std::max(0, cgraph->n_nodes - 10);
+            for (int ni = cgraph->n_nodes - 1; ni >= search_lo; ni--) {
                 auto * nd = cgraph->nodes[ni];
                 if (nd->op == GGML_OP_MUL_MAT && nd->ne[0] >= 100000) {
                     vocab_mm = nd;
@@ -3400,6 +4231,8 @@ void dx12_device::run_autotune() {
         DX12_LOG_INFO("Auto-tune cache '%s' version mismatch or corrupt — regenerating\n", cache_path);
     }
 
+    // @TODO_SDM: try running auto-tune on UMA anyway.
+
     // UMA fallback (no cache available): use conservative defaults that skip
     // the expensive GPU benchmark. Only override settings where 32t is safe.
     // Note: Q6_K 32t uses per-element scalar access — slower for large K on
@@ -3411,9 +4244,25 @@ void dx12_device::run_autotune() {
         f16_use_load4 = false;   // load2 sufficient for shared-memory bandwidth
         q5k_use_mr    = true;    // multi-row Q5_K: 14% faster than standard 256t
         q6k_use_mr    = false;   // disabled: q6k_mr shader 2.1x slower than standard 256t
-        fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D≤128)
-        DX12_LOG_INFO("Auto-tune v%d UMA defaults: Q5_0=32t Q8_0=32t Q6_K=256t Q5_K=mr FA=uma F16=load2\n", TUNE_VERSION);
-        return;
+        fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D<=128)
+        // Per-flag env overrides for UMA bisection.
+        // GGML_DX12_Q5_0_USE_256=1 forces 256t cooperative shader for Q5_0
+        // GGML_DX12_Q8_0_USE_256=1 forces 256t cooperative shader for Q8_0
+        // GGML_DX12_Q5K_USE_MR=0   disables multi-row Q5_K
+        // GGML_DX12_FA_USE_UMA=0   disables UMA FA shader (use standard FA)
+        if (const char * e = getenv("GGML_DX12_Q5_0_USE_256")) q5_0_use_256 = (atoi(dx12_env_unquote(e)) != 0);
+        if (const char * e = getenv("GGML_DX12_Q8_0_USE_256")) q8_0_use_256 = (atoi(dx12_env_unquote(e)) != 0);
+        if (const char * e = getenv("GGML_DX12_Q5K_USE_MR"))   q5k_use_mr   = (atoi(dx12_env_unquote(e)) != 0);
+        if (const char * e = getenv("GGML_DX12_FA_USE_UMA"))   fa_use_uma   = (atoi(dx12_env_unquote(e)) != 0);
+        DX12_LOG_INFO("Auto-tune v%d UMA: Q5_0=%s Q8_0=%s Q6_K=256t Q5_K=%s FA=%s F16=load2\n",
+                      TUNE_VERSION,
+                      q5_0_use_256 ? "256t" : "32t",
+                      q8_0_use_256 ? "256t" : "32t",
+                      q5k_use_mr   ? "mr"   : "std",
+                      fa_use_uma   ? "uma"  : "std");
+        // Allow forcing the benchmark on UMA via GGML_DX12_FORCE_AUTOTUNE=1
+        if (!getenv("GGML_DX12_FORCE_AUTOTUNE")) return;
+        DX12_LOG_INFO("GGML_DX12_FORCE_AUTOTUNE set -- running benchmark on UMA\n");
     }
 
     DX12_LOG_INFO("Running auto-tune benchmark...\n");
@@ -3440,9 +4289,11 @@ void dx12_device::run_autotune() {
         }
     }
 
-    // Create timestamp query heap
+    // Create timestamp query heap -- disabled on Xbox (hangs on GDKX compute CLs)
+    // Wall-clock timing with GPU sync is used instead.
     ComPtr<ID3D12QueryHeap> ts_heap;
     ComPtr<ID3D12Resource> ts_readback;
+#if !defined(GGML_DX12_XBOX_GDKX)
     {
         D3D12_QUERY_HEAP_DESC qhd = {};
         qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -3462,18 +4313,51 @@ void dx12_device::run_autotune() {
                      D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ts_readback));
         if (FAILED(hr)) { DX12_LOG_WARN("Auto-tune: failed to create readback buffer\n"); return; }
     }
+#endif
 
     // Helper: benchmark a pipeline variant
     // Returns GPU time in ticks, or UINT64_MAX on failure
     auto bench_pipeline = [&](dx12_pipeline_key key, uint32_t K, uint32_t N, uint32_t ts_start) -> uint64_t {
+        DX12_LOG_INFO("  bench: op=%d src0=%d flags=%u K=%u N=%u\n",
+                      key.op, key.src0_type, key.flags, K, N);
+        fflush(stderr);
         dx12_pipeline * pl = get_or_create_pipeline(key);
-        if (!pl || !pl->pso) return UINT64_MAX;
+        if (!pl || !pl->pso) {
+            DX12_LOG_WARN("  bench: no PSO!\n");
+            return UINT64_MAX;
+        }
 
         // Create command allocator + list for benchmarking
         ComPtr<ID3D12CommandAllocator> alloc;
         ComPtr<ID3D12GraphicsCommandList> cl;
         device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
         device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), nullptr, IID_PPV_ARGS(&cl));
+
+        auto submit_and_wait = [&]() {
+            cl->Close();
+            ID3D12CommandList * lists[] = { cl.Get() };
+            compute_queue->ExecuteCommandLists(1, lists);
+            ComPtr<ID3D12Fence> f;
+            device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+            compute_queue->Signal(f.Get(), 1);
+            HANDLE ev = dx12_create_event();
+            f->SetEventOnCompletion(1, ev);
+#ifdef _WIN32
+            DWORD wr = WaitForSingleObject(ev, 5000);
+            dx12_close_event(ev);
+            if (wr == WAIT_TIMEOUT) { DX12_LOG_WARN("  bench: GPU timeout!\n"); return false; }
+#else
+            auto t0 = std::chrono::steady_clock::now();
+            while (f->GetCompletedValue() < 1) {
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(5000)) {
+                    DX12_LOG_WARN("  bench: GPU timeout!\n"); dx12_close_event(ev); return false;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            dx12_close_event(ev);
+#endif
+            return true;
+        };
 
         cl->SetComputeRootSignature(common_root_sig.Get());
         cl->SetPipelineState(pl->pso.Get());
@@ -3499,58 +4383,45 @@ void dx12_device::run_autotune() {
         params.dst_esize = 4;
         cl->SetComputeRoot32BitConstants(0, (uint32_t)(sizeof(params)/4), &params, 0);
 
-        // Warmup dispatch
+        // Warmup dispatch + GPU sync
         cl->Dispatch(N, 1, 1);
         D3D12_RESOURCE_BARRIER barrier = {}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         cl->ResourceBarrier(1, &barrier);
+        if (!submit_and_wait()) return UINT64_MAX;
 
-        // Timed dispatch
-        cl->EndQuery(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_start);
+        // Timed dispatches -- wall-clock with GPU sync
+        // (timestamp queries hang on Xbox GDKX compute command lists)
+        alloc->Reset();
+        cl->Reset(alloc.Get(), nullptr);
+        cl->SetComputeRootSignature(common_root_sig.Get());
+        cl->SetPipelineState(pl->pso.Get());
+        D3D12_GPU_VIRTUAL_ADDRESS va2 = bench_buf->GetGPUVirtualAddress();
+        cl->SetComputeRootShaderResourceView(1, va2);
+        cl->SetComputeRootShaderResourceView(2, va2);
+        cl->SetComputeRootUnorderedAccessView(3, va2);
+        cl->SetComputeRootShaderResourceView(4, va2);
+        cl->SetComputeRootShaderResourceView(5, va2);
+        cl->SetComputeRoot32BitConstants(0, (uint32_t)(sizeof(params)/4), &params, 0);
         for (int rep = 0; rep < 10; rep++) {
             cl->Dispatch(N, 1, 1);
             cl->ResourceBarrier(1, &barrier);
         }
-        cl->EndQuery(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_start + 1);
-        cl->ResolveQueryData(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_start, 2, ts_readback.Get(), ts_start * sizeof(uint64_t));
-
-        cl->Close();
-        ID3D12CommandList * lists[] = { cl.Get() };
-        compute_queue->ExecuteCommandLists(1, lists);
-
-        // Wait
-        ComPtr<ID3D12Fence> fence;
-        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-        // Wait with timeout — GPU hangs should not block indefinitely
-        HANDLE event = dx12_create_event();
-        fence->SetEventOnCompletion(1, event);
-        compute_queue->Signal(fence.Get(), 1);
 #ifdef _WIN32
-        DWORD wait_result = WaitForSingleObject(event, 5000);
-        dx12_close_event(event);
-
-        if (wait_result == WAIT_TIMEOUT) {
-            DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
-            return UINT64_MAX;
-        }
+        LARGE_INTEGER wc0, wc1, wcf;
+        QueryPerformanceFrequency(&wcf);
+        QueryPerformanceCounter(&wc0);
 #else
-        // WSL2: poll with timeout
-        auto start = std::chrono::steady_clock::now();
-        while (fence->GetCompletedValue() < 1) {
-            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(5000)) {
-                DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
-                return UINT64_MAX;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-        dx12_close_event(event);
+        auto wc0 = std::chrono::steady_clock::now();
 #endif
-
-        // Read timestamps
-        uint64_t * ts = nullptr;
-        D3D12_RANGE range = { ts_start * sizeof(uint64_t), (ts_start + 2) * sizeof(uint64_t) };
-        ts_readback->Map(0, &range, (void**)&ts);
-        uint64_t dt = ts[ts_start + 1] - ts[ts_start];
-        ts_readback->Unmap(0, nullptr);
+        if (!submit_and_wait()) return UINT64_MAX;
+#ifdef _WIN32
+        QueryPerformanceCounter(&wc1);
+        uint64_t dt = (uint64_t)((double)(wc1.QuadPart - wc0.QuadPart) / wcf.QuadPart * 1e6);
+#else
+        auto wc1 = std::chrono::steady_clock::now();
+        uint64_t dt = std::chrono::duration_cast<std::chrono::microseconds>(wc1 - wc0).count();
+#endif
+        DX12_LOG_INFO("    => %llu us\n", (unsigned long long)dt);
         return dt;
     };
 
@@ -3659,11 +4530,17 @@ static void dx12_backend_free(ggml_backend_t backend) {
 static void dx12_backend_synchronize(ggml_backend_t backend) {
     auto * ctx = (dx12_backend_context *)backend->context;
 
-    // Submit pending work. The wait happens in get_tensor when data is actually needed.
-    // This allows GPU to run asynchronously with CPU graph planning.
+    // Submit pending work, then wait for GPU completion. Must wait here:
+    // some buffer paths (notably the CUSTOM-heap zero-copy I/O on systems
+    // where it is enabled) read/write tensor data via Map() with no fence
+    // wait of their own, and depend on synchronize() having quiesced the
+    // device. The non-zero-copy staging paths queue an xfer copy on the
+    // same compute_queue and effectively wait via the xfer fence, so the
+    // extra wait here is harmless for them (the queue is already drained).
     if (ctx->cmd_list_open) {
         ctx->close_and_execute();
     }
+    ctx->wait_for_gpu();
 }
 
 static const ggml_backend_i dx12_backend_interface = {
@@ -3713,7 +4590,7 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
 
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     auto * d = (dx12_device *)dev->context;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(GGML_DX12_XBOX_GDKX)
     // Query fresh memory info from DXGI to reflect current allocations
     ComPtr<IDXGIAdapter3> adapter3;
     if (SUCCEEDED(d->adapter.As(&adapter3))) {
@@ -3727,7 +4604,7 @@ static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * 
         }
     }
 #endif
-    // Fallback to cached values (always used on WSL2)
+    // Fallback to cached values (always used on WSL2 and Xbox)
     if (free)  *free  = d->vram_free;
     if (total) *total = d->vram_total;
 }
@@ -3966,6 +4843,9 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         } else if (key.src0_type == GGML_TYPE_Q6_K) {
             static const dx12_shader_blob wmma_q6k_blob = { g_mul_mat_q6k_wmma_dxil, sizeof(g_mul_mat_q6k_wmma_dxil) };
             blob = &wmma_q6k_blob;
+        } else if (key.src0_type == GGML_TYPE_Q5_0) {
+            static const dx12_shader_blob wmma_q50_blob = { g_mul_mat_q5_0_wmma_dxil, sizeof(g_mul_mat_q5_0_wmma_dxil) };
+            blob = &wmma_q50_blob;
         } else {
             // F16/F32 register-blocked tiled batch MUL_MAT
             static const dx12_shader_blob wmma_blob = { g_mul_mat_wmma_dxil, sizeof(g_mul_mat_wmma_dxil) };

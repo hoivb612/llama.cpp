@@ -18,6 +18,24 @@ if(GGML_DX12)
     add_compile_definitions(GGML_USE_DX12)
 endif()
 
+# ----------------------------------------------------------------------------
+# Xbox (Scarlett / GDKX) cross-compile narrow path:
+# minslm-cli is the only target here that doesn't link `common`. On Xbox
+# everything else (slm-infer dll, ragbuild, server-dll, minslminfer-*,
+# teacher, testme) pulls in common/, hnswlib, nlohmann/json, or Win32
+# desktop-only APIs that don't link against the Gaming.Xbox.Scarlett.x64
+# partition. So short-circuit: build only minslm-cli on Xbox.
+# ----------------------------------------------------------------------------
+if (GGML_XBOX)
+    set(TARGET minslm-cli)
+    add_executable(${TARGET} minslm/minslm_cli.cpp)
+    install(TARGETS ${TARGET} RUNTIME)
+    target_include_directories(${TARGET} PUBLIC ../../include)
+    target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+    return()
+endif()
+
 
 set(TARGET slm-infer)
 

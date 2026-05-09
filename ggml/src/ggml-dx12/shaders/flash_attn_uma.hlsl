@@ -200,13 +200,16 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
         global_sum += s_reduce[0];
 
-        // Pass 3: Accumulate weighted V — each thread owns one output dimension
+        // Pass 3: Accumulate weighted V -- each thread owns one output dimension
         if (local_id < D) {
             precise float tile_acc = 0.0f;
             for (uint t = 0; t < tile_size; t++) {
-                uint kv = tile_start + t;
-                uint v_off = src2_off + local_id * src2_nb0 + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
-                tile_acc += s_scores[t] * load_auto(src2, v_off, src2_es);
+                float w = s_scores[t];
+                if (w != 0.0f) {
+                    uint kv = tile_start + t;
+                    uint v_off = src2_off + local_id * src2_nb0 + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
+                    tile_acc += w * load_auto(src2, v_off, src2_es);
+                }
             }
             acc += tile_acc;
         }

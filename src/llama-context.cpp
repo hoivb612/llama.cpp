@@ -10,6 +10,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "ggml-graph-dump.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -2192,6 +2193,9 @@ ggml_status llama_context::graph_compute(
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+
+    // Per-node tensor dump for cross-backend comparison (gated by GGML_DUMP_OPS env var)
+    ggml_graph_dump_check(gf, batched);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 

@@ -33,6 +33,12 @@ function(ggml_get_system_arch)
         set(GGML_SYSTEM_ARCH "ARM" PARENT_SCOPE)
     elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
             CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
+            # Microsoft GDK / GDKX MSBuild platforms target x86_64 (Zen 2).
+            # CMake doesn't normalize these into AMD64, so detect them by name:
+            #   gaming.desktop.x64
+            #   gaming.xbox.scarlett.x64   (Xbox Series X|S)
+            #   gaming.xbox.xboxone.x64    (Xbox One)
+            CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^gaming\\..*\\.x64$" OR
             (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
             CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64|amd64)$"))
         set(GGML_SYSTEM_ARCH "x86" PARENT_SCOPE)

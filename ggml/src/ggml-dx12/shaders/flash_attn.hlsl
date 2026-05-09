@@ -209,9 +209,12 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             if (d_out < D) {
                 precise float tile_acc = 0.0f;
                 for (uint t = 0; t < tile_size; t++) {
-                    uint kv = tile_start + t;
-                    uint v_off = src2_off + d_out * src2_nb0 + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
-                    tile_acc += s_scores[t] * load_auto(src2, v_off, src2_es);
+                    float w = s_scores[t];
+                    if (w != 0.0f) {
+                        uint kv = tile_start + t;
+                        uint v_off = src2_off + d_out * src2_nb0 + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
+                        tile_acc += w * load_auto(src2, v_off, src2_es);
+                    }
                 }
                 acc[ai] += tile_acc;
             }

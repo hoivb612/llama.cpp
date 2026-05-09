@@ -222,6 +222,9 @@ option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental,
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
 option(GGML_DX12                            "ggml: use DirectX 12"                            OFF)
 option(GGML_DX12_DEBUG                      "ggml: enable DirectX 12 debug output"            OFF)
+option(GGML_XBOX                            "ggml: cross-compile DX12 backend for Xbox Series X (GDKX, Scarlett)" OFF)
+set(GGML_XBOX_GDK_EDITION   "" CACHE STRING "GDKX edition tag (e.g. 251000); empty = use %GameDK% latest")
+set(GGML_XBOX_SHADER_COMPILER "" CACHE FILEPATH "Override path to the Xbox Scarlett HLSL compiler (default: search %GameDK%)")
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
@@ -276,6 +279,41 @@ option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation" 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
+
+#
+# Xbox (Scarlett / GDKX) cross-compile guard
+#
+# When GGML_XBOX is ON, force-enable GGML_DX12 and force-disable every backend
+# that won't cross-compile into a Gaming.Xbox.Scarlett.x64 target. We also
+# disable tests/examples by default since none of them are wired for a
+# loose-layout package deploy.
+#
+if (GGML_XBOX)
+    if (NOT WIN32)
+        message(FATAL_ERROR "GGML_XBOX requires the Windows host toolchain (MSVC + GDKX). Configure on Windows with the Gaming.Xbox.Scarlett.x64 generator platform.")
+    endif()
+
+    message(STATUS "GGML_XBOX=ON: configuring DX12 backend for Xbox Series X (Scarlett)")
+    set(GGML_DX12 ON CACHE BOOL "ggml: use DirectX 12" FORCE)
+
+    # Hard-disable backends that cannot link against the GameCore Scarlett runtime
+    foreach (_xbox_off
+            GGML_BLAS GGML_CANN GGML_CUDA GGML_HIP GGML_METAL GGML_MUSA
+            GGML_RPC GGML_VirtGPU GGML_SYCL GGML_VULKAN GGML_WEBGPU
+            GGML_zDNN GGML_OpenCL GGML_Hexagon GGML_ZenDNN GGML_OPENVINO
+            GGML_KOMPUTE GGML_LLAMAFILE GGML_CPU_KLEIDIAI GGML_CPU_HBM)
+        set(${_xbox_off} OFF CACHE BOOL "force-off for GGML_XBOX" FORCE)
+    endforeach()
+
+    # CPU backend is still useful (CPU-side ops + scheduler), but turn off
+    # CPU-side variants/extras that pull in host-only libraries.
+    set(GGML_NATIVE          OFF CACHE BOOL "force-off for GGML_XBOX" FORCE)
+    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "force-off for GGML_XBOX" FORCE)
+
+    # Tests and examples are not portable to the GDK partition.
+    set(GGML_BUILD_TESTS    OFF CACHE BOOL "force-off for GGML_XBOX" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "force-off for GGML_XBOX" FORCE)
+endif()
 
 #
 # dependencies
