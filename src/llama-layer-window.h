@@ -58,6 +58,7 @@ struct layer_window_manager {
         size_t          file_offset;
         size_t          n_bytes;
         ggml_tensor *   tensor;     // pointer to the tensor (for reload)
+        uint64_t        checksum;   // reference checksum (set during initial load)
     };
     std::map<int, std::vector<tensor_location>> layer_tensors;  // layer_idx -> tensors
 
@@ -117,6 +118,10 @@ struct layer_window_manager {
 
     // Release mmap pages to reclaim physical RAM (call after mmap_bases is set)
     void release_mmap_pages();
+
+    // Compute reference checksums for mmap data integrity verification
+    // Must be called AFTER mmap_bases is populated and BEFORE release_mmap_pages
+    void compute_reference_checksums();
 };
 
 // Eval callback for Phase 4 layer windowing

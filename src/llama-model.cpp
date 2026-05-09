@@ -8331,6 +8331,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     ml.mappings[i]->mapping_handle());
             }
             // mark_initially_resident() was already called from load_all_data
+            // Compute reference checksums before releasing mmap pages
+            lwm->compute_reference_checksums();
             // Now that mmap_bases is set, release physical pages to reclaim RAM
             lwm->release_mmap_pages();
         }

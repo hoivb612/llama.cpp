@@ -2,7 +2,22 @@
 //
 // Implements a GPU compute backend using D3D12, with optional Cooperative Vector
 // acceleration for matrix-vector operations (SM 6.9 / Agility SDK 1.717+).
-
+/*
+Diagnostics environment:
+┌──────────────────────┬──────────────────────────────────────────────────────┬───────────────────────────────────────┐
+│ Env Var              │ What it does                                         │ Isolates                              │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_DIAG         │ Checksum verification of mmap data before GPU upload │ Host-side data corruption             │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_KEEP_MMAP    │ Skip DiscardVirtualMemory after upload               │ OS page reclaim corruption            │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_NO_EVICT     │ Skip all eviction entirely                           │ Eviction path vs. everything else     │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_SOFT_EVICT   │ Bookkeeping only, no tile unmap                      │ Tile decommit vs. subgraph boundaries │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_SOFT_NOUP    │ Skip re-uploads (with SOFT_EVICT)                    │ Graph splitting alone                 │
+└──────────────────────┴──────────────────────────────────────────────────────┴───────────────────────────────────────┘
+*/
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -604,9 +619,9 @@ struct dx12_buffer_context {
                 if (!heap_tile_used[h]) { ht = h; break; }
             }
             if (ht == UINT_MAX) {
-                out_of_heap_tiles_count++;
-                g_dx12_heap_overflow_count++;
-                return false;
+                GGML_ABORT("DX12 heap overflow: no free heap tiles — increase --weight-budget or reduce model size "
+                           "(resource tile %u/%u, heap tiles %d, overflows so far %u)",
+                           t, total_resource_tiles, backing_heap_tiles, g_dx12_heap_overflow_count);
             }
             heap_tile_used[ht] = true;
             heap_search_hint = (ht + 1) % (UINT)backing_heap_tiles;
@@ -3307,7 +3322,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // AMD RDNA 3 requires full pipeline drains (not just UAV barriers) between
         // the final FFN/norm layers and the vocab projection + logit softcapping.
         // Without these splits, the model head produces NaN due to stale GPU caches.
-        if (cgraph->n_nodes > 1000 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
+        // NOTE: Use a low threshold (50) so this still triggers in small subgraphs
+        // created by the eval callback (layer windowing). The full graph has >1000
+        // nodes but a subgraph containing only the last few layers + model head
+        // may have ~100 nodes. The original threshold of 1000 silently skipped
+        // these CL splits for subgraph views, causing garbled output on Gemma-4.
+        if (cgraph->n_nodes > 50 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
