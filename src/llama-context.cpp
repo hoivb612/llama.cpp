@@ -18,6 +18,14 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 //
 // llama_context
 //
@@ -3513,6 +3521,20 @@ void llama_perf_context_print(const llama_context * ctx) {
     if (lwm) {
         lwm->print_stats();
     }
+
+    // Always print process memory (useful for comparing budget vs no-budget)
+#ifdef _WIN32
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc = {};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+            LLAMA_LOG_INFO("process_memory: peak working_set=%.1f MiB, current working_set=%.1f MiB, private=%.1f MiB\n",
+                   pmc.PeakWorkingSetSize / (1024.0 * 1024.0),
+                   pmc.WorkingSetSize / (1024.0 * 1024.0),
+                   pmc.PrivateUsage / (1024.0 * 1024.0));
+        }
+    }
+#endif
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
