@@ -11,6 +11,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <sys/mman.h>
 #endif
@@ -323,6 +324,19 @@ void layer_window_manager::print_stats() const {
         }
         printf("\n");
     }
+
+    // Print peak process memory for accurate UMA measurement
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+        printf("layer_window: peak working_set=%.1f MiB, current working_set=%.1f MiB, private=%.1f MiB\n",
+               pmc.PeakWorkingSetSize / (1024.0 * 1024.0),
+               pmc.WorkingSetSize / (1024.0 * 1024.0),
+               pmc.PrivateUsage / (1024.0 * 1024.0));
+    }
+#endif
+
     fflush(stdout);
 }
 
