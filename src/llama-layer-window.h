@@ -36,9 +36,6 @@ struct layer_window_manager {
     bool     use_mmap        = false; // true if weight data is memory-mapped
     int      current_layer   = -1;   // layer currently being computed (Phase 4)
 
-    // Batch windowing: process layers in batches to minimize GPU syncs
-    int      window_size          = 0;   // max layers per batch (= initial_resident_count)
-
     // Stats for Phase 4 per-pass tracking
     int      loads_this_pass  = 0;
     int      evicts_this_pass = 0;
@@ -80,18 +77,14 @@ struct layer_window_manager {
 
     // Ensure a specific layer is resident (load from mmap if needed)
     // Returns true if layer was loaded (false if already resident)
-    bool ensure_layer_resident(int layer_idx);
+    // When allow_evict=false, loads without evicting (caller handles eviction later)
+    bool ensure_layer_resident(int layer_idx, bool allow_evict = true);
 
     // Evict a layer — release physical pages for mmap (OS reclaims memory)
     void evict_layer(int layer_idx);
 
     // Evict layers to bring resident_bytes under budget, skipping protected layer
     void evict_to_budget(int protected_layer);
-
-    // Look-ahead batch load: starting from layer_idx, find contiguous non-resident
-    // layers (capped at window_size), MRU-evict to make room, batch-load all.
-    // Returns true if any data was loaded (caller should sync).
-    bool batch_load_ahead(int layer_idx);
 
     // Ensure all deferred layers are loaded (Phase 3 convenience)
     void ensure_all_layers_resident();
