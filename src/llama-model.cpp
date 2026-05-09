@@ -8233,12 +8233,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             } else {
                 // Set weight budget hint for DX12 reserved resources:
                 // non-CPU devices use CreateReservedResource to only commit
-                // physical memory for the layer window instead of the full model
+                // physical memory for the layer window instead of the full model.
+                // The heap must hold: budget (layers) + non-layer (embed/output) + headroom.
                 if (!is_cpu_dev) {
                     static const char * budget_env_str = getenv("GGML_WEIGHT_BUDGET_MB");
                     size_t budget_mb = budget_env_str ? (size_t)atoi(budget_env_str) : 0;
                     if (budget_mb > 0) {
-                        ggml_backend_set_weight_budget_hint(budget_mb * 1024ULL * 1024ULL);
+                        // Compute non-layer tensor size in this context (embed/output are always committed)
+                        size_t non_layer_size = 0;
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                            if (strncmp(t->name, "blk.", 4) != 0) {
+                                non_layer_size += ggml_nbytes(t);
+                            }
+                        }
+                        // Pass budget + non_layer so heap can fit both
+                        ggml_backend_set_weight_budget_hint(
+                            budget_mb * 1024ULL * 1024ULL + non_layer_size);
                     }
                 }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
