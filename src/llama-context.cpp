@@ -3508,9 +3508,9 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
-    // Print layer windowing lifetime stats (budget mode)
+    // Print layer windowing / process memory stats
     layer_window_manager * lwm = llama_get_layer_window_manager();
-    if (lwm && lwm->budget_bytes > 0) {
+    if (lwm) {
         lwm->print_stats();
     }
 }

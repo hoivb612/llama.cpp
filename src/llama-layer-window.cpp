@@ -311,18 +311,19 @@ void layer_window_manager::end_pass() {
 }
 
 void layer_window_manager::print_stats() const {
-    if (budget_bytes == 0) return;
-    if (total_passes == 0) {
-        printf("layer_window: no windowing passes (all layers fit in budget)\n");
-    } else {
-        printf("layer_window: %d passes, %d loads (%.1f MiB), %d evictions (%.1f MiB)",
-               total_passes, total_loads, total_bytes_loaded / (1024.0 * 1024.0),
-               total_evicts, total_bytes_evicted / (1024.0 * 1024.0));
-        uint32_t overflow = ggml_backend_get_heap_overflow_count();
-        if (overflow > 0) {
-            printf(", %u heap overflows", overflow);
+    if (budget_bytes > 0) {
+        if (total_passes == 0) {
+            printf("layer_window: no windowing passes (all layers fit in budget)\n");
+        } else {
+            printf("layer_window: %d passes, %d loads (%.1f MiB), %d evictions (%.1f MiB)",
+                   total_passes, total_loads, total_bytes_loaded / (1024.0 * 1024.0),
+                   total_evicts, total_bytes_evicted / (1024.0 * 1024.0));
+            uint32_t overflow = ggml_backend_get_heap_overflow_count();
+            if (overflow > 0) {
+                printf(", %u heap overflows", overflow);
+            }
+            printf("\n");
         }
-        printf("\n");
     }
 
     // Print peak process memory for accurate UMA measurement
