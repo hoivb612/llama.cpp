@@ -114,6 +114,9 @@ struct layer_window_manager {
 
     // Mark initially loaded layers as resident (call after model loading completes)
     void mark_initially_resident();
+
+    // Release mmap pages to reclaim physical RAM (call after mmap_bases is set)
+    void release_mmap_pages();
 };
 
 // Eval callback for Phase 4 layer windowing

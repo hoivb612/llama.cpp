@@ -8321,6 +8321,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     ml.mappings[i]->mapping_handle());
             }
             // mark_initially_resident() was already called from load_all_data
+            // Now that mmap_bases is set, release physical pages to reclaim RAM
+            lwm->release_mmap_pages();
         }
         // Only keep mmaps alive if buffer_from_host_ptr succeeded (tensor->data points into mmap)
         // or layer windowing needs them for on-demand reload.

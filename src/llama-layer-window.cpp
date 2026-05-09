@@ -356,24 +356,26 @@ void layer_window_manager::mark_initially_resident() {
             resident_bytes += entries[i].memory_size;
         }
     }
+}
 
-    // Release mmap pages after initial load — data is already in GPU tiles.
-    // Keeps the mapping alive (virtual address space) for future demand-paging
-    // during ensure_layer_resident, but frees physical RAM now.
-    if (!use_mmap) {
-        size_t released = 0;
-        for (const auto & [layer_idx, locs] : layer_tensors) {
-            for (const auto & loc : locs) {
-                if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
-                const uint8_t * data = mmap_bases[loc.file_idx] + loc.file_offset;
+void layer_window_manager::release_mmap_pages() {
+    if (budget_bytes == 0 || use_mmap) return;
+    if (mmap_bases.empty()) return;
+
+    size_t released = 0;
+    for (const auto & [layer_idx, locs] : layer_tensors) {
+        for (const auto & loc : locs) {
+            if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
+            const uint8_t * data = mmap_bases[loc.file_idx] + loc.file_offset;
 #ifdef _WIN32
-                DiscardVirtualMemory((void *)data, loc.n_bytes);
+            DiscardVirtualMemory((void *)data, loc.n_bytes);
 #else
-                madvise((void *)data, loc.n_bytes, MADV_DONTNEED);
+            madvise((void *)data, loc.n_bytes, MADV_DONTNEED);
 #endif
-                released += loc.n_bytes;
-            }
+            released += loc.n_bytes;
         }
+    }
+    if (released > 0) {
         printf("layer_window: released %.1f MiB of mmap pages after initial load\n",
                released / (1024.0 * 1024.0));
         fflush(stdout);
