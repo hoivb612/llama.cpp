@@ -301,11 +301,29 @@ void layer_window_manager::begin_pass() {
 
 void layer_window_manager::end_pass() {
     if (loads_this_pass > 0 || evicts_this_pass > 0) {
-        printf("layer_window: pass done — loaded %d layers (%.1f MiB), evicted %d layers (%.1f MiB)\n",
-               loads_this_pass, bytes_loaded / (1024.0 * 1024.0),
-               evicts_this_pass, bytes_evicted / (1024.0 * 1024.0));
-        fflush(stdout);
+        total_loads  += loads_this_pass;
+        total_evicts += evicts_this_pass;
+        total_bytes_loaded  += bytes_loaded;
+        total_bytes_evicted += bytes_evicted;
+        total_passes++;
     }
+}
+
+void layer_window_manager::print_stats() const {
+    if (budget_bytes == 0) return;
+    if (total_passes == 0) {
+        printf("layer_window: no windowing passes (all layers fit in budget)\n");
+    } else {
+        printf("layer_window: %d passes, %d loads (%.1f MiB), %d evictions (%.1f MiB)",
+               total_passes, total_loads, total_bytes_loaded / (1024.0 * 1024.0),
+               total_evicts, total_bytes_evicted / (1024.0 * 1024.0));
+        uint32_t overflow = ggml_backend_get_heap_overflow_count();
+        if (overflow > 0) {
+            printf(", %u heap overflows", overflow);
+        }
+        printf("\n");
+    }
+    fflush(stdout);
 }
 
 int layer_window_manager::get_layer_from_tensor(const ggml_tensor * t) {
@@ -337,6 +355,28 @@ void layer_window_manager::mark_initially_resident() {
             entries[i].last_access = ++access_counter;
             resident_bytes += entries[i].memory_size;
         }
+    }
+
+    // Release mmap pages after initial load — data is already in GPU tiles.
+    // Keeps the mapping alive (virtual address space) for future demand-paging
+    // during ensure_layer_resident, but frees physical RAM now.
+    if (!use_mmap) {
+        size_t released = 0;
+        for (const auto & [layer_idx, locs] : layer_tensors) {
+            for (const auto & loc : locs) {
+                if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
+                const uint8_t * data = mmap_bases[loc.file_idx] + loc.file_offset;
+#ifdef _WIN32
+                DiscardVirtualMemory((void *)data, loc.n_bytes);
+#else
+                madvise((void *)data, loc.n_bytes, MADV_DONTNEED);
+#endif
+                released += loc.n_bytes;
+            }
+        }
+        printf("layer_window: released %.1f MiB of mmap pages after initial load\n",
+               released / (1024.0 * 1024.0));
+        fflush(stdout);
     }
 }
 

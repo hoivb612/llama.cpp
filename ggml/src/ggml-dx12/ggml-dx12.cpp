@@ -554,6 +554,9 @@ struct dx12_device {
 // Buffer context
 // ---------------------------------------------------------------------------
 
+// Global heap overflow counter (summed across all buffer contexts)
+static uint32_t g_dx12_heap_overflow_count = 0;
+
 struct dx12_buffer_context {
     dx12_device *          dev       = nullptr;
     ComPtr<ID3D12Resource> resource;
@@ -572,6 +575,7 @@ struct dx12_buffer_context {
     std::vector<UINT>      resource_to_heap;     // resource_tile -> heap_tile mapping (UINT_MAX = unmapped)
     std::vector<uint16_t>  tile_refcount;        // per-resource-tile reference count (shared boundary tiles)
     size_t                 total_resource_tiles = 0;
+    uint32_t               out_of_heap_tiles_count = 0; // count of heap tile exhaustion events
 
     static constexpr size_t TILE_SIZE = 65536;   // D3D12 tile size for buffers: 64KB
 
@@ -600,7 +604,8 @@ struct dx12_buffer_context {
                 if (!heap_tile_used[h]) { ht = h; break; }
             }
             if (ht == UINT_MAX) {
-                DX12_LOG_WARN("commit_range: out of heap tiles (need tile for resource tile %u)\n", t);
+                out_of_heap_tiles_count++;
+                g_dx12_heap_overflow_count++;
                 return false;
             }
             heap_tile_used[ht] = true;
@@ -1485,6 +1490,8 @@ static void dx12_tensor_decommit(struct ggml_tensor * tensor);
 static void dx12_batch_tensor_set(struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
 static bool dx12_register_mmap(const void * base, size_t size, void * mapping_handle, void * dev_ctx);
 
+static uint32_t dx12_get_heap_overflow_count(void) { return g_dx12_heap_overflow_count; }
+
 static const char * dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return "DX12";
@@ -1577,6 +1584,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
         if (dev->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
             ggml_backend_set_tensor_decommit_fn(dx12_tensor_decommit);
             ggml_backend_set_batch_tensor_set_fn(dx12_batch_tensor_set);
+            ggml_backend_set_heap_overflow_fn(dx12_get_heap_overflow_count);
         }
         ggml_backend_set_register_mmap_fn(dx12_register_mmap, (void *)dev);
     }
@@ -4372,6 +4380,7 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
     if (d->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
         ggml_backend_set_tensor_decommit_fn(dx12_tensor_decommit);
         ggml_backend_set_batch_tensor_set_fn(dx12_batch_tensor_set);
+        ggml_backend_set_heap_overflow_fn(dx12_get_heap_overflow_count);
     }
 
     // Register OEHA mmap handler (works for any device that supports ID3D12Device3)

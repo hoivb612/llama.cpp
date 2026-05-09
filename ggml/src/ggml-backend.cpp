@@ -685,6 +685,16 @@ bool ggml_backend_register_mmap(const void * base, size_t size, void * mapping_h
     return false;
 }
 
+static ggml_backend_get_heap_overflow_fn g_heap_overflow_fn = nullptr;
+
+void ggml_backend_set_heap_overflow_fn(ggml_backend_get_heap_overflow_fn fn) {
+    g_heap_overflow_fn = fn;
+}
+
+uint32_t ggml_backend_get_heap_overflow_count(void) {
+    return g_heap_overflow_fn ? g_heap_overflow_fn() : 0;
+}
+
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
     return device->iface.supports_op(device, op);

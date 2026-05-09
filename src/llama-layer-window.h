@@ -42,6 +42,13 @@ struct layer_window_manager {
     size_t   bytes_loaded     = 0;
     size_t   bytes_evicted    = 0;
 
+    // Lifetime counters (accumulated across all passes)
+    int      total_loads      = 0;
+    int      total_evicts     = 0;
+    int      total_passes     = 0;
+    size_t   total_bytes_loaded  = 0;
+    size_t   total_bytes_evicted = 0;
+
     std::vector<layer_window_entry> entries;
 
     // Per-layer tensor info for reload from file
@@ -92,8 +99,11 @@ struct layer_window_manager {
     // Reset per-pass stats (call at start of each forward pass)
     void begin_pass();
 
-    // Print per-pass stats (call at end of each forward pass)
+    // Accumulate per-pass stats into lifetime counters (call at end of each forward pass)
     void end_pass();
+
+    // Print lifetime windowing stats summary
+    void print_stats() const;
 
     // Determine layer index from a graph node's source tensors
     // Returns -1 if no layer weight is referenced

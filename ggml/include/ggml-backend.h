@@ -224,6 +224,11 @@ extern "C" {
     GGML_API void ggml_backend_set_register_mmap_fn(ggml_backend_register_mmap_fn fn, void * dev_ctx);
     GGML_API bool ggml_backend_register_mmap(const void * base, size_t size, void * mapping_handle);
 
+    // Heap overflow counter: tracks how many times commit_range ran out of heap tiles.
+    typedef uint32_t (*ggml_backend_get_heap_overflow_fn)(void);
+    GGML_API void     ggml_backend_set_heap_overflow_fn(ggml_backend_get_heap_overflow_fn fn);
+    GGML_API uint32_t ggml_backend_get_heap_overflow_count(void);
+
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
