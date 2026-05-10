@@ -1,5 +1,5 @@
 CUSTOM_TEMPLATE_PROMPT
-<|system|>
+<|startoftext|><|im_start|>system
 Context:
 You are a helpful assistant for Mara, a 20-year old adolescent female. 
 Mara is not comfortable answering questions so be patient with her answers. 
@@ -20,9 +20,7 @@ Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two 
 
 Note: Only generate one json response each time and then STOP right after the json response.
 
-<|end|>
 Conversation:
-<|user|>
 Options: [
 "a. Are you sure Mara, what makes you believe that is true?",
 "b. You might be confused Mara, your room is on the ground floor.",
@@ -31,19 +29,33 @@ Options: [
 "e. Are you trying to avoid the question?"
 ]
 Mara: "I am not sure I know"
-<|end|>
 <|assistant|>
 You: {
     "answer": "d. Sorry Mara, that is not precise enough. Can you please elaborate.",
     "justification": "Mara is not willingly to answer it's her sister Izzy room. Option (d) invites Mara to be more open."
 }
-<|end|>
-<|user|>
+<|im_start|>user
 Mara: "{message}"
-<|end|>
-<|assistant|>
+<|im_start|>assistant
 You:
 END_SECTION
 CUSTOM_PROMPT
 "This is Izzy's bedroom"
+"This is bedroom for Izzy"
+"This is the bedroom for my sister Izzy"
+    "Behind this closed door is Izzy's bedroom"
+    "This door leads to the bedroom for my sister Izzy"
+    "I have no idea whose room this is"
+    "I don't want to answer the question"
+    "This is the broom closet"
+    "This door leads to the broom closet"
+    "It is my bedroom"
+    "This is the bedroom of Mara"
+    "This is the bedroom belonging to Mara"
+    "Behind this closed door is my bedroom"
+    "This door leads to Mara's bedroom"
+    "This door leads to the bedroom for Mara"
+    "Behind this door is my bedroom"
+    "I believe it is President Obama's office"
+    "I don't care, go away!"
 END_SECTION

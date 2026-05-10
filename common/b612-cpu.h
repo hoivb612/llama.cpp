@@ -298,17 +298,30 @@ xb_set_process_affinity (
 
 #endif
 
+    const char * default_mode = "none";
+    uint32_t mxcsr = 0;
+    uint32_t round_mode = 0;
+
+    struct {
+        uint32_t eax;
+        uint32_t ebx;
+        uint32_t ecx;
+        uint32_t edx;
+    } cpu_info = {};
+
     uint64_t affinity_mask = affinity_mask_requested;
+
+    if (affinity_mask_requested != 0) {
+        goto set_affinity;
+    }
 
     //
     // Get the default rounding mode.
     //
 
-    char * default_mode = "none";
+    mxcsr = _mm_getcsr();
 
-    uint32_t mxcsr = _mm_getcsr();
-
-    uint32_t round_mode = mxcsr & _MM_ROUND_MASK;
+    round_mode = mxcsr & _MM_ROUND_MASK;
 
     switch (round_mode) {
     case _MM_ROUND_NEAREST:
@@ -337,30 +350,7 @@ xb_set_process_affinity (
     // Get cpuid information.
     //
 
-    struct {
-        uint32_t eax;
-        uint32_t ebx;
-        uint32_t ecx;
-        uint32_t edx;
-    } cpu_info;
-
-    uint32_t eax;
-
     if (verbose) {
-
-        //
-        // Get version and feature information.
-        //
-
-        __cpuid((int *)&cpu_info, 0x00000001);
-        printf("hypervisor present: ");
-        if (cpu_info.ecx & (1 << 31)) {
-            printf("yes\n\n");
-
-        } else {
-            printf("no\n\n");
-        }
-
         //
         // Get avx features for the current system.
         //
@@ -458,131 +448,6 @@ xb_set_process_affinity (
 
         if (cpu_info.edx & (1 << 19)) {
             printf("    Avx10\n");
-        }
-
-        printf("\n");
-
-        //
-        // Display the XSTATE features available for the current system.
-        //
-
-        __cpuidex((int *)&cpu_info, 0x0000000d, 0);
-        printf("  cpuidex function 0x0000000d, subleaf 0 - XSTATE features\n");
-        printf("    low feature mask  0x%lx\n", cpu_info.eax);
-        printf("    max size enabled  %d\n", cpu_info.ebx);
-        printf("    max size hardware %d\n", cpu_info.ecx);
-        printf("    high feature mask 0x%lx\n\n", cpu_info.edx);
-
-        //
-        // Save XSTATE featue mask.
-        //
-
-        eax = cpu_info.eax;
-
-        //
-        // Display XSTATE xsave features available for the current system.
-        //
-
-        __cpuidex((int *)&cpu_info, 0x0000000d, 1);
-        printf("  cpuidex function 0x0000000d, subleaf 1- XSAVE features\n");
-        printf("    xsave op mask     0x%lx\n", cpu_info.eax);
-        printf("    xsave max size    %d\n", cpu_info.ebx);
-        printf("    xss low mask      0x%lx\n", cpu_info.ecx);
-        printf("    xss high mask     0x%lx\n\n", cpu_info.edx);
-
-        //
-        // Enumerate XSTATE features and xsave offset and size.
-        //
-
-        if (eax & (1 << 0)) {
-            printf("    LegacyX87\n");
-        }
-
-        if (eax & (1 << 1)) {
-            printf("    LegacySse\n");
-        }
-
-        if (eax & (1 << 2)) {
-            printf("    Avx\n");
-            __cpuidex((int *)&cpu_info, 0x0000000d, 2);
-            printf("        Size   %d Ymm[0..15] high (16 bytes each)\n", cpu_info.eax);
-            printf("        Offset %d\n\n", cpu_info.ebx);
-        }
-
-        if (eax & (1 << 3)) {
-            printf("    MpxBndreg\n");
-            __cpuidex((int *)&cpu_info, 0x0000000d, 3);
-            printf("        Size   %d\n", cpu_info.eax);
-            printf("        Offset %d\n\n", cpu_info.ebx);
-        }
-
-        if (eax & (1 << 4)) {
-            printf("    MpxBndcsr\n");
-            __cpuidex((int *)&cpu_info, 0x0000000d, 4);
-            printf("        Size   %d\n", cpu_info.eax);
-            printf("        Offset %d\n\n", cpu_info.ebx);
-        }
-
-        if (eax & (1 << 5)) {
-            printf("    Avx512Opmask\n");
-            __cpuidex((int *)&cpu_info, 0x0000000d, 5);
-            printf("        Size   %d K[0..7] (8 bytes each)\n", cpu_info.eax);
-            printf("        Offset %d\n\n", cpu_info.ebx);
-        }
-
-        if (eax & (1 << 6)) {
-            printf("    Avx512Zmmhi\n");
-            __cpuidex((int *)&cpu_info, 0x0000000d, 6);
-            printf("        Size   %d Zmm[0..15] high (32 bytes each)\n", cpu_info.eax);
-            printf("        Offset %d\n\n", cpu_info.ebx);
-        }
-
-        if (eax & (1 << 7)) {
-            printf("    Avx512Zmm16_31\n");
-            __cpuidex((int *)&cpu_info, 0x0000000d, 7);
-            printf("        Size   %d Zmm[16..31] low and high (64 bytes each)\n", cpu_info.eax);
-            printf("        Offset %d\n\n", cpu_info.ebx);
-        }
-
-        printf("\n");
-
-
-        //
-        // Display the XSTATE features enabled for the current system.
-        //
-
-        uint64_t enabled_features = GetEnabledXStateFeatures();    
-        printf("  enabled XSTATE features\n");
-        if (enabled_features & (1 << 0)) {
-            printf("    LegacyX87\n");
-        }
-
-        if (enabled_features & (1 << 1)) {
-            printf("    LegacySse\n");
-        }
-
-        if (enabled_features & (1 << 2)) {
-            printf("    Avx\n");
-        }
-
-        if (enabled_features & (1 << 3)) {
-            printf("    MpxBndreg\n");
-        }
-
-        if (enabled_features & (1 << 4)) {
-            printf("    MpxBndcsr\n");
-        }
-
-        if (enabled_features & (1 << 5)) {
-            printf("    Avx512Opmask\n");
-        }
-
-        if (enabled_features & (1 << 6)) {
-            printf("    Avx512Zmmhi\n");
-        }
-
-        if (enabled_features & (1 << 7)) {
-            printf("    Avx512Zmm16_31\n");
         }
 
         printf("\n");
@@ -741,30 +606,29 @@ xb_set_process_affinity (
     // Set process affinity.
     //
 
-    if (affinity_mask == 0) {
-        affinity_mask = ((1ull << (n_threads * 2)) - 1) & 0x55555555ull;
+    affinity_mask = ((1ull << (n_threads * 2)) - 1) & 0x55555555ull;
+
+    //
+    // It is known that the number of threads fits within the maximum smt set. If the
+    // maximum smt set is less than or equal to 32, then the threads can be pushed
+    // up to higher numbered threads which will remove them from contention issues
+    // with clock and device interrupts.
+    //
+
+    if (maximum_smt_threads <= 32) {
 
         //
-        // It is known that the number of threads fits within the maximum smt set. If the
-        // maximum smt set is less than or equal to 32, then the threads can be pushed
-        // up to higher numbered threads which will remove them from contention issues
-        // with clock and device interrupts.
+        // Compute the shift up such that the thread affinity straddles CCDs.
         //
 
-        if (maximum_smt_threads <= 32) {
+        uint32_t half_shift = maximum_logical - (n_threads * 2);
 
-            //
-            // Compute the shift up such that the thread affinity straddles CCDs.
-            //
+        half_shift = ((half_shift / 2) + 1) & 0x1e;
 
-            uint32_t half_shift = maximum_logical - (n_threads * 2);
-
-            half_shift = ((half_shift / 2) + 1) & 0x1e;
-
-            affinity_mask <<= half_shift;
-        }
+        affinity_mask <<= half_shift;
     }
 
+    set_affinity:
     if (SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
         if (verbose) {
            printf("process group affinity set to 0x%016llx\n", affinity_mask);
@@ -916,7 +780,7 @@ xb_set_optimal_process_affinity(uint32_t n_threads, bool verbose = false) {
             break;
     }
 
-    affinity_mask = ggml_b612::xb_set_process_affinity(n_threads, affinity_mask, verbose);
+    affinity_mask = xb_set_process_affinity(n_threads, affinity_mask);
     return(affinity_mask);
 }
 

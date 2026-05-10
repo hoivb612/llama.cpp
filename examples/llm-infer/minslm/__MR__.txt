@@ -1,0 +1,337 @@
+
+Layer Windowing System — Phases 1-4
+
+Problem
+
+GGUF models load ALL transformer layers into memory at startup, even on memory-constrained systems. A 1.4 GB model occupies 1.4 GB
+regardless of available RAM.
+
+Solution
+
+A layer windowing system that only keeps N layers resident at a time, streaming the rest from NVMe/mmap on demand during compute.
+
+---------------------------------------------------------------------------------------------------------------------------------
+
+Phase 1: Instrumentation
+
+ - Added per-layer weight size reporting in load_all_data() (gated by GGML_MODEL_LAYERS_STAT=1 env var)
+ - Shows non-layer breakdown (token_embd, output, output_norm), per-layer min/max/avg, and a budget table estimating how many 
+layers fit at 64/128/256/512/1024/2048 MiB
+
+Phase 2: Infrastructure
+
+ - Created llama-layer-window.h/.cpp — the layer_window_manager struct tracking per-layer size, residency, and tensor locations
+ - Added --weight-budget MB CLI parameter to minslm tools, which sets GGML_WEIGHT_BUDGET_MB env var
+ - Modified load_all_data() with a two-pass approach: pre-scan all tensors for layer sizes, then skip loading deferred layers 
+(layers that don't fit within the budget)
+
+Phase 3: Deferred Loading with On-Demand Reload
+
+ - For deferred layers in mmap mode: still sets up the tensor data pointer (so the graph can reference it) but skips mlock — pages
+ aren't pinned in physical RAM
+ - Added ensure_layer_resident() — calls VirtualLock (Windows) or mlock (Linux) to pin mmap pages when a layer is needed
+ - Added record_tensor_location() — stores file offset, size, and tensor pointer for each deferred tensor so it can be reloaded 
+later
+ - Stored mmap base addresses from load_tensors() before mappings are moved
+ - Initially hooked as "load all deferred layers at first compute" — proved the mechanism works (14 layers loaded in 60ms =
+  7.4 GB/s)
+
+Phase 4: True Per-Layer Windowing (Eval Callback)
+
+ - Leverages ggml_backend_sched_eval_callback — fires per graph node during compute
+ - layer_window_eval_callback() detects layer boundaries by inspecting tensor source names for blk.N. patterns
+ - At each layer transition: calls ensure_layer_resident(new_layer) then evict_to_budget(new_layer)
+ - Eviction: evict_layer() uses VirtualUnlock + DiscardVirtualMemory (Windows) or munlock + madvise(DONTNEED) (Linux) to release 
+physical pages back to the OS while keeping the virtual mapping valid
+ - LRU strategy: evict_to_budget() finds the oldest-accessed layer (excluding the current layer and initially-loaded layers 
+without recorded tensor locations) and evicts until resident_bytes ≤ budget_bytes
+ - Per-pass statistics: begin_pass()/end_pass() track and print loads/evicts per forward pass
+ - Replaces the Phase 3 hook — the eval callback is set before graph_compute() and restored after
+
+Additional: Vulkan UMA
+
+ - Enabled buffer_from_host_ptr = true for integrated GPUs in the Vulkan backend, so mmap-based windowing works on Vulkan UMA 
+systems the same as DX12 UMA
+
+---------------------------------------------------------------------------------------------------------------------------------
+
+Files Changed
+
+┌────────────────────────────────────────┬───────────────────────────────────────────────────────┐
+│ File                                   │ Changes                                               │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ src/llama-layer-window.h               │ New — manager struct, eval callback, all APIs         │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ src/llama-layer-window.cpp             │ New — full implementation (~300 lines)                │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ src/llama-model-loader.cpp             │ Pre-scan, layer stats, skip logic for deferred layers │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ src/llama-model.cpp                    │ mmap base storage, initial residency marking          │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ src/llama-context.cpp                  │ Eval callback hook before/after graph_compute         │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ src/CMakeLists.txt                     │ Added llama-layer-window.cpp                          │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ examples/llm-infer/dll/llm-infer.h     │ Added weight_budget_mb to model_params                │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ examples/llm-infer/minslm/*.cpp        │ --weight-budget MB CLI in all 4 minslm variants       │
+├────────────────────────────────────────┼───────────────────────────────────────────────────────┤
+│ ggml/src/ggml-vulkan/ggml-vulkan.cpp   │ UMA: buffer_from_host_ptr for iGPU                    │
+└────────────────────────────────────────┴───────────────────────────────────────────────────────┘
+
+Key Design Decisions
+
+ - Budget applies to layers only — non-layer tensors (embeddings, output head) are always resident as mandatory overhead
+ - mmap-based eviction — no data copying; just pin/unpin physical pages via OS APIs
+ - Initially-loaded layers are never evicted — they have no recorded tensor locations (loaded normally), so they form the 
+permanent "base window"
+ - Eval callback minimizes sync points — returns true (observe) only at layer boundaries, letting nodes within a layer batch 
+together
+
+Validated Results (Gemma-4 E2B Q3_K_M, 35 layers, DX12)
+
+┌──────────┬─────────────┬───────────────┬─────────┬────────┐
+│ Budget   │ Resident    │ Streamed/pass │ Prefill │ Decode │
+├──────────┼─────────────┼───────────────┼─────────┼────────┤
+│ 2048 MiB │ 35/35 (all) │ 0             │ 464 t/s │ 32 t/s │
+├──────────┼─────────────┼───────────────┼─────────┼────────┤
+│ 512 MiB  │ 21/35       │ 458 MiB       │ 466 t/s │ 31 t/s │
+├──────────┼─────────────┼───────────────┼─────────┼────────┤
+│ 128 MiB  │ 6/35        │ 832 MiB       │ 462 t/s │ 32 t/s │
+└──────────┴─────────────┴───────────────┴─────────┴────────┘
+
+Zero measurable performance impact — NVMe mmap + OS page cache makes load/evict essentially free.
+
+==========================================================================
+
+┌────────────┬───────────────────────────────────────────────┬───────────────────────┐
+│ Backend    │ buffer_from_host_ptr                          │ mmap windowing works? │
+├────────────┼───────────────────────────────────────────────┼───────────────────────┤
+│ CPU        │ ✅ true                                       │ ✅ Yes                │
+├────────────┼───────────────────────────────────────────────┼───────────────────────┤
+│ Metal      │ ✅ true                                       │ ✅ Yes                │
+├────────────┼───────────────────────────────────────────────┼───────────────────────┤
+│ DX12       │ ❌ false (caps), but has UMA path             │ ✅ Via your UMA code  │
+├────────────┼───────────────────────────────────────────────┼───────────────────────┤
+│ Vulkan     │ ❌ false (caps), but has implementation       │ ⚠️ Partially          │
+├────────────┼───────────────────────────────────────────────┼───────────────────────┤
+│ CUDA       │ ❌ false, no impl                             │ ❌ Copies to device   │
+├────────────┼───────────────────────────────────────────────┼───────────────────────┤
+│ BLAS       │ ✅ true                                       │ ✅ Yes                │
+└────────────┴───────────────────────────────────────────────┴───────────────────────┘
+
+ 1. VRAM not reduced:
+
+  This is the key limitation of the current design. The buffer allocation happens in load_tensors() before load_all_data():
+
+   load_tensors() → ggml_backend_alloc_ctx_tensors_from_buft()  // allocates ALL tensors
+   load_all_data() → fills data (with windowing skip)            // controls which get loaded
+
+  The GPU buffer for all tensors is pre-allocated upfront — windowing only controls which pages are faulted into physical RAM. On
+  your system with DX12 mmap (buffer_from_host_ptr), the GPU maps the entire mmap region. VirtualLock/DiscardVirtualMemory controls
+  physical page residency, but the virtual address space and reported VRAM size stay the same.
+
+  True VRAM reduction would require deferring buffer allocation for non-resident layers (Phase 5) — a much bigger change to the
+  tensor allocation pipeline.
+
+  What windowing DOES save today: physical RAM working set. The OS can reclaim those pages for other processes. Task Manager's
+  "working set" should reflect the reduction even though "committed" memory stays the same.
+
+  2. Backend compatibility:
+
+  Yes — the windowing logic lives in load_all_data() which is backend-agnostic. It works for:
+
+   - CPU ✅ — weights in host memory, mmap page control works directly
+   - DX12 ✅ — buffer_from_host_ptr maps host mmap, page faults go through OS
+   - Vulkan — depends on whether it uses mmap or copies to device-local VRAM. If it copies, the skip logic in load_all_data prevents 
+  the copy for deferred layers, but the buffer is still allocated
+   - CUDA — similar to Vulkan
+
+  The VirtualLock/madvise eviction code is host-memory specific, so it works best with mmap-backed backends (CPU, DX12 on your
+  system).
+
+ - minslm_cli.cpp — --weight-budget CLI param
+ - CMakeLists.txt — added layer-window source
+ - llama-context.cpp — Phase 4 eval callback hook
+ - llama-model-loader.cpp — layer stats + partial load logic
+ - llama-model.cpp — mmap base storage + residency tracking
+
+New (2 files):
+
+ - llama-layer-window.h — layer window manager header
+ - llama-layer-window.cpp — full implementation (eval callback, LRU eviction, mmap page mgmt)
+
+======================================================
+
+ Now there's one issue: for ggml_backend_tensor_set() to work on deferred tensors, the tensor must have its buffer allocated (which
+  it does — the buffer space is pre-allocated by load_tensors()). But for mmap mode, the tensor data pointer might be set to the mmap
+  address directly OR be NULL. Let me check what happens when we skip a tensor in the mmap path:
+
+  Looking back at the load loop — when we continue to skip a deferred tensor, it skips both the ggml_backend_tensor_alloc call AND
+  the ggml_backend_tensor_set call. For mmap mode, if cur->data == nullptr and we skip the ggml_backend_tensor_alloc, the tensor
+  won't have storage.
+
+  This is the key problem. Let me check — does the tensor already have storage allocated from load_tensors() (buffer allocation
+  phase)?
+
+● Search (grep)
+  │ "ggml_backend_alloc_ctx_tensors|alloc_ctx_tensors" (D:\llama.cpp\b612\src\llama-model.cpp)
+  └ 2 lines found
+
+● Read llama-model.cpp
+  │ D:\llama.cpp\b612\src\llama-model.cpp
+  └ L8180:8210 (30 lines read)
+
+● At line 8188: ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft) — this allocates buffer space for ALL tensors in the context and
+  assigns each tensor its data pointer. So tensors DO have pre-allocated buffer space!
+
+● For mmap mode with buffer_from_host_ptr_supported (line 8159): the buffer is created directly from the mmap host pointer — tensors
+  point directly into the mmap. In this case, load_all_data() uses ggml_backend_tensor_alloc(buf_mmap, cur, data) which maps the
+  tensor to its mmap location.
+
+  For deferred layers that we skip: the tensor gets buffer assignment from line 8173 (buffer_from_host_ptr) but its data pointer
+  within that buffer is set by ggml_backend_tensor_alloc which we skip! So the tensor has a buffer but data == nullptr.
+
+  This means for ensure_layer_resident(), I should use ggml_backend_tensor_alloc first (to set the data pointer), OR since we're
+  using mmap, just set the tensor's data pointer directly.
+
+  Actually looking more closely at the mmap path in load_all_data:
+
+   if (buf_mmap && cur->data == nullptr) {
+       ggml_backend_tensor_alloc(buf_mmap, cur, data);
+
+  So ggml_backend_tensor_alloc sets the tensor's data pointer to point at the mmap data. For deferred layers, we need to do the same
+  thing when loading them.
+
+  But wait — for ggml_backend_tensor_set() to work, the tensor needs cur->data set. Let me use a different approach: for mmap, just
+  set the tensor's data pointer directly since it's the same memory space.
+
+  Actually, the simpler approach for the mmap case: just call ggml_backend_tensor_alloc(buf_mmap, cur, data) for the deferred tensor.
+  But we don't have buf_mmap at ensure_layer_resident time...
+
+  Let me rethink. The cleanest approach: in the skip path of load_all_data(), still call ggml_backend_tensor_alloc to set up the
+  tensor's data pointer (pointing at mmap), but DON'T do the lmlock->grow_to() (which is what forces physical RAM residency). Then
+  the tensor points at mmap but the OS doesn't pin those pages. When accessed, the OS page-faults them in.
+
+  This is actually the ideal solution for mmap mode — the tensor is "allocated" (has a valid data pointer into mmap), but the pages
+  aren't pinned/locked, so the OS manages residency via its page cache. We just skip the grow_to call for deferred layers!
+
+● Now, since for mmap mode the tensor data pointer IS already pointing at the mmap, the ensure_layer_resident() in llama-context.cpp
+  effectively just needs to page-fault the memory (which happens automatically when the GPU reads it). So for mmap/UMA systems, the
+  windowing is essentially "free" — the OS page cache IS the window manager!
+
+  For discrete GPU (like the RX 7700 XT), the mmap buffer is a host buffer that the GPU can access. The deferred layers have valid
+  host pointers but their pages might not be in physical RAM. When the GPU reads them, the driver/OS will page them in.
+
+🔥 The complete picture:
+
+┌────────────────────────┬───────────┬─────────────────────┬─────────────────────────┐
+│ Metric                 │ Full load │ Windowed (512 MB)   │ Delta                   │
+├────────────────────────┼───────────┼─────────────────────┼─────────────────────────┤
+│ Initial load           │ 1144 MiB  │ 686.5 MiB           │ -40% I/O at startup     │
+├────────────────────────┼───────────┼─────────────────────┼─────────────────────────┤
+│ First-inference reload │ 0         │ 60.4 ms (457.7 MiB) │ One-time penalty        │
+├────────────────────────┼───────────┼─────────────────────┼─────────────────────────┤
+│ Effective bandwidth    │ —         │ 7.4 GB/s            │ NVMe → host → GPU       │
+├────────────────────────┼───────────┼─────────────────────┼─────────────────────────┤
+│ Prefill                │ 441 t/s   │ 431 t/s             │ -2% (within noise)      │
+├────────────────────────┼───────────┼─────────────────────┼─────────────────────────┤
+│ Decode                 │ 31.3 t/s  │ 31.9 t/s            │ no regression           │
+├────────────────────────┼───────────┼─────────────────────┼─────────────────────────┤
+│ Output                 │ ✓ correct │ ✓ correct           │ Identical answers       │
+└────────────────────────┴───────────┴─────────────────────┴─────────────────────────┘
+
+What happened: 
+
+ - Model loads with only 21/35 layers from disk (fast startup)
+ - On first inference call, the 14 deferred layers are loaded from mmap at
+  7.4 GB/s (60ms!)
+ - After that, all layers are resident and inference runs at full speed
+ - Zero quality impact — same tokens per second, same output
+
+The 60ms reload penalty is essentially free for interactive use. And on a UMA system where mmap maps directly to GPU-accessible
+memory, this would be even faster (just page faults, no copy).
+
+What we have now (Phase 3 — "Deferred Loading"):
+
+ - Model loads fast: only 21/35 layers read from disk at startup
+ - BUT: GPU buffer space for ALL 35 layers (1144 MiB) is still pre-allocated
+ - On first inference: the 14 skipped layers are loaded from mmap → all 35 now resident
+ - From that point on: everything is in memory — identical to no windowing
+ - Benefit: faster app startup. No runtime memory savings.
+
+True per-layer windowing (what I called Phase 4):
+
+ - Only allocate buffer space for N layers at a time (e.g., N=8 at ~270 MiB)
+ - During each forward pass (every token):
+  - Load layer 0 weights into window slot → compute → evict
+  - Load layer 1 weights into window slot → compute → evict
+  - ... cycle through all 35 layers
+ - At no point are all 35 layers in memory simultaneously
+ - Benefit: actual runtime memory reduction — from 1144 MiB to ~270 MiB of weight memory
+
+Why Phase 4 is hard: The compute graph is monolithic — all 35 layers are baked into one graph. We can't pause mid-graph to swap
+weights. We'd need to either:
+
+ 1. Break the graph into per-layer sub-graphs (major architecture change)
+ 2. Or intercept the scheduler between layer dispatches to swap buffer contents
+
+The honest summary: What we have now proves the infrastructure (tracking, deferred I/O, mmap integration) but the real memory win
+requires restructuring how the graph executes. That's a much deeper change.
+
+● Tensors have a name field (char[64]). The weight tensors have names like blk.0.attn_q.weight. Compute nodes use src[0]/src[1] which
+  point to weight tensors. So from a compute node, I can trace src[0]->name or src[1]->name to determine which layer's weights are
+  being used.
+
+  Now, the eval callback approach won't work cleanly for our purpose because:
+
+   1. It's meant for node-by-node observation with synchronization (performance killer)
+   2. The ask phase fires for each node — lots of overhead
+   3. We'd need to intercept BEFORE the compute, not after
+
+  A better approach: use the existing eval callback mechanism but only intercept at layer boundaries. When ask == true, check if the
+  node's weight tensor belongs to a new layer. If so, ensure that layer is loaded and return true (which causes a sync point).
+  Otherwise return false (let nodes batch together).
+
+  But actually, there's an even simpler approach that works with the current architecture:
+
+  The key realization: for mmap mode, all tensor data pointers already point into the mmap. The "loading" we did in Phase 3 was
+  unnecessary for mmap — the data was already accessible! The OS just needs to page it in. So for mmap mode on this system, true
+  windowing is already happening at the OS level — we just need to tell the OS which pages to keep resident (mlock) and which to let
+  go.
+
+  But for actual control (and for discrete GPU / non-mmap paths), let me implement a proper eval-callback-based approach. Let me
+  actually check whether the mmap-based approach is already giving us windowing behavior.
+
+   Phase 4 using the eval callback. The approach:
+
+ 1. Set up an eval callback that fires at layer boundaries
+ 2. When a new layer's first node is about to compute: ensure that layer is resident
+ 3. Evict the oldest layer(s) if over budget
+ 4. For mmap: "evict" means madvise(MADV_DONTNEED) (Linux) or VirtualUnlock + DiscardVirtualMemory (Windows) to hint the OS to 
+release pages
+ 5. For non-mmap: would need explicit buffer management (future)
+
+For now, the practical approach on this mmap-based system:
+
+ - Use the eval callback to track which layer is being computed
+ - Before computing a layer: mlock its pages (ensure resident)
+ - After a layer exits the window: munlock + madvise(DONTNEED) to let OS reclaim
+
+Actually, let me step back and think about what's practical and impactful right now. On this mmap system:
+
+ - All weight data pointers already point into the mmap
+ - The GPU reads from these host pointers (buffer_from_host_ptr on UMA)
+ - The OS page cache already manages what's physically resident
+ - We can use madvise/VirtualUnlock to hint the OS
+
+The simplest Phase 4: rather than the eval callback (which adds per-node overhead), do a per-forward-pass windowing with madvise
+hints:
+
+ 1. Before graph compute: madvise(WILLNEED) for all layers (prefetch)
+ 2. After graph compute: madvise(DONTNEED) for layers outside the window
+
+But this doesn't actually limit peak memory — the GPU reads all layers during the forward pass.
+
+For TRUE memory limiting, we need per-layer control during compute. The eval callback is the right tool.
+

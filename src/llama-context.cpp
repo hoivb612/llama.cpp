@@ -18,6 +18,14 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 //
 // llama_context
 //
@@ -1200,11 +1208,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        const auto t_start_us = ggml_time_us();
+        //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
 
-        LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1249,7 +1257,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         }
     }
-
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1709,19 +1716,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-#if XBOX_FIX
-        // Xbox: fix for CLIP models creating embeddings only
-
-        // Pooling does not use the KV cache
-        if (!embd_pooled) {
-            if (!kv_self->find_slot(ubatch)) {
-                LLAMA_LOG_WARN("%s: failed to find KV cache slot for ubatch of size %d\n", __func__, ubatch.n_tokens);
-#else
-
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
-
-#endif
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3512,17 +3508,33 @@ void llama_perf_context_print(const llama_context * ctx) {
 
     const double t_end_ms = 1e-3 * ggml_time_us();
 
-    LLAMA_LOG_INFO("\n");
     LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
     LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_p_eval_ms, data.n_p_eval, (data.n_p_eval == 0) ? 0.0: data.t_p_eval_ms / data.n_p_eval, 
-            (data.t_p_eval_ms == 0) ? 0.0 : 1e3 / data.t_p_eval_ms * data.n_p_eval);
+            __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_eval_ms, data.n_eval, (data.n_eval == 0) ? 0.0 : data.t_eval_ms / data.n_eval, 
-            (data.t_eval_ms == 0) ? 0.0 : 1e3 / data.t_eval_ms * data.n_eval);
-    LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), 
-            (data.n_p_eval + data.n_eval));
+            __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
+    LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    // Print layer windowing / process memory stats
+    layer_window_manager * lwm = llama_get_layer_window_manager();
+    if (lwm) {
+        lwm->print_stats();
+    }
+
+    // Always print process memory (useful for comparing budget vs no-budget)
+#ifdef _WIN32
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc = {};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+            LLAMA_LOG_INFO("process_memory: peak working_set=%.1f MiB, current working_set=%.1f MiB, private=%.1f MiB\n",
+                   pmc.PeakWorkingSetSize / (1024.0 * 1024.0),
+                   pmc.WorkingSetSize / (1024.0 * 1024.0),
+                   pmc.PrivateUsage / (1024.0 * 1024.0));
+        }
+    }
+#endif
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
@@ -3598,7 +3610,7 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
         ggml_backend_dev_memory(dev, &free, &total);
 
         const size_t self = mb.model + mb.context + mb.compute;
-        const size_t unaccounted = total - self - free;
+        const size_t unaccounted = (total > self + free) ? (total - self - free) : 0;
 
         table_data.push_back({
             template_gpu,

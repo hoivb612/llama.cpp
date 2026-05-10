@@ -1414,90 +1414,47 @@ bool llama_model_loader::load_all_data(
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
-    // Layer windowing: check for weight budget and layer stat env vars
+    // Per-layer weight size tracking (gated by GGML_MODEL_LAYERS_STAT env var)
+    static bool show_layer_stat = (getenv("GGML_MODEL_LAYERS_STAT") != nullptr);
+    std::map<int, size_t> layer_sizes;  // layer_idx -> total bytes
+    size_t non_layer_size = 0;          // embeddings, output, etc.
+    std::map<std::string, size_t> non_layer_tensors;  // tensor_name -> bytes
+
+    // Layer windowing: check for weight budget (env var or programmatic)
     static const char * budget_env = getenv("GGML_WEIGHT_BUDGET_MB");
     size_t weight_budget_mb = budget_env ? (size_t)atoi(budget_env) : 0;
     layer_window_manager * lwm = llama_get_layer_window_manager();
     bool windowing_active = (weight_budget_mb > 0) || (lwm && lwm->budget_bytes > 0);
 
-    static const char * layer_stat_env = getenv("GGML_MODEL_LAYERS_STAT");
-    bool show_layer_stat = layer_stat_env && atoi(layer_stat_env) != 0;
-
-    // Pre-scan: measure per-layer sizes for windowing decisions and/or stat display
-    std::map<int, size_t> layer_sizes;  // layer_idx -> total bytes
-    size_t non_layer_size = 0;
-    std::map<std::string, size_t> non_layer_tensors;  // tensor_name -> bytes
-
+    // Pre-scan: measure per-layer sizes for windowing decisions
     if (windowing_active || show_layer_stat) {
         for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
             const auto * weight = get_weight(ggml_get_name(cur));
             if (!weight) continue;
             size_t n_size = ggml_nbytes(cur);
             const char * name = ggml_get_name(cur);
-
             int layer_idx = -1;
             if (strncmp(name, "blk.", 4) == 0) {
                 layer_idx = atoi(name + 4);
             }
-
             if (layer_idx >= 0) {
                 layer_sizes[layer_idx] += n_size;
             } else {
                 non_layer_size += n_size;
-                non_layer_tensors[name] = n_size;
+                if (show_layer_stat) {
+                    non_layer_tensors[name] += n_size;
+                }
             }
         }
 
-        // Display layer stat if requested
-        if (show_layer_stat && !layer_sizes.empty()) {
-            int n_layers = (int)layer_sizes.size();
-            size_t min_layer = SIZE_MAX, max_layer = 0, total_layer = 0;
-            for (const auto & [idx, sz] : layer_sizes) {
-                min_layer = std::min(min_layer, sz);
-                max_layer = std::max(max_layer, sz);
-                total_layer += sz;
+        // Initialize layer window manager if budget is set
+        if (windowing_active && !layer_sizes.empty()) {
+            if (!lwm) {
+                // Create a static instance if none was set programmatically
+                static layer_window_manager static_lwm;
+                lwm = &static_lwm;
+                llama_set_layer_window_manager(lwm);
             }
-            double avg = (double)total_layer / n_layers;
-            printf("\n%s: weight memory breakdown (%d layers):\n", __func__, n_layers);
-            printf("%s:   non-layer (embed/output): %7.2f MiB\n", __func__, non_layer_size / (1024.0 * 1024.0));
-            for (const auto & [name, sz] : non_layer_tensors) {
-                printf("%s:     %-40s %7.2f MiB\n", __func__, name.c_str(), sz / (1024.0 * 1024.0));
-            }
-            printf("%s:   per-layer: min = %.2f MiB, max = %.2f MiB, avg = %.2f MiB\n",
-                __func__, min_layer / (1024.0 * 1024.0), max_layer / (1024.0 * 1024.0), avg / (1024.0 * 1024.0));
-            printf("%s:   total layers: %.2f MiB, total: %.2f MiB\n",
-                __func__, total_layer / (1024.0 * 1024.0), (total_layer + non_layer_size) / (1024.0 * 1024.0));
-
-            // Budget table
-            size_t biggest = max_layer;
-            printf("%s:   weight budget estimates:\n", __func__);
-            for (int budget_mb : {0, 64, 128, 256, 512, 1024, 2048}) {
-                if (budget_mb == 0) {
-                    printf("%s:     %4d MiB => 1 layer  resident (minimum)\n", __func__,
-                        (int)(biggest / (1024 * 1024) + 1));
-                    continue;
-                }
-                size_t budget_bytes = (size_t)budget_mb * 1024 * 1024;
-                int fit = 0;
-                size_t accum = 0;
-                for (const auto & [idx, sz] : layer_sizes) {
-                    if (accum + sz <= budget_bytes) { accum += sz; fit++; } else break;
-                }
-                if (fit >= (int)layer_sizes.size()) {
-                    printf("%s:     %4d MiB => all %zu layers resident (no windowing needed)\n",
-                        __func__, budget_mb, layer_sizes.size());
-                    break;
-                } else {
-                    printf("%s:     %4d MiB => %d of %zu layers resident\n",
-                        __func__, budget_mb, fit, layer_sizes.size());
-                }
-            }
-            printf("\n");
-            fflush(stdout);
-        }
-
-        // Initialize layer window manager if windowing is active
-        if (windowing_active && lwm) {
             int n_layers = (int)layer_sizes.size();
             if (weight_budget_mb > 0) {
                 lwm->init(n_layers, weight_budget_mb);
@@ -1632,9 +1589,12 @@ bool llama_model_loader::load_all_data(
             if (strncmp(name, "blk.", 4) == 0) {
                 layer_idx = atoi(name + 4);
             }
-            if (layer_idx >= 0 && !lwm->should_load_layer(layer_idx)) {
-                // Record file location and tensor pointer for on-demand loading
+            if (layer_idx >= 0) {
+                // Record file location for ALL layers (even initially loaded ones)
+                // so they can be evicted and reloaded later during windowing
                 lwm->record_tensor_location(layer_idx, name, weight->idx, weight->offs, n_size, cur);
+            }
+            if (layer_idx >= 0 && !lwm->should_load_layer(layer_idx)) {
 
                 // For mmap: still set up the tensor data pointer so the graph can use it,
                 // but skip mlock (let OS manage page residency via page cache)
@@ -1651,7 +1611,9 @@ bool llama_model_loader::load_all_data(
                         auto & mmap_used = mmaps_used[weight->idx];
                         mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                         mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-                    } else if (cur->data) {
+                    } else if (cur->data && ggml_backend_buffer_is_host(cur->buffer)) {
+                        // Only copy for CPU/host buffers (mmap-backed).
+                        // GPU buffers: ensure_layer_resident will fill via set_tensor later.
                         ggml_backend_tensor_set(cur, data, 0, n_size);
                     }
                 }
@@ -1767,6 +1729,60 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    // Mark initially loaded layers as resident in the layer window manager
+    if (lwm && lwm->budget_bytes > 0) {
+        lwm->mark_initially_resident();
+    }
+
+    // Print per-layer weight size summary (gated by GGML_MODEL_LAYERS_STAT)
+    if (show_layer_stat && !layer_sizes.empty()) {
+        size_t total_layer = 0;
+        for (const auto & [idx, sz] : layer_sizes) { total_layer += sz; }
+        printf("\n%s: weight memory breakdown (%zu layers):\n", __func__, layer_sizes.size());
+        printf("%s:   non-layer (embed/output): %7.2f MiB\n", __func__, non_layer_size / (1024.0 * 1024.0));
+        // List individual non-layer tensors
+        for (const auto & [name, sz] : non_layer_tensors) {
+            printf("%s:     %-40s %7.2f MiB\n", __func__, name.c_str(), sz / (1024.0 * 1024.0));
+        }
+        size_t min_layer = SIZE_MAX, max_layer = 0;
+        for (const auto & [idx, sz] : layer_sizes) {
+            min_layer = std::min(min_layer, sz);
+            max_layer = std::max(max_layer, sz);
+        }
+        printf("%s:   per-layer: min = %.2f MiB, max = %.2f MiB, avg = %.2f MiB\n", __func__,
+            min_layer / (1024.0 * 1024.0), max_layer / (1024.0 * 1024.0),
+            (total_layer / layer_sizes.size()) / (1024.0 * 1024.0));
+        printf("%s:   total layers: %.2f MiB, total: %.2f MiB\n", __func__,
+            total_layer / (1024.0 * 1024.0), (total_layer + non_layer_size) / (1024.0 * 1024.0));
+
+        // Budget table
+        size_t biggest = max_layer;
+        printf("%s:   weight budget estimates:\n", __func__);
+        for (int budget_mb : {0, 64, 128, 256, 512, 1024, 2048}) {
+            if (budget_mb == 0) {
+                printf("%s:     %4d MiB => 1 layer  resident (minimum)\n", __func__,
+                    (int)(biggest / (1024 * 1024) + 1));
+                continue;
+            }
+            size_t budget_bytes = (size_t)budget_mb * 1024 * 1024;
+            int fit = 0;
+            size_t accum = 0;
+            for (const auto & [idx, sz] : layer_sizes) {
+                if (accum + sz <= budget_bytes) { accum += sz; fit++; } else break;
+            }
+            if (fit >= (int)layer_sizes.size()) {
+                printf("%s:     %4d MiB => all %zu layers resident (no windowing needed)\n",
+                    __func__, budget_mb, layer_sizes.size());
+                break;
+            } else {
+                printf("%s:     %4d MiB => %d of %zu layers resident\n",
+                    __func__, budget_mb, fit, layer_sizes.size());
+            }
+        }
+        printf("\n");
+        fflush(stdout);
     }
 
     // free temporary resources used for async uploads

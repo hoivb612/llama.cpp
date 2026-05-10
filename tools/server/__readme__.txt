@@ -1,0 +1,1 @@
+bin\RelWithDebInfo\llama-server.exe -t 4 --jinja -c 0 --host 127.0.0.1 --port 8033 -m c:\llama.cpp\models\Ministral-3-3B\Reasoning\Ministral-3-3B-Reasoning-2512-BF16.gguf

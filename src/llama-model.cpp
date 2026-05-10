@@ -3,10 +3,10 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
-#include "llama-layer-window.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-layer-window.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -821,7 +821,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
         ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT, hparams.n_rot_full, false);
 
-        if (arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_DECI || arch == LLM_ARCH_FALCON || arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_BITNET_25 || arch == LLM_ARCH_BITNET_B158) {
+        if (arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_DECI || arch == LLM_ARCH_FALCON || arch == LLM_ARCH_LLAMA_EMBED) {
             if (hparams.n_rot_full != hparams.n_embd_head_k_full) {
                 throw std::runtime_error(format("invalid n_rot: %u, expected %u", hparams.n_rot_full, hparams.n_embd_head_k_full));
             }
@@ -2148,18 +2148,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
                 switch (hparams.n_layer) {
-                    case 24: type = LLM_TYPE_700M; break; // 1bitLLM/bitnet_b1_58-large
-                    case 26: type = LLM_TYPE_3B; break;   // 1bitLLM/bitnet_b1_58-3B
-                    default: type = LLM_TYPE_UNKNOWN;
-                }
-            } break;
-        case LLM_ARCH_BITNET_B158:
-        case LLM_ARCH_BITNET_25:
-            {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-
-                switch (hparams.n_layer) {
-                    case 30: type = LLM_TYPE_2B; break; // bitnet2b_2501
+                    case 26: type = LLM_TYPE_3B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -2976,7 +2965,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
 
-    bool use_mmap_buffer = true;
+    const bool use_mmap_buffer = true;
     bool mmap_used_for_host_ptr = false; // true if any buffer_from_host_ptr succeeded (mmaps must stay alive)
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -3114,8 +3103,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_LLAMA_EMBED:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-                    //printf("%s: model.tok_embd [%p]['%s'] - type [%d]\n",
-                    //    __func__, tok_embd, tok_embd->name, tok_embd->type);
 
                     // output
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -5576,63 +5563,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale",  i), {1}, TENSOR_NOT_REQUIRED);
                         layer.ffn_up         = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
                         layer.ffn_up_s   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "scale",  i), {1}, TENSOR_NOT_REQUIRED);
-                    }
-                } break;
-            case LLM_ARCH_BITNET_B158:
-            case LLM_ARCH_BITNET_25:
-                {
-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-
-                    // output
-                    {
-                        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-                        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
-
-                        // if output is NULL, init from the input tok embed
-                        if (output == NULL) {
-                            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
-                        }
-                    }
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        auto & layer = layers[i];
-
-                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-
-                        layer.attn_sub_norm = create_tensor(tn(LLM_TENSOR_ATTN_SUB_NORM, "weight", i), {n_embd}, 0);
-                        layer.ffn_sub_norm = create_tensor(tn(LLM_TENSOR_FFN_SUB_NORM, "weight", i), {n_ff}, 0);
-                        
-                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa}, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa}, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
-
-                        // optional bias tensors
-                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
-                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                        layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
-
-                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-
-                        layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight"), {n_rot/2}, llama_model_loader::TENSOR_NOT_REQUIRED | (i != 0 ? llama_model_loader::TENSOR_DUPLICATED : 0));
-
-                        if (n_expert == 0) {
-                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
-
-                            // optional MLP bias
-                            layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                            layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i), {n_embd}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                            layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                        } else {
-                            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-
-                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
-                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
-                        }
                     }
                 } break;
             case LLM_ARCH_T5:
@@ -8227,10 +8157,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        // On UMA, skip buffer_from_host_ptr for CPU devices — the 52 MiB copy is trivial,
-        // but keeping the entire mmap alive (just for CPU tensors) wastes ~2 GB of shared memory.
+        // Skip buffer_from_host_ptr for CPU devices when the copy is small relative to
+        // the mmap — releasing mmap pages saves far more than the copy costs.
+        // If CPU tensors are >= 75% of mmap, the savings are marginal and peak memory spikes.
         bool is_cpu_dev = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr && !is_cpu_dev;
+        bool skip_cpu_for_mmap_release = false;
+        if (is_cpu_dev && !skip_buffer_from_host_ptr) {
+            size_t ctx_tensor_bytes = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                ctx_tensor_bytes += ggml_nbytes(t);
+            }
+            size_t total_mmap = 0;
+            for (auto & m : ml.mappings) {
+                total_mmap += m->size();
+            }
+            if (total_mmap > 0 && ctx_tensor_bytes * 4 < total_mmap * 3) { // < 75%
+                skip_cpu_for_mmap_release = true;
+                LLAMA_LOG_INFO("%s: CPU tensors %.1f MiB < 75%% of mmap %.1f MiB, will copy to release mmap\n",
+                               __func__, ctx_tensor_bytes / (1024.0 * 1024.0), total_mmap / (1024.0 * 1024.0));
+            }
+        }
+        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr && !skip_buffer_from_host_ptr && !skip_cpu_for_mmap_release;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
@@ -8249,9 +8196,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                // Pass file mapping handle as hint for DX12 UMA zero-copy
+                // Pass file mapping hint for DX12 UMA zero-copy
+                ggml_backend_host_ptr_hint hint = { nullptr, nullptr };
                 if (idx < ml.mappings.size()) {
-                    ggml_backend_host_ptr_set_hint(ml.mappings[idx]->mapping_handle());
+                    hint.mapping_handle = ml.mappings[idx]->mapping_handle();
+                    hint.mapping_base   = ml.mappings[idx]->addr();
+                    ggml_backend_host_ptr_set_hint(&hint);
                 }
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 ggml_backend_host_ptr_set_hint(nullptr);
@@ -8281,7 +8231,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                // Set weight budget hint for DX12 reserved resources:
+                // non-CPU devices use CreateReservedResource to only commit
+                // physical memory for the layer window instead of the full model.
+                // The heap must hold: budget (layers) + non-layer (embed/output) + headroom.
+                if (!is_cpu_dev) {
+                    static const char * budget_env_str = getenv("GGML_WEIGHT_BUDGET_MB");
+                    size_t budget_mb = budget_env_str ? (size_t)atoi(budget_env_str) : 0;
+                    if (budget_mb > 0) {
+                        // Compute non-layer tensor size in this context (embed/output are always committed)
+                        size_t non_layer_size = 0;
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                            if (strncmp(t->name, "blk.", 4) != 0) {
+                                non_layer_size += ggml_nbytes(t);
+                            }
+                        }
+                        // Pass budget + non_layer so heap can fit both
+                        ggml_backend_set_weight_budget_hint(
+                            budget_mb * 1024ULL * 1024ULL + non_layer_size);
+                    }
+                }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                ggml_backend_set_weight_budget_hint(0); // clear hint
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -8344,22 +8315,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Store mmap base addresses in layer window manager for on-demand reload
     if (use_mmap_buffer) {
-        // Store mmap base addresses in layer window manager for on-demand reload
         layer_window_manager * lwm = llama_get_layer_window_manager();
         if (lwm && lwm->budget_bytes > 0) {
-            lwm->use_mmap = true;
+            // use_mmap means tensor->data points directly into the mmap (buffer_from_host_ptr).
+            // When buffer_from_host_ptr failed, tensors are in GPU VRAM — need ggml_backend_tensor_set.
+            lwm->use_mmap = mmap_used_for_host_ptr;
             lwm->mmap_bases.resize(ml.mappings.size());
             for (size_t i = 0; i < ml.mappings.size(); i++) {
                 lwm->mmap_bases[i] = (const uint8_t *)ml.mappings[i]->addr();
+                // Register mmap for OEHA direct GPU copy (skip staging memcpy)
+                ggml_backend_register_mmap(
+                    ml.mappings[i]->addr(), ml.mappings[i]->size(),
+                    ml.mappings[i]->mapping_handle());
             }
-            // Mark initially loaded layers as resident
-            for (int i = 0; i < lwm->total_layers; i++) {
-                if (lwm->should_load_layer(i)) {
-                    lwm->entries[i].resident = true;
-                    lwm->resident_bytes += lwm->entries[i].memory_size;
-                }
-            }
+            // mark_initially_resident() was already called from load_all_data
+            // Compute reference checksums before releasing mmap pages
+            lwm->compute_reference_checksums();
+            // Now that mmap_bases is set, release physical pages to reclaim RAM
+            lwm->release_mmap_pages();
         }
         // Only keep mmaps alive if buffer_from_host_ptr succeeded (tensor->data points into mmap)
         // or layer windowing needs them for on-demand reload.
@@ -9174,13 +9149,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_bitnet>(*this, params);
             } break;
-#if 0 // GGML_B612 TBD
-        case LLM_ARCH_BITNET_B158:
-        case LLM_ARCH_BITNET_25:
-            {
-                llm = std::make_unique<llm_build_bitnet_158>(*this, params);
-            } break;
-#endif
         case LLM_ARCH_T5:
             {
                 switch (params.gtype) {
@@ -9410,15 +9378,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs();
 
-#ifdef GGML_B612
-    auto *gf = llm->res->get_gf();
-    // ggml_graph_print(gf);
-    // ggml_graph_dump_dot_b612(gf, NULL, "ggml_new.dot");
-
-    llama_repack_tensor_callgraph(gf);
-
-#endif
-
     return llm->res->get_gf();
 }
 
@@ -9602,8 +9561,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_EUROBERT:
         case LLM_ARCH_STABLELM:
         case LLM_ARCH_BITNET:
-        case LLM_ARCH_BITNET_25:
-        case LLM_ARCH_BITNET_B158:
         case LLM_ARCH_QWEN:
         case LLM_ARCH_QWEN2:
         case LLM_ARCH_DREAM:

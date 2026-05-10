@@ -6,6 +6,7 @@
 // Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [stream] [-d N] [-sm none|layer|row]
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -179,21 +180,19 @@ int main(int argc, char ** argv) {
         llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
     }
 
+    // --- Load model ---
     // Set weight budget env var if specified (picked up by load_all_data)
     if (p.weight_budget_mb > 0) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%d", p.weight_budget_mb);
 #ifdef _WIN32
         _putenv_s("GGML_WEIGHT_BUDGET_MB", buf);
-        _putenv_s("GGML_MODEL_LAYERS_STAT", "1");
 #else
         setenv("GGML_WEIGHT_BUDGET_MB", buf, 1);
-        setenv("GGML_MODEL_LAYERS_STAT", "1", 1);
 #endif
         printf("[%s]: weight budget = %d MiB (layer windowing enabled)\n", __func__, p.weight_budget_mb);
     }
 
-    // --- Load model ---
     llama_model_params model_params = llama_model_default_params();
     if (p.force_cpu) {
         model_params.n_gpu_layers = 0;
@@ -262,7 +261,7 @@ int main(int argc, char ** argv) {
         // Clear KV cache for each prompt (no prefix-cache in this version)
         llama_memory_clear(llama_get_memory(ctx), true);
 
-        // Tokenize (add_special=false, parse_special=true ΓÇö same as minslminfer)
+        // Tokenize (add_special=false, parse_special=true — same as minslminfer)
         std::vector<llama_token> tokens = tokenize(ctx, full_prompt, false, true);
 
         // --- Prompt eval (prefill) ---
@@ -370,6 +369,16 @@ int main(int argc, char ** argv) {
     // Re-enable llama logging for perf report
     llama_log_set(nullptr, nullptr);
     llama_perf_context_print(ctx);
+
+    // Print DX12 per-op perf stats if GGML_DX12_PERF was set
+    {
+        typedef void (*perf_fn_t)();
+        for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto fn = (perf_fn_t)ggml_backend_reg_get_proc_address(reg, "ggml_cpu_print_tensor_op_perf");
+            if (fn) { fn(); break; }
+        }
+    }
 
 cleanup:
     llama_free(ctx);

@@ -7,7 +7,7 @@
 //   op1 = nb2 (overlay stride dim2, bytes)
 //   op2 = nb3 (overlay stride dim3, bytes)
 //   op3 = offset (byte offset into dst where overlay begins)
-//   op4 = inplace flag (unused in shader ΓÇö handled by scheduler)
+//   op4 = inplace flag (unused in shader — handled by scheduler)
 #include "ggml_common.hlsli"
 
 [numthreads(256, 1, 1)]
@@ -40,7 +40,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         uint i0 = rem1 % stride1;
 
         if (i0 < ne10 && i1 < ne11 && i2 < ne12 && i3 < ne13) {
-            // Inside overlay region ΓÇö read from src1
+            // Inside overlay region — read from src1
             uint off1 = src1_offset + i0 * nb10 + i1 * nb11 + i2 * nb12 + i3 * nb13;
             float val = load_auto(src1, off1, src1_esize);
             store_auto(dst, dst_offset + idx * esize, val, dst_esize);
@@ -48,7 +48,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
-    // Outside overlay ΓÇö copy from src0
+    // Outside overlay — copy from src0
     float val = load_auto(src0, src0_offset + idx * esize, src0_esize);
     store_auto(dst, dst_offset + idx * esize, val, dst_esize);
 }

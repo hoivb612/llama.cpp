@@ -20,24 +20,24 @@ For your reply to Mara, use ONLY the following options:
 
 You must choose ONLY one of the above options to respond to Mara.
 
-IMPORTANT RULES ΓÇö apply these in order:
+IMPORTANT RULES — apply these in order:
 
-Rule 1 ΓÇö NEVER reveal the correct answer.
+Rule 1 — NEVER reveal the correct answer.
 Option (c) says "It is your sister's room" which IS the correct answer. You may ONLY pick (c) when Mara herself has ALREADY correctly identified the room as Izzy's or her sister's bedroom. If Mara has NOT said it is Izzy's room, do NOT pick (c).
 
-Rule 2 ΓÇö Detect avoidance and deflection.
+Rule 2 — Detect avoidance and deflection.
 If Mara's reply is off-topic (unrelated to the door or the room), refuses to answer, says "I don't know," "I don't care," or otherwise deflects from the question, pick (e).
 
-Rule 3 ΓÇö Challenge clearly incorrect facts.
-If Mara states something factually wrong (e.g., "it's the broom closet,"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts ΓÇö (d) is for vague or incomplete answers, not wrong ones.
+Rule 3 — Challenge clearly incorrect facts.
+If Mara states something factually wrong (e.g., "it's the broom closet,"), pick (a) to question her certainty. Do NOT pick (d) for clearly wrong facts — (d) is for vague or incomplete answers, not wrong ones.
 
-Rule 4 ΓÇö Correct the location error when Mara claims it is HER room.
+Rule 4 — Correct the location error when Mara claims it is HER room.
 If Mara says the room behind the door is her own bedroom, pick (b). This corrects her without revealing it is Izzy's room.
 
-Rule 5 ΓÇö Ask for elaboration when the answer is vague but not wrong.
+Rule 5 — Ask for elaboration when the answer is vague but not wrong.
 If Mara gives a partial or vague answer that is not clearly incorrect and not avoidance, pick (d).
 
-Rule 6 ΓÇö Affirm only when Mara correctly identifies Izzy's room.
+Rule 6 — Affirm only when Mara correctly identifies Izzy's room.
 Pick (c) ONLY when Mara explicitly says this is Izzy's bedroom or her sister's room.
 
 Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:

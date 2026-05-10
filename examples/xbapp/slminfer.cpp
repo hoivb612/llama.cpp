@@ -6,6 +6,7 @@ llama_context *ctx;
 llama_context_params ctx_params;
 llama_model *model;
 llama_model_params model_params;
+llama_memory_t lmem;
 static int total_tokens_generated = 0;
 bool save_slm_state = false;
 std::vector<llama_token> session_tokens;
@@ -131,6 +132,8 @@ int slm_init(xbapp_params& xbparams) {
     ctx_params.no_perf = false;
 
     ctx = llama_init_from_model(model, ctx_params);
+    lmem = llama_get_memory(ctx);
+
     if (ctx == NULL) {
         printf("%s: error: failed to create the llama_context\n" , __func__);
         return 1;
@@ -141,7 +144,8 @@ int slm_init(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // start from a known point
-        llama_memory_clear(llama_get_memory(ctx), true);
+        //llama_kv_self_clear(ctx);
+        llama_memory_clear(lmem, true);
 
         std::string template_prompt = xbparams.custom_template_prompt;
         size_t pos = template_prompt.find("{message}");
@@ -190,7 +194,7 @@ int slm_init(xbapp_params& xbparams) {
                 //printf("%s: token_shared=%zd - %s\n", __func__, tokens_shared.size(), LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_shared).c_str());
 
                 // remove any "future" tokens that we might have inherited from the previous session
-                llama_memory_seq_rm(llama_get_memory(ctx), 0, tokens_shared.size(), -1);
+                llama_memory_seq_rm(lmem, -1, tokens_shared.size(), -1);
             }
 
 #else // use llama_set_state_data()
@@ -234,7 +238,7 @@ int slm_inference(xbapp_params& xbparams) {
 
     if (xbparams.pfc_mode) {
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_memory_seq_rm(llama_get_memory(ctx), 0, tokens_shared.size(), -1);
+        llama_memory_seq_rm(lmem, -1, tokens_shared.size(), -1);
         embd_inp.insert(embd_inp.end(), tokens_shared.begin(), tokens_shared.end());
         n_past = tokens_shared.size();
         n_kv_pfx = tokens_shared.size();
@@ -243,7 +247,7 @@ int slm_inference(xbapp_params& xbparams) {
         xbparams.prompt.append("\"\n<|end|>\n<|Assistant|>\nYou:");
     } else {
         // start from a known point for each new user prompt
-        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_memory_clear(lmem, true);
         n_past = 0;
         n_kv_pfx = 0;
     }

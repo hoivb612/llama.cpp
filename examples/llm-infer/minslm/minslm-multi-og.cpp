@@ -41,27 +41,6 @@ Usage:
 
  minslminfer-multi-og MODEL #threads SCRIPT [template=FILE] [stream] [verbose] ...
 
-Template file format — two sections delimited by END_SECTION:
-
- CUSTOM_TEMPLATE_PROMPT
- <|turn>system
- You are a helpful assistant.
- <turn|>
- END_SECTION
- CUSTOM_TURN_TEMPLATE
- <|turn>user
- {message}<turn|>
- <|turn>model
- END_SECTION
-
- - CUSTOM_TEMPLATE_PROMPT — the system prefix (decoded once into KV cache at start)
- - CUSTOM_TURN_TEMPLATE — the per-user-turn wrapper; must contain {message} placeholder
-
-When to use:
-
- - If you omit template=, the program auto-detects the model's chat format from GGUF metadata (Gemma-4, Phi-3/4, Llama-3, ChatML, etc.)
- - Use template= only when auto-detection fails or you want to override the format manually
-
 - Fix template: Gemma-4 uses <|turn>role/<turn|> tokens (not <start_of_turn>/<end_of_turn> like older Gemma), and its 16K-char jinja template isn't recognized 
 by llama_chat_apply_template()
 - Fix: 3-level template detection — API → jinja pattern scan → ChatML fallback — with Gemma-4 pattern added to the scanner
@@ -853,7 +832,6 @@ int main(int argc, char** argv) {
         printf("           add-special  parse-special  template=<file>\n");
         printf("           -d N (GPU device index)  -sm none|layer|row\n");
         printf("           --weight-budget MB (layer windowing budget)\n");
-        printf("           repack-ggml  repack-xbox  repack-xbcg  repack-xbox-st  mulmat-xbox\n");
         return 1;
     }
 
@@ -910,20 +888,10 @@ int main(int argc, char** argv) {
             if (sm == "none")       params.split_mode = 0;
             else if (sm == "layer") params.split_mode = 1;
             else if (sm == "row")   params.split_mode = 2;
-        } else if (arg == "repack-ggml") {
-            params.tensor_repack_mode = 1;
-        } else if (arg == "repack-xbox") {
-            params.tensor_repack_mode = 2;
-        } else if (arg == "repack-xbcg") {
-            params.tensor_repack_mode = 3;
-        } else if (arg == "repack-xbox-st") {
-            params.tensor_repack_mode = 4;
-        } else if (arg == "mulmat-xbox") {
-            params.tensor_repack_mode = 5;
-        } else if (arg.substr(0, 9) == "template=") {
-            template_file = arg.substr(9);
         } else if (arg == "--weight-budget" && i + 1 < argc) {
             params.weight_budget_mb = std::stoi(argv[++i]);
+        } else if (arg.substr(0, 9) == "template=") {
+            template_file = arg.substr(9);
         }
     }
 
@@ -961,13 +929,7 @@ int main(int argc, char** argv) {
     if (params.weight_budget_mb > 0) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%d", params.weight_budget_mb);
-#ifdef _WIN32
         _putenv_s("GGML_WEIGHT_BUDGET_MB", buf);
-        _putenv_s("GGML_MODEL_LAYERS_STAT", "1");
-#else
-        setenv("GGML_WEIGHT_BUDGET_MB", buf, 1);
-        setenv("GGML_MODEL_LAYERS_STAT", "1", 1);
-#endif
         printf("[%s]: weight budget = %d MiB (layer windowing enabled)\n", __func__, params.weight_budget_mb);
     }
 

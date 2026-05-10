@@ -348,13 +348,7 @@ int main(int argc, char** argv) {
     if (params.weight_budget_mb > 0) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%d", params.weight_budget_mb);
-#ifdef _WIN32
         _putenv_s("GGML_WEIGHT_BUDGET_MB", buf);
-        _putenv_s("GGML_MODEL_LAYERS_STAT", "1");
-#else
-        setenv("GGML_WEIGHT_BUDGET_MB", buf, 1);
-        setenv("GGML_MODEL_LAYERS_STAT", "1", 1);
-#endif
         printf("[%s]: weight budget = %d MiB (layer windowing enabled)\n", __func__, params.weight_budget_mb);
     }
 

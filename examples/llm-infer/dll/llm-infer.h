@@ -64,7 +64,7 @@ struct model_params {
     bool parse_special                 = false; // for tokenizer: parse recognized special tokens in text
     int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
     bool process_affinity              = false; // true if set process affinity is enabled
-    int32_t weight_budget_mb           = 0;     // weight budget in MB (0 = unlimited)
+    int32_t weight_budget_mb           = 0;     // layer windowing budget in MiB (0=unlimited)
 
     // Multi-turn fields
     std::string turn_template          = "";    // template for subsequent user turns (e.g. "<|user|>\n{message}<|end|>\n<|assistant|>\n")

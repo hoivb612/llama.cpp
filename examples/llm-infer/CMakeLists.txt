@@ -109,7 +109,6 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_include_directories(${TARGET} PUBLIC ../../include)
 target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})

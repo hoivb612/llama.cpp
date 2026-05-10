@@ -2,15 +2,42 @@
 //
 // Implements a GPU compute backend using D3D12, with optional Cooperative Vector
 // acceleration for matrix-vector operations (SM 6.9 / Agility SDK 1.717+).
-
+/*
+Diagnostics environment:
+┌──────────────────────┬──────────────────────────────────────────────────────┬───────────────────────────────────────┐
+│ Env Var              │ What it does                                         │ Isolates                              │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_DIAG         │ Checksum verification of mmap data before GPU upload │ Host-side data corruption             │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_KEEP_MMAP    │ Skip DiscardVirtualMemory after upload               │ OS page reclaim corruption            │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_NO_EVICT     │ Skip all eviction entirely                           │ Eviction path vs. everything else     │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_SOFT_EVICT   │ Bookkeeping only, no tile unmap                      │ Tile decommit vs. subgraph boundaries │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_SOFT_NOUP    │ Skip re-uploads (with SOFT_EVICT)                    │ Graph splitting alone                 │
+└──────────────────────┴──────────────────────────────────────────────────────┴───────────────────────────────────────┘
+*/
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
+#ifdef _WIN32
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#else
+// WSL2: use DirectX-Headers and DXCore (no DXGI on Linux)
+#include <winadapter.h>
+#include <directx/d3d12.h>
+#include <directx/dxcore.h>
+#include <directx/dxcore_interface.h>
+#include <directx/dxgiformat.h>
+#include <dxguids/dxguids.h>
+#include <thread>
+#include <chrono>
+#endif
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -94,7 +121,6 @@ static void ggml_dx12_print_tensor_op_perf() {
         printf("          Total     Total  Tensor\n");
         printf("   Count Time(sec)   %%     Time(us) Shader / Src0 Type\n");
 
-        // GEMM rows (ne[1]>1, prompt eval)
         for (int i = 0; i < GGML_TYPE_COUNT; i++) {
             int64_t c = dx12_mm_gemm_counts[i].load();
             int64_t t = dx12_mm_gemm_time_us[i].load();
@@ -106,7 +132,6 @@ static void ggml_dx12_print_tensor_op_perf() {
                        ggml_type_name((enum ggml_type)i));
             }
         }
-        // VEC rows (ne[1]==1, decode)
         for (int i = 0; i < GGML_TYPE_COUNT; i++) {
             int64_t c = dx12_mm_vec_counts[i].load();
             int64_t t = dx12_mm_vec_time_us[i].load();
@@ -119,13 +144,51 @@ static void ggml_dx12_print_tensor_op_perf() {
             }
         }
         printf("\n%8lld %8.2f 100.00\n",
-               (long long)mm_total_count, (double)mm_total_time / 1e6);
+                (long long)mm_total_count, (double)mm_total_time / 1e6);
     }
     printf("\n");
 }
 
+// ---------------------------------------------------------------------------
+// WSL2 compatibility shims
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+
+// DXGI error codes (raw HRESULT values) used in D3D12 error checking
+#ifndef DXGI_ERROR_NOT_FOUND
+#define DXGI_ERROR_NOT_FOUND      ((HRESULT)0x887A0002L)
+#endif
+#ifndef DXGI_ERROR_DEVICE_REMOVED
+#define DXGI_ERROR_DEVICE_REMOVED ((HRESULT)0x887A0005L)
+#endif
+
+// Win32 sync shims: fence wait uses polling on WSL2
+static inline HANDLE dx12_create_event() { return nullptr; }
+static inline void   dx12_close_event(HANDLE) {}
+static inline void   dx12_wait_event(HANDLE, DWORD) {}
+
+// WideCharToMultiByte replacement for DXCore (provides UTF-8 natively)
+static inline void dx12_wide_to_utf8(const wchar_t * src, char * dst, int dst_size) {
+    int i = 0;
+    while (src[i] && i < dst_size - 1) { dst[i] = (char)src[i]; i++; }
+    dst[i] = '\0';
+}
+
+#else // _WIN32
+
+static inline HANDLE dx12_create_event() { return CreateEvent(nullptr, FALSE, FALSE, nullptr); }
+static inline void   dx12_close_event(HANDLE h) { CloseHandle(h); }
+static inline void   dx12_wait_event(HANDLE h, DWORD ms) { WaitForSingleObject(h, ms); }
+#define dx12_wide_to_utf8(src, dst, sz) WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, sz, nullptr, nullptr)
+
+#endif // _WIN32
+
 // Sentinel base address for non-host-accessible GPU buffers (matches Vulkan approach)
 static void * const DX12_PTR_BASE = (void *)(uintptr_t)0x1000;
+
+// Safe mode: single allocator, sync after every CL, no binding cache.
+// Enabled via GGML_DX12_SAFE_MODE=1 env var. Useful for debugging WSL2 issues.
+static bool dx12_safe_mode = false;
 
 // dx12_tensor_offset defined after dx12_buffer_context (see below)
 
@@ -247,36 +310,45 @@ static_assert(sizeof(dx12_shader_params) / 4 <= 64, "must fit in root constants"
 // ---------------------------------------------------------------------------
 
 struct dx12_device {
+#ifdef _WIN32
     ComPtr<IDXGIAdapter1>     adapter;
+    DXGI_ADAPTER_DESC1        adapter_desc = {};
+#else
+    ComPtr<IDXCoreAdapter>    adapter;
+#endif
     ComPtr<ID3D12Device>      device;
     ComPtr<ID3D12CommandQueue> compute_queue;
 
-    DXGI_ADAPTER_DESC1        adapter_desc = {};
     size_t                    vram_total   = 0;
     size_t                    vram_free    = 0;
+    uint32_t                  vendor_id    = 0;
+    uint32_t                  device_id    = 0;
 
     bool cooperative_vector_supported = false;
 
     // UMA (Unified Memory Architecture) — APU/integrated GPU
-    /*
+    /* 
     UMA indicates that the GPU shares system memory with the CPU (integrated GPU / APU),
     which allows zero-copy access to buffers allocated in shared memory. On UMA systems,
     if the GPU cache is coherent with the CPU cache (CC-UMA), then writes from the CPU
     are immediately visible to the GPU and vice versa without explicit flushes.
 
-    On non-CacheCoherentUMA (AMD 8060S reports UMA: yes but NOT CC), using WRITE_COMBINE + L0
-    custom heap for UAV buffers causes data corruption. The GPU's L2 cache writes back through
-    write-combine pages inconsistently — coherent for CPU→GPU loads, but not for GPU UAV read-modify-write
+    On non-CacheCoherentUMA (AMD 8060S reports UMA: yes but NOT CC), using WRITE_COMBINE + L0 
+    custom heap for UAV buffers causes data corruption. The GPU's L2 cache writes back through 
+    write-combine pages inconsistently — coherent for CPU→GPU loads, but not for GPU UAV read-modify-write 
     patterns (KV cache, intermediate compute).
 
-    Caution: Only use D3D12_HEAP_TYPE_CUSTOM (zero-copy) on CacheCoherentUMA systems where hardware
-    guarantees coherency. For plain UMA (like this 8060S), use D3D12_HEAP_TYPE_DEFAULT — the driver
+    Caution: Only use D3D12_HEAP_TYPE_CUSTOM (zero-copy) on CacheCoherentUMA systems where hardware 
+    guarantees coherency. For plain UMA (like this 8060S), use D3D12_HEAP_TYPE_DEFAULT — the driver 
     still allocates from shared system memory (you still get the 15.2 GB), just without the zero-copy CPU path.
 
     The VRAM expansion (Dedicated → Shared VRAM) still works — that's separate from the heap type.
     */
     bool is_uma = false;
     bool is_cache_coherent_uma = false;
+
+    // Tiled (reserved) resource support — required for layer windowing memory savings
+    D3D12_TILED_RESOURCES_TIER tiled_resource_tier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
 
     // WaveMMA (SM 6.9 Wave Matrix) support
     bool wave_mma_supported = false;
@@ -336,15 +408,21 @@ struct dx12_device {
         xfer.cmd_list->Close(); // start in closed state
         hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&xfer.fence));
         DX12_CHECK(hr, "CreateFence(xfer)");
-        xfer.fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        xfer.fence_event = dx12_create_event();
         xfer.initialized = true;
     }
 
     void xfer_wait() {
         if (xfer.fence_value == 0) return;
         if (xfer.fence->GetCompletedValue() >= xfer.fence_value) return;
+#ifdef _WIN32
         xfer.fence->SetEventOnCompletion(xfer.fence_value, xfer.fence_event);
-        WaitForSingleObject(xfer.fence_event, INFINITE);
+        dx12_wait_event(xfer.fence_event, INFINITE);
+#else
+        while (xfer.fence->GetCompletedValue() < xfer.fence_value) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+#endif
     }
 
     void xfer_ensure_staging(size_t up_size, size_t rb_size) {
@@ -374,6 +452,99 @@ struct dx12_device {
     std::string name;        // "DX120", "DX121", etc. (for --dev matching)
     std::string description; // GPU name from adapter desc
 
+    // OEHA: mmap regions registered for direct GPU copy (skip staging)
+    struct mmap_heap_entry {
+        const void *           base;
+        size_t                 size;
+        size_t                 prefix;    // alignment padding from base to aligned_base
+        ComPtr<ID3D12Heap>     heap;
+        ComPtr<ID3D12Resource> resource;  // placed resource for CopyBufferRegion
+    };
+    std::vector<mmap_heap_entry> mmap_heaps;
+
+    bool register_mmap_heap(const void * base, size_t size, void * mapping_handle) {
+        // Check if already registered
+        for (auto & e : mmap_heaps) {
+            if (e.base == base) return true;
+        }
+
+        const size_t ALIGNMENT = 64 * 1024;
+        uintptr_t addr         = (uintptr_t)base;
+        uintptr_t aligned_addr = addr & ~(ALIGNMENT - 1);
+        size_t prefix       = addr - aligned_addr;
+        size_t aligned_size = (size + prefix + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+        ComPtr<ID3D12Device3> device3;
+        if (FAILED(device.As(&device3))) return false;
+
+        ComPtr<ID3D12Heap> heap;
+        size_t heap_offset = 0;
+        HRESULT hr;
+
+        // Try file mapping first, fall back to address-based
+        if (mapping_handle) {
+            hr = device3->OpenExistingHeapFromFileMapping((HANDLE)mapping_handle, IID_PPV_ARGS(&heap));
+            if (FAILED(hr)) {
+                DX12_LOG_INFO("register_mmap_heap: OpenExistingHeapFromFileMapping failed (hr=0x%08X)\n", (unsigned)hr);
+            } else {
+                heap_offset = 0;
+            }
+        }
+        if (!heap) {
+            hr = device3->OpenExistingHeapFromAddress((void *)aligned_addr, IID_PPV_ARGS(&heap));
+            if (FAILED(hr)) {
+                // Expected on dGPU — file-mapped memory can't be wrapped as D3D12 heap.
+                // Layer windowing will use the staging upload path (still correct, just slower).
+                DX12_LOG_INFO("register_mmap_heap: OEHA not available (hr=0x%08X) — using staging path\n",
+                              (unsigned)hr);
+                return false;
+            }
+            heap_offset = 0;
+        }
+
+        // Query actual heap size (file mapping heaps may be larger than our mmap)
+        D3D12_HEAP_DESC hd = heap->GetDesc();
+        size_t resource_size = mapping_handle ? hd.SizeInBytes : aligned_size;
+
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width            = resource_size;
+        rd.Height           = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+        ComPtr<ID3D12Resource> resource;
+        hr = device->CreatePlacedResource(heap.Get(), heap_offset, &rd,
+                                           D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&resource));
+        if (FAILED(hr)) {
+            DX12_LOG_WARN("register_mmap_heap: CreatePlacedResource failed (hr=0x%08X, size=%zu)\n",
+                          (unsigned)hr, resource_size);
+            return false;
+        }
+
+        // For file mapping heaps: prefix includes the file offset of our mmap base
+        size_t effective_prefix = mapping_handle ? (size_t)addr : prefix;
+
+        mmap_heaps.push_back({ base, size, effective_prefix, std::move(heap), std::move(resource) });
+        DX12_LOG_INFO("register_mmap_heap: registered %.1f MiB mmap at %p (OEHA %s)\n",
+                      size / (1024.0 * 1024.0), base, mapping_handle ? "file-mapping" : "address");
+        return true;
+    }
+
+    // Find the OEHA mmap entry containing a pointer
+    mmap_heap_entry * find_mmap_entry(const void * ptr) {
+        auto p = (const uint8_t *)ptr;
+        for (auto & e : mmap_heaps) {
+            auto b = (const uint8_t *)e.base;
+            if (p >= b && p < b + e.size) return &e;
+        }
+        return nullptr;
+    }
+
     dx12_device() = default;
     dx12_device(const dx12_device &) = delete;
     dx12_device & operator=(const dx12_device &) = delete;
@@ -381,11 +552,15 @@ struct dx12_device {
     ~dx12_device() {
         if (xfer.fence_event) {
             xfer_wait();
-            CloseHandle(xfer.fence_event);
+            dx12_close_event(xfer.fence_event);
         }
     }
 
+#ifdef _WIN32
     void init(ComPtr<IDXGIAdapter1> adapter_, size_t idx);
+#else
+    void init(ComPtr<IDXCoreAdapter> adapter_, size_t idx);
+#endif
     void create_common_root_signature();
     dx12_pipeline * get_or_create_pipeline(const dx12_pipeline_key & key);
 };
@@ -393,6 +568,9 @@ struct dx12_device {
 // ---------------------------------------------------------------------------
 // Buffer context
 // ---------------------------------------------------------------------------
+
+// Global heap overflow counter (summed across all buffer contexts)
+static uint32_t g_dx12_heap_overflow_count = 0;
 
 struct dx12_buffer_context {
     dx12_device *          dev       = nullptr;
@@ -403,6 +581,111 @@ struct dx12_buffer_context {
     void *                 host_base = nullptr; // non-null for buffer_from_host_ptr (mmap base)
     size_t                 host_prefix = 0;     // bytes from resource start to host_base (alignment padding)
     ComPtr<ID3D12Heap>     placed_heap;         // heap for buffer_from_host_ptr
+
+    // Reserved resource support (Phase 5c: layer windowing memory savings)
+    bool                   is_reserved = false;  // true if using CreateReservedResource
+    ComPtr<ID3D12Heap>     backing_heap;         // physical memory for reserved resource tiles
+    size_t                 backing_heap_tiles = 0;
+    std::vector<bool>      heap_tile_used;       // bitmap: which heap tiles are in use
+    std::vector<UINT>      resource_to_heap;     // resource_tile -> heap_tile mapping (UINT_MAX = unmapped)
+    std::vector<uint16_t>  tile_refcount;        // per-resource-tile reference count (shared boundary tiles)
+    size_t                 total_resource_tiles = 0;
+    uint32_t               out_of_heap_tiles_count = 0; // count of heap tile exhaustion events
+
+    static constexpr size_t TILE_SIZE = 65536;   // D3D12 tile size for buffers: 64KB
+
+    UINT heap_search_hint = 0; // start position for free tile search
+
+    // Commit a byte range: map resource tiles to heap tiles
+    bool commit_range(size_t offset, size_t byte_size) {
+        if (!is_reserved || byte_size == 0) return true;
+
+        UINT start_tile = (UINT)(offset / TILE_SIZE);
+        UINT end_tile   = (UINT)((offset + byte_size - 1) / TILE_SIZE);
+
+        // Collect tiles that need NEW mappings (refcount was 0)
+        std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords;
+        std::vector<D3D12_TILE_REGION_SIZE> regions;
+        std::vector<UINT> heap_offsets;
+        for (UINT t = start_tile; t <= end_tile; t++) {
+            if (t >= total_resource_tiles) break;
+            tile_refcount[t]++;
+            if (resource_to_heap[t] != UINT_MAX) continue; // already mapped, just bumped refcount
+
+            // Find a free heap tile (start from hint for O(1) amortized)
+            UINT ht = UINT_MAX;
+            for (UINT i = 0; i < (UINT)backing_heap_tiles; i++) {
+                UINT h = (heap_search_hint + i) % (UINT)backing_heap_tiles;
+                if (!heap_tile_used[h]) { ht = h; break; }
+            }
+            if (ht == UINT_MAX) {
+                GGML_ABORT("DX12 heap overflow: no free heap tiles — increase --weight-budget or reduce model size "
+                           "(resource tile %u/%u, heap tiles %d, overflows so far %u)",
+                           t, total_resource_tiles, backing_heap_tiles, g_dx12_heap_overflow_count);
+            }
+            heap_tile_used[ht] = true;
+            heap_search_hint = (ht + 1) % (UINT)backing_heap_tiles;
+            resource_to_heap[t] = ht;
+
+            D3D12_TILED_RESOURCE_COORDINATE coord = {};
+            coord.X = t;
+            coords.push_back(coord);
+            D3D12_TILE_REGION_SIZE region = {};
+            region.NumTiles = 1;
+            regions.push_back(region);
+            heap_offsets.push_back(ht);
+        }
+
+        if (coords.empty()) return true; // all already committed
+
+        // Batch all tile mappings into a single UpdateTileMappings call
+        UINT n = (UINT)coords.size();
+        std::vector<D3D12_TILE_RANGE_FLAGS> flags(n, D3D12_TILE_RANGE_FLAG_NONE);
+        std::vector<UINT> counts(n, 1);
+        dev->compute_queue->UpdateTileMappings(
+            resource.Get(), n, coords.data(), regions.data(),
+            backing_heap.Get(), n, flags.data(), heap_offsets.data(), counts.data(),
+            D3D12_TILE_MAPPING_FLAG_NONE);
+        return true;
+    }
+
+    // Decommit a byte range: decrement refcounts, unmap tiles that reach 0
+    void decommit_range(size_t offset, size_t byte_size) {
+        if (!is_reserved || byte_size == 0) return;
+
+        UINT start_tile = (UINT)(offset / TILE_SIZE);
+        UINT end_tile   = (UINT)((offset + byte_size - 1) / TILE_SIZE);
+
+        std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords;
+        std::vector<D3D12_TILE_REGION_SIZE> regions;
+        for (UINT t = start_tile; t <= end_tile; t++) {
+            if (t >= total_resource_tiles) break;
+            if (tile_refcount[t] == 0) continue;
+            tile_refcount[t]--;
+            if (tile_refcount[t] > 0) continue; // still referenced by adjacent layer
+            if (resource_to_heap[t] == UINT_MAX) continue;
+            heap_tile_used[resource_to_heap[t]] = false;
+            resource_to_heap[t] = UINT_MAX;
+
+            D3D12_TILED_RESOURCE_COORDINATE coord = {};
+            coord.X = t;
+            coords.push_back(coord);
+            D3D12_TILE_REGION_SIZE region = {};
+            region.NumTiles = 1;
+            regions.push_back(region);
+        }
+
+        if (coords.empty()) return;
+
+        // Batch unmap into a single UpdateTileMappings call with NULL flag
+        UINT n = (UINT)coords.size();
+        std::vector<D3D12_TILE_RANGE_FLAGS> flags(n, D3D12_TILE_RANGE_FLAG_NULL);
+        std::vector<UINT> counts(n, 1);
+        dev->compute_queue->UpdateTileMappings(
+            resource.Get(), n, coords.data(), regions.data(),
+            nullptr, n, flags.data(), nullptr, counts.data(),
+            D3D12_TILE_MAPPING_FLAG_NONE);
+    }
 };
 
 static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
@@ -438,7 +721,7 @@ struct dx12_backend_context {
     ComPtr<ID3D12Resource> readback_staging;
     size_t                 readback_staging_size = 0;
 
-    // Split-KV temp buffer for flash attention partials
+    // Split-KV flash attention temp buffer
     ComPtr<ID3D12Resource> splitkv_temp;
     size_t                 splitkv_temp_size = 0;
 
@@ -469,11 +752,11 @@ struct dx12_backend_context {
 
     ~dx12_backend_context() {
         // RAII cleanup: wait for ALL GPU work and close event handle
-        if (fence && fence_event && dev) {
+        if (fence && dev) {
             wait_for_gpu();
         }
         if (fence_event) {
-            CloseHandle(fence_event);
+            dx12_close_event(fence_event);
             fence_event = nullptr;
         }
     }
@@ -489,15 +772,30 @@ struct dx12_backend_context {
 // Global state
 // ---------------------------------------------------------------------------
 
-static struct {
+static struct dx12_global_state {
     bool                                        initialized = false;
+#ifdef _WIN32
     ComPtr<IDXGIFactory4>                       factory;
+#else
+    ComPtr<IDXCoreAdapterFactory>               factory;
+#endif
     std::vector<std::unique_ptr<dx12_device>>   devices;
     std::mutex                                  init_mutex;
 
     // Backend device & registry objects
     std::vector<ggml_backend_device> backend_devices;
     ggml_backend_reg               backend_reg_obj = {};
+
+#ifndef _WIN32
+    // WSL2: D3D12 runtime (libd3d12core.so) calls abort() if COM objects are
+    // released during __cxa_finalize. Leak intentionally — OS reclaims at exit.
+    ~dx12_global_state() {
+        for (auto & dev : devices) {
+            dev.release(); // release unique_ptr ownership without calling destructor
+        }
+        factory.Detach(); // release ComPtr ownership without calling Release()
+    }
+#endif
 } g_dx12;
 
 // ---------------------------------------------------------------------------
@@ -507,6 +805,12 @@ static struct {
 static void dx12_ensure_initialized() {
     std::lock_guard<std::mutex> lock(g_dx12.init_mutex);
     if (g_dx12.initialized) return;
+
+    // Check safe mode
+    dx12_safe_mode = (getenv("GGML_DX12_SAFE_MODE") != nullptr);
+    if (dx12_safe_mode) {
+        DX12_LOG_INFO("Safe mode enabled (single allocator, sync after every CL)\n");
+    }
 
     // Enable debug layer when DX12_DEBUG env var is set
     if (getenv("DX12_DEBUG")) {
@@ -526,6 +830,8 @@ static void dx12_ensure_initialized() {
         }
     }
 
+#ifdef _WIN32
+    // --- Windows: DXGI-based adapter enumeration ---
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&g_dx12.factory));
     DX12_CHECK(hr, "CreateDXGIFactory1");
 
@@ -555,7 +861,7 @@ static void dx12_ensure_initialized() {
         // Skip Microsoft Basic Render Driver (WARP) — not always flagged as software
         {
             char name_buf[256];
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+            dx12_wide_to_utf8(desc.Description, name_buf, sizeof(name_buf));
             if (strstr(name_buf, "Basic Render") || strstr(name_buf, "Microsoft Basic")) {
                 DX12_LOG_DEBUG("Skipping software adapter: %s\n", name_buf);
                 continue;
@@ -577,7 +883,7 @@ static void dx12_ensure_initialized() {
             }
             if (duplicate) {
                 char name_buf[256];
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                dx12_wide_to_utf8(desc.Description, name_buf, sizeof(name_buf));
                 DX12_LOG_DEBUG("Skipping duplicate adapter: %s\n", name_buf);
                 continue;
             }
@@ -609,7 +915,7 @@ static void dx12_ensure_initialized() {
                 D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&test_buf));
             if (FAILED(hr)) {
                 char name_buf[128];
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                dx12_wide_to_utf8(desc.Description, name_buf, sizeof(name_buf));
                 DX12_LOG_WARN("Skipping %s: UAV allocation failed (HRESULT 0x%08X)\n", name_buf, (unsigned)hr);
                 continue;
             }
@@ -622,6 +928,82 @@ static void dx12_ensure_initialized() {
         g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
     }
 
+#else
+    // --- WSL2: DXCore-based adapter enumeration ---
+    HRESULT hr = DXCoreCreateAdapterFactory(IID_PPV_ARGS(&g_dx12.factory));
+    DX12_CHECK(hr, "DXCoreCreateAdapterFactory");
+
+    const GUID filter_attrs[] = { DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE };
+    ComPtr<IDXCoreAdapterList> adapter_list;
+    hr = g_dx12.factory->CreateAdapterList(1, filter_attrs, IID_PPV_ARGS(&adapter_list));
+    DX12_CHECK(hr, "CreateAdapterList");
+
+    const uint32_t adapter_count = adapter_list->GetAdapterCount();
+    for (uint32_t i = 0; i < adapter_count; ++i) {
+        ComPtr<IDXCoreAdapter> adapter;
+        hr = adapter_list->GetAdapter(i, IID_PPV_ARGS(&adapter));
+        if (FAILED(hr)) continue;
+
+        // Skip software adapters (IsHardware == false)
+        bool is_hardware = false;
+        if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::IsHardware,
+                                           sizeof(is_hardware), &is_hardware)) && !is_hardware) {
+            continue;
+        }
+
+        // Get adapter description (UTF-8 natively from DXCore)
+        size_t desc_size = 0;
+        adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription, &desc_size);
+        std::string adapter_name(desc_size, '\0');
+        adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, desc_size, adapter_name.data());
+        if (!adapter_name.empty() && adapter_name.back() == '\0') adapter_name.pop_back();
+
+        // Skip WARP / Basic Render
+        if (adapter_name.find("Basic Render") != std::string::npos ||
+            adapter_name.find("Microsoft Basic") != std::string::npos) {
+            DX12_LOG_DEBUG("Skipping software adapter: %s\n", adapter_name.c_str());
+            continue;
+        }
+
+        // Try to create a D3D12 device
+        ComPtr<ID3D12Device> test_device;
+        hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device));
+        if (FAILED(hr)) {
+            DX12_LOG_DEBUG("Skipping %s: D3D12CreateDevice failed (0x%08X)\n", adapter_name.c_str(), (unsigned)hr);
+            continue;
+        }
+
+        // Validate compute capability with UAV allocation test
+        {
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width            = 4096;
+            rd.Height           = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            ComPtr<ID3D12Resource> test_buf;
+            hr = test_device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&test_buf));
+            if (FAILED(hr)) {
+                DX12_LOG_WARN("Skipping %s: UAV allocation failed (0x%08X)\n", adapter_name.c_str(), (unsigned)hr);
+                continue;
+            }
+        }
+        test_device.Reset();
+
+        if (g_dx12.devices.size() >= GGML_DX12_MAX_DEVICES) break;
+
+        g_dx12.devices.push_back(std::make_unique<dx12_device>());
+        g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
+    }
+#endif // _WIN32
+
     DX12_LOG_INFO("Found %zu D3D12 device(s)\n", g_dx12.devices.size());
     g_dx12.initialized = true;
 }
@@ -630,6 +1012,7 @@ static void dx12_ensure_initialized() {
 // dx12_device implementation
 // ---------------------------------------------------------------------------
 
+#ifdef _WIN32
 void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     adapter   = std::move(adapter_);
     dev_index = idx;
@@ -638,7 +1021,7 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
 
     // Convert wide name to narrow
     char narrow[256];
-    WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, narrow, sizeof(narrow), nullptr, nullptr);
+    dx12_wide_to_utf8(adapter_desc.Description, narrow, sizeof(narrow));
     description = narrow;
     name = std::string(GGML_DX12_NAME) + std::to_string(idx);
 
@@ -682,6 +1065,55 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     } else {
         vram_free = vram_total;
     }
+    vendor_id = adapter_desc.VendorId;
+    device_id = adapter_desc.DeviceId;
+#else
+void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
+    adapter   = std::move(adapter_);
+    dev_index = idx;
+
+    // Get adapter description (UTF-8 from DXCore)
+    size_t desc_size = 0;
+    adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription, &desc_size);
+    description.resize(desc_size);
+    adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, desc_size, description.data());
+    if (!description.empty() && description.back() == '\0') description.pop_back();
+    name = std::string(GGML_DX12_NAME) + std::to_string(idx);
+
+    HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    DX12_CHECK(hr, "D3D12CreateDevice");
+
+    // Create compute command queue
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    qd.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_queue));
+    DX12_CHECK(hr, "CreateCommandQueue(compute)");
+
+    // VRAM: query dedicated memory from DXCore
+    size_t dedicated_mem = 0;
+    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DedicatedAdapterMemory,
+                                       sizeof(dedicated_mem), &dedicated_mem))) {
+        vram_total = dedicated_mem;
+    }
+    if (vram_total == 0) {
+        // Fallback: use shared memory estimate
+        size_t shared_mem = 0;
+        if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::SharedSystemMemory,
+                                           sizeof(shared_mem), &shared_mem))) {
+            vram_total = shared_mem / 4;
+        }
+    }
+    vram_free = vram_total;
+
+    // Get hardware IDs from DXCore
+    DXCoreHardwareID hw_id = {};
+    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::HardwareID, sizeof(hw_id), &hw_id))) {
+        vendor_id = hw_id.vendorID;
+        device_id = hw_id.deviceID;
+    }
+#endif
 
     // Check Cooperative Vector support
     cooperative_vector_supported = false;
@@ -695,47 +1127,6 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
         HRESULT hr2 = device->CheckFeatureSupport((D3D12_FEATURE)52, &exp_opts, sizeof(exp_opts));
         if (SUCCEEDED(hr2) && exp_opts.CooperativeVectorTier >= 1) {
             cooperative_vector_supported = true;
-        }
-    }
-
-    // Query UMA (Unified Memory Architecture) — APU/integrated GPU zero-copy path
-    {
-        D3D12_FEATURE_DATA_ARCHITECTURE1 arch1 = {};
-        HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch1, sizeof(arch1));
-        if (SUCCEEDED(hr2)) {
-            is_uma = (arch1.UMA != FALSE);
-            is_cache_coherent_uma = (arch1.CacheCoherentUMA != FALSE);
-        } else {
-            D3D12_FEATURE_DATA_ARCHITECTURE arch0 = {};
-            hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch0, sizeof(arch0));
-            if (SUCCEEDED(hr2)) {
-                is_uma = (arch0.UMA != FALSE);
-                is_cache_coherent_uma = (arch0.CacheCoherentUMA != FALSE);
-            }
-        }
-    }
-
-    // Environment override: GGML_DX12_NO_UMA=1 disables UMA optimizations for testing
-    if (is_uma && getenv("GGML_DX12_NO_UMA")) {
-        DX12_LOG_INFO("GGML_DX12_NO_UMA set: disabling UMA/CC-UMA optimizations\n");
-        is_uma = false;
-        is_cache_coherent_uma = false;
-    }
-
-    // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
-    // Expand VRAM to shared memory if dedicated VRAM is small (< 2 GB).
-    if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
-        MEMORYSTATUSEX mem_status = {};
-        mem_status.dwLength = sizeof(mem_status);
-        if (GlobalMemoryStatusEx(&mem_status)) {
-            size_t sys_ram = (size_t)mem_status.ullTotalPhys;
-            if (sys_ram > vram_total) {
-                DX12_LOG_INFO("UMA detected: expanding VRAM from %.1f GB to %.1f GB (shared system memory)\n",
-                              (double)vram_total / (1024.0 * 1024.0 * 1024.0),
-                              (double)sys_ram / (1024.0 * 1024.0 * 1024.0));
-                vram_total = sys_ram;
-                vram_free  = sys_ram > (size_t)(512 * 1024 * 1024) ? sys_ram - (size_t)(512 * 1024 * 1024) : sys_ram;
-            }
         }
     }
 
@@ -776,17 +1167,87 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
         }
     }
 
+    // Query wave lane count (D3D12_FEATURE_D3D12_OPTIONS1)
+    uint32_t wave_lane_min = 0, wave_lane_max = 0;
+    {
+        struct {
+            BOOL WaveOps;
+            UINT WaveLaneCountMin;
+            UINT WaveLaneCountMax;
+            UINT TotalLaneCount;
+        } opts1 = {};
+        HRESULT hr2 = device->CheckFeatureSupport((D3D12_FEATURE)8, &opts1, sizeof(opts1));
+        if (SUCCEEDED(hr2)) {
+            wave_lane_min = opts1.WaveLaneCountMin;
+            wave_lane_max = opts1.WaveLaneCountMax;
+        }
+    }
+
+    // Query UMA (Unified Memory Architecture) — APU/integrated GPU zero-copy path
+    {
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch1 = {};
+        HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch1, sizeof(arch1));
+        if (SUCCEEDED(hr2)) {
+            is_uma = (arch1.UMA != FALSE);
+            is_cache_coherent_uma = (arch1.CacheCoherentUMA != FALSE);
+        } else {
+            // Fallback: D3D12_FEATURE_ARCHITECTURE (no CacheCoherent field)
+            D3D12_FEATURE_DATA_ARCHITECTURE arch0 = {};
+            hr2 = device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch0, sizeof(arch0));
+            if (SUCCEEDED(hr2)) {
+                is_uma = (arch0.UMA != FALSE);
+                is_cache_coherent_uma = (arch0.CacheCoherentUMA != FALSE);
+            }
+        }
+    }
+
+    // Environment override: GGML_DX12_NO_UMA=1 disables UMA optimizations for testing
+    if (is_uma && getenv("GGML_DX12_NO_UMA")) {
+        DX12_LOG_INFO("GGML_DX12_NO_UMA set: disabling UMA/CC-UMA optimizations\n");
+        is_uma = false;
+        is_cache_coherent_uma = false;
+    }
+
+    // Query tiled resource tier (needed for reserved resources / layer windowing)
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+        HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts));
+        if (SUCCEEDED(hr2)) {
+            tiled_resource_tier = opts.TiledResourcesTier;
+        }
+    }
+
+    // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
+    // Report SharedSystemMemory so the model loader puts all layers on GPU.
+    if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
+#ifdef _WIN32
+        size_t shared = adapter_desc.SharedSystemMemory;
+#else
+        size_t shared = 0;
+        adapter->GetProperty(DXCoreAdapterProperty::SharedSystemMemory, sizeof(shared), &shared);
+#endif
+        if (shared > vram_total) {
+            DX12_LOG_INFO("UMA detected: expanding VRAM from %.1f GB to %.1f GB (shared system memory)\n",
+                          (double)vram_total / (1024.0 * 1024.0 * 1024.0),
+                          (double)shared / (1024.0 * 1024.0 * 1024.0));
+            vram_total = shared;
+            vram_free  = shared;
+        }
+    }
+
     create_common_root_signature();
 
-    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, CV: %s, WaveMMA: %s%s, UMA: %s)\n",
+    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, Wave: %u-%u, CV: %s, WaveMMA: %s%s, UMA: %s, Tiled: T%d)\n",
                   idx, name.c_str(), description.c_str(),
                   (double)vram_total / (1024.0 * 1024.0 * 1024.0),
+                  wave_lane_min, wave_lane_max,
                   cooperative_vector_supported ? "yes" : "no",
                   wave_mma_supported ? "yes" : "no",
                   wave_mma_supported ? (std::string(" K=") + std::to_string(wave_mma_K) +
                                         " wave=" + std::to_string(wave_mma_wave_size) +
                                         (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "",
-                  is_uma ? (is_cache_coherent_uma ? "CC" : "yes") : "no");
+                  is_uma ? (is_cache_coherent_uma ? "CC" : "yes") : "no",
+                  (int)tiled_resource_tier);
 }
 
 void dx12_device::create_common_root_signature() {
@@ -863,9 +1324,11 @@ void dx12_device::create_common_root_signature() {
 void dx12_backend_context::ensure_cmd_list_open() {
     if (cmd_list_open) return;
 
-    // Pick the next allocator in the ring
-    int slot = cmd_ring_head;
-    cmd_ring_head = (cmd_ring_head + 1) % CMD_RING_SIZE;
+    // Pick the next allocator in the ring (safe mode: always use slot 0)
+    int slot = dx12_safe_mode ? 0 : cmd_ring_head;
+    if (!dx12_safe_mode) {
+        cmd_ring_head = (cmd_ring_head + 1) % CMD_RING_SIZE;
+    }
 
     // Only wait if THIS allocator's previous submission hasn't finished
     // Other allocators may still be in-flight — that's fine
@@ -906,10 +1369,15 @@ void dx12_backend_context::close_and_execute() {
     DX12_CHECK(hr, "Signal fence");
 
     // Record which fence value this allocator was submitted with
-    int submitted_slot = (cmd_ring_head + CMD_RING_SIZE - 1) % CMD_RING_SIZE;
+    int submitted_slot = dx12_safe_mode ? 0 : (cmd_ring_head + CMD_RING_SIZE - 1) % CMD_RING_SIZE;
     cmd_alloc_fence[submitted_slot] = fence_value;
 
     cmd_list_open = false;
+
+    // Safe mode: force full GPU sync after every submission
+    if (dx12_safe_mode) {
+        wait_for_gpu();
+    }
 }
 
 void dx12_backend_context::wait_for_fence(uint64_t value) {
@@ -918,7 +1386,13 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
 
     HRESULT hr = fence->SetEventOnCompletion(value, fence_event);
     DX12_CHECK(hr, "SetEventOnCompletion");
-    WaitForSingleObject(fence_event, INFINITE);
+#ifdef _WIN32
+    dx12_wait_event(fence_event, INFINITE);
+#else
+    while (fence->GetCompletedValue() < value) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+#endif
 }
 
 void dx12_backend_context::wait_for_gpu() {
@@ -1026,6 +1500,13 @@ static ComPtr<ID3D12Resource> dx12_create_buffer(dx12_device * dev, size_t size,
 // Buffer type interface
 // ---------------------------------------------------------------------------
 
+// Forward declarations for TLS handlers (defined later, needed during buffer alloc)
+static void dx12_tensor_decommit(struct ggml_tensor * tensor);
+static void dx12_batch_tensor_set(struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
+static bool dx12_register_mmap(const void * base, size_t size, void * mapping_handle, void * dev_ctx);
+
+static uint32_t dx12_get_heap_overflow_count(void) { return g_dx12_heap_overflow_count; }
+
 static const char * dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return "DX12";
@@ -1040,11 +1521,87 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     ctx->heap_type = dev->is_cache_coherent_uma ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
 
     if (size > 0) {
-        ctx->resource = dx12_create_buffer(dev, size);
-        if (!ctx->resource) {
-            delete ctx;
-            return nullptr;
+        // Check if layer windowing requested a reserved (tiled) resource
+        size_t budget = ggml_backend_get_weight_budget_hint();
+        bool use_reserved = (budget > 0 &&
+                             dev->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2 &&
+                             size > budget);  // only if buffer exceeds budget
+
+        if (use_reserved) {
+            // Create reserved resource: virtual address space only, no physical memory
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width            = std::max<size_t>(size, 256);
+            rd.Height           = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+            HRESULT hr = dev->device->CreateReservedResource(
+                &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ctx->resource));
+
+            if (SUCCEEDED(hr)) {
+                // Create backing heap sized to budget + headroom for transient peak
+                size_t heap_size = budget + 128ULL * 1024 * 1024; // budget + 128 MiB headroom
+                heap_size = (heap_size + dx12_buffer_context::TILE_SIZE - 1) & ~(dx12_buffer_context::TILE_SIZE - 1);
+
+                D3D12_HEAP_PROPERTIES hp = {};
+                if (dev->is_cache_coherent_uma) {
+                    hp.Type                 = D3D12_HEAP_TYPE_CUSTOM;
+                    hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+                    hp.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+                } else {
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                }
+
+                D3D12_HEAP_DESC heap_desc = {};
+                heap_desc.SizeInBytes = heap_size;
+                heap_desc.Properties  = hp;
+                heap_desc.Alignment   = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                heap_desc.Flags       = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+
+                hr = dev->device->CreateHeap(&heap_desc, IID_PPV_ARGS(&ctx->backing_heap));
+                if (SUCCEEDED(hr)) {
+                    ctx->is_reserved = true;
+                    ctx->backing_heap_tiles  = heap_size / dx12_buffer_context::TILE_SIZE;
+                    ctx->total_resource_tiles = (rd.Width + dx12_buffer_context::TILE_SIZE - 1) / dx12_buffer_context::TILE_SIZE;
+                    ctx->heap_tile_used.resize(ctx->backing_heap_tiles, false);
+                    ctx->resource_to_heap.resize(ctx->total_resource_tiles, UINT_MAX);
+                    ctx->tile_refcount.resize(ctx->total_resource_tiles, 0);
+
+                    DX12_LOG_INFO("Reserved resource: %.1f MiB virtual, %.1f MiB heap (%zu tiles), tier %d\n",
+                                  (double)size / (1024.0 * 1024.0),
+                                  (double)heap_size / (1024.0 * 1024.0),
+                                  ctx->backing_heap_tiles,
+                                  (int)dev->tiled_resource_tier);
+                } else {
+                    DX12_LOG_WARN("CreateHeap for reserved resource failed (0x%08X), falling back to committed\n", (unsigned)hr);
+                    ctx->resource.Reset();
+                }
+            } else {
+                DX12_LOG_WARN("CreateReservedResource failed (0x%08X), falling back to committed\n", (unsigned)hr);
+            }
         }
+
+        // Fallback or non-reserved: normal committed resource
+        if (!ctx->resource) {
+            ctx->resource = dx12_create_buffer(dev, size);
+            if (!ctx->resource) {
+                delete ctx;
+                return nullptr;
+            }
+        }
+
+        // Set OEHA and layer-windowing TLS handlers during buffer allocation
+        // (must be set before model loading completes, not just at backend init)
+        if (dev->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
+            ggml_backend_set_tensor_decommit_fn(dx12_tensor_decommit);
+            ggml_backend_set_batch_tensor_set_fn(dx12_batch_tensor_set);
+            ggml_backend_set_heap_overflow_fn(dx12_get_heap_overflow_count);
+        }
+        ggml_backend_set_register_mmap_fn(dx12_register_mmap, (void *)dev);
     }
 
     static const ggml_backend_buffer_i iface = {
@@ -1133,6 +1690,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
 
             // UMA zero-copy: buffer is CPU-writable, write directly
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                // Commit tiles for reserved resources before writing
+                if (ctx->is_reserved) {
+                    ctx->commit_range(tensor_offset, size);
+                }
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { 0, 0 };
                 HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
@@ -1146,6 +1707,11 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             // CRITICAL: Ensure compute command list is closed before transfer
             // The scheduler may call set_tensor between graph splits
             // We need all compute work to be submitted first
+
+            // Auto-commit tiles for reserved resources before uploading
+            if (ctx->is_reserved) {
+                ctx->commit_range(tensor_offset, size);
+            }
             
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait(); // wait for any previous transfer
@@ -1190,7 +1756,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
                 return;
             }
 
-            // UMA zero-copy: buffer is CPU-readable (WRITE_BACK cache-coherent)
+            // UMA zero-copy: buffer is CPU-readable (WRITE_BACK) or slow-read (WRITE_COMBINE)
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { tensor_offset, tensor_offset + size };
@@ -1335,6 +1901,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             auto * ctx = (dx12_buffer_context *)buffer->context;
             if (!ctx->resource || ctx->size == 0) return;
 
+            // Reserved resource: skip clear — no tiles committed yet, data will be
+            // written on demand via set_tensor which auto-commits tiles
+            if (ctx->is_reserved) return;
+
             // buffer_from_host_ptr: direct memset
             if (ctx->host_base) {
                 memset(ctx->host_base, value, ctx->size);
@@ -1437,8 +2007,9 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
         case GGML_OP_ROPE:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_DIAG_MASK_INF:
-            // Support F32, F16, and BF16 output; sources must be F32/F16/BF16/I32
+            // Only support F32 output and F32 sources
             if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
+                // Check source types too — our shaders handle F32/F16/BF16 via load_auto
                 for (int s = 0; s < GGML_MAX_SRC; s++) {
                     if (op->src[s] && op->src[s]->type != GGML_TYPE_F32 &&
                         op->src[s]->type != GGML_TYPE_F16 &&
@@ -1542,7 +2113,8 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return true;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            // FA supports F16 or BF16 KV cache values
+            // Re-enabled: NaN was in model head (dispatches 1598-1608), not attention.
+            // FA is MQA-safe and handles attention softcapping internally.
             if (op->type == GGML_TYPE_F32 && op->src[1] &&
                 (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16)) {
                 return true;
@@ -1558,13 +2130,11 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
 // Graph compute: dispatch shaders for a compute graph
 // ---------------------------------------------------------------------------
 
-// Map ggml_type to shader element size sentinel.
-// BF16 uses esize=3 as a sentinel (actual byte size is 2) so shaders
-// can distinguish BF16 from F16 in load_auto/store_auto.
-static uint32_t dx12_esize(enum ggml_type type) {
-    if (type == GGML_TYPE_BF16) return 3;
-    if (type == GGML_TYPE_F16)  return 2;
-    return (uint32_t)ggml_type_size(type);
+// Map ggml type to shader esize: 2=F16, 3=BF16 (sentinel), 4=F32
+// BF16 uses 3 as dispatch sentinel so shaders can distinguish from F16.
+static uint32_t dx12_esize(ggml_type t) {
+    if (t == GGML_TYPE_BF16) return 3;
+    return (uint32_t)ggml_type_size(t);
 }
 
 static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_params & p) {
@@ -1618,7 +2188,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         p.op_params[2] = src2 ? (uint32_t)src2->nb[1] : 0;             // src2_nb1
         p.op_params[3] = src2 ? (uint32_t)src2->nb[2] : 0;             // src2_nb2
         p.op_params[4] = src2 ? (uint32_t)src2->nb[3] : 0;             // src2_nb3
-        p.op_params[5] = src2 ? dx12_esize(src2->type) : 4; // src2_esize
+        p.op_params[5] = src2 ? (uint32_t)ggml_type_size(src2->type) : 4; // src2_esize
         memcpy(&p.op_params[6], &scale, sizeof(float));                 // scale
         p.op_params[7] = (uint32_t)src1->ne[2];                        // n_kv_heads
 
@@ -1720,10 +2290,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
     // Track wall time for TDR yield: GPU must periodically yield to DWM
     // to prevent display-level TDR from cumulative compute monopolization.
+    // (WSL2 has no DWM, so this is Windows-only)
+#ifdef _WIN32
     LARGE_INTEGER tdr_t0, tdr_freq;
     QueryPerformanceFrequency(&tdr_freq);
     QueryPerformanceCounter(&tdr_t0);
     static constexpr double TDR_YIELD_MS = 800.0;  // yield to DWM every 800ms
+#endif
 
     // Prompt diagnostics gated under GGML_DX12_DIAG
     static int prompt_eval_count = 0;
@@ -1951,7 +2524,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             float eps = 0.0f;
             memcpy(&eps, fused_rms_node->op_params, sizeof(float));
             memcpy(&params.op_params[2], &eps, sizeof(uint32_t));
-            params.op_params[3] = dx12_esize(node->type);  // ADD dst esize
+            params.op_params[3] = (uint32_t)ggml_type_size(node->type);  // ADD dst esize
         } else if (fused_mul_node) {
             // For fused rms_norm_mul or rms_norm_mul_rope
             dx12_fill_params(node, params);
@@ -2031,11 +2604,43 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (N_queries == 1 && N_kv >= 512) {
                 if (splitk_env > 1) {
                     fa_split_k = (uint32_t)splitk_env;
+                    // Still cap to avoid too many empty splits (wastes temp memory)
                     uint32_t max_split = (N_kv + 255) / 256;
                     if (fa_split_k > max_split) fa_split_k = max_split;
                     if (fa_split_k < 2) fa_split_k = 1;
                 } else {
-                    // Auto: target ~64 total thread groups for good CU occupancy
+                    // Auto split-KV heuristic: target ~64 total thread groups.
+                    //
+                    // Why 64: DX12 has no standard API to query CU/SM count (unlike
+                    // Vulkan which uses shader_core_count * 2 / total_workgroups).
+                    // 64 is a conservative target that provides good occupancy across:
+                    //   - APU/iGPU (16 CUs): 64 groups ≈ 4 waves/CU → near-full occupancy
+                    //   - Mid-range (32-48 CUs): reasonable saturation
+                    //   - High-end (96+ CUs): still helpful, could benefit from higher target
+                    //
+                    // Future optimization: derive target from GPU CU count via
+                    // DXGI_ADAPTER_DESC3, DXCore properties, or autotune probing.
+                    //
+                    // Formula: split_k = ceil(64 / (n_heads * batch)), capped so each
+                    // split processes at least 256 KV tokens (one TILE_KV).
+                    /*
+                      Auto selects based on: split_k = ceil(64 / (n_heads × batch)) then capped by ceil(N_kv / 256).
+
+                      For decode (N_queries=1) and for example with a 540-token prompt (max_split = ceil(540/256) = 3):
+
+                      ┌────────────────────┬─────────┬───────────────┬──────────┬──────────────┐
+                      │ Model              │ Q Heads │ Formula       │ Capped   │ Auto split_k │
+                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
+                      │ Phi-3              │ 32      │ ceil(64/32)=2 │ min(2,3) │ 2            │
+                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
+                      │ Gemma-4 (8 heads)  │ 8       │ ceil(64/8)=8  │ min(8,3) │ 3            │
+                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
+                      │ Gemma-4 (16 heads) │ 16      │ ceil(64/16)=4 │ min(4,3) │ 3            │
+                      └────────────────────┴─────────┴───────────────┴──────────┴──────────────┘
+
+                      The goal is ~64 total thread groups to fill the GPU. As context grows (N_kv increases), 
+                      the cap loosens — e.g., at 2048 tokens, max_split=8.
+                    */
                     uint32_t total_wgs = N_queries * n_heads * batch;
                     if (total_wgs < 64) {
                         fa_split_k = (64 + total_wgs - 1) / total_wgs;
@@ -2362,8 +2967,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             case GGML_OP_FLASH_ATTN_EXT: {
-                // One thread group per query row per head per batch, multiplied by split_k
-                groups_x = (uint32_t)node->src[0]->ne[1] * fa_split_k; // N_queries * split_k
+                // groups_x encodes query_idx * split_k + split_k_index (split_k precomputed above)
+                uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
+                groups_x = N_queries * fa_split_k;
                 groups_y = (uint32_t)node->src[0]->ne[2]; // n_heads
                 groups_z = (uint32_t)node->src[0]->ne[3]; // batch
                 break;
@@ -2425,10 +3031,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
             bctx->cmd_list->SetComputeRoot32BitConstants(0, sizeof(params) / 4, &params, 0);
         }
-        // dx12_perf: no pre-flush needed — post-flush after prior dispatch already drained the GPU
 
+#ifdef _WIN32
         LARGE_INTEGER t0, t1, freq;
         if (do_profile || dx12_perf) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0); }
+#else
+        std::chrono::steady_clock::time_point t0;
+        if (do_profile || dx12_perf) { t0 = std::chrono::steady_clock::now(); }
+#endif
 
         // Determine the effective destination tensor (accounting for fusion)
         struct ggml_tensor * dst_tensor = fused_rope_after_rms ? fused_rope_after_rms :
@@ -2564,6 +3174,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 bctx->cmd_list->SetComputeRoot32BitConstants(0, (uint32_t)(sizeof(reduce_params) / 4), &reduce_params, 0);
 
                 // Dispatch reduce: one group per (query, head, batch)
+                // REDUCE_GROUP_SIZE=256, each thread handles D/256 dimensions
                 bctx->cmd_list->Dispatch(ne01, ne02, ne03);
             }
         }
@@ -2711,7 +3322,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // AMD RDNA 3 requires full pipeline drains (not just UAV barriers) between
         // the final FFN/norm layers and the vocab projection + logit softcapping.
         // Without these splits, the model head produces NaN due to stale GPU caches.
-        if (cgraph->n_nodes > 1000 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
+        // NOTE: Use a low threshold (50) so this still triggers in small subgraphs
+        // created by the eval callback (layer windowing). The full graph has >1000
+        // nodes but a subgraph containing only the last few layers + model head
+        // may have ~100 nodes. The original threshold of 1000 silently skipped
+        // these CL splits for subgraph views, causing garbled output on Gemma-4.
+        if (cgraph->n_nodes > 50 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
@@ -2789,8 +3405,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->ensure_cmd_list_open();
             bctx->reset_binding_cache();
             unsynced_writes.clear();
+#ifdef _WIN32
             QueryPerformanceCounter(&t1);
             double ms = (double)(t1.QuadPart - t0.QuadPart) / freq.QuadPart * 1000.0;
+#else
+            auto t1 = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
             char key[128];
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
             snprintf(key, sizeof(key), "%s(src0t=%d,grp=%u)", ggml_op_name(node->op), src0t, groups_x);
@@ -2801,8 +3422,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->ensure_cmd_list_open();
             bctx->reset_binding_cache();
             unsynced_writes.clear();
+#ifdef _WIN32
             QueryPerformanceCounter(&t1);
             int64_t elapsed_us = (int64_t)((double)(t1.QuadPart - t0.QuadPart) / freq.QuadPart * 1e6);
+#else
+            auto t1 = std::chrono::steady_clock::now();
+            int64_t elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+#endif
             dx12_op_counts[node->op].fetch_add(1, std::memory_order_relaxed);
             dx12_op_time_us[node->op].fetch_add(elapsed_us, std::memory_order_relaxed);
             // MUL_MAT breakdown by src0 type
@@ -2836,6 +3462,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (dispatch_weight >= TDR_FLUSH_THRESHOLD) {
                 static int flush_num = 0;
                 flush_num++;
+#ifdef _WIN32
                 if (trace_prompt) {
                     LARGE_INTEGER tdr_now;
                     QueryPerformanceCounter(&tdr_now);
@@ -2843,6 +3470,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     fprintf(stderr, "  F#%d @d%d w=%d t=%.0fms\n", flush_num, i, dispatch_weight, elapsed_ms);
                     fflush(stderr);
                 }
+#else
+                if (trace_prompt) {
+                    fprintf(stderr, "  F#%d @d%d w=%d\n", flush_num, i, dispatch_weight);
+                    fflush(stderr);
+                }
+#endif
                 bctx->close_and_execute();
                 bctx->wait_for_gpu();
                 bctx->ensure_cmd_list_open();
@@ -2860,6 +3493,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // monopolize the GPU and prevent display compositing.  The Windows
                 // TDR timer covers the ENTIRE adapter — if DWM can't draw for ~2s,
                 // the OS resets the GPU even though individual CLs are fast.
+#ifdef _WIN32
                 {
                     LARGE_INTEGER tdr_now;
                     QueryPerformanceCounter(&tdr_now);
@@ -2873,6 +3507,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         }
                     }
                 }
+#endif
 
                 if (dx12_diag) {
                     fprintf(stderr, "ggml-dx12: flush #%d OK after dispatch %d\n", flush_num, i);
@@ -3082,10 +3717,28 @@ void dx12_device::run_autotune() {
     if (tuning_done) return;
     tuning_done = true;
 
+#ifndef _WIN32
+    // WSL2: timestamp queries and benchmark dispatches can hang on some
+    // GPU-PV configurations.  Use safe defaults instead of benchmarking.
+    if (is_uma) {
+        q5_0_use_256  = false;
+        q8_0_use_256  = false;
+        q6k_use_32    = false;
+        f16_use_load4 = false;
+        q5k_use_mr    = true;    // multi-row Q5_K: 14% faster than standard 256t
+        q6k_use_mr    = false;   // disabled: q6k_mr shader 2.1x slower than standard 256t
+        fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D≤128)
+        DX12_LOG_INFO("Auto-tune: skipped on WSL2 (UMA defaults: Q5_K=mr FA=uma)\n");
+    } else {
+        DX12_LOG_INFO("Auto-tune: skipped on WSL2 (using defaults)\n");
+    }
+    return;
+#endif
+
     // Check for cache file in current directory (easy to verify/delete)
     char cache_path[512];
     snprintf(cache_path, sizeof(cache_path), ".ggml_dx12_tune_%04X_%04X.txt",
-             adapter_desc.VendorId, adapter_desc.DeviceId);
+             vendor_id, device_id);
 
     FILE * f = fopen(cache_path, "r");
     if (f) {
@@ -3097,7 +3750,7 @@ void dx12_device::run_autotune() {
             q6k_use_32   = (q6 != 0);
             f16_use_load4 = (f16l4 != 0);
             fclose(f);
-            // On UMA, also enable UMA-optimized variants
+            // On UMA, also enable multi-row variants (activation sharing)
             if (is_uma) {
                 q5k_use_mr = true;   // multi-row Q5_K: 14% faster than standard 256t
                 q6k_use_mr = false;  // disabled: q6k_mr shader 2.1x slower than standard 256t
@@ -3235,16 +3888,29 @@ void dx12_device::run_autotune() {
         ComPtr<ID3D12Fence> fence;
         device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
         // Wait with timeout — GPU hangs should not block indefinitely
-        HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        HANDLE event = dx12_create_event();
         fence->SetEventOnCompletion(1, event);
         compute_queue->Signal(fence.Get(), 1);
+#ifdef _WIN32
         DWORD wait_result = WaitForSingleObject(event, 5000);
-        CloseHandle(event);
+        dx12_close_event(event);
 
         if (wait_result == WAIT_TIMEOUT) {
             DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
             return UINT64_MAX;
         }
+#else
+        // WSL2: poll with timeout
+        auto start = std::chrono::steady_clock::now();
+        while (fence->GetCompletedValue() < 1) {
+            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(5000)) {
+                DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
+                return UINT64_MAX;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        dx12_close_event(event);
+#endif
 
         // Read timestamps
         uint64_t * ts = nullptr;
@@ -3414,6 +4080,7 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
 
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     auto * d = (dx12_device *)dev->context;
+#ifdef _WIN32
     // Query fresh memory info from DXGI to reflect current allocations
     ComPtr<IDXGIAdapter3> adapter3;
     if (SUCCEEDED(d->adapter.As(&adapter3))) {
@@ -3426,7 +4093,8 @@ static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * 
             return;
         }
     }
-    // Fallback to cached values
+#endif
+    // Fallback to cached values (always used on WSL2)
     if (free)  *free  = d->vram_free;
     if (total) *total = d->vram_total;
 }
@@ -3482,11 +4150,20 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     // Try OpenExistingHeapFromFileMapping first (works with MapViewOfFile),
     // fall back to OpenExistingHeapFromAddress (works with VirtualAlloc)
     ComPtr<ID3D12Heap> heap;
-    void * file_mapping_handle = ggml_backend_host_ptr_get_hint();
-    if (file_mapping_handle) {
-        hr = device3->OpenExistingHeapFromFileMapping((HANDLE)file_mapping_handle, IID_PPV_ARGS(&heap));
+    size_t heap_offset = 0; // offset within heap for CreatePlacedResource
+    auto * hint = (ggml_backend_host_ptr_hint *)ggml_backend_host_ptr_get_hint();
+    if (hint && hint->mapping_handle) {
+        hr = device3->OpenExistingHeapFromFileMapping((HANDLE)hint->mapping_handle, IID_PPV_ARGS(&heap));
         if (FAILED(hr)) {
             DX12_LOG_WARN("buffer_from_host_ptr: OpenExistingHeapFromFileMapping failed (hr=0x%08X)\n", (unsigned)hr);
+        } else if (hint->mapping_base) {
+            // The heap wraps the ENTIRE file mapping. Compute offset from mapping base
+            // to our aligned address so CreatePlacedResource starts at the right location.
+            uintptr_t mapping_base = (uintptr_t)hint->mapping_base;
+            heap_offset = aligned_addr - mapping_base;
+            // heap_offset must be 64KB-aligned (guaranteed since both are 64KB-aligned)
+            DX12_LOG_INFO("buffer_from_host_ptr: file mapping heap offset = %zu (0x%zX)\n",
+                          heap_offset, heap_offset);
         }
     }
     if (!heap) {
@@ -3496,9 +4173,11 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
                           (unsigned)hr, (void *)aligned_addr, aligned_size);
             return nullptr;
         }
+        heap_offset = 0; // OpenExistingHeapFromAddress starts at aligned_addr
     }
 
-    // Create placed resource in the heap (read-only model weights, but UAV for shader access)
+    // Create placed resource — model weights are read-only (SRV), no UAV needed.
+    // Removing UAV is required for PAGE_READONLY file mappings.
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
     rd.Alignment        = 0;
@@ -3509,10 +4188,10 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     rd.Format           = DXGI_FORMAT_UNKNOWN;
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
 
     ComPtr<ID3D12Resource> resource;
-    hr = d->device->CreatePlacedResource(heap.Get(), 0, &rd,
+    hr = d->device->CreatePlacedResource(heap.Get(), heap_offset, &rd,
                                           D3D12_RESOURCE_STATE_COMMON,
                                           nullptr, IID_PPV_ARGS(&resource));
     if (FAILED(hr)) {
@@ -3521,6 +4200,9 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
         return nullptr;
     }
 
+    // Create buffer context — host_base points to the original (unaligned) ptr
+    // so tensor offsets are computed relative to ptr, matching the mmap layout.
+    // host_prefix accounts for the 64KB alignment padding at the start of the resource.
     auto * ctx = new dx12_buffer_context();
     ctx->dev         = d;
     ctx->resource    = resource;
@@ -3533,15 +4215,24 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     DX12_LOG_INFO("buffer_from_host_ptr: created UMA zero-copy buffer (size=%.1f MiB, ptr=%p)\n",
                   size / (1024.0 * 1024.0), ptr);
 
+    // Use the same buffer interface as dx12_buft_alloc_buffer — all the lambda
+    // implementations already check ctx->host_base for the fast path.
+    // We need to get the iface from an existing buffer allocation... but since
+    // it's a static local in dx12_buft_alloc_buffer, we replicate the reference here.
+
+    // Get buffer type for this device
     ggml_backend_buffer_type_t buft = dx12_dev_get_buffer_type(dev);
 
+    // Allocate a dummy 0-size buffer to get the interface, then replace context
+    // Actually, easier: just use the buft's alloc to get a temporary buffer for the iface.
+    // But that's wasteful. Instead, declare the iface inline:
     static const ggml_backend_buffer_i host_ptr_iface = {
         /* .free_buffer   = */ [](ggml_backend_buffer_t buffer) {
             delete (dx12_buffer_context *)buffer->context;
         },
         /* .get_base      = */ [](ggml_backend_buffer_t buffer) -> void * {
-            auto * bctx = (dx12_buffer_context *)buffer->context;
-            return bctx->host_base;
+            auto * ctx = (dx12_buffer_context *)buffer->context;
+            return ctx->host_base;
         },
         /* .init_tensor   = */ [](ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) -> ggml_status {
             GGML_UNUSED(buffer); GGML_UNUSED(tensor);
@@ -3569,15 +4260,127 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
         /* .get_tensor_2d = */ nullptr,
         /* .cpy_tensor    = */ nullptr,
         /* .clear         = */ [](ggml_backend_buffer_t buffer, uint8_t value) {
-            auto * bctx = (dx12_buffer_context *)buffer->context;
-            if (bctx->host_base && bctx->size > 0) {
-                memset(bctx->host_base, value, bctx->size);
+            auto * ctx = (dx12_buffer_context *)buffer->context;
+            if (ctx->host_base && ctx->size > 0) {
+                memset(ctx->host_base, value, ctx->size);
             }
         },
         /* .reset         = */ nullptr,
     };
 
     return ggml_backend_buffer_init(buft, host_ptr_iface, ctx, size);
+}
+
+// Tensor decommit handler for reserved resources (called by layer_window_manager)
+static void dx12_tensor_decommit(struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer) return;
+    auto * ctx = (dx12_buffer_context *)tensor->buffer->context;
+    if (!ctx->is_reserved) return;
+    size_t tensor_offset = dx12_tensor_offset(tensor);
+    ctx->decommit_range(tensor_offset, ggml_nbytes(tensor));
+}
+
+// Batch upload: commit tiles + copy all tensors in one command list + one fence wait
+// Uses OEHA (OpenExistingHeapFromAddress) path when available to skip staging memcpy.
+static void dx12_batch_tensor_set(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count) {
+    if (count == 0) return;
+
+    auto * ctx = (dx12_buffer_context *)tensors[0]->buffer->context;
+
+    // UMA paths: just delegate per-tensor (already fast — no GPU copy)
+    if (ctx->host_base || ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+        for (int i = 0; i < count; i++) {
+            ggml_backend_tensor_set(tensors[i], data_ptrs[i], 0, sizes[i]);
+        }
+        return;
+    }
+
+    g_tls_device = ctx->dev->device.Get();
+
+    // Commit tiles for all tensors (reserved resources)
+    if (ctx->is_reserved) {
+        for (int i = 0; i < count; i++) {
+            size_t offs = dx12_tensor_offset(tensors[i]);
+            ctx->commit_range(offs, sizes[i]);
+        }
+    }
+
+    ctx->dev->init_xfer();
+    ctx->dev->xfer_wait();
+
+    // Check if data comes from a registered OEHA mmap region
+    auto * mmap_entry = ctx->dev->find_mmap_entry(data_ptrs[0]);
+    if (mmap_entry) {
+        // OEHA path: CopyBufferRegion directly from mmap resource — no staging memcpy
+        HRESULT hr = ctx->dev->xfer.cmd_alloc->Reset();
+        DX12_CHECK(hr, "xfer cmd_alloc Reset (OEHA batch)");
+        hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
+        DX12_CHECK(hr, "xfer cmd_list Reset (OEHA batch)");
+
+        for (int i = 0; i < count; i++) {
+            size_t dest_offset = dx12_tensor_offset(tensors[i]);
+            size_t src_offset  = (const uint8_t *)data_ptrs[i] - (const uint8_t *)mmap_entry->base
+                               + mmap_entry->prefix;
+            ctx->dev->xfer.cmd_list->CopyBufferRegion(
+                ctx->resource.Get(), dest_offset,
+                mmap_entry->resource.Get(), src_offset, sizes[i]);
+        }
+        ctx->dev->xfer.cmd_list->Close();
+
+        ID3D12CommandList * lists[] = { ctx->dev->xfer.cmd_list.Get() };
+        ctx->dev->compute_queue->ExecuteCommandLists(1, lists);
+        ctx->dev->xfer.fence_value++;
+        ctx->dev->compute_queue->Signal(ctx->dev->xfer.fence.Get(), ctx->dev->xfer.fence_value);
+        ctx->dev->xfer_wait();
+        return;
+    }
+
+    // Staging path: memcpy to upload heap, then CopyBufferRegion
+    size_t total = 0;
+    for (int i = 0; i < count; i++) total += sizes[i];
+
+    ctx->dev->xfer_ensure_staging(total, 0);
+
+    // Map staging buffer once, copy all tensor data
+    void * mapped = nullptr;
+    D3D12_RANGE read_range = { 0, 0 };
+    HRESULT hr = ctx->dev->xfer.upload_staging->Map(0, &read_range, &mapped);
+    DX12_CHECK(hr, "Map upload staging (batch)");
+    size_t staging_offset = 0;
+    for (int i = 0; i < count; i++) {
+        memcpy((uint8_t *)mapped + staging_offset, data_ptrs[i], sizes[i]);
+        staging_offset += sizes[i];
+    }
+    ctx->dev->xfer.upload_staging->Unmap(0, nullptr);
+
+    // Record all copy commands in one command list
+    hr = ctx->dev->xfer.cmd_alloc->Reset();
+    DX12_CHECK(hr, "xfer cmd_alloc Reset (batch)");
+    hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
+    DX12_CHECK(hr, "xfer cmd_list Reset (batch)");
+
+    staging_offset = 0;
+    for (int i = 0; i < count; i++) {
+        size_t dest = dx12_tensor_offset(tensors[i]);
+        ctx->dev->xfer.cmd_list->CopyBufferRegion(
+            ctx->resource.Get(), dest,
+            ctx->dev->xfer.upload_staging.Get(), staging_offset, sizes[i]);
+        staging_offset += sizes[i];
+    }
+    ctx->dev->xfer.cmd_list->Close();
+
+    ID3D12CommandList * lists[] = { ctx->dev->xfer.cmd_list.Get() };
+    ctx->dev->compute_queue->ExecuteCommandLists(1, lists);
+    ctx->dev->xfer.fence_value++;
+    ctx->dev->compute_queue->Signal(ctx->dev->xfer.fence.Get(), ctx->dev->xfer.fence_value);
+    ctx->dev->xfer_wait();
+}
+
+// OEHA mmap registration handler — wraps mmap as D3D12 heap for direct GPU copy
+static bool dx12_register_mmap(const void * base, size_t size, void * mapping_handle, void * dev_ctx) {
+    auto * dev = (dx12_device *)dev_ctx;
+    return dev->register_mmap_heap(base, size, mapping_handle);
 }
 
 static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
@@ -3589,13 +4392,24 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
 
     HRESULT hr = d->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence));
     DX12_CHECK(hr, "CreateFence");
-    ctx->fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    ctx->fence_event = dx12_create_event();
 
     auto * backend = new ggml_backend();
     backend->guid    = dx12_backend_get_guid();
     backend->iface   = dx12_backend_interface;
     backend->device  = dev;
     backend->context = ctx;
+
+    // Register reserved-resource handlers for layer windowing
+    if (d->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
+        ggml_backend_set_tensor_decommit_fn(dx12_tensor_decommit);
+        ggml_backend_set_batch_tensor_set_fn(dx12_batch_tensor_set);
+        ggml_backend_set_heap_overflow_fn(dx12_get_heap_overflow_count);
+    }
+
+    // Register OEHA mmap handler (works for any device that supports ID3D12Device3)
+    ggml_backend_set_register_mmap_fn(dx12_register_mmap, (void *)d);
+
     return backend;
 }
 
@@ -3774,6 +4588,14 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         // Fused ROPE + VIEW + SET_ROWS
         static const dx12_shader_blob fused_blob = { g_rope_set_rows_dxil, sizeof(g_rope_set_rows_dxil) };
         blob = &fused_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 1) {
+        // Split-KV reduce shader
+        static const dx12_shader_blob reduce_blob = { g_flash_attn_reduce_dxil, sizeof(g_flash_attn_reduce_dxil) };
+        blob = &reduce_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 2) {
+        // UMA-optimized FA (GROUP_SIZE=128, TILE_KV=128, D≤128)
+        static const dx12_shader_blob uma_blob = { g_flash_attn_uma_dxil, sizeof(g_flash_attn_uma_dxil) };
+        blob = &uma_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 4) {
         // Register-blocked tiled batch MUL_MAT (M > 1)
         if (key.src0_type == GGML_TYPE_Q4_K) {
@@ -3924,14 +4746,6 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     } else if (key.op == GGML_OP_GET_ROWS && key.src0_type == GGML_TYPE_Q8_1) {
         static const dx12_shader_blob q81_gr_blob = { g_get_rows_q8_1_dxil, sizeof(g_get_rows_q8_1_dxil) };
         blob = &q81_gr_blob;
-    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 1) {
-        // Split-KV reduce shader
-        static const dx12_shader_blob reduce_blob = { g_flash_attn_reduce_dxil, sizeof(g_flash_attn_reduce_dxil) };
-        blob = &reduce_blob;
-    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 2) {
-        // UMA-optimized FA (GROUP_SIZE=128, TILE_KV=128, D≤128)
-        static const dx12_shader_blob uma_blob = { g_flash_attn_uma_dxil, sizeof(g_flash_attn_uma_dxil) };
-        blob = &uma_blob;
     } else {
         auto sit = g_shader_blobs.find((int)key.op);
         if (sit != g_shader_blobs.end()) {

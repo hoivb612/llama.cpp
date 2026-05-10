@@ -188,9 +188,46 @@ extern "C" {
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 
     // Optional hint for buffer_from_host_ptr: set before calling to pass platform-specific context
-    // (e.g., Windows file mapping HANDLE for DX12 UMA zero-copy)
+    // (e.g., Windows file mapping HANDLE + base address for DX12 UMA zero-copy)
+    struct ggml_backend_host_ptr_hint {
+        void * mapping_handle; // platform file mapping handle (Windows HANDLE)
+        void * mapping_base;   // base address of the mapping (from MapViewOfFile)
+    };
     GGML_API void   ggml_backend_host_ptr_set_hint(void * hint);
     GGML_API void * ggml_backend_host_ptr_get_hint(void);
+
+    // Weight budget hint: set before buffer allocation to request a reserved (tiled) resource
+    // with a backing heap of budget_bytes. 0 = no budget (normal committed resource).
+    GGML_API void   ggml_backend_set_weight_budget_hint(size_t budget_bytes);
+    GGML_API size_t ggml_backend_get_weight_budget_hint(void);
+
+    // Tensor decommit: release physical backing for a tensor's region in a reserved resource.
+    // No-op if the buffer doesn't support reserved resources.
+    typedef void (*ggml_backend_tensor_decommit_fn)(struct ggml_tensor * tensor);
+    GGML_API void ggml_backend_set_tensor_decommit_fn(ggml_backend_tensor_decommit_fn fn);
+    GGML_API void ggml_backend_tensor_decommit(struct ggml_tensor * tensor);
+
+    // Batch tensor set: upload multiple tensors in a single GPU submission.
+    // Reduces per-tensor sync overhead for layer windowing.
+    // Falls back to individual ggml_backend_tensor_set calls if no handler registered.
+    typedef void (*ggml_backend_batch_tensor_set_fn)(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
+    GGML_API void ggml_backend_set_batch_tensor_set_fn(ggml_backend_batch_tensor_set_fn fn);
+    GGML_API void ggml_backend_batch_tensor_set(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
+
+    // Register mmap region for direct GPU copy (OEHA: OpenExistingHeapFromAddress).
+    // When registered, batch_tensor_set can CopyBufferRegion directly from mmap
+    // instead of going through staging (eliminates WC memcpy bottleneck).
+    typedef bool (*ggml_backend_register_mmap_fn)(
+        const void * base, size_t size, void * mapping_handle, void * dev_ctx);
+    GGML_API void ggml_backend_set_register_mmap_fn(ggml_backend_register_mmap_fn fn, void * dev_ctx);
+    GGML_API bool ggml_backend_register_mmap(const void * base, size_t size, void * mapping_handle);
+
+    // Heap overflow counter: tracks how many times commit_range ran out of heap tiles.
+    typedef uint32_t (*ggml_backend_get_heap_overflow_fn)(void);
+    GGML_API void     ggml_backend_set_heap_overflow_fn(ggml_backend_get_heap_overflow_fn fn);
+    GGML_API uint32_t ggml_backend_get_heap_overflow_count(void);
 
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
