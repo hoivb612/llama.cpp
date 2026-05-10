@@ -167,5 +167,16 @@ target_include_directories(${TARGET} PUBLIC ../../common)
 #target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# Vulkan sparse resource probe — tests feasibility of layer windowing on Vulkan
+if(GGML_VULKAN)
+    find_package(Vulkan REQUIRED)
+    set(TARGET vk-sparse-test)
+    add_executable(${TARGET} test/vk_sparse_test.cpp)
+    install(TARGETS ${TARGET} RUNTIME)
+    target_include_directories(${TARGET} PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PRIVATE ${Vulkan_LIBRARIES})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+endif()
+
 # end of CMakeLists.txt ...
 
