@@ -656,6 +656,10 @@ struct vk_device_struct {
 
     bool coopmat2;
 
+    // Sparse buffer support (layer windowing)
+    bool sparse_binding {};
+    bool sparse_residency_buffer {};
+
     bool pipeline_executable_properties_support {};
 
     size_t idx;
@@ -918,13 +922,132 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    // Sparse buffer support (layer windowing)
+    bool is_sparse = false;
+    vk::DeviceMemory backing_memory = VK_NULL_HANDLE;  // pool of 64KB pages
+    size_t backing_memory_size = 0;
+    size_t backing_pages = 0;
+    size_t total_resource_pages = 0;
+    std::vector<bool>     page_used;           // bitmap: which backing pages are in use
+    std::vector<uint32_t> resource_to_page;    // resource page → backing page (UINT32_MAX = unmapped)
+    std::vector<uint16_t> page_refcount;       // per-resource-page reference count
+    uint32_t page_search_hint = 0;
+    static constexpr size_t TILE_SIZE = 65536; // 64KB sparse page size
+
+    // Commit a byte range: bind resource pages to backing memory pages
+    bool commit_range(size_t offset, size_t byte_size) {
+        if (!is_sparse || byte_size == 0) return true;
+
+        uint32_t start_page = (uint32_t)(offset / TILE_SIZE);
+        uint32_t end_page   = (uint32_t)((offset + byte_size - 1) / TILE_SIZE);
+
+        std::vector<vk::SparseMemoryBind> binds;
+        for (uint32_t p = start_page; p <= end_page; p++) {
+            if (p >= total_resource_pages) break;
+            page_refcount[p]++;
+            if (resource_to_page[p] != UINT32_MAX) continue; // already mapped
+
+            // Find a free backing page
+            uint32_t bp = UINT32_MAX;
+            for (uint32_t i = 0; i < (uint32_t)backing_pages; i++) {
+                uint32_t h = (page_search_hint + i) % (uint32_t)backing_pages;
+                if (!page_used[h]) { bp = h; break; }
+            }
+            if (bp == UINT32_MAX) {
+                GGML_ABORT("Vulkan sparse heap overflow: no free pages — increase --weight-budget or reduce model size "
+                           "(resource page %u/%zu, backing pages %zu)",
+                           p, total_resource_pages, backing_pages);
+            }
+            page_used[bp] = true;
+            page_search_hint = (bp + 1) % (uint32_t)backing_pages;
+            resource_to_page[p] = bp;
+
+            vk::SparseMemoryBind bind;
+            bind.resourceOffset = (vk::DeviceSize)p * TILE_SIZE;
+            bind.size           = TILE_SIZE;
+            bind.memory         = backing_memory;
+            bind.memoryOffset   = (vk::DeviceSize)bp * TILE_SIZE;
+            bind.flags          = {};
+            binds.push_back(bind);
+        }
+
+        if (binds.empty()) return true;
+
+        // Submit sparse bind
+        vk::SparseBufferMemoryBindInfo buf_bind;
+        buf_bind.buffer    = buffer;
+        buf_bind.bindCount = (uint32_t)binds.size();
+        buf_bind.pBinds    = binds.data();
+
+        vk::BindSparseInfo bind_info;
+        bind_info.bufferBindCount = 1;
+        bind_info.pBufferBinds    = &buf_bind;
+
+        {
+            std::lock_guard<std::recursive_mutex> guard(device->mutex);
+            device->compute_queue.queue.bindSparse(bind_info, vk::Fence{});
+            device->compute_queue.queue.waitIdle();
+        }
+        return true;
+    }
+
+    // Decommit a byte range: unbind pages with zero refcount
+    void decommit_range(size_t offset, size_t byte_size) {
+        if (!is_sparse || byte_size == 0) return;
+
+        uint32_t start_page = (uint32_t)(offset / TILE_SIZE);
+        uint32_t end_page   = (uint32_t)((offset + byte_size - 1) / TILE_SIZE);
+
+        std::vector<vk::SparseMemoryBind> binds;
+        for (uint32_t p = start_page; p <= end_page; p++) {
+            if (p >= total_resource_pages) break;
+            if (page_refcount[p] == 0) continue;
+            page_refcount[p]--;
+            if (page_refcount[p] > 0) continue; // still referenced
+            if (resource_to_page[p] == UINT32_MAX) continue;
+
+            page_used[resource_to_page[p]] = false;
+            resource_to_page[p] = UINT32_MAX;
+
+            vk::SparseMemoryBind bind;
+            bind.resourceOffset = (vk::DeviceSize)p * TILE_SIZE;
+            bind.size           = TILE_SIZE;
+            bind.memory         = VK_NULL_HANDLE; // unbind
+            bind.memoryOffset   = 0;
+            bind.flags          = {};
+            binds.push_back(bind);
+        }
+
+        if (binds.empty()) return;
+
+        vk::SparseBufferMemoryBindInfo buf_bind;
+        buf_bind.buffer    = buffer;
+        buf_bind.bindCount = (uint32_t)binds.size();
+        buf_bind.pBinds    = binds.data();
+
+        vk::BindSparseInfo bind_info;
+        bind_info.bufferBindCount = 1;
+        bind_info.pBufferBinds    = &buf_bind;
+
+        {
+            std::lock_guard<std::recursive_mutex> guard(device->mutex);
+            device->compute_queue.queue.bindSparse(bind_info, vk::Fence{});
+            device->compute_queue.queue.waitIdle();
+        }
+    }
+
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        device->device.freeMemory(device_memory);
+        if (is_sparse && backing_memory) {
+            device->device.freeMemory(backing_memory);
+        }
+        if (!is_sparse && device_memory) {
+            device->device.freeMemory(device_memory);
+        }
         device->device.destroyBuffer(buffer);
     }
 };
@@ -2763,6 +2886,105 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
         throw e;
     }
+
+    return buf;
+}
+
+// Create a sparse buffer for layer windowing: virtual address space with backing memory pool
+static vk_buffer ggml_vk_create_sparse_buffer(vk_device& device, size_t size, size_t budget) {
+    GGML_ASSERT(device->sparse_binding && device->sparse_residency_buffer);
+
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    if (size == 0) {
+        buf->size = 0;
+        return buf;
+    }
+
+    // Create sparse buffer (virtual address space, no memory bound yet)
+    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer |
+                                       vk::BufferUsageFlagBits::eTransferSrc |
+                                       vk::BufferUsageFlagBits::eTransferDst;
+
+    vk::BufferCreateInfo buffer_ci;
+    buffer_ci.flags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+    buffer_ci.size  = size;
+    buffer_ci.usage = usage_flags;
+    buffer_ci.sharingMode = vk::SharingMode::eExclusive;
+
+    buf->buffer = device->device.createBuffer(buffer_ci);
+
+    // Query memory requirements to find suitable memory type
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+
+    // Choose memory type: prefer DEVICE_LOCAL|HOST_VISIBLE on UMA, DEVICE_LOCAL on dGPU
+    vk::MemoryPropertyFlags preferred_flags;
+    if (device->uma) {
+        preferred_flags = vk::MemoryPropertyFlagBits::eDeviceLocal |
+                          vk::MemoryPropertyFlagBits::eHostVisible |
+                          vk::MemoryPropertyFlagBits::eHostCoherent;
+    } else {
+        preferred_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    }
+
+    uint32_t mem_type_idx = UINT32_MAX;
+    // Try preferred first
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if (!(mem_req.memoryTypeBits & (1u << i))) continue;
+        if ((mem_props.memoryTypes[i].propertyFlags & preferred_flags) == preferred_flags) {
+            mem_type_idx = i;
+            break;
+        }
+    }
+    // Fallback to any compatible type
+    if (mem_type_idx == UINT32_MAX) {
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+            if (!(mem_req.memoryTypeBits & (1u << i))) continue;
+            if (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+                mem_type_idx = i;
+                break;
+            }
+        }
+    }
+    if (mem_type_idx == UINT32_MAX) {
+        device->device.destroyBuffer(buf->buffer);
+        throw vk::OutOfDeviceMemoryError("No suitable memory type for sparse buffer");
+    }
+
+    buf->memory_property_flags = mem_props.memoryTypes[mem_type_idx].propertyFlags;
+
+    // Allocate backing memory pool: budget + 128 MiB headroom, aligned to TILE_SIZE
+    size_t heap_size = budget + 128ULL * 1024 * 1024;
+    heap_size = (heap_size + vk_buffer_struct::TILE_SIZE - 1) & ~(vk_buffer_struct::TILE_SIZE - 1);
+
+    vk::MemoryAllocateInfo alloc_info;
+    alloc_info.allocationSize  = heap_size;
+    alloc_info.memoryTypeIndex = mem_type_idx;
+
+    buf->backing_memory = device->device.allocateMemory(alloc_info);
+    buf->backing_memory_size = heap_size;
+    buf->backing_pages = heap_size / vk_buffer_struct::TILE_SIZE;
+    buf->total_resource_pages = (size + vk_buffer_struct::TILE_SIZE - 1) / vk_buffer_struct::TILE_SIZE;
+
+    // Initialize tile tracking
+    buf->page_used.resize(buf->backing_pages, false);
+    buf->resource_to_page.resize(buf->total_resource_pages, UINT32_MAX);
+    buf->page_refcount.resize(buf->total_resource_pages, 0);
+    buf->is_sparse = true;
+    buf->ptr = nullptr;
+
+    // No bindBufferMemory for sparse buffers — pages are bound via vkQueueBindSparse
+    buf->device = device;
+    buf->size = size;
+
+    device->memory_logger->log_allocation(buf, size);
+
+    GGML_LOG_INFO("ggml-vulkan: Sparse buffer: %.1f MiB virtual, %.1f MiB backing (%zu pages), mem type %u%s\n",
+                  (double)size / (1024.0 * 1024.0),
+                  (double)heap_size / (1024.0 * 1024.0),
+                  buf->backing_pages,
+                  mem_type_idx,
+                  device->uma ? " (UMA)" : "");
 
     return buf;
 }
@@ -5234,6 +5456,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->shader_int64 = device_features2.features.shaderInt64;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
+
+        // Sparse buffer support for layer windowing
+        device->sparse_binding = device_features2.features.sparseBinding;
+        device->sparse_residency_buffer = device_features2.features.sparseResidencyBuffer;
 
         if (device->subgroup_size_control) {
             device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
@@ -13451,6 +13677,16 @@ static void ggml_vk_get_device_description(int device, char * description, size_
     snprintf(description, description_size, "%s", props.deviceName.data());
 }
 
+// Layer windowing: tensor decommit callback for sparse buffers
+static void vk_tensor_decommit(struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer) return;
+    auto * ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    vk_buffer buf = ctx->dev_buffer;
+    if (!buf || !buf->is_sparse) return;
+    size_t tensor_offset = vk_tensor_offset(tensor) + tensor->view_offs;
+    buf->decommit_range(tensor_offset, ggml_nbytes(tensor));
+}
+
 // backend interface
 
 #define UNUSED GGML_UNUSED
@@ -13492,7 +13728,14 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
     }
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
-    ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+    size_t tensor_off = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    // Auto-commit tiles for sparse buffers before memset
+    if (buf->is_sparse) {
+        buf->commit_range(tensor_off, size);
+    }
+
+    ggml_vk_buffer_memset(buf, tensor_off, val32, size);
 }
 
 static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -13504,7 +13747,39 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
-    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    size_t tensor_off = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    // Auto-commit tiles for sparse buffers before writing
+    if (buf->is_sparse) {
+        buf->commit_range(tensor_off, size);
+
+        // UMA path: if backing memory is host-visible, write directly via map
+        if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+            // Map the backing memory pages and copy data
+            // For sparse buffers, we map the backing_memory and write to the mapped pages
+            void * mapped = buf->device->device.mapMemory(buf->backing_memory, 0, buf->backing_memory_size);
+            // Copy data page by page (resource pages may map to non-contiguous backing pages)
+            size_t remaining = size;
+            size_t src_offset = 0;
+            size_t cur_offset = tensor_off;
+            while (remaining > 0) {
+                uint32_t page_idx = (uint32_t)(cur_offset / vk_buffer_struct::TILE_SIZE);
+                size_t   page_off = cur_offset % vk_buffer_struct::TILE_SIZE;
+                size_t   chunk    = std::min(remaining, vk_buffer_struct::TILE_SIZE - page_off);
+                uint32_t bp = buf->resource_to_page[page_idx];
+                GGML_ASSERT(bp != UINT32_MAX);
+                memcpy((uint8_t *)mapped + bp * vk_buffer_struct::TILE_SIZE + page_off,
+                       (const uint8_t *)data + src_offset, chunk);
+                src_offset += chunk;
+                cur_offset += chunk;
+                remaining  -= chunk;
+            }
+            buf->device->device.unmapMemory(buf->backing_memory);
+            return;
+        }
+    }
+
+    ggml_vk_buffer_write(buf, tensor_off, data, size);
 }
 
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -13574,7 +13849,21 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        // Check if layer windowing requested a sparse buffer
+        size_t budget = ggml_backend_get_weight_budget_hint();
+        bool use_sparse = (budget > 0 &&
+                           ctx->device->sparse_binding &&
+                           ctx->device->sparse_residency_buffer &&
+                           size > budget);
+
+        if (use_sparse) {
+            dev_buffer = ggml_vk_create_sparse_buffer(ctx->device, size, budget);
+
+            // Register decommit and mmap callbacks for layer windowing
+            ggml_backend_set_tensor_decommit_fn(vk_tensor_decommit);
+        } else {
+            dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        }
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
