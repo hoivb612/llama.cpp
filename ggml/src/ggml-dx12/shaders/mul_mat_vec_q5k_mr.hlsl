@@ -111,24 +111,22 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             float sc6 = float((combined_8 >> 16) & 0xFFu);
             float sc7 = float((combined_8 >> 24) & 0xFFu);
 
-            // Load qs + qh and decode Q5_K values
+            // Load qs + qh and decode Q5_K values (4-byte aligned loads)
             uint qs_off = block_off + 48;
-            uint qs_addr0 = qs_off + (q_offset & ~1u);
-            uint qs_addr16 = qs_off + ((q_offset + 16) & ~1u);
-            uint qs_raw0 = src0.Load(qs_addr0);
-            uint qs_raw16 = src0.Load(qs_addr16);
-            uint qs_lo0, qs_lo16;
-            if ((q_offset & 1u) == 0u) { qs_lo0 = qs_raw0 & 0xFFFFu; qs_lo16 = qs_raw16 & 0xFFFFu; }
-            else { qs_lo0 = (qs_raw0 >> 8) & 0xFFFFu; qs_lo16 = (qs_raw16 >> 8) & 0xFFFFu; }
+            uint qs_byte0  = qs_off + q_offset;
+            uint qs_byte16 = qs_off + q_offset + 16;
+            uint qs_raw0   = src0.Load(qs_byte0 & ~3u);
+            uint qs_raw16  = src0.Load(qs_byte16 & ~3u);
+            uint qs_lo0  = (qs_byte0  & 2u) ? (qs_raw0  >> 16) : (qs_raw0  & 0xFFFFu);
+            uint qs_lo16 = (qs_byte16 & 2u) ? (qs_raw16 >> 16) : (qs_raw16 & 0xFFFFu);
             uint qs0_16_u32 = qs_lo0 | (qs_lo16 << 16);
 
-            uint qs_addr64 = qs_off + ((q_offset + 64) & ~1u);
-            uint qs_addr80 = qs_off + ((q_offset + 80) & ~1u);
-            uint qs_raw64 = src0.Load(qs_addr64);
-            uint qs_raw80 = src0.Load(qs_addr80);
-            uint qs_lo64, qs_lo80;
-            if ((q_offset & 1u) == 0u) { qs_lo64 = qs_raw64 & 0xFFFFu; qs_lo80 = qs_raw80 & 0xFFFFu; }
-            else { qs_lo64 = (qs_raw64 >> 8) & 0xFFFFu; qs_lo80 = (qs_raw80 >> 8) & 0xFFFFu; }
+            uint qs_byte64 = qs_off + q_offset + 64;
+            uint qs_byte80 = qs_off + q_offset + 80;
+            uint qs_raw64  = src0.Load(qs_byte64 & ~3u);
+            uint qs_raw80  = src0.Load(qs_byte80 & ~3u);
+            uint qs_lo64 = (qs_byte64 & 2u) ? (qs_raw64 >> 16) : (qs_raw64 & 0xFFFFu);
+            uint qs_lo80 = (qs_byte80 & 2u) ? (qs_raw80 >> 16) : (qs_raw80 & 0xFFFFu);
             uint qs64_80_u32 = qs_lo64 | (qs_lo80 << 16);
 
             uint qs0_lo4 = qs0_16_u32 & 0x0F0F0F0Fu;
@@ -136,15 +134,14 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             uint qs64_lo4 = qs64_80_u32 & 0x0F0F0F0Fu;
             uint qs64_hi4 = (qs64_80_u32 >> 4) & 0x0F0F0F0Fu;
 
-            // qh high bits
+            // qh high bits (4-byte aligned loads)
             uint qh_off = block_off + 16;
-            uint qh_addr0 = qh_off + (l0 & ~1u);
-            uint qh_addr16 = qh_off + ((l0 + 16) & ~1u);
-            uint qh_raw0 = src0.Load(qh_addr0);
-            uint qh_raw16 = src0.Load(qh_addr16);
-            uint qh_lo0, qh_lo16;
-            if ((l0 & 1u) == 0u) { qh_lo0 = qh_raw0 & 0xFFFFu; qh_lo16 = qh_raw16 & 0xFFFFu; }
-            else { qh_lo0 = (qh_raw0 >> 8) & 0xFFFFu; qh_lo16 = (qh_raw16 >> 8) & 0xFFFFu; }
+            uint qh_byte0  = qh_off + l0;
+            uint qh_byte16 = qh_off + l0 + 16;
+            uint qh_raw0   = src0.Load(qh_byte0 & ~3u);
+            uint qh_raw16  = src0.Load(qh_byte16 & ~3u);
+            uint qh_lo0  = (qh_byte0  & 2u) ? (qh_raw0  >> 16) : (qh_raw0  & 0xFFFFu);
+            uint qh_lo16 = (qh_byte16 & 2u) ? (qh_raw16 >> 16) : (qh_raw16 & 0xFFFFu);
             uint qh = qh_lo0 | (qh_lo16 << 16);
 
             uint qh_shift = 2 * v_im;
@@ -205,23 +202,22 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             float sc6 = float((combined_8 >> 16) & 0xFFu);
             float sc7 = float((combined_8 >> 24) & 0xFFu);
 
+            // Load qs + qh and decode Q5_K values (4-byte aligned loads)
             uint qs_off = block_off + 48;
-            uint qs_addr0 = qs_off + (q_offset & ~1u);
-            uint qs_addr16 = qs_off + ((q_offset + 16) & ~1u);
-            uint qs_raw0 = src0.Load(qs_addr0);
-            uint qs_raw16 = src0.Load(qs_addr16);
-            uint qs_lo0, qs_lo16;
-            if ((q_offset & 1u) == 0u) { qs_lo0 = qs_raw0 & 0xFFFFu; qs_lo16 = qs_raw16 & 0xFFFFu; }
-            else { qs_lo0 = (qs_raw0 >> 8) & 0xFFFFu; qs_lo16 = (qs_raw16 >> 8) & 0xFFFFu; }
+            uint qs_byte0  = qs_off + q_offset;
+            uint qs_byte16 = qs_off + q_offset + 16;
+            uint qs_raw0   = src0.Load(qs_byte0 & ~3u);
+            uint qs_raw16  = src0.Load(qs_byte16 & ~3u);
+            uint qs_lo0  = (qs_byte0  & 2u) ? (qs_raw0  >> 16) : (qs_raw0  & 0xFFFFu);
+            uint qs_lo16 = (qs_byte16 & 2u) ? (qs_raw16 >> 16) : (qs_raw16 & 0xFFFFu);
             uint qs0_16_u32 = qs_lo0 | (qs_lo16 << 16);
 
-            uint qs_addr64 = qs_off + ((q_offset + 64) & ~1u);
-            uint qs_addr80 = qs_off + ((q_offset + 80) & ~1u);
-            uint qs_raw64 = src0.Load(qs_addr64);
-            uint qs_raw80 = src0.Load(qs_addr80);
-            uint qs_lo64, qs_lo80;
-            if ((q_offset & 1u) == 0u) { qs_lo64 = qs_raw64 & 0xFFFFu; qs_lo80 = qs_raw80 & 0xFFFFu; }
-            else { qs_lo64 = (qs_raw64 >> 8) & 0xFFFFu; qs_lo80 = (qs_raw80 >> 8) & 0xFFFFu; }
+            uint qs_byte64 = qs_off + q_offset + 64;
+            uint qs_byte80 = qs_off + q_offset + 80;
+            uint qs_raw64  = src0.Load(qs_byte64 & ~3u);
+            uint qs_raw80  = src0.Load(qs_byte80 & ~3u);
+            uint qs_lo64 = (qs_byte64 & 2u) ? (qs_raw64 >> 16) : (qs_raw64 & 0xFFFFu);
+            uint qs_lo80 = (qs_byte80 & 2u) ? (qs_raw80 >> 16) : (qs_raw80 & 0xFFFFu);
             uint qs64_80_u32 = qs_lo64 | (qs_lo80 << 16);
 
             uint qs0_lo4 = qs0_16_u32 & 0x0F0F0F0Fu;
@@ -229,14 +225,14 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             uint qs64_lo4 = qs64_80_u32 & 0x0F0F0F0Fu;
             uint qs64_hi4 = (qs64_80_u32 >> 4) & 0x0F0F0F0Fu;
 
+            // qh high bits (4-byte aligned loads)
             uint qh_off = block_off + 16;
-            uint qh_addr0 = qh_off + (l0 & ~1u);
-            uint qh_addr16 = qh_off + ((l0 + 16) & ~1u);
-            uint qh_raw0 = src0.Load(qh_addr0);
-            uint qh_raw16 = src0.Load(qh_addr16);
-            uint qh_lo0, qh_lo16;
-            if ((l0 & 1u) == 0u) { qh_lo0 = qh_raw0 & 0xFFFFu; qh_lo16 = qh_raw16 & 0xFFFFu; }
-            else { qh_lo0 = (qh_raw0 >> 8) & 0xFFFFu; qh_lo16 = (qh_raw16 >> 8) & 0xFFFFu; }
+            uint qh_byte0  = qh_off + l0;
+            uint qh_byte16 = qh_off + l0 + 16;
+            uint qh_raw0   = src0.Load(qh_byte0 & ~3u);
+            uint qh_raw16  = src0.Load(qh_byte16 & ~3u);
+            uint qh_lo0  = (qh_byte0  & 2u) ? (qh_raw0  >> 16) : (qh_raw0  & 0xFFFFu);
+            uint qh_lo16 = (qh_byte16 & 2u) ? (qh_raw16 >> 16) : (qh_raw16 & 0xFFFFu);
             uint qh = qh_lo0 | (qh_lo16 << 16);
 
             uint qh_shift = 2 * v_im;

@@ -90,39 +90,27 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 
         // Load qs as uint16 pairs combined into uint32
         // Q5_K: qs at block_off + 48 (after 4+12+32 = 48 bytes)
+        // Each thread reads 2 consecutive bytes at q_offset, q_offset+16, etc.
+        // ByteAddressBuffer.Load() requires 4-byte alignment, so we align down
+        // and extract the correct 16-bit half.
         uint qs_off = block_off + 48;
-        // Load 2 uint16 from qs and combine (stride-2 access)
-        uint qs_addr0 = qs_off + (q_offset & ~1u);
-        uint qs_addr16 = qs_off + ((q_offset + 16) & ~1u);
-        uint qs_raw0 = src0.Load(qs_addr0);
-        uint qs_raw16 = src0.Load(qs_addr16);
 
-        // Extract the right uint16 based on q_offset alignment
-        uint qs_lo0, qs_lo16;
-        if ((q_offset & 1u) == 0u) {
-            qs_lo0 = qs_raw0 & 0xFFFFu;
-            qs_lo16 = qs_raw16 & 0xFFFFu;
-        } else {
-            qs_lo0 = (qs_raw0 >> 8) & 0xFFFFu;  // shift by 8 bits for odd byte offset
-            qs_lo16 = (qs_raw16 >> 8) & 0xFFFFu;
-        }
+        uint qs_byte0  = qs_off + q_offset;
+        uint qs_byte16 = qs_off + q_offset + 16;
+        uint qs_raw0   = src0.Load(qs_byte0 & ~3u);
+        uint qs_raw16  = src0.Load(qs_byte16 & ~3u);
+        uint qs_lo0  = (qs_byte0  & 2u) ? (qs_raw0  >> 16) : (qs_raw0  & 0xFFFFu);
+        uint qs_lo16 = (qs_byte16 & 2u) ? (qs_raw16 >> 16) : (qs_raw16 & 0xFFFFu);
 
         // Combine two uint16 into uint32 for each pair
         uint qs0_16_u32 = qs_lo0 | (qs_lo16 << 16);
 
-        uint qs_addr64 = qs_off + ((q_offset + 64) & ~1u);
-        uint qs_addr80 = qs_off + ((q_offset + 80) & ~1u);
-        uint qs_raw64 = src0.Load(qs_addr64);
-        uint qs_raw80 = src0.Load(qs_addr80);
-
-        uint qs_lo64, qs_lo80;
-        if ((q_offset & 1u) == 0u) {
-            qs_lo64 = qs_raw64 & 0xFFFFu;
-            qs_lo80 = qs_raw80 & 0xFFFFu;
-        } else {
-            qs_lo64 = (qs_raw64 >> 8) & 0xFFFFu;
-            qs_lo80 = (qs_raw80 >> 8) & 0xFFFFu;
-        }
+        uint qs_byte64 = qs_off + q_offset + 64;
+        uint qs_byte80 = qs_off + q_offset + 80;
+        uint qs_raw64  = src0.Load(qs_byte64 & ~3u);
+        uint qs_raw80  = src0.Load(qs_byte80 & ~3u);
+        uint qs_lo64 = (qs_byte64 & 2u) ? (qs_raw64 >> 16) : (qs_raw64 & 0xFFFFu);
+        uint qs_lo80 = (qs_byte80 & 2u) ? (qs_raw80 >> 16) : (qs_raw80 & 0xFFFFu);
 
         uint qs64_80_u32 = qs_lo64 | (qs_lo80 << 16);
 
@@ -133,21 +121,15 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         uint qs64_hi4 = (qs64_80_u32 >> 4) & 0x0F0F0F0Fu;
 
         // Load qh (high bits) - Q5_K: qh at block_off + 16 (after 4+12 = 16 bytes)
+        // Same 4-byte alignment fix as qs loads above.
         uint qh_off = block_off + 16;
-        // Load 4 bytes of qh as 2 × uint16 combined
-        uint qh_addr0 = qh_off + (l0 & ~1u);
-        uint qh_addr16 = qh_off + ((l0 + 16) & ~1u);
-        uint qh_raw0 = src0.Load(qh_addr0);
-        uint qh_raw16 = src0.Load(qh_addr16);
 
-        uint qh_lo0, qh_lo16;
-        if ((l0 & 1u) == 0u) {
-            qh_lo0 = qh_raw0 & 0xFFFFu;
-            qh_lo16 = qh_raw16 & 0xFFFFu;
-        } else {
-            qh_lo0 = (qh_raw0 >> 8) & 0xFFFFu;
-            qh_lo16 = (qh_raw16 >> 8) & 0xFFFFu;
-        }
+        uint qh_byte0  = qh_off + l0;
+        uint qh_byte16 = qh_off + l0 + 16;
+        uint qh_raw0   = src0.Load(qh_byte0 & ~3u);
+        uint qh_raw16  = src0.Load(qh_byte16 & ~3u);
+        uint qh_lo0  = (qh_byte0  & 2u) ? (qh_raw0  >> 16) : (qh_raw0  & 0xFFFFu);
+        uint qh_lo16 = (qh_byte16 & 2u) ? (qh_raw16 >> 16) : (qh_raw16 & 0xFFFFu);
 
         uint qh = qh_lo0 | (qh_lo16 << 16);
 

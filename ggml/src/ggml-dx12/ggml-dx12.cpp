@@ -2105,6 +2105,656 @@ static ID3D12Resource * dx12_get_resource(const struct ggml_tensor * tensor) {
     return ctx ? ctx->resource.Get() : nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Q5_K matvec unit test: feed known data through the shader and verify output
+// Triggered by GGML_DX12_TEST_MATVEC=1 env var (runs once at first graph_compute)
+// ---------------------------------------------------------------------------
+static void dx12_test_matvec_q5k(dx12_device * dev) {
+    fprintf(stderr, "ggml-dx12: === Q5_K MATVEC UNIT TEST ===\n");
+
+    // ---- Reference: dequantize_row_q5_K from ggml-quants.c ----
+    auto get_scale_min_k4 = [](int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+        if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+        else { *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4); *m = (q[j+4] >> 4) | ((q[j] >> 6) << 4); }
+    };
+
+    // Create a synthetic Q5_K block (176 bytes) with known values
+    const uint32_t QK_K = 256;
+    const uint32_t Q5K_BSIZE = 176;
+    uint8_t block[Q5K_BSIZE] = {};
+
+    // d = 0.01, dmin = 0.005 (as F16)
+    uint16_t d_f16 = 0x211E;   // ~0.01 in F16
+    uint16_t dmin_f16 = 0x1D0E; // ~0.005 in F16
+    memcpy(&block[0], &d_f16, 2);
+    memcpy(&block[2], &dmin_f16, 2);
+
+    // Scales: all set to known values
+    // For j<4: d=scales[j]&63, m=scales[j+4]&63
+    // Simple: set scales[0..11] to sequential values
+    for (int i = 0; i < 12; i++) block[4 + i] = (uint8_t)(10 + i);
+
+    // qh (32 bytes): set bit patterns
+    for (int i = 0; i < 32; i++) block[16 + i] = (uint8_t)(i & 0xFF);
+
+    // qs (128 bytes): set to known nibble pairs
+    for (int i = 0; i < 128; i++) block[48 + i] = (uint8_t)((i % 16) | (((i + 3) % 16) << 4));
+
+    // Create activation vector: simple ramp
+    float activations[QK_K];
+    for (uint32_t i = 0; i < QK_K; i++) activations[i] = 0.01f * (float)(i % 32) - 0.15f;
+
+    // ---- CPU reference dot product ----
+    float ref_dequant[QK_K];
+    {
+        float dall, dmin_val;
+        { uint16_t h; memcpy(&h, &block[0], 2); uint32_t s=(uint32_t)(h>>15)<<31, e=(h>>10)&0x1F, m_=h&0x3FF;
+          if(e==0){if(m_==0){uint32_t r=s;memcpy(&dall,&r,4);dall=dall;}else{e=1;while(!(m_&0x400)){m_<<=1;e--;}m_&=0x3FF;uint32_t r=s|((e+112)<<23)|(m_<<13);memcpy(&dall,&r,4);}}
+          else if(e==31){uint32_t r=s|0x7F800000|(m_<<13);memcpy(&dall,&r,4);}
+          else{uint32_t r=s|((e+112)<<23)|(m_<<13);memcpy(&dall,&r,4);}}
+        { uint16_t h; memcpy(&h, &block[2], 2); uint32_t s=(uint32_t)(h>>15)<<31, e=(h>>10)&0x1F, m_=h&0x3FF;
+          if(e==0){if(m_==0){uint32_t r=s;memcpy(&dmin_val,&r,4);dmin_val=dmin_val;}else{e=1;while(!(m_&0x400)){m_<<=1;e--;}m_&=0x3FF;uint32_t r=s|((e+112)<<23)|(m_<<13);memcpy(&dmin_val,&r,4);}}
+          else if(e==31){uint32_t r=s|0x7F800000|(m_<<13);memcpy(&dmin_val,&r,4);}
+          else{uint32_t r=s|((e+112)<<23)|(m_<<13);memcpy(&dmin_val,&r,4);}}
+
+        const uint8_t * ql = &block[48];
+        const uint8_t * qh = &block[16];
+        const uint8_t * scales = &block[4];
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < (int)QK_K; j += 64) {
+            uint8_t sc, mi;
+            get_scale_min_k4(is + 0, scales, &sc, &mi);
+            float d1 = dall * sc, m1 = dmin_val * mi;
+            get_scale_min_k4(is + 1, scales, &sc, &mi);
+            float d2 = dall * sc, m2 = dmin_val * mi;
+            for (int l = 0; l < 32; ++l) ref_dequant[j + l]      = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) ref_dequant[j + 32 + l] = d2 * ((ql[l] >> 4)  + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+        }
+    }
+    float ref_dot = 0.0f;
+    for (uint32_t i = 0; i < QK_K; i++) ref_dot += ref_dequant[i] * activations[i];
+    fprintf(stderr, "  CPU reference dot product: %.8f\n", ref_dot);
+
+    // ---- GPU test ----
+    // Create buffers: src0 (1 Q5_K block), src1 (256 F32 activations), dst (1 F32 output)
+    auto make_gpu_buf = [&](size_t size) -> ComPtr<ID3D12Resource> {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = std::max(size, (size_t)256);
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Resource> res;
+        dev->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res));
+        return res;
+    };
+
+    ComPtr<ID3D12Resource> src0_buf = make_gpu_buf(Q5K_BSIZE);
+    ComPtr<ID3D12Resource> src1_buf = make_gpu_buf(QK_K * 4);
+    ComPtr<ID3D12Resource> dst_buf  = make_gpu_buf(256);  // need at least 1 float output
+
+    // Upload data via staging
+    dev->init_xfer();
+    auto upload = [&](ID3D12Resource * gpu_buf, const void * data, size_t size) {
+        dev->xfer_wait();
+        dev->xfer_ensure_staging(size, 0);
+        void * mapped = nullptr;
+        D3D12_RANGE rr = { 0, 0 };
+        dev->xfer.upload_staging->Map(0, &rr, &mapped);
+        memcpy(mapped, data, size);
+        dev->xfer.upload_staging->Unmap(0, nullptr);
+        HRESULT hr = dev->xfer.cmd_alloc->Reset();
+        if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+        if (SUCCEEDED(hr)) {
+            dev->xfer.cmd_list->CopyBufferRegion(gpu_buf, 0, dev->xfer.upload_staging.Get(), 0, size);
+            dev->xfer.cmd_list->Close();
+            ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
+            dev->compute_queue->ExecuteCommandLists(1, lists);
+            dev->xfer.fence_value++;
+            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+            dev->xfer_wait();
+        }
+    };
+
+    upload(src0_buf.Get(), block, Q5K_BSIZE);
+    upload(src1_buf.Get(), activations, QK_K * 4);
+
+    // Zero the output
+    float zero = 0.0f;
+    upload(dst_buf.Get(), &zero, 4);
+
+    // Get the Q5_K matvec pipeline
+    dx12_pipeline_key key = {};
+    key.op = GGML_OP_MUL_MAT;
+    key.src0_type = GGML_TYPE_Q5_K;
+    key.flags = 1;  // standard matvec
+    dx12_pipeline * pl = dev->get_or_create_pipeline(key);
+
+    // Also test flags=4 (tiled batch MUL_MAT) -- used when ne[1] > 1
+    dx12_pipeline_key key4 = {};
+    key4.op = GGML_OP_MUL_MAT;
+    key4.src0_type = GGML_TYPE_Q5_K;
+    key4.flags = 4;  // tiled batch
+    dx12_pipeline * pl4 = dev->get_or_create_pipeline(key4);
+
+    if (!pl || !pl->pso) {
+        fprintf(stderr, "  FAILED: Q5_K matvec pipeline not available\n");
+        return;
+    }
+
+    // Set up shader params for K=256, N=1 (1 block, 1 output row)
+    dx12_shader_params params = {};
+    params.ne00 = QK_K;  // K dimension (elements per row)
+    params.ne01 = 1;     // N=1 (1 output row)
+    params.ne02 = 1; params.ne03 = 1;
+    params.nb00 = Q5K_BSIZE;  // stride = 1 block
+    params.nb01 = Q5K_BSIZE;  // row stride
+    params.nb02 = Q5K_BSIZE; params.nb03 = Q5K_BSIZE;
+    params.ne10 = QK_K;  // activation length
+    params.ne11 = 1; params.ne12 = 1; params.ne13 = 1;
+    params.nb10 = 4;  // F32 stride
+    params.nb11 = QK_K * 4; params.nb12 = QK_K * 4; params.nb13 = QK_K * 4;
+    params.ne0 = 1;  // output: 1 element
+    params.ne1 = 1; params.ne2 = 1; params.ne3 = 1;
+    params.nb0 = 4; params.nb1 = 4; params.nb2 = 4; params.nb3 = 4;
+    params.src0_offset = 0;
+    params.src1_offset = 0;
+    params.dst_offset = 0;
+    params.src0_esize = Q5K_BSIZE;  // block size for quantized types
+    params.src1_esize = 4;
+    params.dst_esize = 4;
+
+    // Dispatch
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    dev->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+    dev->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), nullptr, IID_PPV_ARGS(&cl));
+
+    cl->SetComputeRootSignature(dev->common_root_sig.Get());
+    cl->SetPipelineState(pl->pso.Get());
+    cl->SetComputeRoot32BitConstants(0, sizeof(params) / 4, &params, 0);
+    cl->SetComputeRootShaderResourceView(1, src0_buf->GetGPUVirtualAddress());
+    cl->SetComputeRootShaderResourceView(2, src1_buf->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(3, dst_buf->GetGPUVirtualAddress());
+    // Bind src0 as fallback for slots 4/5
+    cl->SetComputeRootShaderResourceView(4, src0_buf->GetGPUVirtualAddress());
+    cl->SetComputeRootShaderResourceView(5, src0_buf->GetGPUVirtualAddress());
+
+    // Dispatch 1 group (1 output row)
+    cl->Dispatch(1, 1, 1);
+    cl->Close();
+
+    ID3D12CommandList * lists[] = { cl.Get() };
+    dev->compute_queue->ExecuteCommandLists(1, lists);
+    ComPtr<ID3D12Fence> f;
+    dev->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f));
+    dev->compute_queue->Signal(f.Get(), 1);
+    HANDLE ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    f->SetEventOnCompletion(1, ev);
+    WaitForSingleObject(ev, 5000);
+    CloseHandle(ev);
+
+    // Readback result
+    dev->xfer_ensure_staging(0, 256);
+    dev->xfer_wait();
+    HRESULT hr = dev->xfer.cmd_alloc->Reset();
+    if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+    if (SUCCEEDED(hr)) {
+        dev->xfer.cmd_list->CopyBufferRegion(dev->xfer.readback_staging.Get(), 0, dst_buf.Get(), 0, 4);
+        dev->xfer.cmd_list->Close();
+        ID3D12CommandList * rl[] = { dev->xfer.cmd_list.Get() };
+        dev->compute_queue->ExecuteCommandLists(1, rl);
+        dev->xfer.fence_value++;
+        dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+        dev->xfer_wait();
+    }
+
+    void * mapped = nullptr;
+    D3D12_RANGE rr = { 0, 4 };
+    hr = dev->xfer.readback_staging->Map(0, &rr, &mapped);
+    float gpu_result = 0.0f;
+    if (SUCCEEDED(hr)) {
+        gpu_result = *(float *)mapped;
+        D3D12_RANGE wr = { 0, 0 };
+        dev->xfer.readback_staging->Unmap(0, &wr);
+    }
+
+    fprintf(stderr, "  GPU shader result:         %.8f\n", gpu_result);
+    fprintf(stderr, "  Difference:                %.8e\n", (double)(gpu_result - ref_dot));
+    float rel_err = (ref_dot != 0.0f) ? fabsf((gpu_result - ref_dot) / ref_dot) : fabsf(gpu_result);
+    fprintf(stderr, "  Relative error:            %.6f%%\n", rel_err * 100.0f);
+    fprintf(stderr, "  RESULT: %s\n", rel_err < 0.01f ? "PASS" : "*** FAIL ***");
+
+    // ---- Test 2: tiled batch MUL_MAT (flags=4) ----
+    if (pl4 && pl4->pso) {
+        fprintf(stderr, "\n  --- Tiled batch Q5_K (flags=4) ---\n");
+
+        // Zero the output
+        upload(dst_buf.Get(), &zero, 4);
+
+        // Tiled shader expects different params layout
+        dx12_shader_params p4 = {};
+        p4.ne00 = QK_K;  // K
+        p4.ne01 = 1;     // N (output rows) -- but the weight matrix is [K, N]
+        p4.ne02 = 1; p4.ne03 = 1;
+        p4.nb00 = Q5K_BSIZE;  // block size
+        p4.nb01 = Q5K_BSIZE;  // row stride in weight buffer
+        p4.nb02 = Q5K_BSIZE; p4.nb03 = Q5K_BSIZE;
+        p4.ne10 = QK_K;  // activation K
+        p4.ne11 = 1;     // M (number of input vectors)
+        p4.ne12 = 1; p4.ne13 = 1;
+        p4.nb10 = 4;  // F32
+        p4.nb11 = QK_K * 4;
+        p4.nb12 = QK_K * 4; p4.nb13 = QK_K * 4;
+        p4.ne0 = 1;  // output N
+        p4.ne1 = 1;  // output M
+        p4.ne2 = 1; p4.ne3 = 1;
+        p4.nb0 = 4; p4.nb1 = 4; p4.nb2 = 4; p4.nb3 = 4;
+        p4.src0_offset = 0;
+        p4.src1_offset = 0;
+        p4.dst_offset = 0;
+        p4.src0_esize = Q5K_BSIZE;
+        p4.src1_esize = 4;
+        p4.dst_esize = 4;
+
+        ComPtr<ID3D12CommandAllocator> alloc4;
+        ComPtr<ID3D12GraphicsCommandList> cl4;
+        dev->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc4));
+        dev->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc4.Get(), nullptr, IID_PPV_ARGS(&cl4));
+
+        cl4->SetComputeRootSignature(dev->common_root_sig.Get());
+        cl4->SetPipelineState(pl4->pso.Get());
+        cl4->SetComputeRoot32BitConstants(0, sizeof(p4) / 4, &p4, 0);
+        cl4->SetComputeRootShaderResourceView(1, src0_buf->GetGPUVirtualAddress());
+        cl4->SetComputeRootShaderResourceView(2, src1_buf->GetGPUVirtualAddress());
+        cl4->SetComputeRootUnorderedAccessView(3, dst_buf->GetGPUVirtualAddress());
+        cl4->SetComputeRootShaderResourceView(4, src0_buf->GetGPUVirtualAddress());
+        cl4->SetComputeRootShaderResourceView(5, src0_buf->GetGPUVirtualAddress());
+
+        // Tiled: groups_x = ceil(N/32) = 1, groups_y = ceil(M/32) = 1
+        cl4->Dispatch(1, 1, 1);
+        cl4->Close();
+
+        ID3D12CommandList * l4[] = { cl4.Get() };
+        dev->compute_queue->ExecuteCommandLists(1, l4);
+        ComPtr<ID3D12Fence> f4;
+        dev->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f4));
+        dev->compute_queue->Signal(f4.Get(), 1);
+        HANDLE ev4 = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        f4->SetEventOnCompletion(1, ev4);
+        WaitForSingleObject(ev4, 5000);
+        CloseHandle(ev4);
+
+        // Readback
+        dev->xfer_ensure_staging(0, 256);
+        dev->xfer_wait();
+        hr = dev->xfer.cmd_alloc->Reset();
+        if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+        if (SUCCEEDED(hr)) {
+            dev->xfer.cmd_list->CopyBufferRegion(dev->xfer.readback_staging.Get(), 0, dst_buf.Get(), 0, 4);
+            dev->xfer.cmd_list->Close();
+            ID3D12CommandList * rl4[] = { dev->xfer.cmd_list.Get() };
+            dev->compute_queue->ExecuteCommandLists(1, rl4);
+            dev->xfer.fence_value++;
+            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+            dev->xfer_wait();
+        }
+        mapped = nullptr;
+        hr = dev->xfer.readback_staging->Map(0, &rr, &mapped);
+        float gpu4 = 0.0f;
+        if (SUCCEEDED(hr)) {
+            gpu4 = *(float *)mapped;
+            D3D12_RANGE wr4 = { 0, 0 };
+            dev->xfer.readback_staging->Unmap(0, &wr4);
+        }
+        fprintf(stderr, "  GPU tiled result:          %.8f\n", gpu4);
+        fprintf(stderr, "  CPU reference:             %.8f\n", ref_dot);
+        float re4 = (ref_dot != 0.0f) ? fabsf((gpu4 - ref_dot) / ref_dot) : fabsf(gpu4);
+        fprintf(stderr, "  Relative error:            %.6f%%\n", re4 * 100.0f);
+        fprintf(stderr, "  RESULT: %s\n", re4 < 0.01f ? "PASS" : "*** FAIL ***");
+    }
+
+    // ---- Test 3: matvec with non-zero offsets (mimics real dispatch) ----
+    {
+        fprintf(stderr, "\n  --- Matvec with offset (mimics real dispatch) ---\n");
+
+        // Create larger buffers and place data at non-zero offsets
+        size_t weight_offset = 80813568;  // same offset as real blk.0.attn_qkv.weight
+        size_t act_offset = 14692352;     // same offset as real attn_norm-0
+
+        ComPtr<ID3D12Resource> big_src0 = make_gpu_buf(weight_offset + Q5K_BSIZE);
+        ComPtr<ID3D12Resource> big_src1 = make_gpu_buf(act_offset + QK_K * 4);
+        ComPtr<ID3D12Resource> big_dst  = make_gpu_buf(1024);
+
+        // Upload data at the real offsets
+        dev->xfer_wait();
+        dev->xfer_ensure_staging(std::max(Q5K_BSIZE, QK_K * 4), 0);
+
+        // Upload weight block at weight_offset
+        {
+            void * m = nullptr;
+            D3D12_RANGE r0 = { 0, 0 };
+            dev->xfer.upload_staging->Map(0, &r0, &m);
+            memcpy(m, block, Q5K_BSIZE);
+            dev->xfer.upload_staging->Unmap(0, nullptr);
+            HRESULT h = dev->xfer.cmd_alloc->Reset();
+            if (SUCCEEDED(h)) h = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+            if (SUCCEEDED(h)) {
+                dev->xfer.cmd_list->CopyBufferRegion(big_src0.Get(), weight_offset,
+                    dev->xfer.upload_staging.Get(), 0, Q5K_BSIZE);
+                dev->xfer.cmd_list->Close();
+                ID3D12CommandList * ll[] = { dev->xfer.cmd_list.Get() };
+                dev->compute_queue->ExecuteCommandLists(1, ll);
+                dev->xfer.fence_value++;
+                dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                dev->xfer_wait();
+            }
+        }
+        // Upload activations at act_offset
+        {
+            void * m = nullptr;
+            D3D12_RANGE r0 = { 0, 0 };
+            dev->xfer.upload_staging->Map(0, &r0, &m);
+            memcpy(m, activations, QK_K * 4);
+            dev->xfer.upload_staging->Unmap(0, nullptr);
+            HRESULT h = dev->xfer.cmd_alloc->Reset();
+            if (SUCCEEDED(h)) h = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+            if (SUCCEEDED(h)) {
+                dev->xfer.cmd_list->CopyBufferRegion(big_src1.Get(), act_offset,
+                    dev->xfer.upload_staging.Get(), 0, QK_K * 4);
+                dev->xfer.cmd_list->Close();
+                ID3D12CommandList * ll[] = { dev->xfer.cmd_list.Get() };
+                dev->compute_queue->ExecuteCommandLists(1, ll);
+                dev->xfer.fence_value++;
+                dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                dev->xfer_wait();
+            }
+        }
+
+        // Set up params with real offsets
+        dx12_shader_params p3 = {};
+        p3.ne00 = QK_K; p3.ne01 = 1; p3.ne02 = 1; p3.ne03 = 1;
+        p3.nb00 = Q5K_BSIZE; p3.nb01 = Q5K_BSIZE;
+        p3.nb02 = Q5K_BSIZE; p3.nb03 = Q5K_BSIZE;
+        p3.ne10 = QK_K; p3.ne11 = 1; p3.ne12 = 1; p3.ne13 = 1;
+        p3.nb10 = 4; p3.nb11 = QK_K * 4;
+        p3.nb12 = QK_K * 4; p3.nb13 = QK_K * 4;
+        p3.ne0 = 1; p3.ne1 = 1; p3.ne2 = 1; p3.ne3 = 1;
+        p3.nb0 = 4; p3.nb1 = 4; p3.nb2 = 4; p3.nb3 = 4;
+        p3.src0_offset = (uint32_t)weight_offset;
+        p3.src1_offset = (uint32_t)act_offset;
+        p3.dst_offset = 0;
+        p3.src0_esize = Q5K_BSIZE;
+        p3.src1_esize = 4;
+        p3.dst_esize = 4;
+
+        ComPtr<ID3D12CommandAllocator> a3;
+        ComPtr<ID3D12GraphicsCommandList> c3;
+        dev->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&a3));
+        dev->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, a3.Get(), nullptr, IID_PPV_ARGS(&c3));
+
+        c3->SetComputeRootSignature(dev->common_root_sig.Get());
+        c3->SetPipelineState(pl->pso.Get());
+        c3->SetComputeRoot32BitConstants(0, sizeof(p3) / 4, &p3, 0);
+        c3->SetComputeRootShaderResourceView(1, big_src0->GetGPUVirtualAddress());
+        c3->SetComputeRootShaderResourceView(2, big_src1->GetGPUVirtualAddress());
+        c3->SetComputeRootUnorderedAccessView(3, big_dst->GetGPUVirtualAddress());
+        c3->SetComputeRootShaderResourceView(4, big_src0->GetGPUVirtualAddress());
+        c3->SetComputeRootShaderResourceView(5, big_src0->GetGPUVirtualAddress());
+        c3->Dispatch(1, 1, 1);
+        c3->Close();
+
+        ID3D12CommandList * l3[] = { c3.Get() };
+        dev->compute_queue->ExecuteCommandLists(1, l3);
+        ComPtr<ID3D12Fence> f3;
+        dev->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f3));
+        dev->compute_queue->Signal(f3.Get(), 1);
+        HANDLE ev3 = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        f3->SetEventOnCompletion(1, ev3);
+        WaitForSingleObject(ev3, 5000);
+        CloseHandle(ev3);
+
+        // Readback
+        dev->xfer_ensure_staging(0, 256);
+        dev->xfer_wait();
+        hr = dev->xfer.cmd_alloc->Reset();
+        if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+        if (SUCCEEDED(hr)) {
+            dev->xfer.cmd_list->CopyBufferRegion(dev->xfer.readback_staging.Get(), 0, big_dst.Get(), 0, 4);
+            dev->xfer.cmd_list->Close();
+            ID3D12CommandList * rl3[] = { dev->xfer.cmd_list.Get() };
+            dev->compute_queue->ExecuteCommandLists(1, rl3);
+            dev->xfer.fence_value++;
+            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+            dev->xfer_wait();
+        }
+        mapped = nullptr;
+        hr = dev->xfer.readback_staging->Map(0, &rr, &mapped);
+        float gpu3 = 0.0f;
+        if (SUCCEEDED(hr)) {
+            gpu3 = *(float *)mapped;
+            D3D12_RANGE wr3 = { 0, 0 };
+            dev->xfer.readback_staging->Unmap(0, &wr3);
+        }
+        fprintf(stderr, "  GPU result with offset:    %.8f\n", gpu3);
+        fprintf(stderr, "  CPU reference:             %.8f\n", ref_dot);
+        float re3 = (ref_dot != 0.0f) ? fabsf((gpu3 - ref_dot) / ref_dot) : fabsf(gpu3);
+        fprintf(stderr, "  Relative error:            %.6f%%\n", re3 * 100.0f);
+        fprintf(stderr, "  RESULT: %s\n", re3 < 0.01f ? "PASS" : "*** FAIL ***");
+    }
+
+    // ---- Test 4: K=3072 (12 blocks, matching real Phi-3 K dimension) ----
+    {
+        fprintf(stderr, "\n  --- K=3072 matvec (12 blocks, real K) ---\n");
+
+        const uint32_t K4 = 3072;
+        const uint32_t NBLOCKS4 = K4 / QK_K;  // 12
+        const size_t ROW_BYTES = NBLOCKS4 * Q5K_BSIZE;  // 12 * 176 = 2112
+
+        // Create 12 blocks of weight data
+        std::vector<uint8_t> weight_data(ROW_BYTES, 0);
+        for (uint32_t b = 0; b < NBLOCKS4; b++) {
+            uint8_t * blk = &weight_data[b * Q5K_BSIZE];
+            memcpy(blk, &d_f16, 2);
+            memcpy(blk + 2, &dmin_f16, 2);
+            for (int i = 0; i < 12; i++) blk[4 + i] = (uint8_t)(10 + i + b);
+            for (int i = 0; i < 32; i++) blk[16 + i] = (uint8_t)((i + b * 7) & 0xFF);
+            for (int i = 0; i < 128; i++) blk[48 + i] = (uint8_t)(((i + b) % 16) | ((((i + b) + 3) % 16) << 4));
+        }
+
+        // Create K4 activations
+        std::vector<float> act4(K4);
+        for (uint32_t i = 0; i < K4; i++) act4[i] = 0.01f * (float)(i % 32) - 0.15f;
+
+        // CPU reference: dequant all 12 blocks and dot product
+        float ref4 = 0.0f;
+        for (uint32_t b = 0; b < NBLOCKS4; b++) {
+            const uint8_t * blk = &weight_data[b * Q5K_BSIZE];
+            float dall4, dmin4;
+            // Simplified: use ggml's fp16 conversion
+            dall4 = GGML_FP16_TO_FP32(*(ggml_fp16_t *)(blk));
+            dmin4 = GGML_FP16_TO_FP32(*(ggml_fp16_t *)(blk + 2));
+
+            const uint8_t * ql4 = blk + 48;
+            const uint8_t * qh4 = blk + 16;
+            const uint8_t * sc4 = blk + 4;
+            int is4 = 0;
+            uint8_t u14 = 1, u24 = 2;
+            for (int j = 0; j < (int)QK_K; j += 64) {
+                uint8_t sd, sm;
+                get_scale_min_k4(is4 + 0, sc4, &sd, &sm);
+                float dd1 = dall4 * sd, mm1 = dmin4 * sm;
+                get_scale_min_k4(is4 + 1, sc4, &sd, &sm);
+                float dd2 = dall4 * sd, mm2 = dmin4 * sm;
+                for (int l = 0; l < 32; ++l) {
+                    float w = dd1 * ((ql4[l] & 0xF) + (qh4[l] & u14 ? 16 : 0)) - mm1;
+                    ref4 += w * act4[b * QK_K + j + l];
+                }
+                for (int l = 0; l < 32; ++l) {
+                    float w = dd2 * ((ql4[l] >> 4) + (qh4[l] & u24 ? 16 : 0)) - mm2;
+                    ref4 += w * act4[b * QK_K + j + 32 + l];
+                }
+                ql4 += 32; is4 += 2; u14 <<= 2; u24 <<= 2;
+            }
+        }
+
+        // GPU test
+        ComPtr<ID3D12Resource> s0_4 = make_gpu_buf(ROW_BYTES);
+        ComPtr<ID3D12Resource> s1_4 = make_gpu_buf(K4 * 4);
+        ComPtr<ID3D12Resource> d_4  = make_gpu_buf(256);
+        upload(s0_4.Get(), weight_data.data(), ROW_BYTES);
+        upload(s1_4.Get(), act4.data(), K4 * 4);
+        float z4 = 0.0f;
+        upload(d_4.Get(), &z4, 4);
+
+        dx12_shader_params p44 = {};
+        p44.ne00 = K4; p44.ne01 = 1; p44.ne02 = 1; p44.ne03 = 1;
+        p44.nb00 = Q5K_BSIZE; p44.nb01 = (uint32_t)ROW_BYTES;
+        p44.nb02 = (uint32_t)ROW_BYTES; p44.nb03 = (uint32_t)ROW_BYTES;
+        p44.ne10 = K4; p44.ne11 = 1; p44.ne12 = 1; p44.ne13 = 1;
+        p44.nb10 = 4; p44.nb11 = K4 * 4; p44.nb12 = K4 * 4; p44.nb13 = K4 * 4;
+        p44.ne0 = 1; p44.ne1 = 1; p44.ne2 = 1; p44.ne3 = 1;
+        p44.nb0 = 4; p44.nb1 = 4; p44.nb2 = 4; p44.nb3 = 4;
+        p44.src0_offset = 0; p44.src1_offset = 0; p44.dst_offset = 0;
+        p44.src0_esize = Q5K_BSIZE; p44.src1_esize = 4; p44.dst_esize = 4;
+
+        ComPtr<ID3D12CommandAllocator> a44;
+        ComPtr<ID3D12GraphicsCommandList> c44;
+        dev->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&a44));
+        dev->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, a44.Get(), nullptr, IID_PPV_ARGS(&c44));
+        c44->SetComputeRootSignature(dev->common_root_sig.Get());
+        c44->SetPipelineState(pl->pso.Get());
+        c44->SetComputeRoot32BitConstants(0, sizeof(p44) / 4, &p44, 0);
+        c44->SetComputeRootShaderResourceView(1, s0_4->GetGPUVirtualAddress());
+        c44->SetComputeRootShaderResourceView(2, s1_4->GetGPUVirtualAddress());
+        c44->SetComputeRootUnorderedAccessView(3, d_4->GetGPUVirtualAddress());
+        c44->SetComputeRootShaderResourceView(4, s0_4->GetGPUVirtualAddress());
+        c44->SetComputeRootShaderResourceView(5, s0_4->GetGPUVirtualAddress());
+        c44->Dispatch(1, 1, 1);
+        c44->Close();
+        ID3D12CommandList * l44[] = { c44.Get() };
+        dev->compute_queue->ExecuteCommandLists(1, l44);
+        ComPtr<ID3D12Fence> f44;
+        dev->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f44));
+        dev->compute_queue->Signal(f44.Get(), 1);
+        HANDLE ev44 = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        f44->SetEventOnCompletion(1, ev44);
+        WaitForSingleObject(ev44, 5000);
+        CloseHandle(ev44);
+
+        dev->xfer_ensure_staging(0, 256);
+        dev->xfer_wait();
+        hr = dev->xfer.cmd_alloc->Reset();
+        if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+        if (SUCCEEDED(hr)) {
+            dev->xfer.cmd_list->CopyBufferRegion(dev->xfer.readback_staging.Get(), 0, d_4.Get(), 0, 4);
+            dev->xfer.cmd_list->Close();
+            ID3D12CommandList * rl44[] = { dev->xfer.cmd_list.Get() };
+            dev->compute_queue->ExecuteCommandLists(1, rl44);
+            dev->xfer.fence_value++;
+            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+            dev->xfer_wait();
+        }
+        mapped = nullptr;
+        hr = dev->xfer.readback_staging->Map(0, &rr, &mapped);
+        float gpu44 = 0.0f;
+        if (SUCCEEDED(hr)) {
+            gpu44 = *(float *)mapped;
+            D3D12_RANGE wr44 = { 0, 0 };
+            dev->xfer.readback_staging->Unmap(0, &wr44);
+        }
+        fprintf(stderr, "  GPU K=3072 result:         %.8f\n", gpu44);
+        fprintf(stderr, "  CPU reference:             %.8f\n", ref4);
+        float re44 = (ref4 != 0.0f) ? fabsf((gpu44 - ref4) / ref4) : fabsf(gpu44);
+        fprintf(stderr, "  Relative error:            %.6f%%\n", re44 * 100.0f);
+        fprintf(stderr, "  RESULT: %s\n", re44 < 0.01f ? "PASS" : "*** FAIL ***");
+
+        // Per-block isolation: dispatch each block separately and sum
+        float block_sum = 0.0f;
+        fprintf(stderr, "\n  Per-block isolation (12 separate dispatches):\n");
+        for (uint32_t b = 0; b < NBLOCKS4; b++) {
+            float zb = 0.0f;
+            upload(d_4.Get(), &zb, 4);
+
+            // Create a view: offset into the weight buffer, activation offset
+            dx12_shader_params pb = {};
+            pb.ne00 = QK_K;  // K=256 per block
+            pb.ne01 = 1; pb.ne02 = 1; pb.ne03 = 1;
+            pb.nb00 = Q5K_BSIZE; pb.nb01 = Q5K_BSIZE;
+            pb.nb02 = Q5K_BSIZE; pb.nb03 = Q5K_BSIZE;
+            pb.ne10 = QK_K; pb.ne11 = 1; pb.ne12 = 1; pb.ne13 = 1;
+            pb.nb10 = 4; pb.nb11 = QK_K * 4;
+            pb.nb12 = QK_K * 4; pb.nb13 = QK_K * 4;
+            pb.ne0 = 1; pb.ne1 = 1; pb.ne2 = 1; pb.ne3 = 1;
+            pb.nb0 = 4; pb.nb1 = 4; pb.nb2 = 4; pb.nb3 = 4;
+            pb.src0_offset = b * Q5K_BSIZE;      // offset to this block
+            pb.src1_offset = b * QK_K * 4;         // offset to this block's activations
+            pb.dst_offset = 0;
+            pb.src0_esize = Q5K_BSIZE; pb.src1_esize = 4; pb.dst_esize = 4;
+
+            ComPtr<ID3D12CommandAllocator> ab;
+            ComPtr<ID3D12GraphicsCommandList> cb;
+            dev->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&ab));
+            dev->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, ab.Get(), nullptr, IID_PPV_ARGS(&cb));
+            cb->SetComputeRootSignature(dev->common_root_sig.Get());
+            cb->SetPipelineState(pl->pso.Get());
+            cb->SetComputeRoot32BitConstants(0, sizeof(pb) / 4, &pb, 0);
+            cb->SetComputeRootShaderResourceView(1, s0_4->GetGPUVirtualAddress());
+            cb->SetComputeRootShaderResourceView(2, s1_4->GetGPUVirtualAddress());
+            cb->SetComputeRootUnorderedAccessView(3, d_4->GetGPUVirtualAddress());
+            cb->SetComputeRootShaderResourceView(4, s0_4->GetGPUVirtualAddress());
+            cb->SetComputeRootShaderResourceView(5, s0_4->GetGPUVirtualAddress());
+            cb->Dispatch(1, 1, 1);
+            cb->Close();
+            ID3D12CommandList * lb[] = { cb.Get() };
+            dev->compute_queue->ExecuteCommandLists(1, lb);
+            ComPtr<ID3D12Fence> fb;
+            dev->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fb));
+            dev->compute_queue->Signal(fb.Get(), 1);
+            HANDLE evb = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+            fb->SetEventOnCompletion(1, evb);
+            WaitForSingleObject(evb, 5000);
+            CloseHandle(evb);
+
+            dev->xfer_ensure_staging(0, 256);
+            dev->xfer_wait();
+            hr = dev->xfer.cmd_alloc->Reset();
+            if (SUCCEEDED(hr)) hr = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
+            if (SUCCEEDED(hr)) {
+                dev->xfer.cmd_list->CopyBufferRegion(dev->xfer.readback_staging.Get(), 0, d_4.Get(), 0, 4);
+                dev->xfer.cmd_list->Close();
+                ID3D12CommandList * rlb[] = { dev->xfer.cmd_list.Get() };
+                dev->compute_queue->ExecuteCommandLists(1, rlb);
+                dev->xfer.fence_value++;
+                dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
+                dev->xfer_wait();
+            }
+            mapped = nullptr;
+            hr = dev->xfer.readback_staging->Map(0, &rr, &mapped);
+            float gpub = 0.0f;
+            if (SUCCEEDED(hr)) {
+                gpub = *(float *)mapped;
+                D3D12_RANGE wrb = { 0, 0 };
+                dev->xfer.readback_staging->Unmap(0, &wrb);
+            }
+            block_sum += gpub;
+            fprintf(stderr, "    Block %2u: GPU=%.6f  sum_so_far=%.6f\n", b, gpub, block_sum);
+        }
+        fprintf(stderr, "  Sum of 12 separate dispatches: %.8f\n", block_sum);
+        fprintf(stderr, "  Single dispatch (12 blocks):   %.8f\n", gpu44);
+        fprintf(stderr, "  CPU reference:                 %.8f\n", ref4);
+        float re_iso = (ref4 != 0.0f) ? fabsf((block_sum - ref4) / ref4) : fabsf(block_sum);
+        fprintf(stderr, "  Isolated sum error:            %.6f%%\n", re_iso * 100.0f);
+        fprintf(stderr, "  Isolated RESULT: %s\n", re_iso < 0.01f ? "PASS" : "*** FAIL ***");
+    }
+
+    fflush(stderr);
+}
+
 static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * bctx = (dx12_backend_context *)backend->context;
 
@@ -2113,6 +2763,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // Run auto-tuning on first graph compute
     if (!bctx->dev->tuning_done) {
         bctx->dev->run_autotune();
+    }
+
+    // Q5_K matvec unit test (GGML_DX12_TEST_MATVEC=1)
+    {
+        static bool test_done = false;
+        if (!test_done && getenv("GGML_DX12_TEST_MATVEC")) {
+            test_done = true;
+            dx12_test_matvec_q5k(bctx->dev);
+        }
     }
 
     bctx->ensure_cmd_list_open();
@@ -2848,6 +3507,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         } else {
             src1_res = dx12_get_resource(node->src[1]);
         }
+
         ID3D12Resource * dst_res;
         ID3D12Resource * fa_real_dst_res = nullptr;  // saved for split-KV reduce pass
         if (fused_rope_after_rms) {
@@ -3905,6 +4565,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
                 }
             }
+            // Ensure command list is open for the next dispatch
+            bctx->ensure_cmd_list_open();
+            bctx->reset_binding_cache();
+            unsynced_writes.clear();
         }
 
         // TDR prevention: flush during prompt processing
