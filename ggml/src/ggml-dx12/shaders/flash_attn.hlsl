@@ -203,20 +203,97 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
         global_sum += s_reduce[0];
 
-        // Pass 3: Accumulate weighted V
-        for (uint ai = 0; ai < 4; ai++) {
-            uint d_out = local_id + ai * GROUP_SIZE;
-            if (d_out < D) {
-                precise float tile_acc = 0.0f;
-                for (uint t = 0; t < tile_size; t++) {
-                    float w = s_scores[t];
-                    if (w != 0.0f) {
-                        uint kv = tile_start + t;
-                        uint v_off = src2_off + d_out * src2_nb0 + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
-                        tile_acc += w * load_auto(src2, v_off, src2_es);
+        // Pass 3: Cooperative V accumulation
+        // For D <= GROUP_SIZE/2: remap threads to (d_out, kv_worker) pairs.
+        // Multiple workers split the KV tile, each processing a chunk of KV
+        // tokens. This halves the serial FMA dependency chain per thread.
+        // After the loop, reduce partial sums across workers via s_reduce[].
+        //
+        //   D=96  (Phi-3):  2 workers, 128 KV tokens each (was 256 serial)
+        //   D=128 (Qwen):   2 workers, 128 KV tokens each
+        //   D=64  (Gemma):  4 workers, 64 KV tokens each
+        {
+            uint v_head_base = src2_off + kv_head * src2_nb2 + batch_idx * src2_nb3;
+            uint num_v_workers = D > 0 ? min(GROUP_SIZE / D, 4u) : 1u;
+
+            if (num_v_workers > 1 && src2_es == 2 && src2_nb0 == 2) {
+                // Cooperative F16 fast path
+                uint d_out = local_id % D;
+                uint v_wk  = local_id / D;
+
+                float partial = 0.0f;
+                if (v_wk < num_v_workers) {
+                    uint chunk = (tile_size + num_v_workers - 1) / num_v_workers;
+                    uint kv_lo = v_wk * chunk;
+                    uint kv_hi = min(kv_lo + chunk, tile_size);
+
+                    for (uint t = kv_lo; t < kv_hi; t++) {
+                        float w = s_scores[t];
+                        uint v_row = v_head_base + (tile_start + t) * src2_nb1;
+                        uint v_addr = v_row + d_out * 2;
+                        uint raw = src2.Load(v_addr & ~3u);
+                        partial += w * f16_to_f32((v_addr & 2u) ? (raw >> 16) : (raw & 0xFFFFu));
                     }
                 }
-                acc[ai] += tile_acc;
+
+                // Reduce across workers -- reuse s_reduce[] (GROUP_SIZE entries,
+                // sufficient for up to 4 workers x D<=128 = 512 <= 256... wait,
+                // 4x64=256 is the max that fits. For D>64 num_workers<=2 so 2x128=256.)
+                if (v_wk < num_v_workers) {
+                    s_reduce[v_wk * D + d_out] = partial;
+                }
+                GroupMemoryBarrierWithGroupSync();
+
+                if (local_id < D) {
+                    float total = 0.0f;
+                    for (uint w = 0; w < num_v_workers; w++) {
+                        total += s_reduce[w * D + local_id];
+                    }
+                    acc[0] += total;
+                }
+            } else if (src2_es == 2 && src2_nb0 == 2) {
+                // Non-cooperative F16 fast path (D > GROUP_SIZE/2)
+                uint d0 = local_id;
+                if (d0 < D) {
+                    float tile_acc0 = 0.0f;
+                    for (uint t = 0; t < tile_size; t++) {
+                        float w = s_scores[t];
+                        uint v_row = v_head_base + (tile_start + t) * src2_nb1;
+                        uint v_addr = v_row + d0 * 2;
+                        uint raw = src2.Load(v_addr & ~3u);
+                        float v = f16_to_f32((v_addr & 2u) ? (raw >> 16) : (raw & 0xFFFFu));
+                        tile_acc0 += w * v;
+                    }
+                    acc[0] += tile_acc0;
+                }
+                // Handle d_out >= GROUP_SIZE (only for D > 256, rare)
+                [unroll] for (uint ai = 1; ai < 4; ai++) {
+                    uint d_out = local_id + ai * GROUP_SIZE;
+                    if (d_out < D) {
+                        float tile_acc = 0.0f;
+                        for (uint t = 0; t < tile_size; t++) {
+                            float w = s_scores[t];
+                            uint v_row = v_head_base + (tile_start + t) * src2_nb1;
+                            uint v_addr = v_row + d_out * 2;
+                            uint raw = src2.Load(v_addr & ~3u);
+                            float v = f16_to_f32((v_addr & 2u) ? (raw >> 16) : (raw & 0xFFFFu));
+                            tile_acc += w * v;
+                        }
+                        acc[ai] += tile_acc;
+                    }
+                }
+            } else {
+                // Generic path: F32, BF16, or non-contiguous V
+                for (uint t = 0; t < tile_size; t++) {
+                    float w = s_scores[t];
+                    uint v_row = v_head_base + (tile_start + t) * src2_nb1;
+                    [unroll] for (uint ai = 0; ai < 4; ai++) {
+                        uint d_out = local_id + ai * GROUP_SIZE;
+                        if (d_out < D) {
+                            acc[ai] += w * load_auto(src2, v_row + d_out * src2_nb0, src2_es);
+                        }
+                    }
+                }
             }
         }
         GroupMemoryBarrierWithGroupSync();

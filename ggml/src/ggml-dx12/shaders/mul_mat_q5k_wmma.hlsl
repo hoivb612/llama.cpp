@@ -1,6 +1,8 @@
 // mul_mat_q5k_wmma.hlsl - Register-blocked tiled MUL_MAT with Q5_K weights
-// Q5_K is like Q4_K but with an extra qh array for the 5th bit.
-// Block layout: d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] = 176 bytes
+//
+// Cooperative dequant: threads cooperatively load raw Q5_K block bytes (qs + qh)
+// into shared memory, decode scales once per column, then dequant from LDS.
+// Q5_K block layout: d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] = 176 bytes
 //
 // Dispatch: groups_x = ceil(N/32), groups_y = ceil(M/32), groups_z = ne2*ne3
 #include "ggml_common.hlsli"
@@ -12,64 +14,18 @@
 #define BN 32
 #define BK 32
 
+// Shared memory for cooperative Q5_K dequant
+groupshared uint  raw_qs[BN][8];   // 32 qs bytes as 8 uint32 per column
+groupshared uint  raw_qh[BN][8];   // 32 qh bytes as 8 uint32 per column
+groupshared float col_sc[BN][2];   // (d*scale, dmin*min) per column
+
+groupshared float tile_a[BM][BK];
+groupshared float tile_b[BK][BN];
+
 uint read_byte_q5k(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
     return (word >> ((byte_off & 3u) * 8u)) & 0xFFu;
 }
-
-float dequant_q5k(ByteAddressBuffer buf, uint block_off, uint elem_in_block) {
-    uint dm_raw = buf.Load(block_off);
-    float dall = f16_to_f32(dm_raw & 0xFFFFu);
-    float dmin_val = f16_to_f32(dm_raw >> 16);
-    uint scales_off = block_off + 4;
-    uint qh_off = block_off + 16;
-    uint qs_off = block_off + 48;
-
-    uint il = elem_in_block / 64;
-    uint elem_in_chunk = elem_in_block % 64;
-    bool is_high = (elem_in_chunk >= 32);
-    uint elem_in_half = elem_in_chunk % 32;
-    uint is = 2 * il;
-
-    uint sc_idx, mb_val;
-    uint is_eff = is_high ? (is + 1) : is;
-    {
-        uint scidx0 = (is < 4) ? is_eff : (is_eff + 4);
-        uint scidx1 = (is < 4) ? is_eff : (is_eff - 4);
-        uint scmask1 = (is < 4) ? 0x30u : 0xC0u;
-        uint scshift1 = (is < 4) ? 0u : 2u;
-        uint mbidx0 = is_eff + 4;
-        uint mbidx1 = (is < 4) ? is_eff + 4 : is_eff;
-        uint mbmask0 = (is < 4) ? 0x0Fu : 0xF0u;
-        uint mbshift0 = (is < 4) ? 0u : 4u;
-        uint mbmask1 = (is < 4) ? 0x30u : 0xC0u;
-        uint mbshift1 = (is < 4) ? 0u : 2u;
-
-        sc_idx = (read_byte_q5k(buf, scales_off + scidx0) & 0x0Fu) |
-                 ((read_byte_q5k(buf, scales_off + scidx1) & scmask1) >> scshift1);
-        mb_val = ((read_byte_q5k(buf, scales_off + mbidx0) & mbmask0) >> mbshift0) |
-                 ((read_byte_q5k(buf, scales_off + mbidx1) & mbmask1) >> mbshift1);
-    }
-
-    float d = dall * (float)sc_idx;
-    float m = dmin_val * (float)mb_val;
-
-    uint qs_byte = read_byte_q5k(buf, qs_off + il * 32 + elem_in_half);
-    uint qh_byte = read_byte_q5k(buf, qh_off + elem_in_half);
-    uint hm = is_high ? (1u << (2u * il + 1u)) : (1u << (2u * il));
-
-    float q;
-    if (!is_high) {
-        q = (float)((qs_byte & 0x0Fu) + (((qh_byte & hm) != 0u) ? 16u : 0u));
-    } else {
-        q = (float)((qs_byte >> 4) + (((qh_byte & hm) != 0u) ? 16u : 0u));
-    }
-
-    return d * q - m;
-}
-
-groupshared float tile_a[BM][BK];
-groupshared float tile_b[BK][BN];
 
 [numthreads(16, 16, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -114,25 +70,114 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             }
         }
 
-        // Load tile_b: dequantize Q5_K
+        // Load tile_b: cooperative Q5_K dequant
         {
-            uint base = flat_id * 4;
-            [unroll] for (uint e = 0; e < 4; e++) {
-                uint idx = base + e;
-                uint k_local = idx / BN;
-                uint n_local = idx % BN;
-                uint global_k = k_start + k_local;
-                uint global_n = col_block * BN + n_local;
-                float val = 0.0f;
-                if (global_k < K && global_n < ne01) {
-                    uint block_idx = global_k / QK_K;
-                    uint elem_in_block = global_k % QK_K;
+            uint block_idx    = k_start / QK_K;
+            uint elem_in_blk  = k_start % QK_K;
+            uint sub_chunk    = elem_in_blk / 64;
+            bool is_high_half = (elem_in_blk % 64) >= 32;
+
+            // Phase 1a: First 32 threads load headers and scales
+            if (flat_id < BN) {
+                uint n = flat_id;
+                uint global_n = col_block * BN + n;
+                if (global_n < ne01) {
                     uint row_off = src0_offset + global_n * nb01
                                  + i2_src0 * nb02 + i3_src0 * nb03;
                     uint block_off = row_off + block_idx * Q5K_BLOCK_SIZE;
-                    val = dequant_q5k(src0, block_off, elem_in_block);
+
+                    uint dm_raw = src0.Load(block_off);
+                    float dall = f16_to_f32(dm_raw & 0xFFFFu);
+                    float dmin = f16_to_f32(dm_raw >> 16);
+
+                    uint scales_off = block_off + 4;
+                    uint is = sub_chunk * 2 + (is_high_half ? 1u : 0u);
+                    uint sc_raw, mb_raw;
+                    if (is < 4) {
+                        sc_raw = read_byte_q5k(src0, scales_off + is) & 0x3Fu;
+                        mb_raw = read_byte_q5k(src0, scales_off + is + 4) & 0x3Fu;
+                    } else {
+                        uint lo_sc = read_byte_q5k(src0, scales_off + is + 4) & 0x0Fu;
+                        uint hi_sc = (read_byte_q5k(src0, scales_off + is - 4) >> 6) & 0x03u;
+                        sc_raw = lo_sc | (hi_sc << 4);
+                        uint lo_mb = (read_byte_q5k(src0, scales_off + is + 4) >> 4) & 0x0Fu;
+                        uint hi_mb = (read_byte_q5k(src0, scales_off + is) >> 6) & 0x03u;
+                        mb_raw = lo_mb | (hi_mb << 4);
+                    }
+                    col_sc[n][0] = dall * (float)sc_raw;
+                    col_sc[n][1] = dmin * (float)mb_raw;
+                } else {
+                    col_sc[n][0] = 0.0f; col_sc[n][1] = 0.0f;
                 }
-                tile_b[k_local][n_local] = val;
+            }
+
+            // Phase 1b: 256 threads load qs bytes (32 cols × 8 uint32 = 256)
+            {
+                uint col = flat_id / 8;
+                uint qw  = flat_id % 8;
+                uint global_n = col_block * BN + col;
+                if (global_n < ne01 && k_start < K) {
+                    uint row_off = src0_offset + global_n * nb01
+                                 + i2_src0 * nb02 + i3_src0 * nb03;
+                    uint block_off = row_off + block_idx * Q5K_BLOCK_SIZE;
+                    uint qs_base = block_off + 48 + sub_chunk * 32;
+                    raw_qs[col][qw] = src0.Load(qs_base + qw * 4);
+                } else {
+                    raw_qs[col][qw] = 0;
+                }
+            }
+
+            // Phase 1c: Load qh bytes -- need all 32 qh bytes per column
+            // (qh bits are indexed by elem_in_half, not sub_chunk)
+            // 256 threads load 32 cols × 8 uint32 = 256
+            {
+                uint col = flat_id / 8;
+                uint qw  = flat_id % 8;
+                uint global_n = col_block * BN + col;
+                if (global_n < ne01 && k_start < K) {
+                    uint row_off = src0_offset + global_n * nb01
+                                 + i2_src0 * nb02 + i3_src0 * nb03;
+                    uint block_off = row_off + block_idx * Q5K_BLOCK_SIZE;
+                    uint qh_base = block_off + 16;
+                    raw_qh[col][qw] = src0.Load(qh_base + qw * 4);
+                } else {
+                    raw_qh[col][qw] = 0;
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            // Phase 2: Dequant from shared memory
+            {
+                uint hm = is_high_half ? (1u << (2u * sub_chunk + 1u)) : (1u << (2u * sub_chunk));
+
+                uint base = flat_id * 4;
+                [unroll] for (uint e = 0; e < 4; e++) {
+                    uint idx = base + e;
+                    uint k_local = idx / BN;
+                    uint n_local = idx % BN;
+
+                    float val = 0.0f;
+                    if ((k_start + k_local) < K && (col_block * BN + n_local) < ne01) {
+                        uint word_idx = k_local / 4;
+                        uint byte_in_word = k_local % 4;
+                        uint qs_byte = (raw_qs[n_local][word_idx] >> (byte_in_word * 8)) & 0xFFu;
+                        uint qh_byte = (raw_qh[n_local][word_idx] >> (byte_in_word * 8)) & 0xFFu;
+
+                        float d = col_sc[n_local][0];
+                        float m = col_sc[n_local][1];
+
+                        uint q_base;
+                        if (!is_high_half) {
+                            q_base = qs_byte & 0x0Fu;
+                        } else {
+                            q_base = qs_byte >> 4;
+                        }
+                        uint q5_bit = ((qh_byte & hm) != 0u) ? 16u : 0u;
+                        val = d * (float)(q_base + q5_bit) - m;
+                    }
+                    tile_b[k_local][n_local] = val;
+                }
             }
         }
 

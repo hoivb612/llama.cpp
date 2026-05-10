@@ -278,7 +278,6 @@ int main(int argc, char ** argv) {
             auto sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
             llama_sampler * smpl = llama_sampler_chain_init(sparams);
-#if 1 
             llama_sampler_chain_add(smpl, llama_sampler_init_penalties(128, 1.3f, 0.1f, 0.1f));
             // DRY: penalizes repeated n-gram sequences
             const char * dry_breakers[] = { "\n", ":", "\"", "*" };
@@ -288,10 +287,6 @@ int main(int argc, char ** argv) {
             llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1.0f));
             llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.3f));
             llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
-#else
-            // @TODO_SDM: remove optional greedy sampling for testing
-            llama_sampler_chain_add(smpl, llama_sampler_init_greedy());           
-#endif
             int64_t t3 = timer_us();
 
             while (n_gen < max_gen) {

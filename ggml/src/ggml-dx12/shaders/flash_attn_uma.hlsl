@@ -201,13 +201,25 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         global_sum += s_reduce[0];
 
         // Pass 3: Accumulate weighted V -- each thread owns one output dimension
+        // Branch-free: multiply-by-zero cheaper than divergence on RDNA 2.
+        // F16 fast path: inline Load avoids load_auto call overhead.
         if (local_id < D) {
-            precise float tile_acc = 0.0f;
-            for (uint t = 0; t < tile_size; t++) {
-                float w = s_scores[t];
-                if (w != 0.0f) {
-                    uint kv = tile_start + t;
-                    uint v_off = src2_off + local_id * src2_nb0 + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
+            float tile_acc = 0.0f;
+            uint v_head_base = src2_off + local_id * src2_nb0 + kv_head * src2_nb2 + batch_idx * src2_nb3;
+            if (src2_es == 2 && src2_nb0 == 2) {
+                // F16 contiguous: inline load
+                uint d_byte = local_id * 2;
+                for (uint t = 0; t < tile_size; t++) {
+                    float w = s_scores[t];
+                    uint v_addr = src2_off + d_byte + (tile_start + t) * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
+                    uint raw = src2.Load(v_addr & ~3u);
+                    float v = f16_to_f32((v_addr & 2u) ? (raw >> 16) : (raw & 0xFFFFu));
+                    tile_acc += w * v;
+                }
+            } else {
+                for (uint t = 0; t < tile_size; t++) {
+                    float w = s_scores[t];
+                    uint v_off = v_head_base + (tile_start + t) * src2_nb1;
                     tile_acc += w * load_auto(src2, v_off, src2_es);
                 }
             }

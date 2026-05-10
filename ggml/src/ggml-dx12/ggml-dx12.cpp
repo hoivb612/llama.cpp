@@ -1971,13 +1971,13 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
 
         case GGML_OP_FLASH_ATTN_EXT:
 #if defined(GGML_DX12_XBOX_GDKX)
-            // Disabled on Xbox: the ggml allocator reuses memory from earlier
-            // FA outputs for the ISWA mask cast tensor (same compute buffer).
-            // On GPU, all dispatches run asynchronously so the mask data is
-            // overwritten before global-attention layers read it, producing NaN.
-            // The Vulkan backend avoids this via byte-range overlap barriers;
-            // a similar fix is needed here before FA can be re-enabled.
-            // @TODO_SDM: implement pre-graph mask snapshot or allocator pinning.
+            // FA currently disabled on Xbox. The non-FA path (separate QK matmul
+            // + softmax + attn*V) is ~2x faster for prompt processing due to
+            // better dispatch parallelism, and supports_op must be consistent
+            // across all ne[1] values (the scheduler probes with different batch
+            // sizes during graph_reserve and requires a single answer).
+            // TODO: implement per-graph FA decision (like Vulkan) rather than
+            // the all-or-nothing supports_op gate.
             return false;
 #else
             if (op->type == GGML_TYPE_F32 && op->src[1] &&
@@ -2776,96 +2776,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
     bctx->ensure_cmd_list_open();
 
-    // @TODO_SDM: Detect compute buffer aliasing between INPUT tensors and
-    // computed outputs. The ggml allocator reuses buffer offsets, so an INPUT
-    // tensor (uploaded via set_tensor before graph execution) may share its
-    // byte range with a computed tensor that gets written during execution,
-    // destroying the input data before a later dispatch reads it.
-    // This scan runs once per graph and logs overlaps for diagnosis.
-#if defined(GGML_DX12_XBOX_GDKX)
-    {
-        static bool overlap_scan_done = false;  // only log once to avoid spam
-        if (!overlap_scan_done) {
-            overlap_scan_done = true;
-
-            struct tensor_range {
-                size_t off;
-                size_t size;
-                const char * name;
-                int node_idx;
-                bool is_input;
-            };
-            std::vector<tensor_range> ranges;
-
-            // Collect all tensor byte ranges in the compute buffer
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                struct ggml_tensor * node = cgraph->nodes[i];
-                if (ggml_is_empty(node)) continue;
-
-                // Collect output tensor (the node itself, if it writes to compute buffer)
-                if (node->buffer && !node->view_src &&
-                    node->op != GGML_OP_NONE && node->op != GGML_OP_RESHAPE &&
-                    node->op != GGML_OP_VIEW && node->op != GGML_OP_PERMUTE &&
-                    node->op != GGML_OP_TRANSPOSE) {
-                    auto * bctx_buf = (dx12_buffer_context *)node->buffer->context;
-                    if (bctx_buf && bctx_buf->dev == bctx->dev) {
-                        size_t off = (size_t)dx12_tensor_offset(node);
-                        size_t sz  = ggml_nbytes(node);
-                        ranges.push_back({ off, sz, node->name, i, false });
-                    }
-                }
-
-                // Collect INPUT source tensors
-                for (int s = 0; s < GGML_MAX_SRC; s++) {
-                    struct ggml_tensor * src = node->src[s];
-                    if (!src || !src->buffer) continue;
-                    if (!(src->flags & GGML_TENSOR_FLAG_INPUT)) continue;
-                    if (src->view_src) continue;
-                    auto * src_bctx = (dx12_buffer_context *)src->buffer->context;
-                    if (!src_bctx || src_bctx->dev != bctx->dev) continue;
-                    size_t off = (size_t)dx12_tensor_offset(src);
-                    size_t sz  = ggml_nbytes(src);
-                    // Avoid duplicates (same tensor may be src of multiple nodes)
-                    bool dup = false;
-                    for (auto & r : ranges) {
-                        if (r.is_input && r.off == off && r.size == sz) { dup = true; break; }
-                    }
-                    if (!dup) {
-                        ranges.push_back({ off, sz, src->name, i, true });
-                    }
-                }
-            }
-
-            // Check for overlaps between INPUT ranges and computed output ranges
-            int overlap_count = 0;
-            for (auto & inp : ranges) {
-                if (!inp.is_input) continue;
-                for (auto & out : ranges) {
-                    if (out.is_input) continue;
-                    // Check byte-range overlap
-                    if (inp.off < out.off + out.size && inp.off + inp.size > out.off) {
-                        overlap_count++;
-                        if (overlap_count <= 20) {
-                            fprintf(stderr, "ggml-dx12: OVERLAP #%d: INPUT '%s' [%zu..%zu] vs OUTPUT '%s' @node#%d [%zu..%zu]\n",
-                                    overlap_count,
-                                    inp.name, inp.off, inp.off + inp.size,
-                                    out.name, out.node_idx, out.off, out.off + out.size);
-                        }
-                    }
-                }
-            }
-            if (overlap_count > 0) {
-                fprintf(stderr, "ggml-dx12: OVERLAP SCAN: %d INPUT/OUTPUT overlaps detected in %d ranges (%d nodes)\n",
-                        overlap_count, (int)ranges.size(), cgraph->n_nodes);
-            } else {
-                fprintf(stderr, "ggml-dx12: OVERLAP SCAN: no INPUT/OUTPUT overlaps detected (%d ranges, %d nodes)\n",
-                        (int)ranges.size(), cgraph->n_nodes);
-            }
-            fflush(stderr);
-        }
-    }
-#endif
-
     // Profiling: profile only actual generation graphs (M=1 in MUL_MATs)
     static bool profiling = (getenv("DX12_PROFILE") != nullptr);
     static bool dx12_perf = (getenv("GGML_DX12_PERF") != nullptr);
@@ -3398,42 +3308,31 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     if (fa_split_k > max_split) fa_split_k = max_split;
                     if (fa_split_k < 2) fa_split_k = 1;
                 } else {
-                    // Auto split-KV heuristic: target ~64 total thread groups.
+                    // Auto split-KV heuristic: target enough thread groups to
+                    // saturate the GPU's compute units with multiple wavefronts.
                     //
-                    // Why 64: DX12 has no standard API to query CU/SM count (unlike
-                    // Vulkan which uses shader_core_count * 2 / total_workgroups).
-                    // 64 is a conservative target that provides good occupancy across:
-                    //   - APU/iGPU (16 CUs): 64 groups ≈ 4 waves/CU → near-full occupancy
-                    //   - Mid-range (32-48 CUs): reasonable saturation
-                    //   - High-end (96+ CUs): still helpful, could benefit from higher target
+                    // RDNA 2 (Xbox, AMD discrete) needs 4-8+ wavefronts/CU to hide
+                    // memory latency. With 52 CUs on Xbox, that means 200-400+ groups.
+                    // NVIDIA and smaller APUs are less sensitive but still benefit.
                     //
-                    // Future optimization: derive target from GPU CU count via
-                    // DXGI_ADAPTER_DESC3, DXCore properties, or autotune probing.
+                    // Platform-specific targets:
+                    //   - Xbox (52 CUs, UMA):  256 groups -- ~5 waves/CU
+                    //   - Discrete GPU:        128 groups -- conservative, good for 32-96 CUs
+                    //   - APU/iGPU (16 CUs):    64 groups -- 4 waves/CU, sufficient
                     //
-                    // Formula: split_k = ceil(64 / (n_heads * batch)), capped so each
-                    // split processes at least 256 KV tokens (one TILE_KV).
-                    /*
-                      Auto selects based on: split_k = ceil(64 / (n_heads × batch)) then capped by ceil(N_kv / 256).
-
-                      For decode (N_queries=1) and for example with a 540-token prompt (max_split = ceil(540/256) = 3):
-
-                      ┌────────────────────┬─────────┬───────────────┬──────────┬──────────────┐
-                      │ Model              │ Q Heads │ Formula       │ Capped   │ Auto split_k │
-                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
-                      │ Phi-3              │ 32      │ ceil(64/32)=2 │ min(2,3) │ 2            │
-                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
-                      │ Gemma-4 (8 heads)  │ 8       │ ceil(64/8)=8  │ min(8,3) │ 3            │
-                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
-                      │ Gemma-4 (16 heads) │ 16      │ ceil(64/16)=4 │ min(4,3) │ 3            │
-                      └────────────────────┴─────────┴───────────────┴──────────┴──────────────┘
-
-                      The goal is ~64 total thread groups to fill the GPU. As context grows (N_kv increases), 
-                      the cap loosens — e.g., at 2048 tokens, max_split=8.
-                    */
+                    // Formula: split_k = ceil(target / (n_heads * batch)),
+                    // capped so each split has at least one tile worth of KV tokens.
+                    uint32_t target_groups;
+#if defined(GGML_DX12_XBOX_GDKX)
+                    target_groups = 256;
+#else
+                    target_groups = bctx->dev->is_uma ? 128 : 128;
+#endif
+                    uint32_t tile_kv = (key.flags == 2) ? 128 : 256; // UMA shader uses TILE_KV=128
                     uint32_t total_wgs = N_queries * n_heads * batch;
-                    if (total_wgs < 64) {
-                        fa_split_k = (64 + total_wgs - 1) / total_wgs;
-                        uint32_t max_split = (N_kv + 255) / 256;
+                    if (total_wgs < target_groups) {
+                        fa_split_k = (target_groups + total_wgs - 1) / total_wgs;
+                        uint32_t max_split = (N_kv + tile_kv - 1) / tile_kv;
                         if (fa_split_k > max_split) fa_split_k = max_split;
                         if (fa_split_k < 2) fa_split_k = 1;
                     }
@@ -3875,12 +3774,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 unsynced_writes.clear();
             }
 
-            // @TODO_SDM: the dependency-tracked barrier logic (unsynced_writes)
-            // tracks by tensor pointer, not byte range. On Xbox, the ggml
-            // allocator reuses buffer offsets so two different tensor pointers
-            // can reference overlapping memory, causing the tracker to miss
-            // dependencies. Force unconditional barriers on Xbox until
-            // byte-range overlap detection is implemented (like Vulkan does).
+            // Force unconditional UAV barriers before every dispatch.
+            // On Xbox, the pointer-based dependency tracker above misses
+            // byte-range aliasing (ggml allocator reuses offsets). Force
+            // unconditional barriers as a correctness requirement.
+            // On desktop, enable via GGML_DX12_BARRIER_ALL=1 for debugging.
             static bool force_barriers = []() {
 #if defined(GGML_DX12_XBOX_GDKX)
                 bool v = true;  // default ON for Xbox
@@ -4224,110 +4122,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 unsynced_writes.clear();
                 dispatch_weight = 0;
             }
-
-#if 0 // debug diagnostic code -- // @TODO_SDM: removeme when things are more stable
-            // Per-dispatch NaN bisection on first decode graph.
-            // Decode tensors are tiny (1152, 256, 1024, 4096 floats), so readback
-            // is cheap. Fires only on decode_eval_count==1, only for F32 outputs,
-            // and only on "checkpoint" ops (RMS_NORM, MUL_MAT, FA, ROPE, ADD, MUL,
-            // GLU, SOFT_MAX). Stops 8 dispatches after first NaN. Prints only
-            // first 4 baseline + last 4 trailing + every probe with nans>0, so
-            // the log stays small while still bisecting all 27 layers.
-            if (dx12_diag && !is_prompt && trace_prompt && node->type == GGML_TYPE_F32 &&
-                node->buffer && node->ne[1] <= 4 && node->ne[2] <= 16 && node->ne[3] <= 1) {
-                ggml_op op = node->op;
-                bool is_checkpoint =
-                    op == GGML_OP_RMS_NORM || op == GGML_OP_NORM ||
-                    op == GGML_OP_MUL_MAT  || op == GGML_OP_FLASH_ATTN_EXT ||
-                    op == GGML_OP_ROPE     || op == GGML_OP_ADD ||
-                    op == GGML_OP_MUL      || op == GGML_OP_GLU ||
-                    op == GGML_OP_SOFT_MAX || op == GGML_OP_SCALE;
-                static int dec_probe_count = 0;
-                static int dec_first_nan_disp = -1;
-                static int dec_trailing_after_nan = 0;
-                bool stop = (dec_first_nan_disp >= 0 && dec_trailing_after_nan >= 8);
-                if (is_checkpoint && !stop && dec_probe_count < 1500) {
-                    size_t n_elem = (size_t)node->ne[0] * (size_t)std::max((int64_t)1, node->ne[1]) *
-                                    (size_t)std::max((int64_t)1, node->ne[2]);
-                    size_t bytes = n_elem * sizeof(float);
-                    if (bytes > 0 && bytes <= 32 * 1024) {
-                        // Flush so dispatch is complete on GPU
-                        bctx->close_and_execute();
-                        bctx->wait_for_gpu();
-                        uint32_t off = (uint32_t)dx12_tensor_offset(node);
-                        auto * dev = bctx->dev;
-                        dev->init_xfer();
-                        dev->xfer_ensure_staging(0, bytes);
-                        dev->xfer_wait();
-                        HRESULT hrp = dev->xfer.cmd_alloc->Reset();
-                        if (SUCCEEDED(hrp)) hrp = dev->xfer.cmd_list->Reset(dev->xfer.cmd_alloc.Get(), nullptr);
-                        if (SUCCEEDED(hrp)) {
-                            auto * pbuf = (dx12_buffer_context *)node->buffer->context;
-                            dev->xfer.cmd_list->CopyBufferRegion(
-                                dev->xfer.readback_staging.Get(), 0, pbuf->resource.Get(), off, bytes);
-                            dev->xfer.cmd_list->Close();
-                            ID3D12CommandList * lists[] = { dev->xfer.cmd_list.Get() };
-                            dev->compute_queue->ExecuteCommandLists(1, lists);
-                            dev->xfer.fence_value++;
-                            dev->compute_queue->Signal(dev->xfer.fence.Get(), dev->xfer.fence_value);
-                            dev->xfer_wait();
-                            void * mp = nullptr;
-                            D3D12_RANGE rr = { 0, bytes };
-                            if (SUCCEEDED(dev->xfer.readback_staging->Map(0, &rr, &mp))) {
-                                float * f = (float *)mp;
-                                int n = (int)n_elem;
-                                int nans = 0, infs = 0;
-                                double sum = 0, sum_sq = 0;
-                                for (int j = 0; j < n; j++) {
-                                    if (isnan(f[j])) { nans++; continue; }
-                                    if (isinf(f[j])) { infs++; continue; }
-                                    sum += f[j];
-                                    sum_sq += (double)f[j] * f[j];
-                                }
-                                int n_finite = n - nans - infs;
-                                double rms = n_finite > 0 ? sqrt(sum_sq / n_finite) : 0.0;
-                                double mean = n_finite > 0 ? sum / n_finite : 0.0;
-                                // Print every checkpoint -- previous sparse
-                                // strategy hid the residual growth pattern
-                                // between layers 1 and 11. ~25 checkpoints/layer
-                                // x 27 layers ~= 675 lines, manageable.
-                                bool any_bad = (nans > 0) || (infs > 0);
-                                int src0t = node->src[0] ? (int)node->src[0]->type : -1;
-                                int src1t = node->src[1] ? (int)node->src[1]->type : -1;
-                                fprintf(stderr, "ggml-dx12: DEC PROBE d#%4d %-14s s0t=%d s1t=%d ne=(%lld,%lld,%lld) "
-                                        "rms=%.4g mean=%.4g nans=%d/%d infs=%d  v[0..3]=%.4g %.4g %.4g %.4g\n",
-                                        i, ggml_op_name(op), src0t, src1t,
-                                        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2],
-                                        rms, mean, nans, n, infs,
-                                        f[0], n>1?f[1]:0, n>2?f[2]:0, n>3?f[3]:0);
-                                fflush(stderr);
-                                if (infs > 0 && op == GGML_OP_FLASH_ATTN_EXT) {
-                                    fprintf(stderr, "ggml-dx12: FA OUTPUT DUMP d#%d (%d values, %d infs):\n", i, n, infs);
-                                    for (int j = 0; j < n; j += 16) {
-                                        fprintf(stderr, "  out[%4d..%4d]:", j, std::min(j + 15, n - 1));
-                                        for (int k = j; k < std::min(j + 16, n); ++k) {
-                                            if (isinf(f[k])) fprintf(stderr, " %cinf", f[k] < 0 ? '-' : '+');
-                                            else if (isnan(f[k])) fprintf(stderr, " nan");
-                                            else fprintf(stderr, " %.4g", f[k]);
-                                        }
-                                        fprintf(stderr, "\n");
-                                    }
-                                    fflush(stderr);
-                                }
-                                if (any_bad && dec_first_nan_disp < 0) dec_first_nan_disp = i;
-                                if (dec_first_nan_disp >= 0) dec_trailing_after_nan++;
-                                D3D12_RANGE wr = { 0, 0 };
-                                dev->xfer.readback_staging->Unmap(0, &wr);
-                                dec_probe_count++;
-                            }
-                        }
-                        bctx->ensure_cmd_list_open();
-                        bctx->reset_binding_cache();
-                        unsynced_writes.clear();
-                    }
-                }
-            }
-#endif // debug diagnostic code
         }
 
         // Force CL split at every dispatch in model head region to fix NaN and sync.
@@ -4884,18 +4678,22 @@ void dx12_device::run_autotune() {
                 q6k_use_mr = false;  // disabled: q6k_mr shader 2.1x slower than standard 256t
                 fa_use_uma = true;   // UMA FA: 128t, fewer barriers, no idle threads
             }
+            // Per-flag env overrides (apply regardless of cache)
+            if (const char * e = getenv("GGML_DX12_Q5_0_USE_256")) q5_0_use_256 = (atoi(dx12_env_unquote(e)) != 0);
+            if (const char * e = getenv("GGML_DX12_Q8_0_USE_256")) q8_0_use_256 = (atoi(dx12_env_unquote(e)) != 0);
+            if (const char * e = getenv("GGML_DX12_Q5K_USE_MR"))   q5k_use_mr   = (atoi(dx12_env_unquote(e)) != 0);
+            if (const char * e = getenv("GGML_DX12_FA_USE_UMA"))   fa_use_uma   = (atoi(dx12_env_unquote(e)) != 0);
             DX12_LOG_INFO("Auto-tune v%d loaded from cache '%s': Q5_0=%s Q8_0=%s Q6_K=%s F16=%s%s\n", ver,
                           cache_path,
                           q5_0_use_256 ? "256t" : "32t", q8_0_use_256 ? "256t" : "32t",
                           q6k_use_32 ? "32t" : "256t", f16_use_load4 ? "load4" : "load2",
-                          is_uma ? " +UMA(Q5_K=mr FA=uma)" : "");
+                          is_uma ? (std::string(" +UMA(Q5_K=") + (q5k_use_mr ? "mr" : "std") +
+                                     " FA=" + (fa_use_uma ? "uma" : "std") + ")").c_str() : "");
             return;
         }
         fclose(f);
         DX12_LOG_INFO("Auto-tune cache '%s' version mismatch or corrupt — regenerating\n", cache_path);
     }
-
-    // @TODO_SDM: try running auto-tune on UMA anyway.
 
     // UMA fallback (no cache available): use conservative defaults that skip
     // the expensive GPU benchmark. Only override settings where 32t is safe.

@@ -1,4 +1,13 @@
 // mul_mat_q6k_wmma.hlsl - Register-blocked tiled MUL_MAT with Q6_K weights
+//
+// Cooperative dequant: threads cooperatively load Q6_K block metadata (d, scale)
+// once per column, then load ql/qh bytes into shared memory using alignment-safe
+// reads. Dequant from LDS with zero redundant global loads.
+//
+// CRITICAL: Q6_K block_size=210 is NOT 4-byte aligned. All global loads MUST
+// use read_byte_q6k() (which does Load(addr & ~3u) + shift) to avoid
+// ByteAddressBuffer.Load() misalignment.
+//
 // Q6_K block layout: ql[128] + qh[64] + scales[16] + d(f16) = 210 bytes
 // BK=16 aligns with Q6_K scale granularity (16 elements per scale).
 //
@@ -12,52 +21,18 @@
 #define BN 32
 #define BK 16
 
+// Shared memory for cooperative Q6_K dequant
+groupshared uint  raw_ql[BN][16];  // 16 ql bytes per column (stored as uint for LDS efficiency)
+groupshared uint  raw_qh[BN][16];  // 16 qh bytes per column
+groupshared float col_ds[BN];     // d * scale per column
+
+groupshared float tile_a[BM][BK];
+groupshared float tile_b[BK][BN];
+
 uint read_byte_q6k(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
     return (word >> ((byte_off & 3u) * 8u)) & 0xFFu;
 }
-
-int read_sbyte_q6k(ByteAddressBuffer buf, uint byte_off) {
-    uint b = read_byte_q6k(buf, byte_off);
-    return (b < 128) ? (int)b : (int)b - 256;
-}
-
-float dequant_q6k(ByteAddressBuffer buf, uint block_off, uint elem_in_block) {
-    uint ql_off = block_off;
-    uint qh_off = block_off + 128;
-    uint scales_off = block_off + 192;
-    uint d_off = block_off + 208;
-
-    uint d_word = buf.Load(d_off & ~3u);
-    float d = f16_to_f32((d_word >> ((d_off & 2u) * 8u)) & 0xFFFFu);
-
-    uint ip = elem_in_block / 128;
-    uint il = elem_in_block % 128;
-
-    uint is = 8 * ip + il / 16;
-    int scale = read_sbyte_q6k(buf, scales_off + is);
-
-    uint ql_idx = 64 * ip + (il % 64);
-    uint ql_val = read_byte_q6k(buf, ql_off + ql_idx);
-
-    uint qh_val = read_byte_q6k(buf, qh_off + 32 * ip + (il % 32));
-
-    int q;
-    if (il < 32) {
-        q = (int)((ql_val & 0x0Fu) | (((qh_val >> 0) & 3u) << 4)) - 32;
-    } else if (il < 64) {
-        q = (int)((ql_val & 0x0Fu) | (((qh_val >> 2) & 3u) << 4)) - 32;
-    } else if (il < 96) {
-        q = (int)((ql_val >> 4) | (((qh_val >> 4) & 3u) << 4)) - 32;
-    } else {
-        q = (int)((ql_val >> 4) | (((qh_val >> 6) & 3u) << 4)) - 32;
-    }
-
-    return d * (float)scale * (float)q;
-}
-
-groupshared float tile_a[BM][BK];
-groupshared float tile_b[BK][BN];
 
 [numthreads(16, 16, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -102,25 +77,127 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             }
         }
 
-        // Load tile_b: dequantize Q6_K (512 elements, 256 threads, 2 each)
+        // Load tile_b: cooperative Q6_K dequant
+        //
+        // For BK=16, each K-tile maps to 16 consecutive elements within a Q6_K
+        // block. All 16 share the same scale and same d. The 16 ql bytes and
+        // 16 qh bytes are at consecutive (but potentially misaligned) addresses.
+        //
+        // Element mapping (il = elem_in_block % 128, ip = elem_in_block / 128):
+        //   il 0..31:   ql at 64*ip+il,     low nibble, qh at 32*ip+(il%32), shift 0
+        //   il 32..63:  ql at 64*ip+il%64,   low nibble, qh at 32*ip+(il%32), shift 2
+        //   il 64..95:  ql at 64*ip+il%64,   HIGH nibble, qh at 32*ip+(il%32), shift 4
+        //   il 96..127: ql at 64*ip+il%64,   HIGH nibble, qh at 32*ip+(il%32), shift 6
         {
-            uint base = flat_id * 2;
-            [unroll] for (uint e = 0; e < 2; e++) {
-                uint idx = base + e;
-                uint k_local = idx / BN;
-                uint n_local = idx % BN;
-                uint global_k = k_start + k_local;
-                uint global_n = col_block * BN + n_local;
-                float val = 0.0f;
-                if (global_k < K && global_n < ne01) {
-                    uint block_idx = global_k / QK_K;
-                    uint elem_in_block = global_k % QK_K;
+            uint block_idx   = k_start / QK_K;
+            uint elem_in_blk = k_start % QK_K;
+            uint ip       = elem_in_blk / 128;
+            uint il_start = elem_in_blk % 128;
+
+            // Precompute uniform parameters for this tile
+            bool use_ql_high = (il_start >= 64);
+            uint qh_shift;
+            if      (il_start < 32)  qh_shift = 0;
+            else if (il_start < 64)  qh_shift = 2;
+            else if (il_start < 96)  qh_shift = 4;
+            else                     qh_shift = 6;
+
+            // Phase 1a: First 32 threads load d and scale (one per column)
+            if (flat_id < BN) {
+                uint n = flat_id;
+                uint global_n = col_block * BN + n;
+                if (global_n < ne01) {
                     uint row_off = src0_offset + global_n * nb01
                                  + i2_src0 * nb02 + i3_src0 * nb03;
                     uint block_off = row_off + block_idx * Q6K_BLOCK_SIZE;
-                    val = dequant_q6k(src0, block_off, elem_in_block);
+
+                    // d at offset 208 (misaligned -- use safe read)
+                    uint d_off = block_off + 208;
+                    uint d_word = src0.Load(d_off & ~3u);
+                    float d = f16_to_f32((d_word >> ((d_off & 2u) * 8u)) & 0xFFFFu);
+
+                    // scale is signed byte at offset 192 + scale_idx
+                    uint scale_idx = 8 * ip + il_start / 16;
+                    uint sc_off = block_off + 192 + scale_idx;
+                    uint sc_byte = read_byte_q6k(src0, sc_off);
+                    int scale = (sc_byte < 128) ? (int)sc_byte : (int)sc_byte - 256;
+
+                    col_ds[n] = d * (float)scale;
+                } else {
+                    col_ds[n] = 0.0f;
                 }
-                tile_b[k_local][n_local] = val;
+            }
+
+            // Phase 1b: All 256 threads cooperatively load ql and qh bytes
+            // 32 cols × 16 bytes = 512 ql bytes + 512 qh bytes = 1024 total
+            // 256 threads × 4 bytes each = 1024. Load 2 ql + 2 qh per thread.
+            {
+                // First pass: 256 threads load 512 ql bytes (2 per thread)
+                // Thread flat_id loads ql bytes for col (flat_id/16), byte (flat_id%16)
+                // But 256/16 = 16 cols per pass, need 2 passes for 32 cols
+                uint pass_col = flat_id / 16;        // 0..15
+                uint pass_byte = flat_id % 16;       // 0..15
+
+                // Pass 1: columns 0..15
+                {
+                    uint col = pass_col;
+                    uint global_n = col_block * BN + col;
+                    if (global_n < ne01 && k_start < K) {
+                        uint row_off = src0_offset + global_n * nb01
+                                     + i2_src0 * nb02 + i3_src0 * nb03;
+                        uint block_off = row_off + block_idx * Q6K_BLOCK_SIZE;
+                        uint ql_addr = block_off + 64 * ip + (il_start % 64) + pass_byte;
+                        uint qh_addr = block_off + 128 + 32 * ip + (il_start % 32) + pass_byte;
+                        raw_ql[col][pass_byte] = read_byte_q6k(src0, ql_addr);
+                        raw_qh[col][pass_byte] = read_byte_q6k(src0, qh_addr);
+                    } else {
+                        raw_ql[col][pass_byte] = 0;
+                        raw_qh[col][pass_byte] = 0;
+                    }
+                }
+
+                // Pass 2: columns 16..31
+                {
+                    uint col = pass_col + 16;
+                    uint global_n = col_block * BN + col;
+                    if (global_n < ne01 && k_start < K) {
+                        uint row_off = src0_offset + global_n * nb01
+                                     + i2_src0 * nb02 + i3_src0 * nb03;
+                        uint block_off = row_off + block_idx * Q6K_BLOCK_SIZE;
+                        uint ql_addr = block_off + 64 * ip + (il_start % 64) + pass_byte;
+                        uint qh_addr = block_off + 128 + 32 * ip + (il_start % 32) + pass_byte;
+                        raw_ql[col][pass_byte] = read_byte_q6k(src0, ql_addr);
+                        raw_qh[col][pass_byte] = read_byte_q6k(src0, qh_addr);
+                    } else {
+                        raw_ql[col][pass_byte] = 0;
+                        raw_qh[col][pass_byte] = 0;
+                    }
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+
+            // Phase 2: Dequant from shared memory
+            {
+                uint base = flat_id * 2;
+                [unroll] for (uint e = 0; e < 2; e++) {
+                    uint idx = base + e;
+                    uint k_local = idx / BN;
+                    uint n_local = idx % BN;
+
+                    float val = 0.0f;
+                    if ((k_start + k_local) < K && (col_block * BN + n_local) < ne01) {
+                        uint ql_val = raw_ql[n_local][k_local];
+                        uint qh_val = raw_qh[n_local][k_local];
+
+                        uint ql_nibble = use_ql_high ? (ql_val >> 4) : (ql_val & 0x0Fu);
+                        uint qh_bits = (qh_val >> qh_shift) & 3u;
+                        int q = (int)(ql_nibble | (qh_bits << 4)) - 32;
+
+                        val = col_ds[n_local] * (float)q;
+                    }
+                    tile_b[k_local][n_local] = val;
+                }
             }
         }
 
