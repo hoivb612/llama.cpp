@@ -1550,8 +1550,10 @@ extern "C" {
     LLAMA_API void llama_memory_breakdown_print(const struct llama_context * ctx);
 
     LLAMA_API void                           llama_print_tensor_op_perf();
+#ifdef GGML_XBOX_PERF
     LLAMA_API void                           llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t mode);
     LLAMA_API void                           llama_repack_tensor_callgraph(struct ggml_cgraph *cgraph);
+#endif
     LLAMA_API void                           llama_select_OpenMP();
 
     //

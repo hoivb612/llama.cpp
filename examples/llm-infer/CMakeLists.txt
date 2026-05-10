@@ -143,6 +143,7 @@ set(TARGET minslm-cli)
 add_executable(${TARGET} minslm/minslm_cli.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_include_directories(${TARGET} PUBLIC ../../include)
+target_include_directories(${TARGET} PUBLIC ../../ggml/include)
 target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
