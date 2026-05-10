@@ -1589,9 +1589,12 @@ bool llama_model_loader::load_all_data(
             if (strncmp(name, "blk.", 4) == 0) {
                 layer_idx = atoi(name + 4);
             }
-            if (layer_idx >= 0 && !lwm->should_load_layer(layer_idx)) {
-                // Record file location and tensor pointer for on-demand loading
+            if (layer_idx >= 0) {
+                // Record file location for ALL layers (even initially loaded ones)
+                // so they can be evicted and reloaded later during windowing
                 lwm->record_tensor_location(layer_idx, name, weight->idx, weight->offs, n_size, cur);
+            }
+            if (layer_idx >= 0 && !lwm->should_load_layer(layer_idx)) {
 
                 // For mmap: still set up the tensor data pointer so the graph can use it,
                 // but skip mlock (let OS manage page residency via page cache)
@@ -1608,7 +1611,9 @@ bool llama_model_loader::load_all_data(
                         auto & mmap_used = mmaps_used[weight->idx];
                         mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                         mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-                    } else if (cur->data) {
+                    } else if (cur->data && ggml_backend_buffer_is_host(cur->buffer)) {
+                        // Only copy for CPU/host buffers (mmap-backed).
+                        // GPU buffers: ensure_layer_resident will fill via set_tensor later.
                         ggml_backend_tensor_set(cur, data, 0, n_size);
                     }
                 }
@@ -1724,6 +1729,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    // Mark initially loaded layers as resident in the layer window manager
+    if (lwm && lwm->budget_bytes > 0) {
+        lwm->mark_initially_resident();
     }
 
     // Print per-layer weight size summary (gated by GGML_MODEL_LAYERS_STAT)

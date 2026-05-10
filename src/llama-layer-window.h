@@ -42,6 +42,13 @@ struct layer_window_manager {
     size_t   bytes_loaded     = 0;
     size_t   bytes_evicted    = 0;
 
+    // Lifetime counters (accumulated across all passes)
+    int      total_loads      = 0;
+    int      total_evicts     = 0;
+    int      total_passes     = 0;
+    size_t   total_bytes_loaded  = 0;
+    size_t   total_bytes_evicted = 0;
+
     std::vector<layer_window_entry> entries;
 
     // Per-layer tensor info for reload from file
@@ -51,6 +58,7 @@ struct layer_window_manager {
         size_t          file_offset;
         size_t          n_bytes;
         ggml_tensor *   tensor;     // pointer to the tensor (for reload)
+        uint64_t        checksum;   // reference checksum (set during initial load)
     };
     std::map<int, std::vector<tensor_location>> layer_tensors;  // layer_idx -> tensors
 
@@ -77,7 +85,8 @@ struct layer_window_manager {
 
     // Ensure a specific layer is resident (load from mmap if needed)
     // Returns true if layer was loaded (false if already resident)
-    bool ensure_layer_resident(int layer_idx);
+    // When allow_evict=false, loads without evicting (caller handles eviction later)
+    bool ensure_layer_resident(int layer_idx, bool allow_evict = true);
 
     // Evict a layer — release physical pages for mmap (OS reclaims memory)
     void evict_layer(int layer_idx);
@@ -91,8 +100,11 @@ struct layer_window_manager {
     // Reset per-pass stats (call at start of each forward pass)
     void begin_pass();
 
-    // Print per-pass stats (call at end of each forward pass)
+    // Accumulate per-pass stats into lifetime counters (call at end of each forward pass)
     void end_pass();
+
+    // Print lifetime windowing stats summary
+    void print_stats() const;
 
     // Determine layer index from a graph node's source tensors
     // Returns -1 if no layer weight is referenced
@@ -100,6 +112,16 @@ struct layer_window_manager {
 
     // Print summary of windowing configuration
     void print_config() const;
+
+    // Mark initially loaded layers as resident (call after model loading completes)
+    void mark_initially_resident();
+
+    // Release mmap pages to reclaim physical RAM (call after mmap_bases is set)
+    void release_mmap_pages();
+
+    // Compute reference checksums for mmap data integrity verification
+    // Must be called AFTER mmap_bases is populated and BEFORE release_mmap_pages
+    void compute_reference_checksums();
 };
 
 // Eval callback for Phase 4 layer windowing

@@ -18,6 +18,14 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 //
 // llama_context
 //
@@ -3507,6 +3515,26 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    // Print layer windowing / process memory stats
+    layer_window_manager * lwm = llama_get_layer_window_manager();
+    if (lwm) {
+        lwm->print_stats();
+    }
+
+    // Always print process memory (useful for comparing budget vs no-budget)
+#ifdef _WIN32
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc = {};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+            LLAMA_LOG_INFO("process_memory: peak working_set=%.1f MiB, current working_set=%.1f MiB, private=%.1f MiB\n",
+                   pmc.PeakWorkingSetSize / (1024.0 * 1024.0),
+                   pmc.WorkingSetSize / (1024.0 * 1024.0),
+                   pmc.PrivateUsage / (1024.0 * 1024.0));
+        }
+    }
+#endif
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

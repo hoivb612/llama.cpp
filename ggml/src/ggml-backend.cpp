@@ -630,6 +630,71 @@ void * ggml_backend_host_ptr_get_hint(void) {
     return g_host_ptr_hint;
 }
 
+static thread_local size_t g_weight_budget_hint = 0;
+
+void ggml_backend_set_weight_budget_hint(size_t budget_bytes) {
+    g_weight_budget_hint = budget_bytes;
+}
+
+size_t ggml_backend_get_weight_budget_hint(void) {
+    return g_weight_budget_hint;
+}
+
+static ggml_backend_tensor_decommit_fn g_tensor_decommit_fn = nullptr;
+
+void ggml_backend_set_tensor_decommit_fn(ggml_backend_tensor_decommit_fn fn) {
+    g_tensor_decommit_fn = fn;
+}
+
+void ggml_backend_tensor_decommit(struct ggml_tensor * tensor) {
+    if (g_tensor_decommit_fn) {
+        g_tensor_decommit_fn(tensor);
+    }
+}
+
+static ggml_backend_batch_tensor_set_fn g_batch_tensor_set_fn = nullptr;
+
+void ggml_backend_set_batch_tensor_set_fn(ggml_backend_batch_tensor_set_fn fn) {
+    g_batch_tensor_set_fn = fn;
+}
+
+void ggml_backend_batch_tensor_set(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count) {
+    if (g_batch_tensor_set_fn) {
+        g_batch_tensor_set_fn(tensors, data_ptrs, sizes, count);
+    } else {
+        // Fallback: individual uploads
+        for (int i = 0; i < count; i++) {
+            ggml_backend_tensor_set(tensors[i], data_ptrs[i], 0, sizes[i]);
+        }
+    }
+}
+
+static ggml_backend_register_mmap_fn g_register_mmap_fn  = nullptr;
+static void *                        g_register_mmap_ctx = nullptr;
+
+void ggml_backend_set_register_mmap_fn(ggml_backend_register_mmap_fn fn, void * dev_ctx) {
+    g_register_mmap_fn  = fn;
+    g_register_mmap_ctx = dev_ctx;
+}
+
+bool ggml_backend_register_mmap(const void * base, size_t size, void * mapping_handle) {
+    if (g_register_mmap_fn) {
+        return g_register_mmap_fn(base, size, mapping_handle, g_register_mmap_ctx);
+    }
+    return false;
+}
+
+static ggml_backend_get_heap_overflow_fn g_heap_overflow_fn = nullptr;
+
+void ggml_backend_set_heap_overflow_fn(ggml_backend_get_heap_overflow_fn fn) {
+    g_heap_overflow_fn = fn;
+}
+
+uint32_t ggml_backend_get_heap_overflow_count(void) {
+    return g_heap_overflow_fn ? g_heap_overflow_fn() : 0;
+}
+
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
     return device->iface.supports_op(device, op);

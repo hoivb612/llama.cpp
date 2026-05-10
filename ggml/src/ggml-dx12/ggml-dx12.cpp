@@ -2,7 +2,22 @@
 //
 // Implements a GPU compute backend using D3D12, with optional Cooperative Vector
 // acceleration for matrix-vector operations (SM 6.9 / Agility SDK 1.717+).
-
+/*
+Diagnostics environment:
+┌──────────────────────┬──────────────────────────────────────────────────────┬───────────────────────────────────────┐
+│ Env Var              │ What it does                                         │ Isolates                              │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_DIAG         │ Checksum verification of mmap data before GPU upload │ Host-side data corruption             │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_KEEP_MMAP    │ Skip DiscardVirtualMemory after upload               │ OS page reclaim corruption            │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_NO_EVICT     │ Skip all eviction entirely                           │ Eviction path vs. everything else     │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_SOFT_EVICT   │ Bookkeeping only, no tile unmap                      │ Tile decommit vs. subgraph boundaries │
+├──────────────────────┼──────────────────────────────────────────────────────┼───────────────────────────────────────┤
+│ GGML_LW_SOFT_NOUP    │ Skip re-uploads (with SOFT_EVICT)                    │ Graph splitting alone                 │
+└──────────────────────┴──────────────────────────────────────────────────────┴───────────────────────────────────────┘
+*/
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -332,6 +347,9 @@ struct dx12_device {
     bool is_uma = false;
     bool is_cache_coherent_uma = false;
 
+    // Tiled (reserved) resource support — required for layer windowing memory savings
+    D3D12_TILED_RESOURCES_TIER tiled_resource_tier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+
     // WaveMMA (SM 6.9 Wave Matrix) support
     bool wave_mma_supported = false;
     uint32_t wave_mma_K      = 0;     // hardware K dimension (even multiple of 16)
@@ -434,6 +452,99 @@ struct dx12_device {
     std::string name;        // "DX120", "DX121", etc. (for --dev matching)
     std::string description; // GPU name from adapter desc
 
+    // OEHA: mmap regions registered for direct GPU copy (skip staging)
+    struct mmap_heap_entry {
+        const void *           base;
+        size_t                 size;
+        size_t                 prefix;    // alignment padding from base to aligned_base
+        ComPtr<ID3D12Heap>     heap;
+        ComPtr<ID3D12Resource> resource;  // placed resource for CopyBufferRegion
+    };
+    std::vector<mmap_heap_entry> mmap_heaps;
+
+    bool register_mmap_heap(const void * base, size_t size, void * mapping_handle) {
+        // Check if already registered
+        for (auto & e : mmap_heaps) {
+            if (e.base == base) return true;
+        }
+
+        const size_t ALIGNMENT = 64 * 1024;
+        uintptr_t addr         = (uintptr_t)base;
+        uintptr_t aligned_addr = addr & ~(ALIGNMENT - 1);
+        size_t prefix       = addr - aligned_addr;
+        size_t aligned_size = (size + prefix + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+        ComPtr<ID3D12Device3> device3;
+        if (FAILED(device.As(&device3))) return false;
+
+        ComPtr<ID3D12Heap> heap;
+        size_t heap_offset = 0;
+        HRESULT hr;
+
+        // Try file mapping first, fall back to address-based
+        if (mapping_handle) {
+            hr = device3->OpenExistingHeapFromFileMapping((HANDLE)mapping_handle, IID_PPV_ARGS(&heap));
+            if (FAILED(hr)) {
+                DX12_LOG_INFO("register_mmap_heap: OpenExistingHeapFromFileMapping failed (hr=0x%08X)\n", (unsigned)hr);
+            } else {
+                heap_offset = 0;
+            }
+        }
+        if (!heap) {
+            hr = device3->OpenExistingHeapFromAddress((void *)aligned_addr, IID_PPV_ARGS(&heap));
+            if (FAILED(hr)) {
+                // Expected on dGPU — file-mapped memory can't be wrapped as D3D12 heap.
+                // Layer windowing will use the staging upload path (still correct, just slower).
+                DX12_LOG_INFO("register_mmap_heap: OEHA not available (hr=0x%08X) — using staging path\n",
+                              (unsigned)hr);
+                return false;
+            }
+            heap_offset = 0;
+        }
+
+        // Query actual heap size (file mapping heaps may be larger than our mmap)
+        D3D12_HEAP_DESC hd = heap->GetDesc();
+        size_t resource_size = mapping_handle ? hd.SizeInBytes : aligned_size;
+
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width            = resource_size;
+        rd.Height           = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+        ComPtr<ID3D12Resource> resource;
+        hr = device->CreatePlacedResource(heap.Get(), heap_offset, &rd,
+                                           D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&resource));
+        if (FAILED(hr)) {
+            DX12_LOG_WARN("register_mmap_heap: CreatePlacedResource failed (hr=0x%08X, size=%zu)\n",
+                          (unsigned)hr, resource_size);
+            return false;
+        }
+
+        // For file mapping heaps: prefix includes the file offset of our mmap base
+        size_t effective_prefix = mapping_handle ? (size_t)addr : prefix;
+
+        mmap_heaps.push_back({ base, size, effective_prefix, std::move(heap), std::move(resource) });
+        DX12_LOG_INFO("register_mmap_heap: registered %.1f MiB mmap at %p (OEHA %s)\n",
+                      size / (1024.0 * 1024.0), base, mapping_handle ? "file-mapping" : "address");
+        return true;
+    }
+
+    // Find the OEHA mmap entry containing a pointer
+    mmap_heap_entry * find_mmap_entry(const void * ptr) {
+        auto p = (const uint8_t *)ptr;
+        for (auto & e : mmap_heaps) {
+            auto b = (const uint8_t *)e.base;
+            if (p >= b && p < b + e.size) return &e;
+        }
+        return nullptr;
+    }
+
     dx12_device() = default;
     dx12_device(const dx12_device &) = delete;
     dx12_device & operator=(const dx12_device &) = delete;
@@ -458,6 +569,9 @@ struct dx12_device {
 // Buffer context
 // ---------------------------------------------------------------------------
 
+// Global heap overflow counter (summed across all buffer contexts)
+static uint32_t g_dx12_heap_overflow_count = 0;
+
 struct dx12_buffer_context {
     dx12_device *          dev       = nullptr;
     ComPtr<ID3D12Resource> resource;
@@ -467,6 +581,111 @@ struct dx12_buffer_context {
     void *                 host_base = nullptr; // non-null for buffer_from_host_ptr (mmap base)
     size_t                 host_prefix = 0;     // bytes from resource start to host_base (alignment padding)
     ComPtr<ID3D12Heap>     placed_heap;         // heap for buffer_from_host_ptr
+
+    // Reserved resource support (Phase 5c: layer windowing memory savings)
+    bool                   is_reserved = false;  // true if using CreateReservedResource
+    ComPtr<ID3D12Heap>     backing_heap;         // physical memory for reserved resource tiles
+    size_t                 backing_heap_tiles = 0;
+    std::vector<bool>      heap_tile_used;       // bitmap: which heap tiles are in use
+    std::vector<UINT>      resource_to_heap;     // resource_tile -> heap_tile mapping (UINT_MAX = unmapped)
+    std::vector<uint16_t>  tile_refcount;        // per-resource-tile reference count (shared boundary tiles)
+    size_t                 total_resource_tiles = 0;
+    uint32_t               out_of_heap_tiles_count = 0; // count of heap tile exhaustion events
+
+    static constexpr size_t TILE_SIZE = 65536;   // D3D12 tile size for buffers: 64KB
+
+    UINT heap_search_hint = 0; // start position for free tile search
+
+    // Commit a byte range: map resource tiles to heap tiles
+    bool commit_range(size_t offset, size_t byte_size) {
+        if (!is_reserved || byte_size == 0) return true;
+
+        UINT start_tile = (UINT)(offset / TILE_SIZE);
+        UINT end_tile   = (UINT)((offset + byte_size - 1) / TILE_SIZE);
+
+        // Collect tiles that need NEW mappings (refcount was 0)
+        std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords;
+        std::vector<D3D12_TILE_REGION_SIZE> regions;
+        std::vector<UINT> heap_offsets;
+        for (UINT t = start_tile; t <= end_tile; t++) {
+            if (t >= total_resource_tiles) break;
+            tile_refcount[t]++;
+            if (resource_to_heap[t] != UINT_MAX) continue; // already mapped, just bumped refcount
+
+            // Find a free heap tile (start from hint for O(1) amortized)
+            UINT ht = UINT_MAX;
+            for (UINT i = 0; i < (UINT)backing_heap_tiles; i++) {
+                UINT h = (heap_search_hint + i) % (UINT)backing_heap_tiles;
+                if (!heap_tile_used[h]) { ht = h; break; }
+            }
+            if (ht == UINT_MAX) {
+                GGML_ABORT("DX12 heap overflow: no free heap tiles — increase --weight-budget or reduce model size "
+                           "(resource tile %u/%u, heap tiles %d, overflows so far %u)",
+                           t, total_resource_tiles, backing_heap_tiles, g_dx12_heap_overflow_count);
+            }
+            heap_tile_used[ht] = true;
+            heap_search_hint = (ht + 1) % (UINT)backing_heap_tiles;
+            resource_to_heap[t] = ht;
+
+            D3D12_TILED_RESOURCE_COORDINATE coord = {};
+            coord.X = t;
+            coords.push_back(coord);
+            D3D12_TILE_REGION_SIZE region = {};
+            region.NumTiles = 1;
+            regions.push_back(region);
+            heap_offsets.push_back(ht);
+        }
+
+        if (coords.empty()) return true; // all already committed
+
+        // Batch all tile mappings into a single UpdateTileMappings call
+        UINT n = (UINT)coords.size();
+        std::vector<D3D12_TILE_RANGE_FLAGS> flags(n, D3D12_TILE_RANGE_FLAG_NONE);
+        std::vector<UINT> counts(n, 1);
+        dev->compute_queue->UpdateTileMappings(
+            resource.Get(), n, coords.data(), regions.data(),
+            backing_heap.Get(), n, flags.data(), heap_offsets.data(), counts.data(),
+            D3D12_TILE_MAPPING_FLAG_NONE);
+        return true;
+    }
+
+    // Decommit a byte range: decrement refcounts, unmap tiles that reach 0
+    void decommit_range(size_t offset, size_t byte_size) {
+        if (!is_reserved || byte_size == 0) return;
+
+        UINT start_tile = (UINT)(offset / TILE_SIZE);
+        UINT end_tile   = (UINT)((offset + byte_size - 1) / TILE_SIZE);
+
+        std::vector<D3D12_TILED_RESOURCE_COORDINATE> coords;
+        std::vector<D3D12_TILE_REGION_SIZE> regions;
+        for (UINT t = start_tile; t <= end_tile; t++) {
+            if (t >= total_resource_tiles) break;
+            if (tile_refcount[t] == 0) continue;
+            tile_refcount[t]--;
+            if (tile_refcount[t] > 0) continue; // still referenced by adjacent layer
+            if (resource_to_heap[t] == UINT_MAX) continue;
+            heap_tile_used[resource_to_heap[t]] = false;
+            resource_to_heap[t] = UINT_MAX;
+
+            D3D12_TILED_RESOURCE_COORDINATE coord = {};
+            coord.X = t;
+            coords.push_back(coord);
+            D3D12_TILE_REGION_SIZE region = {};
+            region.NumTiles = 1;
+            regions.push_back(region);
+        }
+
+        if (coords.empty()) return;
+
+        // Batch unmap into a single UpdateTileMappings call with NULL flag
+        UINT n = (UINT)coords.size();
+        std::vector<D3D12_TILE_RANGE_FLAGS> flags(n, D3D12_TILE_RANGE_FLAG_NULL);
+        std::vector<UINT> counts(n, 1);
+        dev->compute_queue->UpdateTileMappings(
+            resource.Get(), n, coords.data(), regions.data(),
+            nullptr, n, flags.data(), nullptr, counts.data(),
+            D3D12_TILE_MAPPING_FLAG_NONE);
+    }
 };
 
 static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
@@ -989,6 +1208,15 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
         is_cache_coherent_uma = false;
     }
 
+    // Query tiled resource tier (needed for reserved resources / layer windowing)
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+        HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts));
+        if (SUCCEEDED(hr2)) {
+            tiled_resource_tier = opts.TiledResourcesTier;
+        }
+    }
+
     // UMA memory adjustment: on UMA systems, the GPU can access all system RAM.
     // Report SharedSystemMemory so the model loader puts all layers on GPU.
     if (is_uma && vram_total < (size_t)2 * 1024 * 1024 * 1024) {
@@ -1009,7 +1237,7 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
 
     create_common_root_signature();
 
-    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, Wave: %u-%u, CV: %s, WaveMMA: %s%s, UMA: %s)\n",
+    DX12_LOG_INFO("Device %zu: %s (%s, VRAM: %.1f GB, Wave: %u-%u, CV: %s, WaveMMA: %s%s, UMA: %s, Tiled: T%d)\n",
                   idx, name.c_str(), description.c_str(),
                   (double)vram_total / (1024.0 * 1024.0 * 1024.0),
                   wave_lane_min, wave_lane_max,
@@ -1018,7 +1246,8 @@ void dx12_device::init(ComPtr<IDXCoreAdapter> adapter_, size_t idx) {
                   wave_mma_supported ? (std::string(" K=") + std::to_string(wave_mma_K) +
                                         " wave=" + std::to_string(wave_mma_wave_size) +
                                         (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "",
-                  is_uma ? (is_cache_coherent_uma ? "CC" : "yes") : "no");
+                  is_uma ? (is_cache_coherent_uma ? "CC" : "yes") : "no",
+                  (int)tiled_resource_tier);
 }
 
 void dx12_device::create_common_root_signature() {
@@ -1271,6 +1500,13 @@ static ComPtr<ID3D12Resource> dx12_create_buffer(dx12_device * dev, size_t size,
 // Buffer type interface
 // ---------------------------------------------------------------------------
 
+// Forward declarations for TLS handlers (defined later, needed during buffer alloc)
+static void dx12_tensor_decommit(struct ggml_tensor * tensor);
+static void dx12_batch_tensor_set(struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count);
+static bool dx12_register_mmap(const void * base, size_t size, void * mapping_handle, void * dev_ctx);
+
+static uint32_t dx12_get_heap_overflow_count(void) { return g_dx12_heap_overflow_count; }
+
 static const char * dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return "DX12";
@@ -1285,11 +1521,87 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
     ctx->heap_type = dev->is_cache_coherent_uma ? D3D12_HEAP_TYPE_CUSTOM : D3D12_HEAP_TYPE_DEFAULT;
 
     if (size > 0) {
-        ctx->resource = dx12_create_buffer(dev, size);
-        if (!ctx->resource) {
-            delete ctx;
-            return nullptr;
+        // Check if layer windowing requested a reserved (tiled) resource
+        size_t budget = ggml_backend_get_weight_budget_hint();
+        bool use_reserved = (budget > 0 &&
+                             dev->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2 &&
+                             size > budget);  // only if buffer exceeds budget
+
+        if (use_reserved) {
+            // Create reserved resource: virtual address space only, no physical memory
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width            = std::max<size_t>(size, 256);
+            rd.Height           = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+            HRESULT hr = dev->device->CreateReservedResource(
+                &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ctx->resource));
+
+            if (SUCCEEDED(hr)) {
+                // Create backing heap sized to budget + headroom for transient peak
+                size_t heap_size = budget + 128ULL * 1024 * 1024; // budget + 128 MiB headroom
+                heap_size = (heap_size + dx12_buffer_context::TILE_SIZE - 1) & ~(dx12_buffer_context::TILE_SIZE - 1);
+
+                D3D12_HEAP_PROPERTIES hp = {};
+                if (dev->is_cache_coherent_uma) {
+                    hp.Type                 = D3D12_HEAP_TYPE_CUSTOM;
+                    hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+                    hp.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+                } else {
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                }
+
+                D3D12_HEAP_DESC heap_desc = {};
+                heap_desc.SizeInBytes = heap_size;
+                heap_desc.Properties  = hp;
+                heap_desc.Alignment   = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                heap_desc.Flags       = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+
+                hr = dev->device->CreateHeap(&heap_desc, IID_PPV_ARGS(&ctx->backing_heap));
+                if (SUCCEEDED(hr)) {
+                    ctx->is_reserved = true;
+                    ctx->backing_heap_tiles  = heap_size / dx12_buffer_context::TILE_SIZE;
+                    ctx->total_resource_tiles = (rd.Width + dx12_buffer_context::TILE_SIZE - 1) / dx12_buffer_context::TILE_SIZE;
+                    ctx->heap_tile_used.resize(ctx->backing_heap_tiles, false);
+                    ctx->resource_to_heap.resize(ctx->total_resource_tiles, UINT_MAX);
+                    ctx->tile_refcount.resize(ctx->total_resource_tiles, 0);
+
+                    DX12_LOG_INFO("Reserved resource: %.1f MiB virtual, %.1f MiB heap (%zu tiles), tier %d\n",
+                                  (double)size / (1024.0 * 1024.0),
+                                  (double)heap_size / (1024.0 * 1024.0),
+                                  ctx->backing_heap_tiles,
+                                  (int)dev->tiled_resource_tier);
+                } else {
+                    DX12_LOG_WARN("CreateHeap for reserved resource failed (0x%08X), falling back to committed\n", (unsigned)hr);
+                    ctx->resource.Reset();
+                }
+            } else {
+                DX12_LOG_WARN("CreateReservedResource failed (0x%08X), falling back to committed\n", (unsigned)hr);
+            }
         }
+
+        // Fallback or non-reserved: normal committed resource
+        if (!ctx->resource) {
+            ctx->resource = dx12_create_buffer(dev, size);
+            if (!ctx->resource) {
+                delete ctx;
+                return nullptr;
+            }
+        }
+
+        // Set OEHA and layer-windowing TLS handlers during buffer allocation
+        // (must be set before model loading completes, not just at backend init)
+        if (dev->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
+            ggml_backend_set_tensor_decommit_fn(dx12_tensor_decommit);
+            ggml_backend_set_batch_tensor_set_fn(dx12_batch_tensor_set);
+            ggml_backend_set_heap_overflow_fn(dx12_get_heap_overflow_count);
+        }
+        ggml_backend_set_register_mmap_fn(dx12_register_mmap, (void *)dev);
     }
 
     static const ggml_backend_buffer_i iface = {
@@ -1378,6 +1690,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
 
             // UMA zero-copy: buffer is CPU-writable, write directly
             if (ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+                // Commit tiles for reserved resources before writing
+                if (ctx->is_reserved) {
+                    ctx->commit_range(tensor_offset, size);
+                }
                 void * mapped = nullptr;
                 D3D12_RANGE read_range = { 0, 0 };
                 HRESULT hr = ctx->resource->Map(0, &read_range, &mapped);
@@ -1391,6 +1707,11 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
             // CRITICAL: Ensure compute command list is closed before transfer
             // The scheduler may call set_tensor between graph splits
             // We need all compute work to be submitted first
+
+            // Auto-commit tiles for reserved resources before uploading
+            if (ctx->is_reserved) {
+                ctx->commit_range(tensor_offset, size);
+            }
             
             ctx->dev->init_xfer();
             ctx->dev->xfer_wait(); // wait for any previous transfer
@@ -1579,6 +1900,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
         /* .clear         = */ [](ggml_backend_buffer_t buffer, uint8_t value) {
             auto * ctx = (dx12_buffer_context *)buffer->context;
             if (!ctx->resource || ctx->size == 0) return;
+
+            // Reserved resource: skip clear — no tiles committed yet, data will be
+            // written on demand via set_tensor which auto-commits tiles
+            if (ctx->is_reserved) return;
 
             // buffer_from_host_ptr: direct memset
             if (ctx->host_base) {
@@ -2997,7 +3322,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // AMD RDNA 3 requires full pipeline drains (not just UAV barriers) between
         // the final FFN/norm layers and the vocab projection + logit softcapping.
         // Without these splits, the model head produces NaN due to stale GPU caches.
-        if (cgraph->n_nodes > 1000 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
+        // NOTE: Use a low threshold (50) so this still triggers in small subgraphs
+        // created by the eval callback (layer windowing). The full graph has >1000
+        // nodes but a subgraph containing only the last few layers + model head
+        // may have ~100 nodes. The original threshold of 1000 silently skipped
+        // these CL splits for subgraph views, causing garbled output on Gemma-4.
+        if (cgraph->n_nodes > 50 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
@@ -3820,11 +4150,20 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     // Try OpenExistingHeapFromFileMapping first (works with MapViewOfFile),
     // fall back to OpenExistingHeapFromAddress (works with VirtualAlloc)
     ComPtr<ID3D12Heap> heap;
-    void * file_mapping_handle = ggml_backend_host_ptr_get_hint();
-    if (file_mapping_handle) {
-        hr = device3->OpenExistingHeapFromFileMapping((HANDLE)file_mapping_handle, IID_PPV_ARGS(&heap));
+    size_t heap_offset = 0; // offset within heap for CreatePlacedResource
+    auto * hint = (ggml_backend_host_ptr_hint *)ggml_backend_host_ptr_get_hint();
+    if (hint && hint->mapping_handle) {
+        hr = device3->OpenExistingHeapFromFileMapping((HANDLE)hint->mapping_handle, IID_PPV_ARGS(&heap));
         if (FAILED(hr)) {
             DX12_LOG_WARN("buffer_from_host_ptr: OpenExistingHeapFromFileMapping failed (hr=0x%08X)\n", (unsigned)hr);
+        } else if (hint->mapping_base) {
+            // The heap wraps the ENTIRE file mapping. Compute offset from mapping base
+            // to our aligned address so CreatePlacedResource starts at the right location.
+            uintptr_t mapping_base = (uintptr_t)hint->mapping_base;
+            heap_offset = aligned_addr - mapping_base;
+            // heap_offset must be 64KB-aligned (guaranteed since both are 64KB-aligned)
+            DX12_LOG_INFO("buffer_from_host_ptr: file mapping heap offset = %zu (0x%zX)\n",
+                          heap_offset, heap_offset);
         }
     }
     if (!heap) {
@@ -3834,9 +4173,11 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
                           (unsigned)hr, (void *)aligned_addr, aligned_size);
             return nullptr;
         }
+        heap_offset = 0; // OpenExistingHeapFromAddress starts at aligned_addr
     }
 
-    // Create placed resource in the heap (read-only model weights, but UAV for shader access)
+    // Create placed resource — model weights are read-only (SRV), no UAV needed.
+    // Removing UAV is required for PAGE_READONLY file mappings.
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
     rd.Alignment        = 0;
@@ -3847,10 +4188,10 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     rd.Format           = DXGI_FORMAT_UNKNOWN;
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
 
     ComPtr<ID3D12Resource> resource;
-    hr = d->device->CreatePlacedResource(heap.Get(), 0, &rd,
+    hr = d->device->CreatePlacedResource(heap.Get(), heap_offset, &rd,
                                           D3D12_RESOURCE_STATE_COMMON,
                                           nullptr, IID_PPV_ARGS(&resource));
     if (FAILED(hr)) {
@@ -3930,6 +4271,118 @@ static ggml_backend_buffer_t dx12_dev_buffer_from_host_ptr(ggml_backend_dev_t de
     return ggml_backend_buffer_init(buft, host_ptr_iface, ctx, size);
 }
 
+// Tensor decommit handler for reserved resources (called by layer_window_manager)
+static void dx12_tensor_decommit(struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer) return;
+    auto * ctx = (dx12_buffer_context *)tensor->buffer->context;
+    if (!ctx->is_reserved) return;
+    size_t tensor_offset = dx12_tensor_offset(tensor);
+    ctx->decommit_range(tensor_offset, ggml_nbytes(tensor));
+}
+
+// Batch upload: commit tiles + copy all tensors in one command list + one fence wait
+// Uses OEHA (OpenExistingHeapFromAddress) path when available to skip staging memcpy.
+static void dx12_batch_tensor_set(
+        struct ggml_tensor ** tensors, const void ** data_ptrs, const size_t * sizes, int count) {
+    if (count == 0) return;
+
+    auto * ctx = (dx12_buffer_context *)tensors[0]->buffer->context;
+
+    // UMA paths: just delegate per-tensor (already fast — no GPU copy)
+    if (ctx->host_base || ctx->heap_type == D3D12_HEAP_TYPE_CUSTOM) {
+        for (int i = 0; i < count; i++) {
+            ggml_backend_tensor_set(tensors[i], data_ptrs[i], 0, sizes[i]);
+        }
+        return;
+    }
+
+    g_tls_device = ctx->dev->device.Get();
+
+    // Commit tiles for all tensors (reserved resources)
+    if (ctx->is_reserved) {
+        for (int i = 0; i < count; i++) {
+            size_t offs = dx12_tensor_offset(tensors[i]);
+            ctx->commit_range(offs, sizes[i]);
+        }
+    }
+
+    ctx->dev->init_xfer();
+    ctx->dev->xfer_wait();
+
+    // Check if data comes from a registered OEHA mmap region
+    auto * mmap_entry = ctx->dev->find_mmap_entry(data_ptrs[0]);
+    if (mmap_entry) {
+        // OEHA path: CopyBufferRegion directly from mmap resource — no staging memcpy
+        HRESULT hr = ctx->dev->xfer.cmd_alloc->Reset();
+        DX12_CHECK(hr, "xfer cmd_alloc Reset (OEHA batch)");
+        hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
+        DX12_CHECK(hr, "xfer cmd_list Reset (OEHA batch)");
+
+        for (int i = 0; i < count; i++) {
+            size_t dest_offset = dx12_tensor_offset(tensors[i]);
+            size_t src_offset  = (const uint8_t *)data_ptrs[i] - (const uint8_t *)mmap_entry->base
+                               + mmap_entry->prefix;
+            ctx->dev->xfer.cmd_list->CopyBufferRegion(
+                ctx->resource.Get(), dest_offset,
+                mmap_entry->resource.Get(), src_offset, sizes[i]);
+        }
+        ctx->dev->xfer.cmd_list->Close();
+
+        ID3D12CommandList * lists[] = { ctx->dev->xfer.cmd_list.Get() };
+        ctx->dev->compute_queue->ExecuteCommandLists(1, lists);
+        ctx->dev->xfer.fence_value++;
+        ctx->dev->compute_queue->Signal(ctx->dev->xfer.fence.Get(), ctx->dev->xfer.fence_value);
+        ctx->dev->xfer_wait();
+        return;
+    }
+
+    // Staging path: memcpy to upload heap, then CopyBufferRegion
+    size_t total = 0;
+    for (int i = 0; i < count; i++) total += sizes[i];
+
+    ctx->dev->xfer_ensure_staging(total, 0);
+
+    // Map staging buffer once, copy all tensor data
+    void * mapped = nullptr;
+    D3D12_RANGE read_range = { 0, 0 };
+    HRESULT hr = ctx->dev->xfer.upload_staging->Map(0, &read_range, &mapped);
+    DX12_CHECK(hr, "Map upload staging (batch)");
+    size_t staging_offset = 0;
+    for (int i = 0; i < count; i++) {
+        memcpy((uint8_t *)mapped + staging_offset, data_ptrs[i], sizes[i]);
+        staging_offset += sizes[i];
+    }
+    ctx->dev->xfer.upload_staging->Unmap(0, nullptr);
+
+    // Record all copy commands in one command list
+    hr = ctx->dev->xfer.cmd_alloc->Reset();
+    DX12_CHECK(hr, "xfer cmd_alloc Reset (batch)");
+    hr = ctx->dev->xfer.cmd_list->Reset(ctx->dev->xfer.cmd_alloc.Get(), nullptr);
+    DX12_CHECK(hr, "xfer cmd_list Reset (batch)");
+
+    staging_offset = 0;
+    for (int i = 0; i < count; i++) {
+        size_t dest = dx12_tensor_offset(tensors[i]);
+        ctx->dev->xfer.cmd_list->CopyBufferRegion(
+            ctx->resource.Get(), dest,
+            ctx->dev->xfer.upload_staging.Get(), staging_offset, sizes[i]);
+        staging_offset += sizes[i];
+    }
+    ctx->dev->xfer.cmd_list->Close();
+
+    ID3D12CommandList * lists[] = { ctx->dev->xfer.cmd_list.Get() };
+    ctx->dev->compute_queue->ExecuteCommandLists(1, lists);
+    ctx->dev->xfer.fence_value++;
+    ctx->dev->compute_queue->Signal(ctx->dev->xfer.fence.Get(), ctx->dev->xfer.fence_value);
+    ctx->dev->xfer_wait();
+}
+
+// OEHA mmap registration handler — wraps mmap as D3D12 heap for direct GPU copy
+static bool dx12_register_mmap(const void * base, size_t size, void * mapping_handle, void * dev_ctx) {
+    auto * dev = (dx12_device *)dev_ctx;
+    return dev->register_mmap_heap(base, size, mapping_handle);
+}
+
 static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
     auto * d = (dx12_device *)dev->context;
@@ -3946,6 +4399,17 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
     backend->iface   = dx12_backend_interface;
     backend->device  = dev;
     backend->context = ctx;
+
+    // Register reserved-resource handlers for layer windowing
+    if (d->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
+        ggml_backend_set_tensor_decommit_fn(dx12_tensor_decommit);
+        ggml_backend_set_batch_tensor_set_fn(dx12_batch_tensor_set);
+        ggml_backend_set_heap_overflow_fn(dx12_get_heap_overflow_count);
+    }
+
+    // Register OEHA mmap handler (works for any device that supports ID3D12Device3)
+    ggml_backend_set_register_mmap_fn(dx12_register_mmap, (void *)d);
+
     return backend;
 }
 
