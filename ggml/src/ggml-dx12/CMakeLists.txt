@@ -120,16 +120,24 @@ file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 # List of shaders to compile
 set(DX12_SHADERS
     add
+    sub
     mul
+    div
     scale
     sqr
     sqrt_
+    sin
+    cos
+    exp
+    log
     silu
     gelu
     gelu_quick
+    gelu_erf
     relu
     tanh_
     sigmoid
+    softplus
     rms_norm
     norm
     soft_max
@@ -166,14 +174,11 @@ set(DX12_SHADERS
     mul_mat_vec
     mul_mat_vec_q4k
     mul_mat_vec_q4k_32
-    mul_mat_vec_q4k_mr
     mul_mat_vec_q5k
-    mul_mat_vec_q5k_mr
     mul_mat_vec_q2k
     mul_mat_vec_q3k
     mul_mat_vec_q6k
     mul_mat_vec_q6k_32
-    mul_mat_vec_q6k_mr
     mul_mat_vec_q5_0
     mul_mat_vec_q5_0_256
     mul_mat_vec_q8_0
@@ -206,15 +211,17 @@ foreach(shader_name ${DX12_SHADERS})
     add_custom_command(
         OUTPUT ${shader_hdr}
         COMMAND ${DXC_EXECUTABLE}
-            -T cs_6_0
+            -T cs_6_6
             -E main
             -Fh ${shader_hdr}
             -Vn g_${shader_name}_dxil
             -I ${SHADER_INPUT_DIR}
             -O3
+            -D WAVE_SIZE=64
             ${shader_src}
         DEPENDS ${shader_src} ${SHADER_INPUT_DIR}/ggml_common.hlsli
-        COMMENT "Compiling HLSL shader: ${shader_name}"
+                ${SHADER_INPUT_DIR}/flash_attn.hlsl
+        COMMENT "Compiling HLSL shader: ${shader_name} (wave64)"
     )
     list(APPEND DX12_SHADER_HEADERS ${shader_hdr})
 endforeach()

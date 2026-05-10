@@ -34,6 +34,27 @@ RWByteAddressBuffer dst  : register(u0);
 ByteAddressBuffer   src2 : register(t2);
 ByteAddressBuffer   src3 : register(t3);
 
+// Wave size: compile-time constant when defined via -D WAVE_SIZE=N,
+// otherwise falls back to runtime WaveGetLaneCount().
+// Compile-time constant enables: division->shift, branch elimination,
+// loop unrolling, and dead code removal in wave reduction patterns.
+#ifdef WAVE_SIZE
+#define WARP_SIZE WAVE_SIZE
+#else
+#define WARP_SIZE WaveGetLaneCount()
+#endif
+
+// Pin the wave/subgroup size at PSO creation when supported (cs_6_6+).
+// Without this attribute, the driver is free to pick any supported wave
+// size for the dispatch. Each annotated shader emits this guarded by
+// `WAVE_SIZE <= GROUP_SIZE` because [WaveSize(N)] requires the
+// threadgroup to contain at least one full wave.
+#ifdef WAVE_SIZE
+#define WAVE_SIZE_ATTR [WaveSize(WAVE_SIZE)]
+#else
+#define WAVE_SIZE_ATTR
+#endif
+
 // Helper: load float from ByteAddressBuffer at byte offset
 float load_f32(ByteAddressBuffer buf, uint byte_offset) {
     return asfloat(buf.Load(byte_offset));
@@ -47,6 +68,28 @@ void store_f32(RWByteAddressBuffer buf, uint byte_offset, float val) {
 // Helper: load float from RWByteAddressBuffer at byte offset
 float load_f32_rw(RWByteAddressBuffer buf, uint byte_offset) {
     return asfloat(buf.Load(byte_offset));
+}
+
+// Helper: compute flat thread index for 2D dispatch overflow.
+// When total thread groups > 65535, dispatch splits across group_id.y.
+uint flat_idx_2d(uint3 group_id, uint local_id) {
+    return (group_id.y * 65535u + group_id.x) * 256u + local_id;
+}
+
+// Matvec row-group index. Supports 2D dispatches that exceed the D3D12
+// per-dimension group limit.
+uint group_x_2d(uint3 group_id) {
+    return op15 + group_id.y * 65535u + group_id.x;
+}
+
+// Load fused bias from src2 (when op0 == 1)
+float load_fused_bias(uint row, uint i2, uint i3) {
+    if (op0 != 1u) {
+        return 0.0f;
+    }
+    uint b2 = (op5 > 1u) ? i2 : 0u;
+    uint b3 = (op6 > 1u) ? i3 : 0u;
+    return asfloat(src2.Load(op1 + row * op2 + b2 * op3 + b3 * op4));
 }
 
 // Helper: convert flat index to 4D indices
