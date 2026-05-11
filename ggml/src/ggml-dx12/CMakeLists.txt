@@ -152,6 +152,8 @@ set(DX12_SHADERS
     sum_rows
     dequant_q4_k
     flash_attn
+    flash_attn_64
+    flash_attn_128
     flash_attn_uma
     flash_attn_reduce
     set
@@ -177,10 +179,15 @@ set(DX12_SHADERS
     mul_mat_vec_q4k_mr
     mul_mat_vec_q5k
     mul_mat_vec_q5k_mr
+    mul_mat_vec_q5_0_mr
+    mul_mat_vec_q5_1_mr
     mul_mat_vec_q2k
+    mul_mat_vec_q2k_mr
     mul_mat_vec_q3k
+    mul_mat_vec_q3k_mr
     mul_mat_vec_q6k
     mul_mat_vec_q6k_mr
+    mul_mat_vec_q8_0_mr
     mul_mat_vec_q6k_32
     mul_mat_vec_q5_0
     mul_mat_vec_q5_0_256

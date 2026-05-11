@@ -376,6 +376,11 @@ struct dx12_device {
     // Pipeline cache
     std::mutex pipeline_mutex;
     std::unordered_map<dx12_pipeline_key, dx12_pipeline, dx12_pipeline_key_hash> pipeline_cache;
+    // Fast-path for consecutive repeated pipeline keys.
+    dx12_pipeline_key  last_pipeline_key = {};
+    dx12_pipeline *    last_pipeline_ptr = nullptr;
+    // Cached pipeline for split-KV FA reduction (key is constant).
+    dx12_pipeline *    flash_attn_reduce_pipeline = nullptr;
 
     // Common root signature for most shaders
     ComPtr<ID3D12RootSignature> common_root_sig;
@@ -700,19 +705,28 @@ static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
 // Backend context (stream)
 // ---------------------------------------------------------------------------
 
-static const int CMD_RING_SIZE = 16;
+// Keep in-flight compute submissions bounded.
+// Capacity is fixed at compile time; active size is runtime-tunable.
+static const int CMD_RING_CAPACITY = 16;
+static const int CMD_RING_DEFAULT  = 4;
 
 struct dx12_backend_context {
     dx12_device * dev = nullptr;
 
     // Command allocator ring — multiple allocators so CPU can record while GPU executes
-    ComPtr<ID3D12CommandAllocator>    cmd_allocs[CMD_RING_SIZE];
-    uint64_t                          cmd_alloc_fence[CMD_RING_SIZE] = {}; // fence value when submitted
+    ComPtr<ID3D12CommandAllocator>    cmd_allocs[CMD_RING_CAPACITY];
+    uint64_t                          cmd_alloc_fence[CMD_RING_CAPACITY] = {}; // fence value when submitted
     int                               cmd_ring_head = 0; // next allocator to use
+    int                               cmd_ring_size = CMD_RING_DEFAULT; // active allocator ring size
     ComPtr<ID3D12GraphicsCommandList> cmd_list;
     ComPtr<ID3D12Fence>              fence;
     HANDLE                           fence_event = nullptr;
     uint64_t                         fence_value = 0;
+    // "Almost-ready" fence: an early decode submit marker used to overlap
+    // CPU-side wait setup with the GPU tail of the current graph.
+    uint64_t                         almost_ready_fence = 0;
+    // Previous graph's total MUL_MAT bytes, used to adapt stream-submit sizing.
+    uint64_t                         last_total_mul_mat_bytes = 0;
 
     // Staging buffers for set/get tensor
     ComPtr<ID3D12Resource> upload_staging;
@@ -723,6 +737,19 @@ struct dx12_backend_context {
     // Split-KV flash attention temp buffer
     ComPtr<ID3D12Resource> splitkv_temp;
     size_t                 splitkv_temp_size = 0;
+    // Reuse the hash-set allocation across graph executes.
+    std::unordered_set<uintptr_t> unsynced_writes;
+
+    // Deferred memcpy queue for get_tensor_async.
+    struct deferred_memcpy_t {
+        void *          dst = nullptr;
+        const uint8_t * src = nullptr; // for direct host pointer reads
+        size_t          size = 0;
+        ComPtr<ID3D12Resource> staging; // keeps readback staging alive until synchronize()
+    };
+    std::vector<deferred_memcpy_t> pending_get_memcpys;
+    // Pool of reusable READBACK staging buffers for async readback.
+    std::vector<ComPtr<ID3D12Resource>> async_readback_pool;
 
     bool cmd_list_open = false;
 
@@ -1271,30 +1298,35 @@ void dx12_device::create_common_root_signature() {
     params[1].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[1].Descriptor.ShaderRegister = 0; // t0
     params[1].Descriptor.RegisterSpace  = 0;
+    params[1].Descriptor.Flags          = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     params[1].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
     // Slot 2: src1 SRV (t1)
     params[2].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[2].Descriptor.ShaderRegister = 1; // t1
     params[2].Descriptor.RegisterSpace  = 0;
+    params[2].Descriptor.Flags          = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     params[2].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
     // Slot 3: dst UAV (u0)
     params[3].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[3].Descriptor.ShaderRegister = 0; // u0
     params[3].Descriptor.RegisterSpace  = 0;
+    params[3].Descriptor.Flags          = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     params[3].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
     // Slot 4: src2 SRV (t2)
     params[4].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[4].Descriptor.ShaderRegister = 2; // t2
     params[4].Descriptor.RegisterSpace  = 0;
+    params[4].Descriptor.Flags          = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     params[4].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
     // Slot 5: src3 SRV (t3) — mask for flash attention
     params[5].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[5].Descriptor.ShaderRegister = 3; // t3
     params[5].Descriptor.RegisterSpace  = 0;
+    params[5].Descriptor.Flags          = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
     params[5].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC rsd = {};
@@ -1326,7 +1358,7 @@ void dx12_backend_context::ensure_cmd_list_open() {
     // Pick the next allocator in the ring (safe mode: always use slot 0)
     int slot = dx12_safe_mode ? 0 : cmd_ring_head;
     if (!dx12_safe_mode) {
-        cmd_ring_head = (cmd_ring_head + 1) % CMD_RING_SIZE;
+        cmd_ring_head = (cmd_ring_head + 1) % cmd_ring_size;
     }
 
     // Only wait if THIS allocator's previous submission hasn't finished
@@ -1368,7 +1400,7 @@ void dx12_backend_context::close_and_execute() {
     DX12_CHECK(hr, "Signal fence");
 
     // Record which fence value this allocator was submitted with
-    int submitted_slot = dx12_safe_mode ? 0 : (cmd_ring_head + CMD_RING_SIZE - 1) % CMD_RING_SIZE;
+    int submitted_slot = dx12_safe_mode ? 0 : (cmd_ring_head + cmd_ring_size - 1) % cmd_ring_size;
     cmd_alloc_fence[submitted_slot] = fence_value;
 
     cmd_list_open = false;
@@ -1382,6 +1414,26 @@ void dx12_backend_context::close_and_execute() {
 void dx12_backend_context::wait_for_fence(uint64_t value) {
     if (value == 0) return; // never submitted
     if (fence->GetCompletedValue() >= value) return;
+
+#ifdef _WIN32
+    // Two-stage wait: when the almost-ready fence has already signaled,
+    // briefly spin before falling back to an OS event wait.
+    static const bool spin_disabled = (getenv("DX12_NO_SPIN_WAIT") != nullptr);
+    const bool early_done =
+        almost_ready_fence != 0 && fence->GetCompletedValue() >= almost_ready_fence;
+    if (early_done && !spin_disabled) {
+        LARGE_INTEGER qfreq, t0, tnow;
+        QueryPerformanceFrequency(&qfreq);
+        QueryPerformanceCounter(&t0);
+        const LONGLONG spin_ticks = qfreq.QuadPart / 2000; // 500us
+        for (int spins = 0; spins < 256; spins++) {
+            for (int j = 0; j < 64; j++) YieldProcessor();
+            if (fence->GetCompletedValue() >= value) return;
+            QueryPerformanceCounter(&tnow);
+            if (tnow.QuadPart - t0.QuadPart > spin_ticks) break;
+        }
+    }
+#endif
 
     HRESULT hr = fence->SetEventOnCompletion(value, fence_event);
     DX12_CHECK(hr, "SetEventOnCompletion");
@@ -1397,6 +1449,7 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
 void dx12_backend_context::wait_for_gpu() {
     if (fence_value == 0) return;
     wait_for_fence(fence_value);
+    almost_ready_fence = 0;
     // Verify GPU didn't TDR during execution — device removal signals all fences
     HRESULT removed = dev->device->GetDeviceRemovedReason();
     if (FAILED(removed)) {
@@ -2275,12 +2328,105 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             break;
         }
     }
+
+    // Heuristic model-head risk detector:
+    // Gemma-class models typically have large vocab projection tails (e.g. >= 100k),
+    // which are more sensitive to decode-tail ordering hazards.
+    int64_t tail_vocab_ne0 = 0;
+    {
+        const int tail_start = std::max(0, cgraph->n_nodes - 64);
+        for (int j = tail_start; j < cgraph->n_nodes; ++j) {
+            struct ggml_tensor * n = cgraph->nodes[j];
+            if (!n) continue;
+            if (n->op == GGML_OP_MUL_MAT) {
+                tail_vocab_ne0 = std::max<int64_t>(tail_vocab_ne0, n->ne[0]);
+            }
+        }
+    }
+    const bool has_large_vocab_tail = (tail_vocab_ne0 >= 100000);
+    // Heavy-op preflush policy:
+    // - env override if set
+    // - otherwise enable for large-vocab tails (Gemma-class) to avoid decode TDRs.
+    static bool decode_heavy_preflush_env_init = false;
+    static int  decode_heavy_preflush_env = 0;
+    static bool decode_heavy_preflush_has_env = false;
+    if (!decode_heavy_preflush_env_init) {
+        const char * env = getenv("GGML_DX12_HEAVY_PREFLUSH");
+        if (!env) env = getenv("DX12_HEAVY_PREFLUSH");
+        if (env) {
+            decode_heavy_preflush_env = atoi(env);
+            decode_heavy_preflush_has_env = true;
+        }
+        decode_heavy_preflush_env_init = true;
+    }
+    const int decode_heavy_preflush = decode_heavy_preflush_has_env ? decode_heavy_preflush_env
+                                                                     : (has_large_vocab_tail ? 1 : 0);
+
     if (!is_prompt) gen_graph++;
     // Profile the 3rd-5th actual generation graphs (skip warmup/reserve)
     bool do_profile = profiling && !is_prompt && gen_graph >= 3 && gen_graph <= 5;
     std::map<std::string, double> op_times;
 
     int dispatch_weight = 0;
+    int stream_nodes = 0;  // dispatched-node counter for stream-submit
+    uint64_t mul_mat_bytes = 0;        // accumulated weight bytes since last submit
+    uint64_t total_mul_mat_bytes = 0;  // grand total this graph (saved for next call)
+    int submit_count = 0;              // for cross-graph doubling heuristic
+
+    static bool stream_threshold_env_init = false;
+    static int  stream_threshold_env = 0;
+    static bool stream_threshold_has_env = false;
+    if (!stream_threshold_env_init) {
+        const char * s = getenv("GGML_DX12_STREAM_NODES");
+        if (!s) s = getenv("DX12_STREAM_NODES");
+        if (s) {
+            stream_threshold_env = atoi(s);
+            stream_threshold_has_env = true;
+        }
+        stream_threshold_env_init = true;
+    }
+    int stream_threshold = stream_threshold_has_env ? stream_threshold_env
+                                                    : (has_large_vocab_tail ? 96 : 128);
+    if (stream_threshold != 0 && stream_threshold < 64) {
+        stream_threshold = 64;
+    }
+
+    static bool decode_flush_env_init = false;
+    static int  decode_flush_env = 0;
+    static bool decode_flush_has_env = false;
+    if (!decode_flush_env_init) {
+        const char * s = getenv("GGML_DX12_DECODE_FLUSH");
+        if (!s) s = getenv("DX12_DECODE_FLUSH");
+        if (s) {
+            decode_flush_env = atoi(s);
+            decode_flush_has_env = true;
+        }
+        decode_flush_env_init = true;
+    }
+    const int decode_flush_threshold = decode_flush_has_env ? decode_flush_env
+                                                            : (has_large_vocab_tail ? 36 : 48);
+
+    static const bool stream_bytes_disabled = []() {
+        const char * s = getenv("GGML_DX12_STREAM_BYTES");
+        if (!s) s = getenv("DX12_STREAM_BYTES");
+        return s && atoi(s) == 0;
+    }();
+    uint64_t bytes_per_submit = 0;
+    if (!stream_bytes_disabled && bctx->last_total_mul_mat_bytes > 0) {
+        const uint64_t base_div = has_large_vocab_tail ? 40u : 24u;
+        const uint64_t cap_div  = has_large_vocab_tail ? 8u  : 6u;
+        const uint64_t base = bctx->last_total_mul_mat_bytes / base_div;
+        const uint64_t cap  = std::max<uint64_t>(100u * 1000u * 1000u,
+                                                  bctx->last_total_mul_mat_bytes / cap_div);
+        bytes_per_submit = std::min(cap, base);
+    }
+    auto on_decode_submit = [&]() {
+        dispatch_weight = 0;
+        stream_nodes = 0;
+        mul_mat_bytes = 0;
+        submit_count++;
+        if (submit_count <= 3 && bytes_per_submit > 0) bytes_per_submit *= 2;
+    };
     // TDR prevention: weighted flush threshold for prompt phase only.
     // Uses wait_for_gpu() so must be generous. Default=16 (weighted).
     // Override: GGML_DX12_PROMPT_FLUSH=N (don't confuse with DECODE_FLUSH).
@@ -2291,8 +2437,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (TDR_FLUSH_THRESHOLD <= 0) TDR_FLUSH_THRESHOLD = 16;
     }
 
-    // Track unsynced tensor writes for smart barrier insertion
-    std::unordered_set<uintptr_t> unsynced_writes;
+    // Track unsynced tensor writes for smart barrier insertion.
+    // Reuse allocation across graph executes.
+    std::unordered_set<uintptr_t> & unsynced_writes = bctx->unsynced_writes;
+    unsynced_writes.clear();
 
     static bool dx12_diag = (getenv("GGML_DX12_DIAG") != nullptr);
 
@@ -2445,9 +2593,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 t == GGML_TYPE_Q8_0) {
                 key.flags = 1;
                 if (t == GGML_TYPE_Q4_K && bctx->dev->q4k_use_32) key.flags = 6;  // 32t wave-only
-                // Q4_K/Q5_K/Q6_K: use multi-row matvec (2 rows/group, flag=9)
-                if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K) {
+                // Multi-row matvec (2 rows/group, flag=9) for main quantized decode paths
+                if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K ||
+                    t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q8_0) {
                     key.flags = 9;
+                }
+                // Q2_K multi-row matvec (2 rows/group, flag=19)
+                if (t == GGML_TYPE_Q2_K) {
+                    key.flags = 19;
+                }
+                // Q3_K multi-row matvec (2 rows/group, flag=20)
+                // Keep d3ddk's K>=4096 safety gate.
+                if (t == GGML_TYPE_Q3_K && node->src[0]->ne[0] >= 4096) {
+                    key.flags = 20;
                 }
                 is_matvec_dispatch = true;
             }
@@ -2486,7 +2644,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             uint32_t D = (uint32_t)node->src[0]->ne[0];
             uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
             if (D <= 128 && N_queries == 1 && bctx->dev->fa_use_uma) {
-                key.flags = 2;  // UMA FA (128t)
+                key.flags = 4;  // UMA FA (128t)
             }
         }
 
@@ -2686,7 +2844,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  node->op == GGML_OP_SCALE ||
                                  fused_bias_tensor ||
                                  fused_add_rms_node ||
-                                 (is_matvec_dispatch && key.flags == 9));
+                                 (is_matvec_dispatch && (key.flags == 9 || key.flags == 19 || key.flags == 20)));
         uint32_t num_constants = needs_op_params ? (uint32_t)(sizeof(params) / 4) : BASE_PARAMS;
         bctx->cmd_list->SetComputeRoot32BitConstants(0, num_constants, &params, 0);
 
@@ -2805,8 +2963,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
 
-                    // Chunked dispatch for very large N to prevent TDR
-                    // A single dispatch of 262K+ rows can exceed the Windows TDR timeout
+                    // Chunked dispatch for very large N to prevent oversized single-dispatch kernels.
                     static constexpr uint32_t MATVEC_CHUNK = 32768;
                     bool no_fusions = (!fused_bias_add && !fused_mul_node &&
                                        !fused_add_rms_node && !fused_rope_after_rms && !fused_rope_set_rows);
@@ -2825,7 +2982,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             params.src0_offset = saved_src0_off + cs * params.nb01;
                             params.dst_offset  = saved_dst_off  + cs * params.nb0;
 
-                            bctx->cmd_list->SetComputeRoot32BitConstants(0, BASE_PARAMS, &params, 0);
+                            uint32_t chunk_num_constants = ((key.flags == 9 || key.flags == 19 || key.flags == 20) ?
+                                (uint32_t)(sizeof(params) / 4) : BASE_PARAMS);
+                            if (chunk_num_constants > BASE_PARAMS) {
+                                params.op_params[15] = 0;
+                            }
+                            bctx->cmd_list->SetComputeRoot32BitConstants(0, chunk_num_constants, &params, 0);
 
                             if (dx12_diag && is_prompt) {
                                 int src0t = node->src[0] ? (int)node->src[0]->type : -1;
@@ -2834,13 +2996,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                 fflush(stderr);
                             }
 
-                            uint32_t dispatch_groups = (key.flags == 9) ? (cr + 1) / 2 : cr;
+                            uint32_t dispatch_groups = (key.flags == 9 || key.flags == 19 || key.flags == 20) ? (cr + 1) / 2 : cr;
                             bctx->cmd_list->Dispatch(dispatch_groups, 1, batches);
 
-                            // Flush between chunks for TDR safety
+                            // Submit between chunks to keep command lists bounded,
+                            // but do not hard-wait (d3ddk-style pipelining).
                             if (cs + MATVEC_CHUNK < N) {
                                 bctx->close_and_execute();
-                                bctx->wait_for_gpu();
                                 if (dx12_diag) {
                                     fprintf(stderr, "ggml-dx12: chunk flush OK after [%u..%u]\n", cs, cs + cr);
                                     fflush(stderr);
@@ -2864,13 +3026,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         params.src0_offset = saved_src0_off;
                         params.dst_offset  = saved_dst_off;
 
-                        // Flush after chunked dispatch for decode: the `continue` below
-                        // skips the periodic decode flush, so explicitly drain here.
+                        // Submit after chunked dispatch for decode: the `continue` below
+                        // skips periodic decode flush logic, so account for submit state here.
                         if (!is_prompt) {
                             bctx->close_and_execute();
-                            bctx->wait_for_gpu();
                             bctx->ensure_cmd_list_open();
                             bctx->reset_binding_cache();
+                            on_decode_submit();
                         }
 
                         unsynced_writes.insert((uintptr_t)node);  // no fusions, dst = node
@@ -2880,7 +3042,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
                     // Normal matvec dispatch (N <= MATVEC_CHUNK)
                     uint32_t matvec_row_groups;
-                    if (key.flags == 9) {
+                    if (key.flags == 9 || key.flags == 19 || key.flags == 20) {
                         // Multi-row: 2 rows per group
                         matvec_row_groups = (N + 1) / 2;
                     } else {
@@ -2953,6 +3115,21 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             case GGML_OP_FLASH_ATTN_EXT: {
+                // Small-D variants for non-UMA path:
+                //   D <= 64  -> 64-thread variant
+                //   D <= 128 -> 128-thread variant
+                uint32_t head_dim = (uint32_t)node->src[0]->ne[0];
+                if (key.flags == 0 && head_dim <= 128) {
+                    dx12_pipeline_key small_key = key;
+                    small_key.flags = (head_dim <= 64) ? 2 : 3;
+                    dx12_pipeline * small_pl = bctx->dev->get_or_create_pipeline(small_key);
+                    if (small_pl && small_pl->pso) {
+                        bctx->cmd_list->SetPipelineState(small_pl->pso.Get());
+                        bctx->last_pso = small_pl->pso.Get();
+                        pipeline = small_pl;
+                    }
+                }
+
                 // groups_x encodes query_idx * split_k + split_k_index (split_k precomputed above)
                 uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
                 groups_x = N_queries * fa_split_k;
@@ -3118,11 +3295,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             barrier.UAV.pResource = nullptr;
             bctx->cmd_list->ResourceBarrier(1, &barrier);
 
-            // Get/create reduce pipeline
-            dx12_pipeline_key reduce_key = {};
-            reduce_key.op    = GGML_OP_FLASH_ATTN_EXT;
-            reduce_key.flags = 1; // reduce variant
-            dx12_pipeline * reduce_pipeline = bctx->dev->get_or_create_pipeline(reduce_key);
+            // Get/create reduce pipeline (cached pointer; key is constant)
+            if (!bctx->dev->flash_attn_reduce_pipeline) {
+                dx12_pipeline_key reduce_key = {};
+                reduce_key.op    = GGML_OP_FLASH_ATTN_EXT;
+                reduce_key.flags = 1; // reduce variant
+                bctx->dev->flash_attn_reduce_pipeline = bctx->dev->get_or_create_pipeline(reduce_key);
+            }
+            dx12_pipeline * reduce_pipeline = bctx->dev->flash_attn_reduce_pipeline;
             if (reduce_pipeline && reduce_pipeline->pso) {
                 bctx->cmd_list->SetPipelineState(reduce_pipeline->pso.Get());
                 bctx->last_pso = reduce_pipeline->pso.Get();
@@ -3281,19 +3461,16 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             i += 2;  // skip the VIEW and SET_ROWS nodes
         }
 
-        // Periodic CL flush for decode — isolate heavy ops from lightweight ops.
-        // Heavy ops (MUL_MAT, FA) pre-flush any accumulated lightweight work so
-        // they always start a clean command list.  This prevents Gemma-4 TDR
-        // caused by MUL_MAT sharing a CL with preceding norms/muls/adds.
-        // After dispatch, heavy ops flush immediately (weight >= threshold).
-        // Lightweight ops batch up to threshold dispatches per CL.
-        // Override: GGML_DX12_DECODE_FLUSH=N (0=off).
+        // Decode submit control: weighted flush + streaming submits.
+        // Weighted flush controls safety (TDR avoidance). Stream submits keep
+        // GPU fed without letting a single command list grow too large.
         if (!is_prompt && cgraph->n_nodes > 10) {
-            static int decode_flush_threshold = -1;
-            if (decode_flush_threshold == -1) {
-                const char * env = getenv("GGML_DX12_DECODE_FLUSH");
-                decode_flush_threshold = env ? atoi(env) : 2;
+            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+                uint64_t nb = ggml_nbytes(node->src[0]);
+                mul_mat_bytes += nb;
+                total_mul_mat_bytes += nb;
             }
+
             if (decode_flush_threshold > 0) {
                 uint64_t total_groups = (uint64_t)groups_x * groups_y * groups_z;
                 int weight = 1;
@@ -3309,30 +3486,55 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         weight = 4;
                     }
                     // Pre-flush: drain lightweight ops so heavy op gets a clean CL
-                    if (dispatch_weight > 0) {
+                    if (decode_heavy_preflush && dispatch_weight > 0) {
                         bctx->close_and_execute();
                         bctx->ensure_cmd_list_open();
-                        dispatch_weight = 0;
+                        on_decode_submit();
                     }
                 }
                 dispatch_weight += weight;
                 if (dispatch_weight >= decode_flush_threshold) {
                     bctx->close_and_execute();
                     bctx->ensure_cmd_list_open();
-                    dispatch_weight = 0;
+                    on_decode_submit();
+                } else {
+                    const bool bytes_trigger = (bytes_per_submit > 0 && mul_mat_bytes >= bytes_per_submit);
+                    const bool nodes_trigger = (stream_threshold > 0 && ++stream_nodes >= stream_threshold);
+                    if (bytes_trigger || nodes_trigger) {
+                        bctx->close_and_execute();
+                        bctx->ensure_cmd_list_open();
+                        bctx->reset_binding_cache();
+                        on_decode_submit();
+                    }
                 }
             }
         }
 
-        // Force CL split at every dispatch in model head region for sync.
-        // AMD RDNA 3 requires full pipeline drains (not just UAV barriers) between
-        // the final FFN/norm layers and the vocab projection + logit softcapping.
-        if (cgraph->n_nodes > 50 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
+        // Model-head drain defaults to ON for large-vocab tails (Gemma-class)
+        // and OFF for smaller-vocab tails (e.g. Phi-class), with env override.
+        static bool model_head_drain_env_init = false;
+        static int  model_head_drain_env = 0;
+        static bool model_head_drain_has_env = false;
+        if (!model_head_drain_env_init) {
+            const char * env = getenv("GGML_DX12_MODEL_HEAD_DRAIN");
+            if (!env) env = getenv("DX12_MODEL_HEAD_DRAIN");
+            if (env) {
+                model_head_drain_env = atoi(env);
+                model_head_drain_has_env = true;
+            }
+            model_head_drain_env_init = true;
+        }
+        const int model_head_drain = model_head_drain_has_env ? model_head_drain_env : (has_large_vocab_tail ? 1 : 0);
+        if (model_head_drain && cgraph->n_nodes > 50 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
             bctx->reset_binding_cache();
-            dispatch_weight = 0;
+            if (!is_prompt) {
+                on_decode_submit();
+            } else {
+                dispatch_weight = 0;
+            }
         }
 
         // Per-dispatch NaN isolation: force flush + readback for target range
@@ -3607,7 +3809,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        // Almost-ready fence: for decode, submit early near the tail so the CPU
+        // can overlap fence setup with the GPU's remaining dispatches.
+        static const bool almost_ready_disabled = (getenv("DX12_NO_ALMOST_READY_FENCE") != nullptr);
+        const int almost_ready_remaining = cgraph->n_nodes / 5;
+        if (!almost_ready_disabled &&
+            !is_prompt && bctx->almost_ready_fence == 0 &&
+            cgraph->n_nodes >= 80 &&
+            (cgraph->n_nodes - i) <= almost_ready_remaining &&
+            bctx->cmd_list_open) {
+            bctx->close_and_execute();
+            bctx->almost_ready_fence = bctx->fence_value;
+            bctx->ensure_cmd_list_open();
+            bctx->reset_binding_cache();
+        }
+
     }
+
+    // Save total matmul bytes for next graph's adaptive submit threshold.
+    bctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
 
     // Diagnostic: sync all remaining work before returning
     if (dx12_diag && is_prompt && bctx->cmd_list_open) {
@@ -4017,21 +4237,186 @@ static void dx12_backend_free(ggml_backend_t backend) {
 static void dx12_backend_synchronize(ggml_backend_t backend) {
     auto * ctx = (dx12_backend_context *)backend->context;
 
-    // Submit pending work. The wait happens in get_tensor when data is actually needed.
-    // This allows GPU to run asynchronously with CPU graph planning.
+    // Submit pending work first.
     if (ctx->cmd_list_open) {
         ctx->close_and_execute();
     }
+
+    // synchronize() must guarantee all submitted GPU work has completed.
+    ctx->wait_for_fence(ctx->fence_value);
+    ctx->almost_ready_fence = 0;
+
+    // Flush deferred async readbacks.
+    for (auto & m : ctx->pending_get_memcpys) {
+        if (m.staging) {
+            void * mapped = nullptr;
+            D3D12_RANGE rr = { 0, m.size };
+            HRESULT hr = m.staging->Map(0, &rr, &mapped);
+            if (SUCCEEDED(hr) && mapped) {
+                memcpy(m.dst, mapped, m.size);
+                D3D12_RANGE wr = { 0, 0 };
+                m.staging->Unmap(0, &wr);
+            }
+            ctx->async_readback_pool.push_back(std::move(m.staging));
+        } else {
+            memcpy(m.dst, m.src, m.size);
+        }
+    }
+    ctx->pending_get_memcpys.clear();
+}
+
+static void dx12_backend_set_tensor_async(ggml_backend_t backend,
+                                          ggml_tensor * tensor,
+                                          const void * data,
+                                          size_t offset, size_t size) {
+    GGML_UNUSED(backend);
+    // Do not force backend-wide synchronization before upload.
+    ggml_backend_tensor_set(tensor, data, offset, size);
+}
+
+static void async_alloc_readback_staging(dx12_backend_context * ctx,
+                                         size_t size,
+                                         ComPtr<ID3D12Resource> & out) {
+    // Reuse pooled staging buffer if large enough.
+    for (auto it = ctx->async_readback_pool.begin(); it != ctx->async_readback_pool.end(); ++it) {
+        D3D12_RESOURCE_DESC d = (*it)->GetDesc();
+        if (d.Width >= size) {
+            out = std::move(*it);
+            ctx->async_readback_pool.erase(it);
+            return;
+        }
+    }
+
+    // Allocate a READBACK buffer, rounded to 64KB.
+    size_t alloc = (size + 0xFFFF) & ~(size_t)0xFFFF;
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = alloc; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    HRESULT hr = ctx->dev->device->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(&out));
+    DX12_CHECK(hr, "CreateCommittedResource(async readback staging)");
+}
+
+static void dx12_backend_get_tensor_async(ggml_backend_t backend,
+                                          const ggml_tensor * tensor,
+                                          void * data,
+                                          size_t offset, size_t size) {
+    auto * ctx = (dx12_backend_context *)backend->context;
+    if (size == 0) return;
+
+    GGML_ASSERT(tensor->buffer && "get_tensor_async on tensor without buffer");
+    auto * buf_ctx = (dx12_buffer_context *)tensor->buffer->context;
+    GGML_ASSERT(buf_ctx && "get_tensor_async on tensor without dx12 buffer context");
+    size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
+
+    // Host-backed buffers can defer a direct memcpy.
+    if (buf_ctx->host_base) {
+        dx12_backend_context::deferred_memcpy_t m;
+        m.dst  = data;
+        m.src  = (const uint8_t *)tensor->data + offset;
+        m.size = size;
+        ctx->pending_get_memcpys.push_back(std::move(m));
+        return;
+    }
+
+    // Queue a readback copy to per-call staging, memcpy deferred to synchronize().
+    GGML_ASSERT(buf_ctx->resource && "get_tensor_async source has no GPU resource");
+    ComPtr<ID3D12Resource> staging;
+    async_alloc_readback_staging(ctx, size, staging);
+
+    // Keep copy in a fresh list to avoid UAV->copy state issues on some drivers.
+    if (ctx->cmd_list_open) {
+        ctx->close_and_execute();
+    }
+    ctx->ensure_cmd_list_open();
+    ctx->cmd_list->CopyBufferRegion(staging.Get(), 0,
+                                    buf_ctx->resource.Get(), tensor_offset, size);
+
+    dx12_backend_context::deferred_memcpy_t m;
+    m.dst     = data;
+    m.src     = nullptr;
+    m.size    = size;
+    m.staging = std::move(staging);
+    ctx->pending_get_memcpys.push_back(std::move(m));
+}
+
+static bool dx12_backend_cpy_tensor_async(ggml_backend_t backend_src,
+                                          ggml_backend_t backend_dst,
+                                          const ggml_tensor * src,
+                                          ggml_tensor * dst) {
+    if (!ggml_backend_is_dx12(backend_src) || !ggml_backend_is_dx12(backend_dst)) {
+        return false;
+    }
+
+    auto * src_backend_ctx = (dx12_backend_context *)backend_src->context;
+    auto * dst_backend_ctx = (dx12_backend_context *)backend_dst->context;
+    if (src_backend_ctx->dev != dst_backend_ctx->dev) {
+        return false;
+    }
+
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!src_buf || !dst_buf) {
+        return false;
+    }
+
+    auto * src_buf_ctx = (dx12_buffer_context *)src_buf->context;
+    auto * dst_buf_ctx = (dx12_buffer_context *)dst_buf->context;
+    if (!src_buf_ctx || !dst_buf_ctx) {
+        return false;
+    }
+
+    const size_t copy_size = ggml_nbytes(src);
+    if (copy_size == 0) {
+        return true;
+    }
+
+    // For host-backed source tensors, queue through set_tensor_async path.
+    if (src_buf_ctx->host_base) {
+        dx12_backend_set_tensor_async(backend_dst, dst, src->data, 0, copy_size);
+        return true;
+    }
+
+    if (!src_buf_ctx->resource || !dst_buf_ctx->resource) {
+        return false;
+    }
+
+    // Preserve source command ordering before issuing the destination copy.
+    if (backend_src != backend_dst && src_backend_ctx->cmd_list_open) {
+        src_backend_ctx->close_and_execute();
+    }
+
+    const size_t src_offset = dx12_tensor_offset(src);
+    const size_t dst_offset = dx12_tensor_offset(dst);
+
+    // Reserved destinations require tile commitment before GPU writes.
+    if (dst_buf_ctx->is_reserved) {
+        dst_buf_ctx->commit_range(dst_offset, copy_size);
+    }
+
+    dst_backend_ctx->ensure_cmd_list_open();
+    dst_backend_ctx->cmd_list->CopyBufferRegion(
+        dst_buf_ctx->resource.Get(), dst_offset,
+        src_buf_ctx->resource.Get(), src_offset,
+        copy_size);
+
+    return true;
 }
 
 static const ggml_backend_i dx12_backend_interface = {
     /* .get_name            = */ dx12_backend_get_name,
     /* .free                = */ dx12_backend_free,
-    /* .set_tensor_async    = */ nullptr,
-    /* .get_tensor_async    = */ nullptr,
+    /* .set_tensor_async    = */ dx12_backend_set_tensor_async,
+    /* .get_tensor_async    = */ dx12_backend_get_tensor_async,
     /* .set_tensor_2d_async = */ nullptr,
     /* .get_tensor_2d_async = */ nullptr,
-    /* .cpy_tensor_async    = */ nullptr,
+    /* .cpy_tensor_async    = */ dx12_backend_cpy_tensor_async,
     /* .synchronize         = */ dx12_backend_synchronize,
     /* .graph_plan_create   = */ nullptr,
     /* .graph_plan_free     = */ nullptr,
@@ -4380,6 +4765,19 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
 
     auto * ctx = new dx12_backend_context();
     ctx->dev = d;
+    {
+        // Runtime-tunable command allocator ring depth.
+        // On UMA, default to 8 to keep CPU further ahead without jumping to 16.
+        int ring_size = d->is_uma ? 8 : CMD_RING_DEFAULT;
+        const char * env = getenv("GGML_DX12_CMD_RING");
+        if (!env) env = getenv("DX12_CMD_RING");
+        if (env) ring_size = atoi(env);
+        if (ring_size < 1) ring_size = 1;
+        if (ring_size > CMD_RING_CAPACITY) ring_size = CMD_RING_CAPACITY;
+        ctx->cmd_ring_size = dx12_safe_mode ? 1 : ring_size;
+        DX12_LOG_INFO("DX12 command ring size: %d (capacity=%d)\n",
+                      ctx->cmd_ring_size, CMD_RING_CAPACITY);
+    }
 
     HRESULT hr = d->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence));
     DX12_CHECK(hr, "CreateFence");
@@ -4555,11 +4953,18 @@ static const std::unordered_map<int, dx12_shader_blob> g_unary_shader_blobs = {
 // ---------------------------------------------------------------------------
 
 dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & key) {
+    // Fast path: skip mutex + map lookup for repeated pipeline keys.
+    if (key == last_pipeline_key && last_pipeline_ptr) {
+        return last_pipeline_ptr;
+    }
+
     std::lock_guard<std::mutex> lock(pipeline_mutex);
 
     auto it = pipeline_cache.find(key);
     if (it != pipeline_cache.end()) {
-        return &it->second;
+        last_pipeline_key = key;
+        last_pipeline_ptr = &it->second;
+        return last_pipeline_ptr;
     }
 
 #ifdef GGML_DX12_SHADERS_COMPILED
@@ -4592,7 +4997,15 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         static const dx12_shader_blob reduce_blob = { g_flash_attn_reduce_dxil, sizeof(g_flash_attn_reduce_dxil) };
         blob = &reduce_blob;
     } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 2) {
-        // UMA-optimized FA (GROUP_SIZE=128, TILE_KV=128, D≤128)
+        // Small-D FA variant (GROUP_SIZE=64, TILE_KV=64, D<=64)
+        static const dx12_shader_blob fa64_blob = { g_flash_attn_64_dxil, sizeof(g_flash_attn_64_dxil) };
+        blob = &fa64_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 3) {
+        // Mid-D FA variant (GROUP_SIZE=128, TILE_KV=128, D<=128)
+        static const dx12_shader_blob fa128_blob = { g_flash_attn_128_dxil, sizeof(g_flash_attn_128_dxil) };
+        blob = &fa128_blob;
+    } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 4) {
+        // UMA-optimized FA (GROUP_SIZE=128, TILE_KV=128, D<=128)
         static const dx12_shader_blob uma_blob = { g_flash_attn_uma_dxil, sizeof(g_flash_attn_uma_dxil) };
         blob = &uma_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 4) {
@@ -4628,7 +5041,24 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         } else if (key.src0_type == GGML_TYPE_Q6_K) {
             static const dx12_shader_blob mv_q6k_mr_blob = { g_mul_mat_vec_q6k_mr_dxil, sizeof(g_mul_mat_vec_q6k_mr_dxil) };
             blob = &mv_q6k_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q8_0) {
+            static const dx12_shader_blob mv_q80_mr_blob = { g_mul_mat_vec_q8_0_mr_dxil, sizeof(g_mul_mat_vec_q8_0_mr_dxil) };
+            blob = &mv_q80_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q5_0) {
+            static const dx12_shader_blob mv_q50_mr_blob = { g_mul_mat_vec_q5_0_mr_dxil, sizeof(g_mul_mat_vec_q5_0_mr_dxil) };
+            blob = &mv_q50_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q5_1) {
+            static const dx12_shader_blob mv_q51_mr_blob = { g_mul_mat_vec_q5_1_mr_dxil, sizeof(g_mul_mat_vec_q5_1_mr_dxil) };
+            blob = &mv_q51_mr_blob;
         }
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 19) {
+        // Q2_K multi-row matvec (2 rows/group, 256 threads)
+        static const dx12_shader_blob mv_q2k_mr_blob = { g_mul_mat_vec_q2k_mr_dxil, sizeof(g_mul_mat_vec_q2k_mr_dxil) };
+        blob = &mv_q2k_mr_blob;
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 20) {
+        // Q3_K multi-row matvec (2 rows/group, 256 threads)
+        static const dx12_shader_blob mv_q3k_mr_blob = { g_mul_mat_vec_q3k_mr_dxil, sizeof(g_mul_mat_vec_q3k_mr_dxil) };
+        blob = &mv_q3k_mr_blob;
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 1) {
         // Matvec path (M=1 single-token generation)
         if (key.src0_type == GGML_TYPE_Q2_K) {
@@ -4775,7 +5205,9 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
 
     pipeline.root_sig = common_root_sig;
     pipeline_cache[key] = std::move(pipeline);
-    return &pipeline_cache[key];
+    last_pipeline_key = key;
+    last_pipeline_ptr = &pipeline_cache[key];
+    return last_pipeline_ptr;
 #else
     DX12_LOG_WARN("Shaders not compiled - op %d unavailable\n", key.op);
     pipeline_cache[key] = {};
