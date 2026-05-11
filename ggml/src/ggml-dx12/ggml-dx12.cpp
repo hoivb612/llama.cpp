@@ -2432,7 +2432,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (node->op == GGML_OP_UNARY) {
             key.flags = (uint32_t)ggml_get_unary_op(node);
         }
-        // For MUL_MAT with M=1, use matvec pipeline (flags=1, or flags=5 for 256-thread auto-tuned)
+        // For MUL_MAT with M=1, use matvec pipeline (flags=1, or flags=9 for multi-row)
         // Only for types that have matvec shaders
         bool is_matvec_dispatch = false;
         if (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->src[0]) {
@@ -2445,6 +2445,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 t == GGML_TYPE_Q8_0) {
                 key.flags = 1;
                 if (t == GGML_TYPE_Q4_K && bctx->dev->q4k_use_32) key.flags = 6;  // 32t wave-only
+                // Q4_K/Q5_K/Q6_K: use multi-row matvec (2 rows/group, flag=9)
+                if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K) {
+                    key.flags = 9;
+                }
                 is_matvec_dispatch = true;
             }
         }
@@ -2494,6 +2498,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // Set pipeline state — skip if unchanged from previous dispatch
         ID3D12RootSignature * root_sig = bctx->dev->common_root_sig.Get();
+        // DEBUG: force re-bind everything (disable binding cache) to test if
+        // the cache causes TDR on Gemma-4 with flush > 1
+        static bool no_cache = (getenv("GGML_DX12_NO_BIND_CACHE") != nullptr);
+        if (no_cache) bctx->reset_binding_cache();
         if (root_sig != bctx->last_root_sig) {
             bctx->cmd_list->SetComputeRootSignature(root_sig);
             bctx->last_root_sig = root_sig;
@@ -2504,7 +2512,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         // Set root constants (shader params)
-        dx12_shader_params params;
+        dx12_shader_params params = {};
         if (fused_add_rms_node) {
             // Triple fusion: ADD + RMS_NORM + MUL
             // node = ADD, fused_rms_node = RMS_NORM, fused_mul_node = MUL
@@ -2566,6 +2574,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (fused_bias_tensor) {
             params.op_params[0] = 1;  // bias fusion flag
             params.op_params[1] = (uint32_t)dx12_tensor_offset(fused_bias_tensor);  // bias byte offset
+            params.op_params[2] = (uint32_t)fused_bias_tensor->nb[0];  // bias stride (bytes per element)
+            params.op_params[3] = (uint32_t)fused_bias_tensor->nb[2];  // bias nb2
+            params.op_params[4] = (uint32_t)fused_bias_tensor->nb[3];  // bias nb3
+            params.op_params[5] = (uint32_t)fused_bias_tensor->ne[2];  // bias ne2
+            params.op_params[6] = (uint32_t)fused_bias_tensor->ne[3];  // bias ne3
             // Use ADD's output as destination
             params.dst_offset = (uint32_t)dx12_tensor_offset(fused_bias_add);
         }
@@ -2672,7 +2685,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  node->op == GGML_OP_GLU ||
                                  node->op == GGML_OP_SCALE ||
                                  fused_bias_tensor ||
-                                 fused_add_rms_node);
+                                 fused_add_rms_node ||
+                                 (is_matvec_dispatch && key.flags == 9));
         uint32_t num_constants = needs_op_params ? (uint32_t)(sizeof(params) / 4) : BASE_PARAMS;
         bctx->cmd_list->SetComputeRoot32BitConstants(0, num_constants, &params, 0);
 
@@ -2820,7 +2834,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                 fflush(stderr);
                             }
 
-                            bctx->cmd_list->Dispatch(cr, 1, batches);
+                            uint32_t dispatch_groups = (key.flags == 9) ? (cr + 1) / 2 : cr;
+                            bctx->cmd_list->Dispatch(dispatch_groups, 1, batches);
 
                             // Flush between chunks for TDR safety
                             if (cs + MATVEC_CHUNK < N) {
@@ -2864,7 +2879,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
 
                     // Normal matvec dispatch (N <= MATVEC_CHUNK)
-                    groups_x = N;
+                    uint32_t matvec_row_groups;
+                    if (key.flags == 9) {
+                        // Multi-row: 2 rows per group
+                        matvec_row_groups = (N + 1) / 2;
+                    } else {
+                        matvec_row_groups = N;
+                    }
+                    groups_x = matvec_row_groups;
                     // D3D12 dispatch limit: 65535 per axis
                     // Linearize into 2D: shader computes row = gid.y * 65535 + gid.x
                     if (groups_x > 65535) {
@@ -2939,8 +2961,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             case GGML_OP_SET_ROWS: {
-                // 2D dispatch to handle tensors exceeding 65535 groups in X
-                uint32_t total_elements = (uint32_t)(ggml_nelements(node));
+                // Dispatch based on SOURCE elements (new rows), not destination (full KV cache).
+                // The shader bounds-checks with ne00*ne01*ne02*ne03 (src0 dims),
+                // so dispatching dst elements wastes up to 4096x thread groups.
+                uint32_t total_elements = (uint32_t)(ggml_nelements(node->src[0]));
                 uint32_t total_groups = (total_elements + 255) / 256;
                 if (total_groups <= 65535) {
                     groups_x = total_groups;
@@ -3257,24 +3281,44 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             i += 2;  // skip the VIEW and SET_ROWS nodes
         }
 
-        // Periodic CL flush for decode (M=1) to prevent stale GPU caches
-        // on AMD RDNA 3.  Required for models like Gemma-4.
-        // Default: flush after every dispatch (interval=1).
-        // Override: GGML_DX12_DECODE_FLUSH=N (0=off, 4-10=good for Phi-3).
-        // Prompt phase does NOT flush — no correctness issue and flush
-        // causes ~24% prompt throughput regression.
+        // Periodic CL flush for decode — isolate heavy ops from lightweight ops.
+        // Heavy ops (MUL_MAT, FA) pre-flush any accumulated lightweight work so
+        // they always start a clean command list.  This prevents Gemma-4 TDR
+        // caused by MUL_MAT sharing a CL with preceding norms/muls/adds.
+        // After dispatch, heavy ops flush immediately (weight >= threshold).
+        // Lightweight ops batch up to threshold dispatches per CL.
+        // Override: GGML_DX12_DECODE_FLUSH=N (0=off).
         if (!is_prompt && cgraph->n_nodes > 10) {
-            static int decode_flush_interval = -1;
-            if (decode_flush_interval == -1) {
+            static int decode_flush_threshold = -1;
+            if (decode_flush_threshold == -1) {
                 const char * env = getenv("GGML_DX12_DECODE_FLUSH");
-                decode_flush_interval = env ? atoi(env) : 1;
+                decode_flush_threshold = env ? atoi(env) : 2;
             }
-            if (decode_flush_interval > 0) {
-                dispatch_weight++;
-                if (dispatch_weight >= decode_flush_interval) {
+            if (decode_flush_threshold > 0) {
+                uint64_t total_groups = (uint64_t)groups_x * groups_y * groups_z;
+                int weight = 1;
+                bool is_heavy = (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_FLASH_ATTN_EXT);
+                if (is_heavy) {
+                    if (total_groups >= 8000) weight = 16;
+                    else if (total_groups >= 1000) weight = 4;
+                    else weight = 2;
+                    // FA workload scales with KV cache length, not thread groups.
+                    // Few groups (num_heads) but each reads the full KV sequence.
+                    // Force weight=4 so FA always post-flushes immediately.
+                    if (node->op == GGML_OP_FLASH_ATTN_EXT && weight < 4) {
+                        weight = 4;
+                    }
+                    // Pre-flush: drain lightweight ops so heavy op gets a clean CL
+                    if (dispatch_weight > 0) {
+                        bctx->close_and_execute();
+                        bctx->ensure_cmd_list_open();
+                        dispatch_weight = 0;
+                    }
+                }
+                dispatch_weight += weight;
+                if (dispatch_weight >= decode_flush_threshold) {
                     bctx->close_and_execute();
                     bctx->ensure_cmd_list_open();
-                    unsynced_writes.clear();
                     dispatch_weight = 0;
                 }
             }
@@ -3288,7 +3332,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
             bctx->reset_binding_cache();
-            unsynced_writes.clear();
             dispatch_weight = 0;
         }
 
@@ -3350,7 +3393,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 bctx->ensure_cmd_list_open();
                 bctx->reset_binding_cache();
-                unsynced_writes.clear();
                 dispatch_weight = 0;
             }
         }
@@ -3436,7 +3478,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 bctx->wait_for_gpu();
                 bctx->ensure_cmd_list_open();
                 bctx->reset_binding_cache();
-                unsynced_writes.clear();
                 if (trace_prompt) {
                     HRESULT dev_stat = bctx->dev->device->GetDeviceRemovedReason();
                     if (FAILED(dev_stat)) {
@@ -4575,6 +4616,18 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         if (key.src0_type == GGML_TYPE_Q4_K) {
             static const dx12_shader_blob mv_q4k_32_blob = { g_mul_mat_vec_q4k_32_dxil, sizeof(g_mul_mat_vec_q4k_32_dxil) };
             blob = &mv_q4k_32_blob;
+        }
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 9) {
+        // Multi-row matvec (2 rows/group, 256 threads)
+        if (key.src0_type == GGML_TYPE_Q4_K) {
+            static const dx12_shader_blob mv_q4k_mr_blob = { g_mul_mat_vec_q4k_mr_dxil, sizeof(g_mul_mat_vec_q4k_mr_dxil) };
+            blob = &mv_q4k_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q5_K) {
+            static const dx12_shader_blob mv_q5k_mr_blob = { g_mul_mat_vec_q5k_mr_dxil, sizeof(g_mul_mat_vec_q5k_mr_dxil) };
+            blob = &mv_q5k_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q6_K) {
+            static const dx12_shader_blob mv_q6k_mr_blob = { g_mul_mat_vec_q6k_mr_dxil, sizeof(g_mul_mat_vec_q6k_mr_dxil) };
+            blob = &mv_q6k_mr_blob;
         }
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 1) {
         // Matvec path (M=1 single-token generation)

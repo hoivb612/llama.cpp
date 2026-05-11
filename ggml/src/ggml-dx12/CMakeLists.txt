@@ -174,10 +174,13 @@ set(DX12_SHADERS
     mul_mat_vec
     mul_mat_vec_q4k
     mul_mat_vec_q4k_32
+    mul_mat_vec_q4k_mr
     mul_mat_vec_q5k
+    mul_mat_vec_q5k_mr
     mul_mat_vec_q2k
     mul_mat_vec_q3k
     mul_mat_vec_q6k
+    mul_mat_vec_q6k_mr
     mul_mat_vec_q6k_32
     mul_mat_vec_q5_0
     mul_mat_vec_q5_0_256

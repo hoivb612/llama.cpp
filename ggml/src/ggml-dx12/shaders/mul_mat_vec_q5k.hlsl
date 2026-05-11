@@ -220,12 +220,12 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
 
     uint num_waves = GROUP_SIZE / WaveGetLaneCount();
-    if (tid < num_waves) {
-        float v = shared_acc[tid];
-        v = WaveActiveSum(v);
-        if (tid == 0) shared_acc[0] = v;
+    for (uint s = num_waves / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_acc[tid] += shared_acc[tid + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
-    GroupMemoryBarrierWithGroupSync();
 
     if (tid == 0) {
         float result = shared_acc[0];
