@@ -8,7 +8,15 @@
 //   offset 6: qs[16] (uint8) -- low 4 bits, packed pairs
 //
 // Dispatch: groups_x = ceil(N/32), groups_y = ceil(M/32), groups_z = ne2*ne3
+//
+// Build variants: see mul_mat_q4k_wmma.hlsl for the USE_F16_TILE story.
 #include "ggml_common.hlsli"
+
+#ifdef USE_F16_TILE
+typedef float16_t tile_t;
+#else
+typedef float     tile_t;
+#endif
 
 #define QK5_0 32
 #define Q5_0_BSIZE 22
@@ -72,8 +80,8 @@ float dequant_q5_0(ByteAddressBuffer buf, uint block_off, uint elem_in_block) {
     }
 }
 
-groupshared float tile_a[BM][BK]; // src1: batch x K
-groupshared float tile_b[BK][BN]; // src0: K x output features (dequantized)
+groupshared tile_t tile_a[BM][BK]; // src1: batch x K
+groupshared tile_t tile_b[BK][BN]; // src0: K x output features (dequantized)
 
 [numthreads(16, 16, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -114,7 +122,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                                          nb10, nb11, nb12, nb13, src1_offset);
                     val = load_auto(src1, off, src1_esize);
                 }
-                tile_a[m_local][k_local] = val;
+                tile_a[m_local][k_local] = (tile_t)val;
             }
         }
 
@@ -137,7 +145,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                     uint block_off = row_off + block_idx * Q5_0_BSIZE;
                     val = dequant_q5_0(src0, block_off, elem_in_block);
                 }
-                tile_b[k_local][n_local] = val;
+                tile_b[k_local][n_local] = (tile_t)val;
             }
         }
 
@@ -146,14 +154,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // 2x2 register-blocked accumulation from shared memory
         [unroll]
         for (uint k = 0; k < BK; k++) {
-            float a0 = tile_a[ty * 2    ][k];
-            float a1 = tile_a[ty * 2 + 1][k];
-            float b0 = tile_b[k][tx * 2    ];
-            float b1 = tile_b[k][tx * 2 + 1];
-            acc00 += a0 * b0;
-            acc01 += a0 * b1;
-            acc10 += a1 * b0;
-            acc11 += a1 * b1;
+            tile_t a0 = tile_a[ty * 2    ][k];
+            tile_t a1 = tile_a[ty * 2 + 1][k];
+            tile_t b0 = tile_b[k][tx * 2    ];
+            tile_t b1 = tile_b[k][tx * 2 + 1];
+            // Multiply in tile_t precision; accumulate in F32 across the K reduction.
+            acc00 += (float)(a0 * b0);
+            acc01 += (float)(a0 * b1);
+            acc10 += (float)(a1 * b0);
+            acc11 += (float)(a1 * b1);
         }
 
         GroupMemoryBarrierWithGroupSync();

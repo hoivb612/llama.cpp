@@ -5,7 +5,15 @@
 // Q5_K block layout: d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128] = 176 bytes
 //
 // Dispatch: groups_x = ceil(N/32), groups_y = ceil(M/32), groups_z = ne2*ne3
+//
+// Build variants: see mul_mat_q4k_wmma.hlsl for the USE_F16_TILE story.
 #include "ggml_common.hlsli"
+
+#ifdef USE_F16_TILE
+typedef float16_t tile_t;
+#else
+typedef float     tile_t;
+#endif
 
 #define QK_K 256
 #define Q5K_BLOCK_SIZE 176
@@ -19,8 +27,9 @@ groupshared uint  raw_qs[BN][8];   // 32 qs bytes as 8 uint32 per column
 groupshared uint  raw_qh[BN][8];   // 32 qh bytes as 8 uint32 per column
 groupshared float col_sc[BN][2];   // (d*scale, dmin*min) per column
 
-groupshared float tile_a[BM][BK];
-groupshared float tile_b[BK][BN];
+// tile_a/tile_b dominate LDS use. F32: 4 KB each. F16: 2 KB each.
+groupshared tile_t tile_a[BM][BK];
+groupshared tile_t tile_b[BK][BN];
 
 uint read_byte_q5k(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
@@ -66,7 +75,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                                          nb10, nb11, nb12, nb13, src1_offset);
                     val = load_auto(src1, off, src1_esize);
                 }
-                tile_a[m_local][k_local] = val;
+                tile_a[m_local][k_local] = (tile_t)val;
             }
         }
 
@@ -176,7 +185,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                         uint q5_bit = ((qh_byte & hm) != 0u) ? 16u : 0u;
                         val = d * (float)(q_base + q5_bit) - m;
                     }
-                    tile_b[k_local][n_local] = val;
+                    tile_b[k_local][n_local] = (tile_t)val;
                 }
             }
         }
@@ -185,14 +194,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
         [unroll]
         for (uint k = 0; k < BK; k++) {
-            float a0 = tile_a[ty * 2    ][k];
-            float a1 = tile_a[ty * 2 + 1][k];
-            float b0 = tile_b[k][tx * 2    ];
-            float b1 = tile_b[k][tx * 2 + 1];
-            acc00 += a0 * b0;
-            acc01 += a0 * b1;
-            acc10 += a1 * b0;
-            acc11 += a1 * b1;
+            tile_t a0 = tile_a[ty * 2    ][k];
+            tile_t a1 = tile_a[ty * 2 + 1][k];
+            tile_t b0 = tile_b[k][tx * 2    ];
+            tile_t b1 = tile_b[k][tx * 2 + 1];
+            // Multiply in tile_t precision; accumulate in F32 across the K reduction.
+            acc00 += (float)(a0 * b0);
+            acc01 += (float)(a0 * b1);
+            acc10 += (float)(a1 * b0);
+            acc11 += (float)(a1 * b1);
         }
 
         GroupMemoryBarrierWithGroupSync();

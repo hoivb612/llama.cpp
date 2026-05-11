@@ -8,7 +8,20 @@
 // 32 low-nibble + 32 high-nibble elements sharing one scale/min pair).
 //
 // Dispatch: groups_x = ceil(N/32), groups_y = ceil(M/32), groups_z = ne2*ne3
+//
+// Build variants:
+//   default       : tile_a/tile_b stored as F32 (works on any SM 6.0 device)
+//   USE_F16_TILE=1: tile_a/tile_b stored as float16_t. Halves LDS bandwidth
+//                   for the tile arrays and lets the compiler emit packed
+//                   FP16 multiplies (e.g. v_pk_mul_f16 on RDNA2). Requires
+//                   -enable-16bit-types and SM >= 6.2. Accumulators stay F32.
 #include "ggml_common.hlsli"
+
+#ifdef USE_F16_TILE
+typedef float16_t tile_t;
+#else
+typedef float     tile_t;
+#endif
 
 #define QK_K 256
 #define Q4K_BLOCK_SIZE 144
@@ -21,12 +34,13 @@
 //   raw_qs[BN][8]: 32 nibble bytes per column, stored as 8 uint32 (4 bytes each)
 //   col_dm[BN][2]: (dall, dmin) per column
 //   col_sc[BN][2]: (scale, min) per column (for current sub-block pair)
-groupshared uint  raw_qs[BN][8];   // 32×8 = 256 uints = 1 KB
-groupshared float col_dm[BN][2];   // 32×2 = 64 floats = 256 B
-groupshared float col_sc[BN][2];   // 32×2 = 64 floats = 256 B
+groupshared uint  raw_qs[BN][8];   // 32x8 = 256 uints = 1 KB
+groupshared float col_dm[BN][2];   // 32x2 = 64 floats = 256 B
+groupshared float col_sc[BN][2];   // 32x2 = 64 floats = 256 B
 
-groupshared float tile_a[BM][BK];
-groupshared float tile_b[BK][BN];
+// tile_a/tile_b dominate LDS use. F32: 4 KB each. F16: 2 KB each.
+groupshared tile_t tile_a[BM][BK];
+groupshared tile_t tile_b[BK][BN];
 
 uint read_byte_q4k(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
@@ -57,7 +71,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     for (uint kt = 0; kt < num_k_tiles; kt++) {
         uint k_start = kt * BK;
 
-        // Load tile_a: BM × BK from src1 (1024 elements, 256 threads, 4 each)
+        // Load tile_a: BM x BK from src1 (1024 elements, 256 threads, 4 each)
         {
             uint base = flat_id * 4;
             [unroll] for (uint e = 0; e < 4; e++) {
@@ -72,7 +86,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                                          nb10, nb11, nb12, nb13, src1_offset);
                     val = load_auto(src1, off, src1_esize);
                 }
-                tile_a[m_local][k_local] = val;
+                tile_a[m_local][k_local] = (tile_t)val;
             }
         }
 
@@ -176,7 +190,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                         }
                         val = d * q - m;
                     }
-                    tile_b[k_local][n_local] = val;
+                    tile_b[k_local][n_local] = (tile_t)val;
                 }
             }
         }
@@ -185,14 +199,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
         [unroll]
         for (uint k = 0; k < BK; k++) {
-            float a0 = tile_a[ty * 2    ][k];
-            float a1 = tile_a[ty * 2 + 1][k];
-            float b0 = tile_b[k][tx * 2    ];
-            float b1 = tile_b[k][tx * 2 + 1];
-            acc00 += a0 * b0;
-            acc01 += a0 * b1;
-            acc10 += a1 * b0;
-            acc11 += a1 * b1;
+            tile_t a0 = tile_a[ty * 2    ][k];
+            tile_t a1 = tile_a[ty * 2 + 1][k];
+            tile_t b0 = tile_b[k][tx * 2    ];
+            tile_t b1 = tile_b[k][tx * 2 + 1];
+            // Multiply in tile_t precision (FP16 packed when USE_F16_TILE),
+            // accumulate in F32 to keep numerical headroom across the K reduction.
+            acc00 += (float)(a0 * b0);
+            acc01 += (float)(a0 * b1);
+            acc10 += (float)(a1 * b0);
+            acc11 += (float)(a1 * b1);
         }
 
         GroupMemoryBarrierWithGroupSync();

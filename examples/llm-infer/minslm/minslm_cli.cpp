@@ -117,6 +117,17 @@ struct cli_params {
     int     verbose      = 0;
     bool    streaming    = false;
     bool    force_cpu    = false;
+    // Flash Attention default. On the GDKX/Xbox build the non-FA path
+    // (separate QK matmul + softmax + attn*V) currently outperforms the FA
+    // shader for prompt processing on RDNA2, so we default to OFF there.
+    // PC builds default to AUTO and let the runtime decide based on the
+    // backend's supports_op (see src/llama-context.cpp's auto_fa block).
+    // Either default can be overridden via `-fa on|off|auto`.
+#if defined(GGML_DX12_XBOX_GDKX)
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+#else
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -127,7 +138,7 @@ int main(int argc, char ** argv) {
     cli_params p;
 
     if (argc < 2 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row]\n", argv[0]);
+        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|-fa on|off|auto]\n", argv[0]);
         return 1;
     }
 
@@ -160,6 +171,16 @@ int main(int argc, char ** argv) {
             if (!strcmp(argv[i], "none"))       p.split_mode = 0;
             else if (!strcmp(argv[i], "layer")) p.split_mode = 1;
             else if (!strcmp(argv[i], "row"))   p.split_mode = 2;
+        }
+        else if ((!strcmp(argv[i], "-fa") || !strcmp(argv[i], "--flash-attn")) && i + 1 < argc) {
+            i++;
+            if      (!strcmp(argv[i], "on")   || !strcmp(argv[i], "1") || !strcmp(argv[i], "true"))  p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            else if (!strcmp(argv[i], "off")  || !strcmp(argv[i], "0") || !strcmp(argv[i], "false")) p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            else if (!strcmp(argv[i], "auto"))                                                       p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            else {
+                fprintf(stderr, "Error: -fa expects on|off|auto, got '%s'\n", argv[i]);
+                return 1;
+            }
         }
     }
 
@@ -201,6 +222,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_threads       = p.n_threads;
     ctx_params.n_threads_batch = p.n_threads;
     ctx_params.no_perf  = false;
+    ctx_params.flash_attn_type = p.flash_attn_type;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
@@ -211,6 +233,7 @@ int main(int argc, char ** argv) {
 
     printf("\n[%s]: n_ctx = %d, n_threads = %d, gpu_layers = %d\n",
            __func__, llama_n_ctx(ctx), p.n_threads, model_params.n_gpu_layers);
+    printf("[%s]: flash_attn = %s\n", __func__, llama_flash_attn_type_name(p.flash_attn_type));
     printf("[%s]: system_info: %s\n", __func__, llama_print_system_info());
 
     // Re-enable logging briefly for memory breakdown, then suppress again

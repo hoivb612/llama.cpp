@@ -33,6 +33,15 @@ if (GGML_XBOX)
     target_include_directories(${TARGET} PUBLIC ../../include)
     target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
+    # The cli source has a Scarlett-only branch that flips the FA default
+    # to DISABLED (the non-FA path is faster on Xbox/RDNA2 right now).
+    # Without this define, the #if guard is dead and -fa defaults to AUTO,
+    # which the runtime resolves to ENABLED.
+    target_compile_definitions(${TARGET} PRIVATE
+        GGML_DX12_XBOX_GDKX
+        _GAMING_XBOX
+        _GAMING_XBOX_SCARLETT
+    )
     return()
 endif()
 

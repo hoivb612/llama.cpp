@@ -248,6 +248,7 @@ set(DX12_SHADERS
     soft_max
     mul_mat
     cpy
+    cpy_contig
     get_rows
     diag_mask_inf
     rope
@@ -313,10 +314,26 @@ set(DX12_SHADERS
 
 set(DX12_SHADER_HEADERS "")
 
-# Per-platform extra args for the shader compiler. Most GDKX builds accept
-# stock dxc flags + cs_6_0; if your revision needs Scarlett-specific switches
-# (e.g. -HV, microarch hints), pass them via -DGGML_XBOX_SHADER_FLAGS="...".
+# Shader model profile. cs_6_6 is the default so we get:
+#   - native 16-bit types (float16_t / int16_t) -- packed FP16 math on RDNA2
+#     (v_pk_*_f16) and similar 2x throughput on NVIDIA / Intel
+#   - dot4add_*_packed intrinsics (SM 6.4)
+#   - [WaveSize(N)] attribute (SM 6.6)
+# Override with -DGGML_DX12_SHADER_MODEL=cs_6_0 (etc.) if a platform DXC is
+# older. Note: 16-bit types require >= cs_6_2, so using anything older than
+# 6_2 will also disable -enable-16bit-types automatically below.
+set(GGML_DX12_SHADER_MODEL "cs_6_6" CACHE STRING
+    "Shader model profile passed to dxc -T (e.g. cs_6_0, cs_6_2, cs_6_6)")
+
+# Per-platform extra args for the shader compiler. If your DXC revision needs
+# Scarlett-specific switches (e.g. -HV, microarch hints), pass them via
+# -DGGML_XBOX_SHADER_FLAGS="...".
 set(_dx12_shader_flags "")
+
+# Enable 16-bit types when the chosen shader model supports them (>= 6_2).
+if (NOT GGML_DX12_SHADER_MODEL MATCHES "^cs_6_[01]$")
+    list(APPEND _dx12_shader_flags -enable-16bit-types)
+endif()
 if (GGML_XBOX)
     # The Scarlett dxc adds a "precompilation" pass after the normal DXIL
     # compile that tries to pre-build a Scarlett PSO from the container.
@@ -346,7 +363,7 @@ foreach(shader_name ${DX12_SHADERS})
     add_custom_command(
         OUTPUT ${shader_hdr}
         COMMAND ${DXC_EXECUTABLE}
-            -T cs_6_0
+            -T ${GGML_DX12_SHADER_MODEL}
             -E main
             -Fh ${shader_hdr}
             -Vn g_${shader_name}_dxil
@@ -360,6 +377,45 @@ foreach(shader_name ${DX12_SHADERS})
     list(APPEND DX12_SHADER_HEADERS ${shader_hdr})
 endforeach()
 
+# ---------------------------------------------------------------------------
+# Dual-compile shaders: shaders that ship in both an F32 and an F16 variant
+# from the same .hlsl source. The F16 variant is built with -DUSE_F16_TILE=1
+# so the shader can typedef tile_t to float16_t. Selection at runtime depends
+# on the device's Native16BitShaderOpsSupported (probed in ggml-dx12.cpp).
+#
+# Only enabled when the chosen shader model supports 16-bit types (>= cs_6_2).
+# ---------------------------------------------------------------------------
+if (NOT GGML_DX12_SHADER_MODEL MATCHES "^cs_6_[01]$")
+    set(DX12_SHADERS_F16
+        mul_mat_q4k_wmma
+        mul_mat_q5k_wmma
+        mul_mat_q6k_wmma
+        mul_mat_q5_0_wmma
+    )
+
+    foreach(shader_name ${DX12_SHADERS_F16})
+        set(shader_src "${SHADER_INPUT_DIR}/${shader_name}.hlsl")
+        set(shader_hdr "${SHADER_OUTPUT_DIR}/${shader_name}_f16_dxil.h")
+
+        add_custom_command(
+            OUTPUT ${shader_hdr}
+            COMMAND ${DXC_EXECUTABLE}
+                -T ${GGML_DX12_SHADER_MODEL}
+                -E main
+                -Fh ${shader_hdr}
+                -Vn g_${shader_name}_f16_dxil
+                -DUSE_F16_TILE=1
+                -I ${SHADER_INPUT_DIR}
+                -O3
+                ${_dx12_shader_flags}
+                ${shader_src}
+            DEPENDS ${shader_src} ${SHADER_INPUT_DIR}/ggml_common.hlsli
+            COMMENT "Compiling HLSL shader (F16 variant): ${shader_name}"
+        )
+        list(APPEND DX12_SHADER_HEADERS ${shader_hdr})
+    endforeach()
+endif()
+
 # Generate a master include header at build time (survives partial cleans)
 set(SHADER_MASTER_HEADER "${SHADER_OUTPUT_DIR}/ggml_dx12_shaders.h")
 
@@ -370,6 +426,12 @@ file(APPEND "${_gen_script}" "file(WRITE \${_h} \"// Auto-generated shader inclu
 foreach(shader_name ${DX12_SHADERS})
     file(APPEND "${_gen_script}" "file(APPEND \${_h} \"#include \\\"${shader_name}_dxil.h\\\"\\n\")\n")
 endforeach()
+if (NOT GGML_DX12_SHADER_MODEL MATCHES "^cs_6_[01]$")
+    foreach(shader_name ${DX12_SHADERS_F16})
+        file(APPEND "${_gen_script}" "file(APPEND \${_h} \"#include \\\"${shader_name}_f16_dxil.h\\\"\\n\")\n")
+    endforeach()
+    file(APPEND "${_gen_script}" "file(APPEND \${_h} \"#define GGML_DX12_HAVE_F16_SHADERS 1\\n\")\n")
+endif()
 
 # Run the script at build time when any shader header changes or master is missing
 add_custom_command(
