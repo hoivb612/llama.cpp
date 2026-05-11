@@ -349,6 +349,7 @@ struct dx12_device {
 
     // Tiled (reserved) resource support — required for layer windowing memory savings
     D3D12_TILED_RESOURCES_TIER tiled_resource_tier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+    bool has_reserved_buffers = false;  // set when any sparse/reserved resource is created
 
     // WaveMMA (SM 6.9 Wave Matrix) support
     bool wave_mma_supported = false;
@@ -368,8 +369,6 @@ struct dx12_device {
     bool q6k_use_32   = false;  // Q6_K matvec: true=32 threads, false=256 threads (default=256)
     bool f16_use_load4 = false; // F16 matvec: true=Load4 variant, false=Load2 (default)
     bool q4k_use_32   = false;  // Q4_K matvec: true=32t wave-only, false=256t (UMA optimization)
-    bool q5k_use_mr   = false;  // Q5_K matvec: true=multi-row (2 rows/group), false=single-row
-    bool q6k_use_mr   = false;  // Q6_K matvec: true=multi-row (2 rows/group), false=single-row
     bool fa_use_uma   = false;  // Flash Attention: true=UMA variant (128t, D≤128), false=standard (256t)
 
     void run_autotune();
@@ -1565,6 +1564,7 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
                 hr = dev->device->CreateHeap(&heap_desc, IID_PPV_ARGS(&ctx->backing_heap));
                 if (SUCCEEDED(hr)) {
                     ctx->is_reserved = true;
+                    dev->has_reserved_buffers = true;
                     ctx->backing_heap_tiles  = heap_size / dx12_buffer_context::TILE_SIZE;
                     ctx->total_resource_tiles = (rd.Width + dx12_buffer_context::TILE_SIZE - 1) / dx12_buffer_context::TILE_SIZE;
                     ctx->heap_tile_used.resize(ctx->backing_heap_tiles, false);
@@ -1991,10 +1991,15 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
             return true;
 
         case GGML_OP_ADD:
+        case GGML_OP_SUB:
         case GGML_OP_MUL:
+        case GGML_OP_DIV:
         case GGML_OP_SCALE:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_LOG:
         case GGML_OP_CLAMP:
         case GGML_OP_CONT:
         case GGML_OP_RMS_NORM:
@@ -2076,6 +2081,9 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_SOFTPLUS:
                     if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                         return true;
                     }
@@ -2273,12 +2281,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     std::map<std::string, double> op_times;
 
     int dispatch_weight = 0;
-    // AMD RDNA 3 workaround: flush threshold for prompt phase.
-    // Lower values = more frequent CL splits = more correct but slower.
-    // Configurable via GGML_DX12_FLUSH_INTERVAL env var (default: 16).
+    // TDR prevention: weighted flush threshold for prompt phase only.
+    // Uses wait_for_gpu() so must be generous. Default=16 (weighted).
+    // Override: GGML_DX12_PROMPT_FLUSH=N (don't confuse with DECODE_FLUSH).
     static int TDR_FLUSH_THRESHOLD = 0;
     if (TDR_FLUSH_THRESHOLD == 0) {
-        const char * env = getenv("GGML_DX12_FLUSH_INTERVAL");
+        const char * env = getenv("GGML_DX12_PROMPT_FLUSH");
         TDR_FLUSH_THRESHOLD = env ? atoi(env) : 16;
         if (TDR_FLUSH_THRESHOLD <= 0) TDR_FLUSH_THRESHOLD = 16;
     }
@@ -2424,7 +2432,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (node->op == GGML_OP_UNARY) {
             key.flags = (uint32_t)ggml_get_unary_op(node);
         }
-        // For MUL_MAT with M=1, use matvec pipeline (flags=1, or flags=5 for 256-thread auto-tuned)
+        // For MUL_MAT with M=1, use matvec pipeline (flags=1, or flags=9 for multi-row)
         // Only for types that have matvec shaders
         bool is_matvec_dispatch = false;
         if (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->src[0]) {
@@ -2436,18 +2444,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q5_0 ||
                 t == GGML_TYPE_Q8_0) {
                 key.flags = 1;
-                // Multi-row matvec (2 rows per group, halves activation traffic)
-                if (t == GGML_TYPE_Q4_K) {
-                    if (bctx->dev->q4k_use_32) key.flags = 6;  // 32t wave-only
-                    else key.flags = 2;  // multi-row 256t (default)
+                if (t == GGML_TYPE_Q4_K && bctx->dev->q4k_use_32) key.flags = 6;  // 32t wave-only
+                // Q4_K/Q5_K/Q6_K: use multi-row matvec (2 rows/group, flag=9)
+                if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K) {
+                    key.flags = 9;
                 }
-                if (t == GGML_TYPE_Q5_K && bctx->dev->q5k_use_mr) key.flags = 2;
-                if (t == GGML_TYPE_Q6_K && bctx->dev->q6k_use_mr) key.flags = 2;
-                // Auto-tuning: use alternate variant if benchmarked as faster
-                if (t == GGML_TYPE_Q5_0 && bctx->dev->q5_0_use_256) key.flags = 5;
-                if (t == GGML_TYPE_Q8_0 && bctx->dev->q8_0_use_256) key.flags = 5;
-                if (t == GGML_TYPE_Q6_K && bctx->dev->q6k_use_32)   key.flags = 5;
-                if ((t == GGML_TYPE_F16 || t == GGML_TYPE_F32) && bctx->dev->f16_use_load4) key.flags = 5;
                 is_matvec_dispatch = true;
             }
         }
@@ -2480,12 +2481,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
-        // Flash Attention: use UMA-optimized variant for decode only (D≤128, single query)
-        // Prefill (N_queries > 1) keeps the standard 256t shader for better batch throughput
-        if (node->op == GGML_OP_FLASH_ATTN_EXT && bctx->dev->fa_use_uma) {
+        // Flash Attention: use UMA variant for single-query decode (D≤128)
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             uint32_t D = (uint32_t)node->src[0]->ne[0];
             uint32_t N_queries = (uint32_t)node->src[0]->ne[1];
-            if (D <= 128 && N_queries == 1) key.flags = 2;  // UMA FA (128t, smaller tile)
+            if (D <= 128 && N_queries == 1 && bctx->dev->fa_use_uma) {
+                key.flags = 2;  // UMA FA (128t)
+            }
         }
 
         // Look up or create pipeline
@@ -2496,6 +2498,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // Set pipeline state — skip if unchanged from previous dispatch
         ID3D12RootSignature * root_sig = bctx->dev->common_root_sig.Get();
+        // DEBUG: force re-bind everything (disable binding cache) to test if
+        // the cache causes TDR on Gemma-4 with flush > 1
+        static bool no_cache = (getenv("GGML_DX12_NO_BIND_CACHE") != nullptr);
+        if (no_cache) bctx->reset_binding_cache();
         if (root_sig != bctx->last_root_sig) {
             bctx->cmd_list->SetComputeRootSignature(root_sig);
             bctx->last_root_sig = root_sig;
@@ -2506,7 +2512,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         // Set root constants (shader params)
-        dx12_shader_params params;
+        dx12_shader_params params = {};
         if (fused_add_rms_node) {
             // Triple fusion: ADD + RMS_NORM + MUL
             // node = ADD, fused_rms_node = RMS_NORM, fused_mul_node = MUL
@@ -2568,6 +2574,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (fused_bias_tensor) {
             params.op_params[0] = 1;  // bias fusion flag
             params.op_params[1] = (uint32_t)dx12_tensor_offset(fused_bias_tensor);  // bias byte offset
+            params.op_params[2] = (uint32_t)fused_bias_tensor->nb[0];  // bias stride (bytes per element)
+            params.op_params[3] = (uint32_t)fused_bias_tensor->nb[2];  // bias nb2
+            params.op_params[4] = (uint32_t)fused_bias_tensor->nb[3];  // bias nb3
+            params.op_params[5] = (uint32_t)fused_bias_tensor->ne[2];  // bias ne2
+            params.op_params[6] = (uint32_t)fused_bias_tensor->ne[3];  // bias ne3
             // Use ADD's output as destination
             params.dst_offset = (uint32_t)dx12_tensor_offset(fused_bias_add);
         }
@@ -2605,42 +2616,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 if (splitk_env > 1) {
                     fa_split_k = (uint32_t)splitk_env;
                     // Still cap to avoid too many empty splits (wastes temp memory)
-                    uint32_t max_split = (N_kv + 255) / 256;
+                    uint32_t max_split = (N_kv + 127) / 128;
                     if (fa_split_k > max_split) fa_split_k = max_split;
                     if (fa_split_k < 2) fa_split_k = 1;
                 } else {
                     // Auto split-KV heuristic: target ~64 total thread groups.
                     //
-                    // Why 64: DX12 has no standard API to query CU/SM count (unlike
-                    // Vulkan which uses shader_core_count * 2 / total_workgroups).
-                    // 64 is a conservative target that provides good occupancy across:
-                    //   - APU/iGPU (16 CUs): 64 groups ≈ 4 waves/CU → near-full occupancy
-                    //   - Mid-range (32-48 CUs): reasonable saturation
-                    //   - High-end (96+ CUs): still helpful, could benefit from higher target
-                    //
-                    // Future optimization: derive target from GPU CU count via
-                    // DXGI_ADAPTER_DESC3, DXCore properties, or autotune probing.
-                    //
-                    // Formula: split_k = ceil(64 / (n_heads * batch)), capped so each
-                    // split processes at least 256 KV tokens (one TILE_KV).
-                    /*
-                      Auto selects based on: split_k = ceil(64 / (n_heads × batch)) then capped by ceil(N_kv / 256).
-
-                      For decode (N_queries=1) and for example with a 540-token prompt (max_split = ceil(540/256) = 3):
-
-                      ┌────────────────────┬─────────┬───────────────┬──────────┬──────────────┐
-                      │ Model              │ Q Heads │ Formula       │ Capped   │ Auto split_k │
-                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
-                      │ Phi-3              │ 32      │ ceil(64/32)=2 │ min(2,3) │ 2            │
-                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
-                      │ Gemma-4 (8 heads)  │ 8       │ ceil(64/8)=8  │ min(8,3) │ 3            │
-                      ├────────────────────┼─────────┼───────────────┼──────────┼──────────────┤
-                      │ Gemma-4 (16 heads) │ 16      │ ceil(64/16)=4 │ min(4,3) │ 3            │
-                      └────────────────────┴─────────┴───────────────┴──────────┴──────────────┘
-
-                      The goal is ~64 total thread groups to fill the GPU. As context grows (N_kv increases), 
-                      the cap loosens — e.g., at 2048 tokens, max_split=8.
-                    */
+                    // Each split processes at least 256 KV tokens to amortize
+                    // the per-split overhead in the reduce pass.
                     uint32_t total_wgs = N_queries * n_heads * batch;
                     if (total_wgs < 64) {
                         fa_split_k = (64 + total_wgs - 1) / total_wgs;
@@ -2702,7 +2685,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  node->op == GGML_OP_GLU ||
                                  node->op == GGML_OP_SCALE ||
                                  fused_bias_tensor ||
-                                 fused_add_rms_node);
+                                 fused_add_rms_node ||
+                                 (is_matvec_dispatch && key.flags == 9));
         uint32_t num_constants = needs_op_params ? (uint32_t)(sizeof(params) / 4) : BASE_PARAMS;
         bctx->cmd_list->SetComputeRoot32BitConstants(0, num_constants, &params, 0);
 
@@ -2850,7 +2834,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                 fflush(stderr);
                             }
 
-                            bctx->cmd_list->Dispatch(cr, 1, batches);
+                            uint32_t dispatch_groups = (key.flags == 9) ? (cr + 1) / 2 : cr;
+                            bctx->cmd_list->Dispatch(dispatch_groups, 1, batches);
 
                             // Flush between chunks for TDR safety
                             if (cs + MATVEC_CHUNK < N) {
@@ -2894,13 +2879,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
 
                     // Normal matvec dispatch (N <= MATVEC_CHUNK)
-                    if (key.flags == 2) {
-                        // Multi-row: 2 rows per thread group
-                        groups_x = (N + 1) / 2;
+                    uint32_t matvec_row_groups;
+                    if (key.flags == 9) {
+                        // Multi-row: 2 rows per group
+                        matvec_row_groups = (N + 1) / 2;
                     } else {
-                        // flags==1 (standard), flags==5 (auto-tune alt), flags==6 (32t wave-only)
-                        groups_x = N;
+                        matvec_row_groups = N;
                     }
+                    groups_x = matvec_row_groups;
                     // D3D12 dispatch limit: 65535 per axis
                     // Linearize into 2D: shader computes row = gid.y * 65535 + gid.x
                     if (groups_x > 65535) {
@@ -2975,8 +2961,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             case GGML_OP_SET_ROWS: {
-                // 2D dispatch to handle tensors exceeding 65535 groups in X
-                uint32_t total_elements = (uint32_t)(ggml_nelements(node));
+                // Dispatch based on SOURCE elements (new rows), not destination (full KV cache).
+                // The shader bounds-checks with ne00*ne01*ne02*ne03 (src0 dims),
+                // so dispatching dst elements wastes up to 4096x thread groups.
+                uint32_t total_elements = (uint32_t)(ggml_nelements(node->src[0]));
                 uint32_t total_groups = (total_elements + 255) / 256;
                 if (total_groups <= 65535) {
                     groups_x = total_groups;
@@ -3293,46 +3281,57 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             i += 2;  // skip the VIEW and SET_ROWS nodes
         }
 
-        // Periodic CL flush for decode phase (M=1) to prevent stale GPU caches
-        // on AMD RDNA 3.  CL boundaries provide GPU pipeline drains (separate
-        // ExecuteCommandLists calls are implicitly ordered).  No CPU-side wait
-        // is needed — the cmd allocator ring handles CPU-GPU pipelining.
-        // Default: flush after every dispatch (interval=1).
-        // Override via GGML_DX12_DECODE_FLUSH env var.
+        // Periodic CL flush for decode — isolate heavy ops from lightweight ops.
+        // Heavy ops (MUL_MAT, FA) pre-flush any accumulated lightweight work so
+        // they always start a clean command list.  This prevents Gemma-4 TDR
+        // caused by MUL_MAT sharing a CL with preceding norms/muls/adds.
+        // After dispatch, heavy ops flush immediately (weight >= threshold).
+        // Lightweight ops batch up to threshold dispatches per CL.
+        // Override: GGML_DX12_DECODE_FLUSH=N (0=off).
         if (!is_prompt && cgraph->n_nodes > 10) {
-            static int decode_flush_interval = 0;
-            if (decode_flush_interval == 0) {
+            static int decode_flush_threshold = -1;
+            if (decode_flush_threshold == -1) {
                 const char * env = getenv("GGML_DX12_DECODE_FLUSH");
-                if (!env) env = getenv("GGML_DX12_FLUSH_INTERVAL");
-                decode_flush_interval = env ? atoi(env) : 1;
-                if (decode_flush_interval <= 0) decode_flush_interval = 1;
+                decode_flush_threshold = env ? atoi(env) : 2;
             }
-            dispatch_weight++;
-            if (dispatch_weight >= decode_flush_interval) {
-                bctx->close_and_execute();
-                // No wait_for_gpu() — CL boundary is the GPU pipeline drain.
-                // The ring of CMD_RING_SIZE allocators handles CPU pipelining.
-                bctx->ensure_cmd_list_open();
-                unsynced_writes.clear();
-                dispatch_weight = 0;
+            if (decode_flush_threshold > 0) {
+                uint64_t total_groups = (uint64_t)groups_x * groups_y * groups_z;
+                int weight = 1;
+                bool is_heavy = (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_FLASH_ATTN_EXT);
+                if (is_heavy) {
+                    if (total_groups >= 8000) weight = 16;
+                    else if (total_groups >= 1000) weight = 4;
+                    else weight = 2;
+                    // FA workload scales with KV cache length, not thread groups.
+                    // Few groups (num_heads) but each reads the full KV sequence.
+                    // Force weight=4 so FA always post-flushes immediately.
+                    if (node->op == GGML_OP_FLASH_ATTN_EXT && weight < 4) {
+                        weight = 4;
+                    }
+                    // Pre-flush: drain lightweight ops so heavy op gets a clean CL
+                    if (dispatch_weight > 0) {
+                        bctx->close_and_execute();
+                        bctx->ensure_cmd_list_open();
+                        dispatch_weight = 0;
+                    }
+                }
+                dispatch_weight += weight;
+                if (dispatch_weight >= decode_flush_threshold) {
+                    bctx->close_and_execute();
+                    bctx->ensure_cmd_list_open();
+                    dispatch_weight = 0;
+                }
             }
         }
 
-        // Force CL split at every dispatch in model head region to fix NaN and sync.
+        // Force CL split at every dispatch in model head region for sync.
         // AMD RDNA 3 requires full pipeline drains (not just UAV barriers) between
         // the final FFN/norm layers and the vocab projection + logit softcapping.
-        // Without these splits, the model head produces NaN due to stale GPU caches.
-        // NOTE: Use a low threshold (50) so this still triggers in small subgraphs
-        // created by the eval callback (layer windowing). The full graph has >1000
-        // nodes but a subgraph containing only the last few layers + model head
-        // may have ~100 nodes. The original threshold of 1000 silently skipped
-        // these CL splits for subgraph views, causing garbled output on Gemma-4.
         if (cgraph->n_nodes > 50 && i >= cgraph->n_nodes - 25 && i <= cgraph->n_nodes - 2) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
             bctx->reset_binding_cache();
-            unsynced_writes.clear();
             dispatch_weight = 0;
         }
 
@@ -3394,7 +3393,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 bctx->ensure_cmd_list_open();
                 bctx->reset_binding_cache();
-                unsynced_writes.clear();
                 dispatch_weight = 0;
             }
         }
@@ -3480,7 +3478,6 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 bctx->wait_for_gpu();
                 bctx->ensure_cmd_list_open();
                 bctx->reset_binding_cache();
-                unsynced_writes.clear();
                 if (trace_prompt) {
                     HRESULT dev_stat = bctx->dev->device->GetDeviceRemovedReason();
                     if (FAILED(dev_stat)) {
@@ -3725,10 +3722,8 @@ void dx12_device::run_autotune() {
         q8_0_use_256  = false;
         q6k_use_32    = false;
         f16_use_load4 = false;
-        q5k_use_mr    = true;    // multi-row Q5_K: 14% faster than standard 256t
-        q6k_use_mr    = false;   // disabled: q6k_mr shader 2.1x slower than standard 256t
         fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D≤128)
-        DX12_LOG_INFO("Auto-tune: skipped on WSL2 (UMA defaults: Q5_K=mr FA=uma)\n");
+        DX12_LOG_INFO("Auto-tune: skipped on WSL2 (UMA defaults: FA=uma)\n");
     } else {
         DX12_LOG_INFO("Auto-tune: skipped on WSL2 (using defaults)\n");
     }
@@ -3750,17 +3745,15 @@ void dx12_device::run_autotune() {
             q6k_use_32   = (q6 != 0);
             f16_use_load4 = (f16l4 != 0);
             fclose(f);
-            // On UMA, also enable multi-row variants (activation sharing)
+            // On UMA, also enable UMA FA variant
             if (is_uma) {
-                q5k_use_mr = true;   // multi-row Q5_K: 14% faster than standard 256t
-                q6k_use_mr = false;  // disabled: q6k_mr shader 2.1x slower than standard 256t
                 fa_use_uma = true;   // UMA FA: 128t, fewer barriers, no idle threads
             }
             DX12_LOG_INFO("Auto-tune v%d loaded from cache '%s': Q5_0=%s Q8_0=%s Q6_K=%s F16=%s%s\n", ver,
                           cache_path,
                           q5_0_use_256 ? "256t" : "32t", q8_0_use_256 ? "256t" : "32t",
                           q6k_use_32 ? "32t" : "256t", f16_use_load4 ? "load4" : "load2",
-                          is_uma ? " +UMA(Q5_K=mr FA=uma)" : "");
+                          is_uma ? " +UMA(FA=uma)" : "");
             return;
         }
         fclose(f);
@@ -3776,10 +3769,8 @@ void dx12_device::run_autotune() {
         q8_0_use_256  = false;   // 32t wave-only (proven better on all UMA)
         q6k_use_32    = false;   // keep 256t cooperative (faster for large K)
         f16_use_load4 = false;   // load2 sufficient for shared-memory bandwidth
-        q5k_use_mr    = true;    // multi-row Q5_K: 14% faster than standard 256t
-        q6k_use_mr    = false;   // disabled: q6k_mr shader 2.1x slower than standard 256t
         fa_use_uma    = true;    // UMA FA: 128t, fewer barriers, no idle threads (D≤128)
-        DX12_LOG_INFO("Auto-tune v%d UMA defaults: Q5_0=32t Q8_0=32t Q6_K=256t Q5_K=mr FA=uma F16=load2\n", TUNE_VERSION);
+        DX12_LOG_INFO("Auto-tune v%d UMA defaults: Q5_0=32t Q8_0=32t Q6_K=256t FA=uma F16=load2\n", TUNE_VERSION);
         return;
     }
 
@@ -4534,6 +4525,11 @@ static const std::unordered_map<int, dx12_shader_blob> g_shader_blobs = {
     { GGML_OP_CONCAT,        { g_concat_dxil,        sizeof(g_concat_dxil)        } },
     { GGML_OP_REPEAT,        { g_repeat_dxil,        sizeof(g_repeat_dxil)        } },
     { GGML_OP_SUM_ROWS,      { g_sum_rows_dxil,      sizeof(g_sum_rows_dxil)      } },
+    { GGML_OP_SUB,           { g_sub_dxil,           sizeof(g_sub_dxil)           } },
+    { GGML_OP_DIV,           { g_div_dxil,           sizeof(g_div_dxil)           } },
+    { GGML_OP_SIN,           { g_sin_dxil,           sizeof(g_sin_dxil)           } },
+    { GGML_OP_COS,           { g_cos_dxil,           sizeof(g_cos_dxil)           } },
+    { GGML_OP_LOG,           { g_log_dxil,           sizeof(g_log_dxil)           } },
     { GGML_OP_FLASH_ATTN_EXT,{ g_flash_attn_dxil,    sizeof(g_flash_attn_dxil)    } },
     { GGML_OP_SET_ROWS,      { g_set_rows_dxil,      sizeof(g_set_rows_dxil)      } },
     { GGML_OP_SET,           { g_set_dxil,           sizeof(g_set_dxil)           } },
@@ -4548,6 +4544,9 @@ static const std::unordered_map<int, dx12_shader_blob> g_unary_shader_blobs = {
     { GGML_UNARY_OP_RELU,       { g_relu_dxil,       sizeof(g_relu_dxil)       } },
     { GGML_UNARY_OP_TANH,       { g_tanh__dxil,      sizeof(g_tanh__dxil)      } },
     { GGML_UNARY_OP_SIGMOID,    { g_sigmoid_dxil,    sizeof(g_sigmoid_dxil)    } },
+    { GGML_UNARY_OP_GELU_ERF,   { g_gelu_erf_dxil,  sizeof(g_gelu_erf_dxil)  } },
+    { GGML_UNARY_OP_EXP,        { g_exp_dxil,        sizeof(g_exp_dxil)       } },
+    { GGML_UNARY_OP_SOFTPLUS,   { g_softplus_dxil,   sizeof(g_softplus_dxil)  } },
 };
 #endif
 
@@ -4612,23 +4611,23 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             static const dx12_shader_blob wmma_blob = { g_mul_mat_wmma_dxil, sizeof(g_mul_mat_wmma_dxil) };
             blob = &wmma_blob;
         }
-    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 2) {
-        // Multi-row matvec (2 rows per group)
-        if (key.src0_type == GGML_TYPE_Q4_K) {
-            static const dx12_shader_blob mr_q4k_blob = { g_mul_mat_vec_q4k_mr_dxil, sizeof(g_mul_mat_vec_q4k_mr_dxil) };
-            blob = &mr_q4k_blob;
-        } else if (key.src0_type == GGML_TYPE_Q5_K) {
-            static const dx12_shader_blob mr_q5k_blob = { g_mul_mat_vec_q5k_mr_dxil, sizeof(g_mul_mat_vec_q5k_mr_dxil) };
-            blob = &mr_q5k_blob;
-        } else if (key.src0_type == GGML_TYPE_Q6_K) {
-            static const dx12_shader_blob mr_q6k_blob = { g_mul_mat_vec_q6k_mr_dxil, sizeof(g_mul_mat_vec_q6k_mr_dxil) };
-            blob = &mr_q6k_blob;
-        }
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 6) {
         // 32-thread wave-only Q4_K matvec (UMA optimized, no barriers)
         if (key.src0_type == GGML_TYPE_Q4_K) {
             static const dx12_shader_blob mv_q4k_32_blob = { g_mul_mat_vec_q4k_32_dxil, sizeof(g_mul_mat_vec_q4k_32_dxil) };
             blob = &mv_q4k_32_blob;
+        }
+    } else if (key.op == GGML_OP_MUL_MAT && key.flags == 9) {
+        // Multi-row matvec (2 rows/group, 256 threads)
+        if (key.src0_type == GGML_TYPE_Q4_K) {
+            static const dx12_shader_blob mv_q4k_mr_blob = { g_mul_mat_vec_q4k_mr_dxil, sizeof(g_mul_mat_vec_q4k_mr_dxil) };
+            blob = &mv_q4k_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q5_K) {
+            static const dx12_shader_blob mv_q5k_mr_blob = { g_mul_mat_vec_q5k_mr_dxil, sizeof(g_mul_mat_vec_q5k_mr_dxil) };
+            blob = &mv_q5k_mr_blob;
+        } else if (key.src0_type == GGML_TYPE_Q6_K) {
+            static const dx12_shader_blob mv_q6k_mr_blob = { g_mul_mat_vec_q6k_mr_dxil, sizeof(g_mul_mat_vec_q6k_mr_dxil) };
+            blob = &mv_q6k_mr_blob;
         }
     } else if (key.op == GGML_OP_MUL_MAT && key.flags == 1) {
         // Matvec path (M=1 single-token generation)
