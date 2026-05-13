@@ -329,3 +329,91 @@ Why Phi-3 Never Hit This
  - Phi-3 vocab = 32K → never exceeds 65535 dispatch limit  
  - Phi-3 has 32 attention heads → after FA, the next PSO switch still had "live" addresses in slots 4/5 by coincidence (more graph 
 nodes between FA and the problematic ops)
+
+=====================================
+
+TDR on Gemma-4
+
+Here's how a single transformer layer flows through decode with the current code. Gemma-4 has 4 KV heads (groups are small for
+K/V/FA):
+
+ CL₁: [NORM]                              ← lightweight, batched
+ CL₂: [Q_proj MUL_MAT]  w=4, post-flush  ← 1024 MR groups, alone
+ CL₃: [K_proj MUL_MAT]  w=2, NO flush    ← 512 MR groups (<1000)
+ CL₄: [V_proj, ROPE, ROPE]  w=2+1+1=4    ← V_proj stays in CL with ROPEs!
+ CL₅: [FA]              w=2, NO flush     ← 4-32 groups, but reads 540 KV entries
+       ↑ next MUL_MAT pre-flushes this
+ CL₆: [O_proj MUL_MAT]  w=4, post-flush  ← alone
+
+The problem: FA has only 4-32 thread groups → weight=2 → doesn't self-flush. It sits in its CL until the next heavy op's pre-flush
+drains it. That's fine. But the actual GPU work inside those few thread groups scales with seq_len (540 KV entries × head_dim ×
+num_heads). Thread group count is a terrible proxy for FA workload.
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Option 1: FA always weight=4
+
+ if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+     weight = 4;  // Always treat as heavy regardless of group count
+ }
+
+What changes: FA now post-flushes immediately (w=4 ≥ threshold=4). It gets a completely isolated CL — pre-flushed AND post-flushed.
+
+Impact: One extra close_and_execute() per layer (34 layers = 34 extra flushes per decode step). Each flush is cheap (~5-20µs on
+DX12), so total overhead ≈ 0.2-0.7ms per decode step. At 40 t/s that's ~25ms per step, so overhead is ~1-3%. Negligible.
+
+Complexity: 2-line change. Simple, predictable.
+
+Risk: Very low. We're just flushing more aggressively for FA, which we know is safe.
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Option 2: Scale FA weight by sequence length
+
+ if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+     int seq_len = /* extract from KV cache or node dims */;
+     if (seq_len > 256) weight = 8;
+     else if (seq_len > 64) weight = 4;
+     else weight = 2;
+ }
+
+What changes: FA weight adapts to how much KV data it reads. Short sequences (early decode) batch more freely; long sequences force
+immediate flush.
+
+Impact: Optimal batching — short prompts don't pay unnecessary flush overhead, long prompts are safe.
+
+Complexity: Medium. Need to extract seq_len from either node->src[1]->ne[1] (KV length) or track n_past. Slightly fragile — depends
+on FA tensor layout staying stable across upstream updates.
+
+Risk: Low-medium. If seq_len extraction breaks on a future upstream merge, we fall back to weight=2 (current behavior, occasional
+TDR on long prompts).
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Option 3: wait_for_gpu() after FA in decode
+
+ if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+     bctx->close_and_execute();
+     bctx->wait_for_gpu();  // CPU blocks until FA completes
+     bctx->ensure_cmd_list_open();
+ }
+
+What changes: CPU waits for FA to fully complete before submitting the next CL. This is the nuclear option — guarantees the GPU
+finishes FA before any new work arrives.
+
+Impact: Eliminates TDR risk entirely. But wait_for_gpu() is expensive — it stalls the CPU-GPU pipeline. The GPU sits idle while the
+CPU prepares the next CL. This is what causes the flush=1 performance penalty. 34 waits per decode step could cost 3-5ms total,
+reducing decode from ~40 t/s to ~35 t/s.
+
+Complexity: 3-line change. Simple.
+
+Risk: Low for correctness, but measurable performance hit. This is the same pattern as the model-head flush (which we know is slow
+but necessary there).
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Recommendation
+
+Option 1 is the best trade-off. It's simple, the performance cost is negligible (flush without wait is cheap), and it fully isolates
+FA. The key insight: close_and_execute() submits the CL but doesn't wait — the GPU can start processing immediately while the CPU
+prepares the next dispatch. The overhead is just the CPU-side CL setup cost.
