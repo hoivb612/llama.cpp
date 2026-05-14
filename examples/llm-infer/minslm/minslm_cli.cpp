@@ -242,7 +242,10 @@ int main(int argc, char ** argv) {
     // --- Run prompts ---
     int64_t t_total_start = timer_us();
     int total_tokens_generated = 0;
+    int total_tokens_emitted = 0;
     int64_t total_tg_us = 0;
+    int64_t total_tg_core_us = 0;
+    int64_t total_ttft_us = 0;
 
     for (size_t pi = 0; pi < pf.prompts.size(); pi++) {
         std::string user_msg = trim(pf.prompts[pi]);
@@ -273,6 +276,8 @@ int main(int argc, char ** argv) {
                 goto cleanup;
             }
         }
+        // Keep prefill/decode accounting explicit when backends run asynchronously.
+        llama_synchronize(ctx);
         int64_t t2 = timer_us();
 
         if (p.verbose >= 2) {
@@ -287,6 +292,7 @@ int main(int argc, char ** argv) {
             int max_gen = std::min(p.n_len - n_past, 128);
             std::string output;
             int n_gen = 0;
+            int n_emit = 0;
 
             auto sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
@@ -302,6 +308,7 @@ int main(int argc, char ** argv) {
             llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
             int64_t t3 = timer_us();
+            int64_t t_first_tok = 0;
 
             while (n_gen < max_gen) {
                 llama_token id = llama_sampler_sample(smpl, ctx, -1);
@@ -310,6 +317,11 @@ int main(int argc, char ** argv) {
                     if (p.streaming) printf("\n");
                     break;
                 }
+
+                if (t_first_tok == 0) {
+                    t_first_tok = timer_us();
+                }
+                n_emit++;
 
                 std::string piece = token_to_piece(ctx, id);
                 if (p.streaming) {
@@ -335,10 +347,17 @@ int main(int argc, char ** argv) {
                 n_past++;
             }
 
+            // Drain outstanding decode work before stopping the decode timer.
+            llama_synchronize(ctx);
             int64_t t4 = timer_us();
             int64_t tg_us = t4 - t3;
+            int64_t ttft_us = t_first_tok > 0 ? (t_first_tok - t3) : 0;
+            int64_t tg_core_us = t_first_tok > 0 ? (t4 - t_first_tok) : 0;
             total_tokens_generated += n_gen;
+            total_tokens_emitted += n_emit;
             total_tg_us += tg_us;
+            total_tg_core_us += tg_core_us;
+            total_ttft_us += ttft_us;
 
             llama_sampler_free(smpl);
 
@@ -349,6 +368,10 @@ int main(int argc, char ** argv) {
             if (p.verbose >= 2 && n_gen > 0) {
                 printf("  decode: %.1fms (%d tokens, %.2f t/s)\n",
                        tg_us / 1000.0f, n_gen, n_gen / (tg_us / 1000000.0f));
+                if (n_emit > 0 && tg_core_us > 0) {
+                    printf("  decode (no-TTFT): %.1fms (%d tokens, %.2f t/s) [TTFT %.1fms]\n",
+                           tg_core_us / 1000.0f, n_emit, n_emit / (tg_core_us / 1000000.0f), ttft_us / 1000.0f);
+                }
             }
         }
 
@@ -362,6 +385,10 @@ int main(int argc, char ** argv) {
         printf("  tokens gen: %d\n", total_tokens_generated);
         if (total_tokens_generated > 0) {
             printf("  avg t/s:    %.2f\n", total_tokens_generated / (total_tg_us / 1000000.0));
+        }
+        if (total_tokens_emitted > 0 && total_tg_core_us > 0) {
+            printf("  avg t/s (no-TTFT): %.2f\n", total_tokens_emitted / (total_tg_core_us / 1000000.0));
+            printf("  avg TTFT:          %.1fms\n", (double) total_ttft_us / (double) pf.prompts.size() / 1000.0);
         }
         printf("  total time: %.2fs\n", t_total / 1000000.0);
     }
