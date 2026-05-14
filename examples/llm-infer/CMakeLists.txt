@@ -14,7 +14,7 @@ if(GGML_VULKAN)
     add_compile_definitions(GGML_USE_VULKAN)
 endif()
 
-if(GGML_DX12)
+if(GGML_DX12 OR GGML_DX12_MAIN)
     add_compile_definitions(GGML_USE_DX12)
 endif()
 
