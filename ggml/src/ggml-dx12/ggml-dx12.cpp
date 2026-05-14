@@ -46,6 +46,7 @@ Diagnostics environment:
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,7 +78,12 @@ static std::atomic<int64_t> dx12_mm_vec_time_us[GGML_TYPE_COUNT] = {};
 static std::atomic<int64_t> dx12_mm_gemm_counts[GGML_TYPE_COUNT] = {};
 static std::atomic<int64_t> dx12_mm_gemm_time_us[GGML_TYPE_COUNT] = {};
 
+// Forward declaration: drain deferred PERF readbacks across all live backend
+// contexts so final stats include in-flight timestamp entries.
+static void dx12_drain_all_pending_perf();
+
 static void ggml_dx12_print_tensor_op_perf() {
+    dx12_drain_all_pending_perf();
     int64_t total_count = 0;
     int64_t total_time  = 0;
     for (int i = 0; i < GGML_OP_COUNT; i++) {
@@ -751,6 +757,35 @@ struct dx12_backend_context {
     // Pool of reusable READBACK staging buffers for async readback.
     std::vector<ComPtr<ID3D12Resource>> async_readback_pool;
 
+    // --- GPU-timestamp perf (GGML_DX12_PERF) ---
+    // Deferred-readback model: each graph reserves a contiguous slot range in
+    // a ring inside ts_heap, emits EndQuery(TIMESTAMP) before+after each
+    // Dispatch on the live compute CL, then at end of graph issues a single
+    // ResolveQueryData on a fresh CL and pushes a pending entry with
+    // {slot range, fence value, records}. No per-dispatch CPU fence wait.
+    static constexpr uint32_t TS_HEAP_SIZE = 32768;
+    ComPtr<ID3D12QueryHeap> ts_heap;
+    ComPtr<ID3D12Resource>  ts_readback;
+    uint64_t                ts_freq = 0;           // ticks per second
+    uint32_t                ts_next_slot = 0;      // ring write head
+    uint32_t                ts_graph_start_slot = 0;
+    bool                    ts_graph_active = false;
+    struct ts_record {
+        uint16_t op;         // ggml_op
+        uint8_t  src0_type;  // ggml_type (or 0xFF if N/A)
+        uint8_t  variant;    // for MUL_MAT: 0=GEMM, 1=matvec
+        uint32_t slot_pair;  // absolute slot index in ts_heap (end is +1)
+    };
+    std::vector<ts_record> ts_records;
+    struct ts_pending {
+        uint32_t               slot_lo = 0; // [slot_lo, slot_hi)
+        uint32_t               slot_hi = 0;
+        uint64_t               fence_value = 0;
+        std::vector<ts_record> records;
+    };
+    std::deque<ts_pending> ts_pending_q;
+    bool ts_init_failed = false; // timestamp init failed; fall back to legacy path
+
     bool cmd_list_open = false;
 
     // --- Redundant D3D12 call elimination state ---
@@ -780,6 +815,7 @@ struct dx12_backend_context {
         // RAII cleanup: wait for ALL GPU work and close event handle
         if (fence && dev) {
             wait_for_gpu();
+            ts_drain_all_with_wait();
         }
         if (fence_event) {
             dx12_close_event(fence_event);
@@ -792,7 +828,40 @@ struct dx12_backend_context {
     void wait_for_gpu();
     void wait_for_fence(uint64_t value);
     void ensure_staging(size_t upload_size, size_t readback_size);
+
+    // GPU-timestamp perf helpers
+    bool ts_init();
+    void ts_begin_graph(int upper_dispatches);
+    void ts_record_dispatch_pre();
+    void ts_record_dispatch_post(uint16_t op, uint8_t src0_type, uint8_t variant);
+    void ts_finalize_graph();
+    void ts_poll_drain();
+    void ts_drain_one_with_wait();
+    void ts_drain_all_with_wait();
+    void ts_accumulate(const ts_pending & p);
 };
+
+// Global registry of live backend contexts for deferred PERF drain.
+static std::mutex                          g_bctx_list_mutex;
+static std::vector<dx12_backend_context *> g_bctx_list;
+
+static void dx12_register_bctx(dx12_backend_context * b) {
+    std::lock_guard<std::mutex> lk(g_bctx_list_mutex);
+    g_bctx_list.push_back(b);
+}
+
+static void dx12_unregister_bctx(dx12_backend_context * b) {
+    std::lock_guard<std::mutex> lk(g_bctx_list_mutex);
+    auto it = std::find(g_bctx_list.begin(), g_bctx_list.end(), b);
+    if (it != g_bctx_list.end()) g_bctx_list.erase(it);
+}
+
+static void dx12_drain_all_pending_perf() {
+    std::lock_guard<std::mutex> lk(g_bctx_list_mutex);
+    for (auto * b : g_bctx_list) {
+        if (b) b->ts_drain_all_with_wait();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -1456,6 +1525,229 @@ void dx12_backend_context::wait_for_gpu() {
         fprintf(stderr, "ggml-dx12: Device removed detected in wait_for_gpu! HRESULT 0x%08lX\n", (unsigned long)removed);
         fflush(stderr);
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-timestamp perf (GGML_DX12_PERF): deferred readback, no per-dispatch wait
+// ---------------------------------------------------------------------------
+
+bool dx12_backend_context::ts_init() {
+    if (ts_heap)        return true;
+    if (ts_init_failed) return false;
+
+    HRESULT hr = dev->compute_queue->GetTimestampFrequency(&ts_freq);
+    if (FAILED(hr) || ts_freq == 0) {
+        DX12_LOG_WARN("GGML_DX12_PERF: GetTimestampFrequency failed (hr=0x%08lX) -- per-op timing fallback\n",
+                      (unsigned long)hr);
+        ts_init_failed = true;
+        return false;
+    }
+
+    D3D12_QUERY_HEAP_DESC qhd = {};
+    qhd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qhd.Count = TS_HEAP_SIZE;
+    hr = dev->device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&ts_heap));
+    if (FAILED(hr)) {
+        DX12_LOG_WARN("GGML_DX12_PERF: CreateQueryHeap(TIMESTAMP) failed (hr=0x%08lX) -- per-op timing fallback\n",
+                      (unsigned long)hr);
+        ts_init_failed = true;
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = TS_HEAP_SIZE * sizeof(uint64_t);
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = dev->device->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&ts_readback));
+    if (FAILED(hr)) {
+        DX12_LOG_WARN("GGML_DX12_PERF: CreateCommittedResource(readback) failed (hr=0x%08lX) -- per-op timing fallback\n",
+                      (unsigned long)hr);
+        ts_heap.Reset();
+        ts_init_failed = true;
+        return false;
+    }
+
+    ts_records.reserve(TS_HEAP_SIZE / 2);
+    DX12_LOG_INFO("GGML_DX12_PERF: GPU-timestamp mode (freq=%llu Hz, %u slots)\n",
+                  (unsigned long long)ts_freq, (unsigned)TS_HEAP_SIZE);
+    return true;
+}
+
+void dx12_backend_context::ts_record_dispatch_pre() {
+    if (!ts_heap || !ts_graph_active) return;
+    if (ts_next_slot + 2 > TS_HEAP_SIZE) return;
+    cmd_list->EndQuery(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_next_slot);
+}
+
+void dx12_backend_context::ts_record_dispatch_post(uint16_t op, uint8_t src0_type, uint8_t variant) {
+    if (!ts_heap || !ts_graph_active) return;
+    if (ts_next_slot + 2 > TS_HEAP_SIZE) return;
+    cmd_list->EndQuery(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_next_slot + 1);
+    ts_records.push_back({ op, src0_type, variant, ts_next_slot });
+    ts_next_slot += 2;
+}
+
+void dx12_backend_context::ts_begin_graph(int upper_dispatches) {
+    if (!ts_heap) return;
+    ts_records.clear();
+    ts_graph_active = false;
+
+    ts_poll_drain();
+
+    if (upper_dispatches <= 0) return;
+    uint32_t needed = (uint32_t)upper_dispatches * 2;
+    if (needed > TS_HEAP_SIZE) {
+        DX12_LOG_WARN("GGML_DX12_PERF: graph dispatch upper bound (%d) exceeds heap (%u slots) -- skipping PERF for this graph\n",
+                      upper_dispatches, (unsigned)TS_HEAP_SIZE);
+        return;
+    }
+
+    if (ts_next_slot + needed > TS_HEAP_SIZE) {
+        ts_next_slot = 0;
+    }
+
+    auto overlaps_prospective = [&](const ts_pending & p) {
+        uint32_t a = ts_next_slot;
+        uint32_t b = ts_next_slot + needed;
+        return (a < p.slot_hi) && (p.slot_lo < b);
+    };
+    while (!ts_pending_q.empty() && overlaps_prospective(ts_pending_q.front())) {
+        ts_drain_one_with_wait();
+    }
+
+    ts_graph_start_slot = ts_next_slot;
+    ts_graph_active     = true;
+}
+
+void dx12_backend_context::ts_accumulate(const ts_pending & p) {
+    if (!ts_readback || p.slot_hi <= p.slot_lo || p.records.empty()) return;
+
+    D3D12_RANGE rr = { p.slot_lo * sizeof(uint64_t), p.slot_hi * sizeof(uint64_t) };
+    void * mapped = nullptr;
+    HRESULT hr = ts_readback->Map(0, &rr, &mapped);
+    if (FAILED(hr) || !mapped) {
+        DX12_LOG_WARN("GGML_DX12_PERF: ts_readback->Map failed (hr=0x%08lX) -- dropping %zu records\n",
+                      (unsigned long)hr, p.records.size());
+        return;
+    }
+
+    const uint64_t * timings = (const uint64_t *)mapped;
+    const double tick_to_us = 1000000.0 / (double)ts_freq;
+
+    static bool ts_diag_done = false;
+    if (!ts_diag_done) {
+        ts_diag_done = true;
+        fprintf(stderr,
+            "ggml-dx12: TS DIAG (first deferred drain): freq=%llu Hz, slot_range=[%u..%u), n_records=%zu\n",
+            (unsigned long long)ts_freq, p.slot_lo, p.slot_hi, p.records.size());
+        size_t n_show = std::min<size_t>(8, p.records.size());
+        for (size_t i = 0; i < n_show; i++) {
+            const auto & r = p.records[i];
+            uint64_t t0 = timings[r.slot_pair];
+            uint64_t t1 = timings[r.slot_pair + 1];
+            int64_t  dt = (int64_t)t1 - (int64_t)t0;
+            fprintf(stderr,
+                "  rec[%zu] op=%u src0=%u var=%u slot=%u  t0=%llu t1=%llu  delta=%lld ticks (%.2f us)\n",
+                i, (unsigned)r.op, (unsigned)r.src0_type, (unsigned)r.variant,
+                r.slot_pair,
+                (unsigned long long)t0, (unsigned long long)t1,
+                (long long)dt, (double)dt * tick_to_us);
+        }
+        fflush(stderr);
+    }
+
+    for (const auto & r : p.records) {
+        uint64_t t0 = timings[r.slot_pair];
+        uint64_t t1 = timings[r.slot_pair + 1];
+        if (t1 <= t0) continue;
+        int64_t us = (int64_t)((double)(t1 - t0) * tick_to_us);
+        if (us <= 0) continue;
+
+        dx12_op_counts[r.op].fetch_add(1, std::memory_order_relaxed);
+        dx12_op_time_us[r.op].fetch_add(us, std::memory_order_relaxed);
+        if (r.op == GGML_OP_MUL_MAT && r.src0_type < GGML_TYPE_COUNT) {
+            if (r.variant) {
+                dx12_mm_vec_counts[r.src0_type].fetch_add(1, std::memory_order_relaxed);
+                dx12_mm_vec_time_us[r.src0_type].fetch_add(us, std::memory_order_relaxed);
+            } else {
+                dx12_mm_gemm_counts[r.src0_type].fetch_add(1, std::memory_order_relaxed);
+                dx12_mm_gemm_time_us[r.src0_type].fetch_add(us, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    D3D12_RANGE empty = { 0, 0 };
+    ts_readback->Unmap(0, &empty);
+}
+
+void dx12_backend_context::ts_poll_drain() {
+    while (!ts_pending_q.empty()) {
+        const auto & front = ts_pending_q.front();
+        if (fence->GetCompletedValue() < front.fence_value) break;
+        ts_accumulate(front);
+        ts_pending_q.pop_front();
+    }
+}
+
+void dx12_backend_context::ts_drain_one_with_wait() {
+    if (ts_pending_q.empty()) return;
+    const auto & front = ts_pending_q.front();
+    wait_for_fence(front.fence_value);
+    ts_accumulate(front);
+    ts_pending_q.pop_front();
+}
+
+void dx12_backend_context::ts_drain_all_with_wait() {
+    while (!ts_pending_q.empty()) {
+        ts_drain_one_with_wait();
+    }
+}
+
+void dx12_backend_context::ts_finalize_graph() {
+    if (!ts_heap || !ts_graph_active) {
+        ts_records.clear();
+        ts_graph_active = false;
+        return;
+    }
+    if (ts_records.empty() || ts_next_slot == ts_graph_start_slot) {
+        ts_records.clear();
+        ts_graph_active = false;
+        return;
+    }
+
+    // Ensure all EndQuery writes from current graph were submitted before resolve.
+    if (cmd_list_open) {
+        close_and_execute();
+    }
+
+    const uint32_t lo = ts_graph_start_slot;
+    const uint32_t hi = ts_next_slot;
+
+    ensure_cmd_list_open();
+    cmd_list->ResolveQueryData(
+        ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+        lo, hi - lo,
+        ts_readback.Get(), (UINT64)lo * sizeof(uint64_t));
+    close_and_execute();
+
+    ts_pending p;
+    p.slot_lo     = lo;
+    p.slot_hi     = hi;
+    p.fence_value = fence_value;
+    p.records.swap(ts_records);
+    ts_pending_q.push_back(std::move(p));
+
+    ts_graph_active = false;
 }
 
 void dx12_backend_context::ensure_staging(size_t upload_size, size_t readback_size) {
@@ -2366,6 +2658,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // Profile the 3rd-5th actual generation graphs (skip warmup/reserve)
     bool do_profile = profiling && !is_prompt && gen_graph >= 3 && gen_graph <= 5;
     std::map<std::string, double> op_times;
+    bool ts_active = dx12_perf && bctx->ts_init();
+    if (ts_active) {
+        bctx->ts_begin_graph(cgraph->n_nodes);
+    }
 
     int dispatch_weight = 0;
     int stream_nodes = 0;  // dispatched-node counter for stream-submit
@@ -2598,9 +2894,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q8_0) {
                     key.flags = 9;
                 }
-                // Q2_K multi-row matvec (2 rows/group, flag=19)
+                // Q2_K multi-row matvec (2 rows/group, flag=19), large-K default.
+                // Override: GGML_DX12_Q2K_MR=0/1 (or DX12_Q2K_MR)
                 if (t == GGML_TYPE_Q2_K) {
-                    key.flags = 19;
+                    static bool q2k_mr_env_init = false;
+                    static int  q2k_mr_env = 0;
+                    static bool q2k_mr_has_env = false;
+                    if (!q2k_mr_env_init) {
+                        const char * env = getenv("GGML_DX12_Q2K_MR");
+                        if (env) {
+                            q2k_mr_env = atoi(env);
+                            q2k_mr_has_env = true;
+                        }
+                        q2k_mr_env_init = true;
+                    }
+                    const bool use_q2k_mr = q2k_mr_has_env ? (q2k_mr_env != 0)
+                                                            : (node->src[0]->ne[0] >= 4096);
+                    if (use_q2k_mr) {
+                        key.flags = 19;
+                    }
                 }
                 // Q3_K multi-row matvec (2 rows/group, flag=20)
                 // Keep d3ddk's K>=4096 safety gate.
@@ -2997,7 +3309,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             }
 
                             uint32_t dispatch_groups = (key.flags == 9 || key.flags == 19 || key.flags == 20) ? (cr + 1) / 2 : cr;
+                            if (ts_active) bctx->ts_record_dispatch_pre();
                             bctx->cmd_list->Dispatch(dispatch_groups, 1, batches);
+                            if (ts_active) {
+                                uint8_t s0t = (node->src[0] && node->src[0]->type < GGML_TYPE_COUNT)
+                                              ? (uint8_t)node->src[0]->type : (uint8_t)0xFFu;
+                                bctx->ts_record_dispatch_post((uint16_t)GGML_OP_MUL_MAT, s0t, /*is_matvec=*/1);
+                            }
 
                             // Submit between chunks to keep command lists bounded,
                             // but do not hard-wait (d3ddk-style pipelining).
@@ -3285,6 +3603,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             continue;
         }
 
+        if (ts_active) bctx->ts_record_dispatch_pre();
         bctx->cmd_list->Dispatch(groups_x, groups_y, groups_z);
 
         // Split-KV reduce pass: merge partial O, M, L into final output
@@ -3345,6 +3664,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // REDUCE_GROUP_SIZE=256, each thread handles D/256 dimensions
                 bctx->cmd_list->Dispatch(ne01, ne02, ne03);
             }
+        }
+
+        if (ts_active) {
+            uint8_t s0t  = (node->src[0] && node->src[0]->type < GGML_TYPE_COUNT)
+                           ? (uint8_t)node->src[0]->type : (uint8_t)0xFFu;
+            uint8_t variant = (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1) ? 1 : 0;
+            bctx->ts_record_dispatch_post((uint16_t)node->op, s0t, variant);
         }
 
         // GLU diagnostic: read back first few values of src0, src1, dst after first GLU dispatch
@@ -3616,7 +3942,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             int src0t = node->src[0] ? (int)node->src[0]->type : -1;
             snprintf(key, sizeof(key), "%s(src0t=%d,grp=%u)", ggml_op_name(node->op), src0t, groups_x);
             op_times[key] += ms;
-        } else if (dx12_perf) {
+        } else if (dx12_perf && !ts_active) {
             bctx->close_and_execute();
             bctx->wait_for_gpu();
             bctx->ensure_cmd_list_open();
@@ -3921,6 +4247,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (p.first > 0.01) fprintf(stderr, "  %8.3f ms  %5.1f%%  %s\n", p.first, p.first/total*100, p.second.c_str());
         }
         fprintf(stderr, "  %8.3f ms  TOTAL\n", total);
+    }
+    if (ts_active) {
+        bctx->ts_finalize_graph();
     }
 
     return GGML_STATUS_SUCCESS;
@@ -4231,7 +4560,8 @@ static const char * dx12_backend_get_name(ggml_backend_t backend) {
 
 static void dx12_backend_free(ggml_backend_t backend) {
     auto * ctx = (dx12_backend_context *)backend->context;
-    delete ctx; // RAII destructor handles fence wait + event close
+    dx12_unregister_bctx(ctx);
+    delete ctx; // RAII destructor handles fence wait + event close + ts drain
 }
 
 static void dx12_backend_synchronize(ggml_backend_t backend) {
@@ -4788,6 +5118,7 @@ static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char *
     backend->iface   = dx12_backend_interface;
     backend->device  = dev;
     backend->context = ctx;
+    dx12_register_bctx(ctx);
 
     // Register reserved-resource handlers for layer windowing
     if (d->tiled_resource_tier >= D3D12_TILED_RESOURCES_TIER_2) {
