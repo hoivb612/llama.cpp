@@ -302,9 +302,10 @@ function(ggml_add_backend backend)
         message(STATUS "Including ${backend} backend")
         if (NOT GGML_BACKEND_DL)
             set(backend_use_name "${backend_id_name}")
-            # DX12-MAIN is an alternate implementation of the DX12 backend, but
-            # backend registration in code is keyed off GGML_USE_DX12.
-            if (backend_use_name STREQUAL "DX12_MAIN")
+            # DX12-MAIN and DX12X are alternate source flavors of the DX12
+            # backend (only one selectable per build) but backend registration
+            # in code is keyed off GGML_USE_DX12.
+            if (backend_use_name STREQUAL "DX12_MAIN" OR backend_use_name STREQUAL "DX12X")
                 set(backend_use_name "DX12")
             endif()
             string(TOUPPER "GGML_USE_${backend_use_name}" backend_use)
@@ -459,6 +460,7 @@ ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
 ggml_add_backend(DX12)
 ggml_add_backend(DX12-MAIN)
+ggml_add_backend(DX12X)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)
 ggml_add_backend(MUSA)
