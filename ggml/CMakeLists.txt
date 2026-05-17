@@ -224,11 +224,24 @@ option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in M
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
+
+# Compatibility aliases for command-line forms that use '-' separators.
+if (DEFINED CACHE{GGML-DX12})
+    set(GGML_DX12 "$CACHE{GGML-DX12}" CACHE BOOL "ggml: use DirectX 12" FORCE)
+endif()
+if (DEFINED CACHE{GGML-DX12-MAIN})
+    set(GGML_DX12_MAIN "$CACHE{GGML-DX12-MAIN}" CACHE BOOL "ggml: use DirectX 12 main branch" FORCE)
+endif()
+
 option(GGML_DX12                            "ggml: use DirectX 12"                            OFF)
 option(GGML_DX12_DEBUG                      "ggml: enable DirectX 12 debug output"            OFF)
+option(GGML_DX12_MAIN                       "ggml: use DirectX 12 main branch"                OFF)
+
+if (GGML_DX12 AND GGML_DX12_MAIN)
+    message(FATAL_ERROR "GGML_DX12 and GGML_DX12_MAIN are mutually exclusive. Enable only one backend flavor per build directory.")
+endif()
+
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
-option(GGML_DX12                            "ggml: use DirectX 12"                            OFF)
-option(GGML_DX12_DEBUG                      "ggml: enable DirectX 12 debug output"            OFF)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
