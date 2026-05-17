@@ -3,7 +3,8 @@
 // Builds on Linux, WSL2, macOS, and Windows.
 // Links directly against libllama (same as llama-cli).
 //
-// Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [stream] [-d N] [-sm none|layer|row]
+// Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [stream]
+//                   [-d N] [-sm none|layer|row] [--weight-budget MB] [-fa on|off|auto]
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +36,35 @@ static std::string trim(const std::string & str) {
     while (start < end && isspace((unsigned char)str[start])) start++;
     while (end > start && isspace((unsigned char)str[end - 1])) end--;
     return str.substr(start, end - start);
+}
+
+static std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return s;
+}
+
+static bool parse_flash_attn_mode(const char * arg, llama_flash_attn_type & out) {
+    if (!arg) {
+        return false;
+    }
+
+    const std::string v = to_lower(trim(arg));
+    if (v == "on" || v == "1" || v == "true" || v == "yes" || v == "enabled") {
+        out = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        return true;
+    }
+    if (v == "off" || v == "0" || v == "false" || v == "no" || v == "disabled") {
+        out = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        return true;
+    }
+    if (v == "auto") {
+        out = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        return true;
+    }
+
+    return false;
 }
 
 static std::vector<llama_token> tokenize(const llama_context * ctx, const std::string & text,
@@ -118,6 +149,7 @@ struct cli_params {
     int     verbose      = 0;
     bool    streaming    = false;
     bool    force_cpu    = false;
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 };
 
 // ---------------------------------------------------------------------------
@@ -128,7 +160,7 @@ int main(int argc, char ** argv) {
     cli_params p;
 
     if (argc < 2 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB]\n", argv[0]);
+        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB|-fa on|off|auto]\n", argv[0]);
         return 1;
     }
 
@@ -164,6 +196,23 @@ int main(int argc, char ** argv) {
         }
         else if (!strcmp(argv[i], "--weight-budget") && i + 1 < argc) {
             p.weight_budget_mb = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "-fa") || !strcmp(argv[i], "--flash-attn")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: %s requires a value: on|off|auto\n", argv[i]);
+                return 1;
+            }
+
+            llama_flash_attn_type mode;
+            if (!parse_flash_attn_mode(argv[++i], mode)) {
+                fprintf(stderr, "Error: unknown value for %s: '%s' (expected on|off|auto)\n",
+                        argv[i - 1], argv[i]);
+                return 1;
+            }
+            p.flash_attn_type = mode;
+        }
+        else {
+            fprintf(stderr, "Warning: unknown argument '%s' ignored\n", argv[i]);
         }
     }
 
@@ -216,6 +265,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch  = p.n_batch;
     ctx_params.n_threads       = p.n_threads;
     ctx_params.n_threads_batch = p.n_threads;
+    ctx_params.flash_attn_type = p.flash_attn_type;
     ctx_params.no_perf  = false;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
@@ -227,6 +277,10 @@ int main(int argc, char ** argv) {
 
     printf("\n[%s]: n_ctx = %d, n_threads = %d, gpu_layers = %d\n",
            __func__, llama_n_ctx(ctx), p.n_threads, model_params.n_gpu_layers);
+    printf("[%s]: flash-attn = %s%s\n",
+           __func__,
+           llama_flash_attn_type_name(p.flash_attn_type),
+           p.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? " (runtime-selected)" : "");
     printf("[%s]: system_info: %s\n", __func__, llama_print_system_info());
 
     // Re-enable logging briefly for memory breakdown, then suppress again

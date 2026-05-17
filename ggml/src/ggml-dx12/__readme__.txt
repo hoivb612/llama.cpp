@@ -417,3 +417,136 @@ Recommendation
 Option 1 is the best trade-off. It's simple, the performance cost is negligible (flush without wait is cheap), and it fully isolates
 FA. The key insight: close_and_execute() submits the CL but doesn't wait — the GPU can start processing immediately while the CPU
 prepares the next dispatch. The overhead is just the CPU-side CL setup cost.
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+┌───────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Aspect                │ ggml-dx12 (this backend)                                                                                │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Wave variants per     │ 1 — hardcoded -D WAVE_SIZE=64 for every shader (CMakeLists.txt line 230)                                │
+│ shader                │                                                                                                         │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shader symbol         │ g_<name>_dxil (single blob)                                                                             │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ init_shader_blobs()   │ Does not exist                                                                                          │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shader registry       │ Static g_shader_blobs map (line 5237) — single blob per op, populated at C++ startup                    │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ C++ wave query        │ Reads WaveLaneCountMin/Max and logs them, but never uses the values to pick anything                    │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ WARP_SIZE macro       │ Resolves to 64 at compile time (because -D WAVE_SIZE=64 is always set)                                  │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shader wave math      │ Inconsistent — many shaders use WaveGetLaneCount() at runtime anyway (in ~20 files), ignoring the       │
+│                       │ compile-time WARP_SIZE define                                                                           │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ WAVE_SIZE_ATTR macro  │ Defined in ggml_common.hlsli, never used by any shader                                                  │
+└───────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+What this actually means
+
+The backend is compiled assuming wave64 but runs on any hardware:
+
+ - On AMD RDNA/GCN (real wave64 in compute mode): everything matches. Optimal.
+ - On NVIDIA (wave32 — half of wave64): shaders compiled with WAVE_SIZE=64 constants are deployed on wave32 hardware. The 
+WARP_SIZE-based math (whatever uses it) is wrong by 2x. The shaders using WaveGetLaneCount() are correct but produce less-optimal 
+code.
+ - On Intel Xe iGPU (wave16 or wave32 depending on the SKU/SIMD mode): same problem, potentially 4x off in WARP_SIZE-based math.
+
+The reason it doesn't blow up in practice: most performance-critical shaders use WaveGetLaneCount() directly (the runtime path),
+bypassing the broken WARP_SIZE. The compile-time -D WAVE_SIZE=64 is only consequential for shaders that use the WARP_SIZE macro —
+and those would silently miscompute on non-wave64 hardware.
+
+The three backends side-by-side
+
+┌─────────────────┬───────────────────────────────────────────────────────┬──────────────────────┬────────────────────────────────┐
+│ Approach        │ ggml-dx12 (b612_clean)                                │ ggml-dx12x (smosier) │ ggml-dx12-main (d3ddk /        │
+│                 │                                                       │                      │ sd.cpp)                        │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Build-time wave │ 1 (forced w64)                                        │ 1 (no -D WAVE_SIZE)  │ 3 (w16, w32, w64)              │
+│ variants        │                                                       │                      │                                │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Optional FP16   │ None                                                  │ 4 WMMA shaders       │ 6 shaders × wave size          │
+│ variants        │                                                       │                      │                                │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Runtime         │ None (single blob)                                    │ None (single blob)   │ init_shader_blobs() picks per  │
+│ selection       │                                                       │                      │ device wave                    │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ [WaveSize(N)]   │ Defined but unused                                    │ Not defined          │ Used (currently only           │
+│ PSO pinning     │                                                       │                      │ gated_delta_net.hlsl)          │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Shader wave     │ Mixed: WARP_SIZE (=64) ⊕ WaveGetLaneCount()           │ Pure                 │ WARP_SIZE (compile-time        │
+│ math            │                                                       │ WaveGetLaneCount()   │ constant per variant)          │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Correct on      │ Only where shader uses WaveGetLaneCount() (most do);  │ Yes (always)         │ Yes (always; with PSO pinning  │
+│ non-wave64 GPUs │ shaders depending on WARP_SIZE silently miscompute    │                      │ where used)                    │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Perf on         │ Suboptimal (when WaveGetLaneCount path runs) or wrong │ Suboptimal (DXC      │ Optimal (compile-time          │
+│ wave32/wave16   │ (when WARP_SIZE path runs)                            │ can't fold lane      │ constants → unrolling/branch   │
+│ GPUs            │                                                       │ count)               │ elimination)                   │
+└─────────────────┴───────────────────────────────────────────────────────┴──────────────────────┴────────────────────────────────┘
+
+So ggml-dx12 (b612_clean original) silently bets on wave64 for correctness; ggml-dx12x (smosier) is correct-everywhere but slower; 
+ggml-dx12-main (d3ddk) is the most engineered — three sets of blobs and a small init-time picker.
+
+┌──────────────────┬──────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ Backend          │ Blob "carries"           │ wave32 GPU result                                                                 │
+├──────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ ggml-dx12        │ wave64 hardcoded via -D  │ Correct only where the shader uses WaveGetLaneCount() directly; shaders relying   │
+│ (b612_clean)     │ WAVE_SIZE=64             │ on the WARP_SIZE macro silently miscompute                                        │
+├──────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ ggml-dx12x       │ No wave constant baked   │ Correct on any wave width; perf is suboptimal because DXC can't fold the lane     │
+│ (smosier)        │ in (wave-neutral)        │ count                                                                             │
+├──────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ ggml-dx12-main   │ Three separate blobs:    │ Binds the w32 blob at init; correct and optimal (constants folded, loops          │
+│ (d3ddk)          │ w16, w32, w64            │ unrolled, optional [WaveSize(32)] PSO pin)                                        │
+└──────────────────┴──────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+GGML_DX12 — "originals", wave64-targeted
+
+ - Build: single blob per shader, -D WAVE_SIZE=64 hardcoded.
+ - Designed for: wave64 hardware (AMD UMA on RDNA3.5 was the development target, yes).
+ - Runs on: wave64 GPUs correctly. On wave32/wave16 GPUs it doesn't crash — most shaders use WaveGetLaneCount() at runtime — but 
+any shader using the WARP_SIZE macro for partitioning silently miscomputes. So best to treat it as wave64-only for correctness.
+
+GGML_DX12X — Xbox Series X (Scarlett) flavor, wave-neutral
+
+ - Origin: smosier_b612, which includes Xbox GDKX support (you can see GGML_XBOX paths and the Scarlett shader-compiler discovery 
+in its CMakeLists).
+ - Hardware target you mentioned (Xbox Series X = RDNA2 wave64): yes, that's the intended deployment target.
+ - But importantly — and this is the surprise: the desktop variant compiles wave-neutral DXIL (no -D WAVE_SIZE, no [WaveSize(N)] 
+attribute). Every shader uses WaveGetLaneCount() at runtime.
+ - Net result: it runs correctly on any DX12 GPU — AMD wave64, NVIDIA wave32, Intel Xe wave16/32 — but at a small ALU-side perf 
+cost because DXC can't fold the wave count into shifts/unrolled loops.
+ - So: Xbox Scarlett is its primary deployment, but it's not restricted to that — it's actually the most portable of the three by 
+accident.
+
+GGML_DX12_MAIN — the engineered one
+
+ - Build: three blobs per shader (w16, w32, w64), plus FP16 variants for select shaders.
+ - Runtime: queries WaveLaneCountMin/Max at device init and picks the matching pre-compiled blob.
+ - Result: correct + optimal on any DX12 GPU (AMD / NVIDIA / Intel iGPU), at the cost of ~3× DXIL footprint in the binary.
+
+Corrected summary
+
+┌───────────────┬─────────────────────────────────────┬──────────────────────────────┬────────────────────────────────────────────┐
+│ Flavor        │ Wave handling                       │ Primary intent               │ Runs correctly on                          │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────┼────────────────────────────────────────────┤
+│ DX12          │ Hardcoded wave64                    │ AMD UMA RDNA3.5 (your dev    │ Wave64 only (safe); other widths "mostly   │
+│               │                                     │ target)                      │ works" but unsafe                          │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────┼────────────────────────────────────────────┤
+│ DX12X         │ Wave-neutral DXIL (runtime          │ Xbox Series X / Scarlett     │ Any DX12 GPU (correct but not specialized) │
+│               │ WaveGetLaneCount())                 │ (RDNA2 wave64)               │                                            │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────┼────────────────────────────────────────────┤
+│ DX12_MAIN     │ 3 pre-compiled blobs per shader,    │ "Anything" — desktop AMD /   │ Any DX12 GPU, optimally                    │
+│               │ runtime picks one                   │ NVIDIA / Intel               │                                            │
+└───────────────┴─────────────────────────────────────┴──────────────────────────────┴────────────────────────────────────────────┘
+
+So your one-line summaries should read:
+
+ - GGML_DX12: dev target was wave64 UMA (RDNA3.5); fastest there, correctness-risky elsewhere.
+ - GGML_DX12X: Xbox Scarlett primary target, but the DXIL is wave-neutral so it actually runs correctly anywhere — just not as fast
+ as DX12_MAIN.
+ - GGML_DX12_MAIN: the portable + tuned one. Runs correctly and at optimal wave width on AMD / NVIDIA / Intel.
+
+The other thing worth noting: DX12X is the only one with active Xbox GDKX build support (GGML_XBOX paths, Scarlett DXC discovery, 
+ggml-xbox.dll output renaming, -noprecompile Scarlett flag). The other two are desktop-only.
