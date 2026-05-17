@@ -1,0 +1,142 @@
+// mul_mat_vec.hlsl - Specialized matrix-vector multiply (M=1) using K-reduction
+// ggml MUL_MAT: dst[row, 0, i2, i3] = sum_k(src0[k, row, i2_src0, i3_src0] * src1[k, 0, i2, i3])
+//
+// src0: weights, ne00 = K, ne01 = N — F16 or F32
+// src1: input,   ne10 = K, ne11 = 1 — F32
+// dst:  output,  ne0  = N, ne1  = 1 — F32
+//
+// Dispatch: groups_x = N (one group per output row), groups_y = 1, groups_z = ne2*ne3
+
+#include "ggml_common.hlsli"
+
+#define GROUP_SIZE 256
+
+groupshared float partial[GROUP_SIZE];
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint tid = gtid.x;
+    uint row = gid.y * 65535u + gid.x;  // linearized 2D for large N (>65535)
+
+    uint i2 = gid.z % ne2;
+    uint i3 = gid.z / ne2;
+
+    uint i2_src0 = i2 * ne02 / ne2;
+    uint i3_src0 = i3 * ne03 / ne3;
+
+    uint K = ne00;
+
+    uint src0_base = src0_offset + row * nb01 + i2_src0 * nb02 + i3_src0 * nb03;
+    uint src1_base = src1_offset + i2 * nb12 + i3 * nb13;
+
+    precise float acc = 0.0f;
+
+    if (src0_esize == 2 || src0_esize == 3) {
+        // F16/BF16 weights: 2 bytes per element, vectorized 4-element loads
+        // BF16 conversion is just a shift (asfloat(bits<<16)), even cheaper than f16tof32
+        // Input is always contiguous F32 during generation (nb10=4)
+        uint k = tid * 4;
+        if (nb10 == 4) {
+            // Fast path: Load4 for contiguous F32 input, paired half-precision loads
+            for (; k + 3 < K; k += GROUP_SIZE * 4) {
+                uint w01 = src0.Load(src0_base + k * 2);
+                uint w23 = src0.Load(src0_base + k * 2 + 4);
+                float w0, w1, w2, w3;
+                if (src0_esize == 3) {
+                    w0 = asfloat((w01 & 0xFFFFu) << 16);
+                    w1 = asfloat(w01 & 0xFFFF0000u);
+                    w2 = asfloat((w23 & 0xFFFFu) << 16);
+                    w3 = asfloat(w23 & 0xFFFF0000u);
+                } else {
+                    w0 = f16tof32(w01 & 0xFFFFu);
+                    w1 = f16tof32(w01 >> 16);
+                    w2 = f16tof32(w23 & 0xFFFFu);
+                    w3 = f16tof32(w23 >> 16);
+                }
+                uint4 xp = src1.Load4(src1_base + k * 4);
+                acc = mad(w0, asfloat(xp.x), mad(w1, asfloat(xp.y),
+                      mad(w2, asfloat(xp.z), mad(w3, asfloat(xp.w), acc))));
+            }
+            // Handle remaining 0-3 elements
+            for (; k < K; k++) {
+                float w = load_auto(src0, src0_base + k * 2, src0_esize);
+                float x = asfloat(src1.Load(src1_base + k * 4));
+                acc += w * x;
+            }
+        } else {
+            k = tid * 2;
+            for (; k + 1 < K; k += GROUP_SIZE * 2) {
+                uint w2 = src0.Load(src0_base + k * 2);
+                float w0, w1;
+                if (src0_esize == 3) {
+                    w0 = asfloat((w2 & 0xFFFFu) << 16);
+                    w1 = asfloat(w2 & 0xFFFF0000u);
+                } else {
+                    w0 = f16tof32(w2 & 0xFFFFu);
+                    w1 = f16tof32(w2 >> 16);
+                }
+                float x0 = load_auto(src1, src1_base + k * nb10, src1_esize);
+                float x1 = load_auto(src1, src1_base + (k + 1) * nb10, src1_esize);
+                acc = mad(w0, x0, mad(w1, x1, acc));
+            }
+            if (k < K) {
+                float w = load_auto(src0, src0_base + k * 2, src0_esize);
+                float x = load_auto(src1, src1_base + k * nb10, src1_esize);
+                acc += w * x;
+            }
+        }
+    } else {
+        // F32 weights: use Load4 for quad reads when possible
+        if (nb10 == 4) {
+            uint k = tid * 4;
+            for (; k + 3 < K; k += GROUP_SIZE * 4) {
+                uint4 wp = src0.Load4(src0_base + k * 4);
+                uint4 xp = src1.Load4(src1_base + k * 4);
+                acc = mad(asfloat(wp.x), asfloat(xp.x),
+                      mad(asfloat(wp.y), asfloat(xp.y),
+                      mad(asfloat(wp.z), asfloat(xp.z),
+                      mad(asfloat(wp.w), asfloat(xp.w), acc))));
+            }
+            for (; k < K; k++) {
+                acc += asfloat(src0.Load(src0_base + k * 4)) * asfloat(src1.Load(src1_base + k * 4));
+            }
+        } else {
+            for (uint k = tid; k < K; k += GROUP_SIZE) {
+                float w = asfloat(src0.Load(src0_base + k * 4));
+                float x = load_auto(src1, src1_base + k * nb10, src1_esize);
+                acc += w * x;
+            }
+        }
+    }
+
+    // Hybrid reduction: wave intrinsics first, then cross-wave via shared memory
+    // Intel Arc wave size = 16, so 256 threads = 16 waves
+    float wave_sum = WaveActiveSum(acc);
+
+    uint wave_id = tid / WaveGetLaneCount();
+    uint lane_id = WaveGetLaneIndex();
+    uint num_waves = GROUP_SIZE / WaveGetLaneCount();
+
+    // Each wave's first lane writes its sum
+    if (lane_id == 0) {
+        partial[wave_id] = wave_sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // First wave reduces across all waves (1 barrier instead of 8)
+    if (tid < num_waves) {
+        float cross_wave = partial[tid];
+        cross_wave = WaveActiveSum(cross_wave);
+        if (tid == 0) {
+            partial[0] = cross_wave;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid == 0 && row < ne0) {
+        float result = partial[0];
+        if (op0 == 1u) result += asfloat(src2.Load(op1 + row * 4));
+        uint off_d = offset_4d(row, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+        store_auto(dst, off_d, result, dst_esize);
+    }
+}

@@ -232,13 +232,25 @@ endif()
 if (DEFINED CACHE{GGML-DX12-MAIN})
     set(GGML_DX12_MAIN "$CACHE{GGML-DX12-MAIN}" CACHE BOOL "ggml: use DirectX 12 main branch" FORCE)
 endif()
+if (DEFINED CACHE{GGML-DX12X})
+    set(GGML_DX12X "$CACHE{GGML-DX12X}" CACHE BOOL "ggml: use DirectX 12 (smosier flavor)" FORCE)
+endif()
 
 option(GGML_DX12                            "ggml: use DirectX 12"                            OFF)
 option(GGML_DX12_DEBUG                      "ggml: enable DirectX 12 debug output"            OFF)
 option(GGML_DX12_MAIN                       "ggml: use DirectX 12 main branch"                OFF)
+option(GGML_DX12X                           "ggml: use DirectX 12 (smosier flavor)"           OFF)
 
-if (GGML_DX12 AND GGML_DX12_MAIN)
-    message(FATAL_ERROR "GGML_DX12 and GGML_DX12_MAIN are mutually exclusive. Enable only one backend flavor per build directory.")
+# Exactly one DX12 source flavor may be selected per build (they all produce
+# the same ggml-dx12 target / GGML_USE_DX12 compile def).
+set(_dx12_flavors_enabled 0)
+foreach(_flav GGML_DX12 GGML_DX12_MAIN GGML_DX12X)
+    if (${_flav})
+        math(EXPR _dx12_flavors_enabled "${_dx12_flavors_enabled} + 1")
+    endif()
+endforeach()
+if (_dx12_flavors_enabled GREATER 1)
+    message(FATAL_ERROR "GGML_DX12, GGML_DX12_MAIN, and GGML_DX12X are mutually exclusive. Enable only one DX12 source flavor per build directory.")
 endif()
 
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
