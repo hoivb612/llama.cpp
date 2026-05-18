@@ -246,12 +246,35 @@ struct ProcInfo {
     uint64_t    pagefile     = 0;
 };
 
+enum class ServiceStartKind : uint8_t {
+    Unknown      = 0,
+    Auto         = 1,   // SERVICE_AUTO_START
+    AutoDelayed  = 2,   // SERVICE_AUTO_START + delayed flag
+    Demand       = 3,   // SERVICE_DEMAND_START
+    Boot         = 4,   // SERVICE_BOOT_START (drivers only)
+    System       = 5,   // SERVICE_SYSTEM_START (drivers only)
+    Disabled     = 6,   // SERVICE_DISABLED
+};
+
+static const char * start_kind_short(ServiceStartKind k) {
+    switch (k) {
+        case ServiceStartKind::Auto:        return "auto";
+        case ServiceStartKind::AutoDelayed: return "auto-d";
+        case ServiceStartKind::Demand:      return "demand";
+        case ServiceStartKind::Boot:        return "boot";
+        case ServiceStartKind::System:      return "system";
+        case ServiceStartKind::Disabled:    return "disabled";
+        default:                            return "?";
+    }
+}
+
 struct ServiceInfo {
     std::string name;
     std::string display_name;
     DWORD       pid          = 0;
     DWORD       service_type = 0;
     DWORD       current_state = 0;
+    ServiceStartKind start_kind = ServiceStartKind::Unknown;
 };
 
 struct DriverInfo {
@@ -445,31 +468,27 @@ static std::vector<ProcInfo> collect_processes() {
     return out;
 }
 
-static std::vector<ServiceInfo> collect_services() {
-    std::vector<ServiceInfo> out;
-    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
-    if (!scm) return out;
-
+// Enumerate one filter (SERVICE_WIN32 or SERVICE_DRIVER) and append results
+// to `out`. Reuses cfg_buf for QueryServiceConfigW scratch.
+static void enum_one_filter(SC_HANDLE scm, DWORD type_filter,
+                            std::vector<ServiceInfo> & out,
+                            std::vector<uint8_t> & cfg_buf) {
     DWORD bytes_needed = 0, services_returned = 0, resume = 0;
     EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO,
-                          SERVICE_WIN32, SERVICE_ACTIVE,
+                          type_filter, SERVICE_ACTIVE,
                           nullptr, 0, &bytes_needed, &services_returned, &resume, nullptr);
-    if (bytes_needed == 0) {
-        CloseServiceHandle(scm);
-        return out;
-    }
+    if (bytes_needed == 0) return;
 
     std::vector<uint8_t> buf(bytes_needed);
     if (!EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO,
-                               SERVICE_WIN32, SERVICE_ACTIVE,
+                               type_filter, SERVICE_ACTIVE,
                                buf.data(), (DWORD)buf.size(),
                                &bytes_needed, &services_returned, &resume, nullptr)) {
-        CloseServiceHandle(scm);
-        return out;
+        return;
     }
 
     auto * status = (ENUM_SERVICE_STATUS_PROCESSW *)buf.data();
-    out.reserve(services_returned);
+    out.reserve(out.size() + services_returned);
     for (DWORD i = 0; i < services_returned; ++i) {
         ServiceInfo si{};
         si.name          = ws_to_utf8(status[i].lpServiceName);
@@ -477,8 +496,56 @@ static std::vector<ServiceInfo> collect_services() {
         si.pid           = status[i].ServiceStatusProcess.dwProcessId;
         si.service_type  = status[i].ServiceStatusProcess.dwServiceType;
         si.current_state = status[i].ServiceStatusProcess.dwCurrentState;
+
+        // Per-service start type via QueryServiceConfig.  Open with the
+        // minimum-needed rights so we don't fail when running non-elevated.
+        SC_HANDLE svc = OpenServiceW(scm, status[i].lpServiceName, SERVICE_QUERY_CONFIG);
+        if (svc) {
+            DWORD cfg_needed = 0;
+            QueryServiceConfigW(svc, nullptr, 0, &cfg_needed);
+            if (cfg_needed > 0) {
+                if (cfg_buf.size() < cfg_needed) cfg_buf.resize(cfg_needed);
+                auto * cfg = (QUERY_SERVICE_CONFIGW *)cfg_buf.data();
+                if (QueryServiceConfigW(svc, cfg, (DWORD)cfg_buf.size(), &cfg_needed)) {
+                    switch (cfg->dwStartType) {
+                        case SERVICE_BOOT_START:   si.start_kind = ServiceStartKind::Boot;     break;
+                        case SERVICE_SYSTEM_START: si.start_kind = ServiceStartKind::System;   break;
+                        case SERVICE_AUTO_START:   si.start_kind = ServiceStartKind::Auto;     break;
+                        case SERVICE_DEMAND_START: si.start_kind = ServiceStartKind::Demand;   break;
+                        case SERVICE_DISABLED:     si.start_kind = ServiceStartKind::Disabled; break;
+                        default:                   si.start_kind = ServiceStartKind::Unknown;  break;
+                    }
+                    if (si.start_kind == ServiceStartKind::Auto) {
+                        SERVICE_DELAYED_AUTO_START_INFO dasi{};
+                        DWORD dasi_needed = 0;
+                        if (QueryServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                                 (LPBYTE)&dasi, sizeof(dasi), &dasi_needed) &&
+                            dasi.fDelayedAutostart) {
+                            si.start_kind = ServiceStartKind::AutoDelayed;
+                        }
+                    }
+                }
+            }
+            CloseServiceHandle(svc);
+        }
+
         out.push_back(si);
     }
+}
+
+static std::vector<ServiceInfo> collect_services() {
+    std::vector<ServiceInfo> out;
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) return out;
+
+    std::vector<uint8_t> cfg_buf;
+    // Win32 user-mode services (svchost-hosted + dedicated .exe).
+    enum_one_filter(scm, SERVICE_WIN32, out, cfg_buf);
+    // Kernel drivers (boot-start, system-start, and a few auto-start drivers).
+    // These don't have a PID/host process; they live in kernel address space.
+    // We include them so the start-kind summary reflects boot-time charge.
+    enum_one_filter(scm, SERVICE_DRIVER, out, cfg_buf);
+
     CloseServiceHandle(scm);
     return out;
 }
@@ -546,6 +613,7 @@ struct Options {
     bool        json            = false;
     bool        processes_only  = false;
     bool        no_processes    = false;
+    bool        no_services     = false;
     bool        show_all_procs  = false;
     int         top_n           = 30;
     bool        help            = false;
@@ -555,6 +623,7 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
                         const MemList & ml,
                         const std::vector<PageFile> & pagefiles,
                         const std::vector<ProcInfo> & procs_sorted,
+                        const std::vector<ServiceInfo> & all_services,
                         const std::map<DWORD, std::vector<ServiceInfo>> & services_by_pid,
                         const std::vector<DriverInfo> & drivers_top,
                         const Options & opts, bool admin) {
@@ -674,13 +743,134 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
             if (it != services_by_pid.end() && !it->second.empty()) {
                 printf("  [");
                 for (size_t s = 0; s < it->second.size(); ++s) {
-                    printf("%s%s", (s ? "," : ""), it->second[s].name.c_str());
+                    const ServiceInfo & svc = it->second[s];
+                    // Suppress tag for Auto (the common case) and for
+                    // Disabled (extremely rare here: a Running service whose
+                    // config was flipped to Disabled after start; will not
+                    // auto-start next boot but is irrelevant to this snapshot).
+                    const bool tagged = (svc.start_kind != ServiceStartKind::Auto     &&
+                                         svc.start_kind != ServiceStartKind::Disabled &&
+                                         svc.start_kind != ServiceStartKind::Unknown);
+                    if (tagged) {
+                        printf("%s%s:%s", (s ? "," : ""),
+                               svc.name.c_str(),
+                               start_kind_short(svc.start_kind));
+                    } else {
+                        printf("%s%s", (s ? "," : ""), svc.name.c_str());
+                    }
                     if (s >= 6 && it->second.size() > 7) {
                         printf(",...+%zu", it->second.size() - s - 1);
                         break;
                     }
                 }
                 printf("]");
+            }
+            printf("\n");
+        }
+        line();
+    }
+
+    if (!opts.no_processes) {
+        printf(" Service start-kind tag legend: unmarked = auto, :demand, :auto-d\n");
+        line();
+    }
+
+    // Running services section: always show services regardless of where their
+    // host process landed in the WS-sorted process table. Useful because
+    // typical svchost.exe hosts have small WS (~15-50 MB) and rarely make
+    // the default --top 30 cutoff.
+    if (!opts.no_services && !all_services.empty()) {
+        // Tally ALL active services (user-mode + kernel drivers) by start
+        // kind for the summary. Drivers won't appear in the per-host table
+        // below (they have no PID), but they DO contribute to boot charge,
+        // so the counts include them.
+        size_t n_auto = 0, n_auto_d = 0, n_demand = 0;
+        size_t n_boot = 0, n_system = 0, n_other = 0;
+        size_t n_drivers = 0, n_usermode = 0;
+        for (const auto & svc : all_services) {
+            const bool is_driver = (svc.service_type &
+                                    (SERVICE_KERNEL_DRIVER | SERVICE_FILE_SYSTEM_DRIVER)) != 0;
+            if (is_driver) ++n_drivers; else ++n_usermode;
+            switch (svc.start_kind) {
+                case ServiceStartKind::Auto:        ++n_auto;   break;
+                case ServiceStartKind::AutoDelayed: ++n_auto_d; break;
+                case ServiceStartKind::Demand:      ++n_demand; break;
+                case ServiceStartKind::Boot:        ++n_boot;   break;
+                case ServiceStartKind::System:      ++n_system; break;
+                default:                            ++n_other;  break;
+            }
+        }
+
+        printf(" Running services (%zu total: %zu user-mode + %zu kernel drivers, across %zu host processes)\n",
+               all_services.size(), n_usermode, n_drivers, services_by_pid.size());
+        printf("   By start kind:");
+        bool first = true;
+        auto tally = [&](const char * label, size_t n) {
+            if (!n) return;
+            printf("%s %zu %s", first ? "" : " |", n, label);
+            first = false;
+        };
+        tally("auto",          n_auto);
+        tally("auto-delayed",  n_auto_d);
+        tally("demand",        n_demand);
+        tally("system",        n_system);
+        tally("boot",          n_boot);
+        tally("other",         n_other);
+        printf("\n");
+        line();
+
+        // Look up host process WS for sort + display.
+        std::map<DWORD, const ProcInfo *> proc_by_pid;
+        for (const auto & pi : procs_sorted) {
+            proc_by_pid[pi.pid] = &pi;
+        }
+
+        // Build a sortable list of user-mode service hosts (kernel drivers
+        // have no PID/host process and are not in services_by_pid).
+        struct HostRow {
+            DWORD pid;
+            uint64_t ws;
+            std::string name;
+            const std::vector<ServiceInfo> * services;
+        };
+        std::vector<HostRow> hosts;
+        hosts.reserve(services_by_pid.size());
+        for (const auto & kv : services_by_pid) {
+            HostRow h{};
+            h.pid = kv.first;
+            h.services = &kv.second;
+            auto pit = proc_by_pid.find(kv.first);
+            if (pit != proc_by_pid.end()) {
+                h.ws   = pit->second->ws;
+                h.name = pit->second->name;
+            } else {
+                h.ws = 0;
+                h.name = "<unknown>";
+            }
+            hosts.push_back(std::move(h));
+        }
+        std::sort(hosts.begin(), hosts.end(),
+                  [](const HostRow & a, const HostRow & b) { return a.ws > b.ws; });
+
+        printf("    %6s  %12s   %-22s   %s\n",
+               "PID", "HostWS", "Host", "Services");
+        for (const auto & h : hosts) {
+            printf("    %6lu  %12s   %-22.22s   ",
+                   (unsigned long)h.pid,
+                   format_bytes(h.ws, 12).c_str(),
+                   h.name.c_str());
+            for (size_t s = 0; s < h.services->size(); ++s) {
+                const ServiceInfo & svc = (*h.services)[s];
+                const bool tagged = (svc.start_kind != ServiceStartKind::Auto     &&
+                                     svc.start_kind != ServiceStartKind::Disabled &&
+                                     svc.start_kind != ServiceStartKind::Unknown);
+                if (tagged) {
+                    printf("%s%s:%s", (s ? ", " : ""),
+                           svc.name.c_str(),
+                           start_kind_short(svc.start_kind));
+                } else {
+                    printf("%s%s", (s ? ", " : ""), svc.name.c_str());
+                }
             }
             printf("\n");
         }
@@ -696,6 +886,7 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
                        const MemList & ml,
                        const std::vector<PageFile> & pagefiles,
                        const std::vector<ProcInfo> & procs_sorted,
+                       const std::vector<ServiceInfo> & all_services,
                        const std::map<DWORD, std::vector<ServiceInfo>> & services_by_pid,
                        const std::vector<DriverInfo> & drivers_top,
                        const Options & opts, bool admin) {
@@ -764,6 +955,49 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
     }
     printf("  ],\n");
 
+    // Full services list (user-mode + kernel drivers) with start kind for
+    // boot-charge analysis.
+    {
+        size_t n_auto = 0, n_auto_d = 0, n_demand = 0;
+        size_t n_boot = 0, n_system = 0, n_other = 0;
+        size_t n_drivers = 0, n_usermode = 0;
+        for (const auto & svc : all_services) {
+            const bool is_driver = (svc.service_type &
+                                    (SERVICE_KERNEL_DRIVER | SERVICE_FILE_SYSTEM_DRIVER)) != 0;
+            if (is_driver) ++n_drivers; else ++n_usermode;
+            switch (svc.start_kind) {
+                case ServiceStartKind::Auto:        ++n_auto;   break;
+                case ServiceStartKind::AutoDelayed: ++n_auto_d; break;
+                case ServiceStartKind::Demand:      ++n_demand; break;
+                case ServiceStartKind::Boot:        ++n_boot;   break;
+                case ServiceStartKind::System:      ++n_system; break;
+                default:                            ++n_other;  break;
+            }
+        }
+        printf("  \"services_summary\": {\n");
+        printf("    \"total\": %zu, \"user_mode\": %zu, \"kernel_driver\": %zu,\n",
+               all_services.size(), n_usermode, n_drivers);
+        printf("    \"by_start_kind\": {\"auto\": %zu, \"auto_delayed\": %zu, \"demand\": %zu, "
+               "\"system\": %zu, \"boot\": %zu, \"other\": %zu}\n",
+               n_auto, n_auto_d, n_demand, n_system, n_boot, n_other);
+        printf("  },\n");
+
+        printf("  \"services\": [\n");
+        for (size_t i = 0; i < all_services.size(); ++i) {
+            const auto & svc = all_services[i];
+            const bool is_driver = (svc.service_type &
+                                    (SERVICE_KERNEL_DRIVER | SERVICE_FILE_SYSTEM_DRIVER)) != 0;
+            printf("    {\"name\":\"%s\",\"display\":\"%s\",\"start\":\"%s\",\"kind\":\"%s\"",
+                   json_escape(svc.name).c_str(),
+                   json_escape(svc.display_name).c_str(),
+                   start_kind_short(svc.start_kind),
+                   is_driver ? "driver" : "user");
+            if (svc.pid != 0) printf(",\"pid\":%lu", (unsigned long)svc.pid);
+            printf("}%s\n", (i + 1 < all_services.size() ? "," : ""));
+        }
+        printf("  ],\n");
+    }
+
     size_t to_show = opts.no_processes ? 0 :
                      (opts.show_all_procs ? procs_sorted.size()
                                           : std::min<size_t>(procs_sorted.size(), (size_t)opts.top_n));
@@ -781,7 +1015,11 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
         if (it != services_by_pid.end() && !it->second.empty()) {
             printf(", \"services\": [");
             for (size_t s = 0; s < it->second.size(); ++s) {
-                printf("%s\"%s\"", (s ? "," : ""), json_escape(it->second[s].name).c_str());
+                const ServiceInfo & svc = it->second[s];
+                printf("%s{\"name\":\"%s\",\"start\":\"%s\"}",
+                       (s ? "," : ""),
+                       json_escape(svc.name).c_str(),
+                       start_kind_short(svc.start_kind));
             }
             printf("]");
         }
@@ -817,6 +1055,7 @@ static bool parse_args(int argc, char ** argv, Options & opts) {
         else if (a == "--json")         { opts.json = true; }
         else if (a == "--processes-only"){ opts.processes_only = true; }
         else if (a == "--no-processes") { opts.no_processes = true; }
+        else if (a == "--no-services")  { opts.no_services = true; }
         else if (a == "--all")          { opts.show_all_procs = true; }
         else if (a == "--top") {
             if (++i >= argc) { fprintf(stderr, "wxemem: --top requires N\n"); return false; }
@@ -865,9 +1104,9 @@ int main(int argc, char ** argv) {
     if (drivers_top.size() > 64) drivers_top.resize(64);
 
     if (opts.json) {
-        print_json(p, k, ml, pagefiles, procs, svc_by_pid, drivers_top, opts, admin);
+        print_json(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
     } else {
-        print_human(p, k, ml, pagefiles, procs, svc_by_pid, drivers_top, opts, admin);
+        print_human(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
     }
     return 0;
 }
