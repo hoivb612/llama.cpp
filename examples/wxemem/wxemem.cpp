@@ -477,7 +477,18 @@ static void enum_one_filter(SC_HANDLE scm, DWORD type_filter,
     EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO,
                           type_filter, SERVICE_ACTIVE,
                           nullptr, 0, &bytes_needed, &services_returned, &resume, nullptr);
-    if (bytes_needed == 0) return;
+    if (bytes_needed == 0) {
+        DWORD err = GetLastError();
+        // ERROR_MORE_DATA with bytes_needed==0 is a true empty result;
+        // anything else (e.g. ERROR_ACCESS_DENIED on SERVICE_DRIVER for
+        // non-admin / hardened tokens) is silently dropping data. Surface
+        // it on stderr so the missing-drivers case is diagnosable.
+        if (err != ERROR_MORE_DATA && err != ERROR_SUCCESS) {
+            fprintf(stderr, "wxemem: EnumServicesStatusExW(filter=0x%lX) sizing failed: GetLastError=%lu\n",
+                    (unsigned long)type_filter, (unsigned long)err);
+        }
+        return;
+    }
 
     std::vector<uint8_t> buf(bytes_needed);
     if (!EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO,
