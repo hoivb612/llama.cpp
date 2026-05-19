@@ -21,6 +21,44 @@
 #include <thread>
 #include <vector>
 
+#if defined(_GAMING_XBOX)
+// On the Xbox GDKX games partition there is no usable stderr/stdout (the
+// process has no console). All log output must be routed through the title's
+// debug channel via OutputDebugStringA, which the developer kit surfaces in
+// PIX, the dev-kit "Debug Spew" view, and a host-side debugger.
+//
+// We install this callback unconditionally on Xbox, replacing both the
+// default stderr-writing callback and the silence callbacks the verbose
+// gating logic uses on PC.
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+
+static void minslm_ods_log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (!text) return;
+    const char * lvl = "    ";
+    switch (level) {
+        case GGML_LOG_LEVEL_ERROR: lvl = "ERR "; break;
+        case GGML_LOG_LEVEL_WARN:  lvl = "WRN "; break;
+        case GGML_LOG_LEVEL_INFO:  lvl = "INF "; break;
+        case GGML_LOG_LEVEL_DEBUG: lvl = "DBG "; break;
+        case GGML_LOG_LEVEL_CONT:  lvl = "    "; break;
+        default: break;
+    }
+    // Mirror to stderr first so the existing console-style output (the
+    // build's normal log destination) keeps working over telnet / kit
+    // console. fputs is what ggml's default callback uses, so format stays
+    // identical for that channel.
+    fputs(text, stdout);
+    fflush(stdout);
+    OutputDebugStringA(text);
+}
+#endif // _GAMING_XBOX
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -149,7 +187,19 @@ struct cli_params {
     int     verbose      = 0;
     bool    streaming    = false;
     bool    force_cpu    = false;
+    bool    no_mmap      = false;
+    bool    direct_io    = true;
+    // Flash Attention default. On the GDKX/Xbox build the non-FA path
+    // (separate QK matmul + softmax + attn*V) currently outperforms the FA
+    // shader for prompt processing on RDNA2, so we default to OFF there.
+    // PC builds default to AUTO and let the runtime decide based on the
+    // backend's supports_op (see src/llama-context.cpp's auto_fa block).
+    // Either default can be overridden via `-fa on|off|auto`.
+#if defined(_GAMING_XBOX)
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+#else
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -187,6 +237,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "verbose")){ p.verbose = 1; }
         else if (!strcmp(argv[i], "stream")) { p.streaming = true; }
         else if (!strcmp(argv[i], "cpu"))    { p.force_cpu = true; }
+        else if (!strcmp(argv[i], "--no-mmap") || !strcmp(argv[i], "-nm")) { p.no_mmap = true; }
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) { p.main_gpu = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-sm") && i + 1 < argc) {
             i++;
@@ -197,19 +248,15 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--weight-budget") && i + 1 < argc) {
             p.weight_budget_mb = atoi(argv[++i]);
         }
-        else if (!strcmp(argv[i], "-fa") || !strcmp(argv[i], "--flash-attn")) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Error: %s requires a value: on|off|auto\n", argv[i]);
+        else if ((!strcmp(argv[i], "-fa") || !strcmp(argv[i], "--flash-attn")) && i + 1 < argc) {
+            i++;
+            if      (!strcmp(argv[i], "on")   || !strcmp(argv[i], "1") || !strcmp(argv[i], "true"))  p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            else if (!strcmp(argv[i], "off")  || !strcmp(argv[i], "0") || !strcmp(argv[i], "false")) p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            else if (!strcmp(argv[i], "auto"))                                                       p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            else {
+                fprintf(stderr, "Error: -fa expects on|off|auto, got '%s'\n", argv[i]);
                 return 1;
             }
-
-            llama_flash_attn_type mode;
-            if (!parse_flash_attn_mode(argv[++i], mode)) {
-                fprintf(stderr, "Error: unknown value for %s: '%s' (expected on|off|auto)\n",
-                        argv[i - 1], argv[i]);
-                return 1;
-            }
-            p.flash_attn_type = mode;
         }
         else {
             fprintf(stderr, "Warning: unknown argument '%s' ignored\n", argv[i]);
@@ -221,13 +268,23 @@ int main(int argc, char ** argv) {
     if (!parse_prompt_file(p.prompt_file.c_str(), pf)) return 1;
     printf("[%s]: loaded %zu prompt(s) from '%s'\n", __func__, pf.prompts.size(), p.prompt_file.c_str());
 
+#if defined(_GAMING_XBOX)
+    // Route all llama / ggml log output to OutputDebugStringA. Installed
+    // once and never overridden -- the verbose-gated silence path below is
+    // skipped on Xbox so this callback stays active for the whole run.
+    llama_log_set(minslm_ods_log_callback, nullptr);
+#endif    
+
     // --- Initialize llama backend ---
     llama_backend_init();
+    // ggml_backend_load_all();
 
+#if !defined(_GAMING_XBOX)
     // Quiet mode unless verbose
     if (p.verbose < 2) {
         llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
     }
+#endif
 
     // --- Load model ---
     // Set weight budget env var if specified (picked up by load_all_data)
@@ -252,6 +309,12 @@ int main(int argc, char ** argv) {
     if (p.split_mode >= 0) {
         model_params.split_mode = (enum llama_split_mode)p.split_mode;
     }
+    if (p.no_mmap) {
+        model_params.use_mmap = false;
+    }
+    if (p.direct_io) {
+        model_params.use_direct_io = true;
+    }
 
     llama_model * model = llama_model_load_from_file(p.model_path.c_str(), model_params);
     if (!model) {
@@ -265,8 +328,8 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch  = p.n_batch;
     ctx_params.n_threads       = p.n_threads;
     ctx_params.n_threads_batch = p.n_threads;
-    ctx_params.flash_attn_type = p.flash_attn_type;
     ctx_params.no_perf  = false;
+    ctx_params.flash_attn_type = p.flash_attn_type;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
@@ -283,12 +346,17 @@ int main(int argc, char ** argv) {
            p.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? " (runtime-selected)" : "");
     printf("[%s]: system_info: %s\n", __func__, llama_print_system_info());
 
-    // Re-enable logging briefly for memory breakdown, then suppress again
+#if !defined(_GAMING_XBOX)
+    // Re-enable logging briefly for memory breakdown, then suppress again.
+    // On Xbox the ODS callback is already installed and stays installed.
     llama_log_set(nullptr, nullptr);
+#endif
     llama_memory_breakdown_print(ctx);
+#if !defined(_GAMING_XBOX)
     if (p.verbose < 2) {
         llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
     }
+#endif
     printf("\n");
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -347,6 +415,9 @@ int main(int argc, char ** argv) {
             std::string output;
             int n_gen = 0;
             int n_emit = 0;
+            size_t empty_pieces = 0;
+            std::vector<llama_token> empty_ids; empty_ids.reserve(16);
+            std::vector<llama_token> all_ids;   all_ids.reserve((size_t)max_gen);
 
             auto sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
@@ -378,6 +449,11 @@ int main(int argc, char ** argv) {
                 n_emit++;
 
                 std::string piece = token_to_piece(ctx, id);
+                all_ids.push_back(id);
+                if (piece.empty()) {
+                    ++empty_pieces;
+                    if (empty_ids.size() < 16) empty_ids.push_back(id);
+                }
                 if (p.streaming) {
                     printf("%s", piece.c_str());
                     fflush(stdout);
@@ -415,8 +491,69 @@ int main(int argc, char ** argv) {
 
             llama_sampler_free(smpl);
 
-            if (!p.streaming && !output.empty()) {
-                printf("%s\n", output.c_str());
+            if (!p.streaming) {
+                if (!output.empty()) {
+                    // Use fwrite to handle embedded NUL bytes from byte-fallback tokens.
+                    // Also escape unprintable control chars so log viewers don't truncate.
+                    std::string esc;
+                    esc.reserve(output.size() + 16);
+                    size_t nuls = 0;
+                    size_t ctrl = 0;
+                    for (unsigned char c : output) {
+                        if (c == 0) {
+                            esc += "\\x00";
+                            ++nuls;
+                        } else if (c < 0x20 && c != '\n' && c != '\t' && c != '\r') {
+                            char buf[5];
+                            snprintf(buf, sizeof(buf), "\\x%02X", c);
+                            esc += buf;
+                            ++ctrl;
+                        } else {
+                            esc += (char)c;
+                        }
+                    }
+                    fwrite(esc.data(), 1, esc.size(), stdout);
+                    putchar('\n');
+                    fflush(stdout);
+                    if (p.verbose >= 2 && (nuls || ctrl || empty_pieces)) {
+                        printf("  [output diag: bytes=%zu nuls=%zu other_ctrl=%zu empty_pieces=%zu/%d]\n",
+                               output.size(), nuls, ctrl, empty_pieces, n_gen);
+                        if (empty_pieces) {
+                            printf("  [empty piece token ids (first %zu):",
+                                   empty_ids.size());
+                            for (auto t : empty_ids) printf(" %d", t);
+                            printf("]\n");
+                        }
+                    }
+                } else if (p.verbose >= 2 && !all_ids.empty()) {
+                    printf("  [output diag: empty output, %zu tokens all produced empty pieces]\n",
+                           all_ids.size());
+                }
+                // Print full token-id sequence for off-line decoding/inspection
+                if (p.verbose >= 2 && !all_ids.empty()) {
+                    printf("  [all token ids (%zu):", all_ids.size());
+                    for (auto t : all_ids) printf(" %d", t);
+                    printf("]\n");
+                }
+                // Hex dump of the raw output bytes (16 bytes/line)
+                if (p.verbose >= 2 && !output.empty()) {
+                    printf("  [output hex (%zu bytes):]\n", output.size());
+                    for (size_t off = 0; off < output.size(); off += 16) {
+                        printf("    %04zx:", off);
+                        size_t end = std::min(off + 16, output.size());
+                        for (size_t i = off; i < end; ++i) {
+                            printf(" %02x", (unsigned char)output[i]);
+                        }
+                        // pad alignment for partial lines
+                        for (size_t i = end - off; i < 16; ++i) printf("   ");
+                        printf("  |");
+                        for (size_t i = off; i < end; ++i) {
+                            unsigned char c = (unsigned char)output[i];
+                            putchar((c >= 0x20 && c < 0x7f) ? (char)c : '.');
+                        }
+                        printf("|\n");
+                    }
+                }
             }
 
             if (p.verbose >= 2 && n_gen > 0) {
@@ -448,7 +585,9 @@ int main(int argc, char ** argv) {
     }
 
     // Re-enable llama logging for perf report
+#if !defined(_GAMING_XBOX)
     llama_log_set(nullptr, nullptr);
+#endif
     llama_perf_context_print(ctx);
 
     // Print DX12 per-op perf stats if GGML_DX12_PERF was set
