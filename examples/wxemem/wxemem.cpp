@@ -648,6 +648,45 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
         printf("   %-22s %12s   (%u%% load)\n",  "Used:",      format_bytes(p.used,      12).c_str(), p.memory_load_pct);
         printf("   %-22s %12s\n",                 "Available:", format_bytes(p.available, 12).c_str());
         line();
+
+        // Memory Breakdown: where the "Used" RAM goes.  Most user-mode work
+        // shows up in the per-process working sets, but the kernel pool,
+        // resident kernel/driver code, file cache currently mapped, dirty
+        // (modified) pages, plus any VBS / Hyper-V / WSL / GPU pinned
+        // allocations are invisible to per-process accounting and live in
+        // the "unattributed" bucket below.
+        {
+            uint64_t all_ws_total = 0;
+            for (const auto & pi : procs_sorted) all_ws_total += pi.ws;
+            const uint64_t kernel_pool   = k.available ? (k.paged_pool + k.non_paged_pool) : 0;
+            const uint64_t kernel_code   = k.available ? (k.driver_code + k.system_code)   : 0;
+            const uint64_t system_cache  = k.available ? k.system_cache                    : 0;
+            const uint64_t modified_list = ml.available ? ml.modified_bytes                : 0;
+            const uint64_t accounted     = kernel_pool + kernel_code + system_cache + modified_list;
+            // Process WS overcounts shared pages, so we can't subtract it
+            // cleanly. Report the (Used - kernel buckets) residual instead
+            // and call out that the residual covers process unique pages
+            // *plus* VBS/Hyper-V/GPU/etc.
+            const uint64_t residual = p.used > accounted ? p.used - accounted : 0;
+
+            printf(" Memory Breakdown (Approximate)\n");
+            printf("   %-32s %12s\n", "\"Used\" (Total - Avail):", format_bytes(p.used, 12).c_str());
+            printf("   %-32s %12s%s\n",
+                   "All processes WS (sum):", format_bytes(all_ws_total, 12).c_str(),
+                   "   (overcounts shared DLL/file pages)");
+            if (k.available) {
+                printf("   %-32s %12s\n", "Kernel pool (paged + nonpaged):", format_bytes(kernel_pool, 12).c_str());
+                printf("   %-32s %12s\n", "Resident kernel + driver code:",  format_bytes(kernel_code, 12).c_str());
+                printf("   %-32s %12s\n", "Resident system cache:",          format_bytes(system_cache, 12).c_str());
+            }
+            if (ml.available) {
+                printf("   %-32s %12s\n", "Modified list (dirty pages):",    format_bytes(modified_list, 12).c_str());
+            }
+            printf("   %-32s %12s   (unique process pages + VBS / Hyper-V / GPU / etc.)\n",
+                   "User resident (Used - kernel):", format_bytes(residual, 12).c_str());
+            line();
+        }
+
         printf(" Commit charge\n");
         printf("   %-22s %12s\n",                 "Used:",     format_bytes(p.commit_total, 12).c_str());
         printf("   %-22s %12s   (physical RAM + page file backing)\n",
@@ -739,7 +778,10 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
     if (!opts.no_processes) {
         size_t to_show = opts.show_all_procs ? procs_sorted.size()
                                               : std::min<size_t>(procs_sorted.size(), (size_t)opts.top_n);
-        printf(" Top %zu processes by working set (of %zu total)\n", to_show, procs_sorted.size());
+        uint64_t top_ws_total = 0;
+        for (size_t i = 0; i < to_show; ++i) top_ws_total += procs_sorted[i].ws;
+        printf(" Top %zu processes by working set (of %zu total): %s\n",
+               to_show, procs_sorted.size(), format_bytes(top_ws_total).c_str());
         printf("    %6s  %15s  %15s  %15s   %s\n",
                "PID", "WorkingSet", "Private", "PageFile", "Image / [services]");
         for (size_t i = 0; i < to_show; ++i) {
@@ -812,8 +854,22 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
             }
         }
 
+        // Tally memory consumed by the user-mode service host processes.
+        // services_by_pid is already keyed by PID, so each iteration is one
+        // unique host even when that host runs several services (svchost
+        // groups). Kernel drivers have no per-driver WS — their resident
+        // footprint is captured by the kernel-pool section above.
+        uint64_t hosts_ws_total = 0;
+        for (const auto & kv : services_by_pid) {
+            auto pit = std::find_if(procs_sorted.begin(), procs_sorted.end(),
+                                    [pid = kv.first](const ProcInfo & p){ return p.pid == pid; });
+            if (pit != procs_sorted.end()) hosts_ws_total += pit->ws;
+        }
+
         printf(" Running services (%zu total: %zu user-mode + %zu kernel drivers, across %zu host processes)\n",
                all_services.size(), n_usermode, n_drivers, services_by_pid.size());
+        printf("   Total memory consumed: %s (sum of host process working sets)\n",
+               format_bytes(hosts_ws_total).c_str());
         printf("   By start kind:");
         bool first = true;
         auto tally = [&](const char * label, size_t n) {
