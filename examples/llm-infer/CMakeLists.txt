@@ -40,7 +40,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_compile_definitions(${TARGET} PRIVATE LLM_INFER_SHARED LLM_INFER_DLL)
-target_link_libraries(llm-infer PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(llm-infer PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 install(TARGETS llm-infer LIBRARY)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
@@ -53,7 +53,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -69,7 +69,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 endif()
@@ -83,7 +83,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -96,7 +96,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -109,7 +109,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -122,7 +122,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/hnswlib)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 set(TARGET minslminfer-multi-og)
@@ -135,7 +135,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
 target_include_directories(${TARGET} PUBLIC ../../include)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # Cross-platform benchmark (no Windows/DLL dependencies - builds on Linux/WSL2/macOS/Windows)
@@ -157,7 +157,7 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-in
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/llm-infer/include/nlohmann)
 target_include_directories(${TARGET} PUBLIC ../../common)
 target_include_directories(${TARGET} PUBLIC ../../include)
-target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 set(TARGET testme)
@@ -165,7 +165,7 @@ add_executable(${TARGET} test/testme.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_include_directories(${TARGET} PRIVATE .)
 target_include_directories(${TARGET} PUBLIC ../../common)
-#target_link_libraries(${TARGET} PRIVATE common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
+#target_link_libraries(${TARGET} PRIVATE llama-common llama llm-infer-static ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # end of CMakeLists.txt ...

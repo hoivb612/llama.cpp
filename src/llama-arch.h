@@ -115,6 +115,7 @@ enum llm_arch {
     LLM_ARCH_ERNIE4_5_MOE,
     LLM_ARCH_HUNYUAN_MOE,
     LLM_ARCH_HUNYUAN_DENSE,
+    LLM_ARCH_HUNYUAN_VL,
     LLM_ARCH_SMOLLM3,
     LLM_ARCH_OPENAI_MOE,
     LLM_ARCH_LFM2,
@@ -237,6 +238,7 @@ enum llm_kv {
     LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
     LLM_KV_ATTENTION_SCALE,
     LLM_KV_ATTENTION_OUTPUT_SCALE,
+    LLM_KV_ATTENTION_VALUE_SCALE,
     LLM_KV_ATTENTION_TEMPERATURE_LENGTH,
     LLM_KV_ATTENTION_TEMPERATURE_SCALE,
     LLM_KV_ATTENTION_KEY_LENGTH_MLA,
@@ -256,6 +258,7 @@ enum llm_kv {
     LLM_KV_ROPE_SCALE_LINEAR,
     LLM_KV_ROPE_SCALING_TYPE,
     LLM_KV_ROPE_SCALING_FACTOR,
+    LLM_KV_ROPE_SCALING_ALPHA,
     LLM_KV_ROPE_SCALING_ATTN_FACTOR,
     LLM_KV_ROPE_SCALING_ORIG_CTX_LEN,
     LLM_KV_ROPE_SCALING_FINETUNED,
@@ -636,3 +639,4 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+bool llm_arch_supports_rs_rollback(const llm_arch & arch);
