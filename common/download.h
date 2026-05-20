@@ -21,6 +21,7 @@ public:
     virtual void on_start(const common_download_progress & p) = 0;
     virtual void on_update(const common_download_progress & p) = 0;
     virtual void on_done(const common_download_progress & p, bool ok) = 0;
+    virtual bool is_cancelled() const { return false; }
 };
 
 struct common_remote_params {
@@ -58,6 +59,7 @@ struct common_download_opts {
 struct common_download_model_result {
     std::string model_path;
     std::string mmproj_path;
+    std::string mtp_path;
 };
 
 // Download model from HuggingFace repo or URL
@@ -82,12 +84,14 @@ struct common_download_model_result {
 // when opts.offline=true, no network requests are made
 // when download_mmproj=true, searches for mmproj in same directory as model or any parent directory
 // then with the closest quantization bits
+// when download_mtp=true, applies the same sibling search for an MTP-head GGUF
 //
-// returns result with model_path and mmproj_path (empty on failure)
+// returns result with model_path, mmproj_path and mtp_path (empty when not found / on failure)
 common_download_model_result common_download_model(
     const common_params_model & model,
     const common_download_opts & opts = {},
-    bool download_mmproj = false
+    bool download_mmproj = false,
+    bool download_mtp    = false
 );
 
 // returns list of cached models

@@ -346,17 +346,13 @@ int main(int argc, char ** argv) {
            p.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? " (runtime-selected)" : "");
     printf("[%s]: system_info: %s\n", __func__, llama_print_system_info());
 
-#if !defined(_GAMING_XBOX)
-    // Re-enable logging briefly for memory breakdown, then suppress again.
-    // On Xbox the ODS callback is already installed and stays installed.
-    llama_log_set(nullptr, nullptr);
-#endif
-    llama_memory_breakdown_print(ctx);
-#if !defined(_GAMING_XBOX)
-    if (p.verbose < 2) {
-        llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
-    }
-#endif
+    // NOTE: upstream removed llama_memory_breakdown_print() from the public
+    // libllama API (PR #22171, "fit-params: refactor"). The breakdown printer
+    // now lives in libcommon as common_memory_breakdown_print(). minslm-cli
+    // is intentionally self-contained (links only against `llama`, not
+    // `common`), so we skip the printout here rather than pull in libcommon.
+    // If you want the breakdown back, add `common` to minslm-cli's
+    // target_link_libraries and call common_memory_breakdown_print(ctx).
     printf("\n");
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
