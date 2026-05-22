@@ -8211,6 +8211,408 @@ void ggml_compute_forward_top_k(
     }
 }
 
+static inline ggml_float ggml_b612_fa_soft_max_f32(const int n, float * y, const float * x, float max) {
+    uint64_t nc = n;
+    uint64_t i = 0;
+    float sumf = 0;
+
+#if defined(__AVX512F__) && defined(__GEN_AVX512__) && defined(__AVX512DQ__)
+    const uint64_t xn = (nc & ~15ULL);
+    if (xn) {
+        __m512 vmax = _mm512_set1_ps(max);
+        __m512 sum = _mm512_setzero_ps();
+        __m512 val;
+
+        do {
+            val = _mm512_loadu_ps(x + i);
+            val = _mm512_sub_ps(val, vmax);
+            val = ggml_v_expf(val);
+            _mm512_storeu_ps(y + i, val);
+            sum = _mm512_add_ps(sum, val);
+            i += 16;
+        } while (i < xn);
+
+        sumf = _mm512_reduce_add_ps(sum);
+    }
+
+    if (nc & 15ULL) {
+        do {
+            float val = expf(x[i] - max);
+            y[i] = val;
+            sumf += val;
+            i += 1;
+        } while (i < nc);
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    const uint64_t xn = (nc & ~7ULL);
+    if (xn) {
+        __m256 vmax = _mm256_set1_ps(max);
+        __m256 sum = _mm256_setzero_ps();
+        __m256 val;
+
+        do {
+            val = _mm256_loadu_ps(x + i);
+            val = _mm256_sub_ps(val, vmax);
+            val = ggml_v_expf(val);
+            _mm256_storeu_ps(y + i, val);
+            sum = _mm256_add_ps(sum, val);
+            i += 8;
+        } while (i < xn);
+
+        const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+        const __m128 t1 = _mm_hadd_ps(t0, t0);
+        sumf = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+    }
+
+    if (nc & 7ULL) {
+        do {
+            float val = expf(x[i] - max);
+            y[i] = val;
+            sumf += val;
+            i += 1;
+        } while (i < nc);
+    }
+#else
+    for (; i < nc; ++i) {
+        float val = expf(x[i] - max);
+        y[i] = val;
+        sumf += val;
+    }
+#endif
+
+    return (ggml_float)sumf;
+}
+
+static inline void ggml_b612_fa_max_f32(const uint32_t n, float * s, const float * x) {
+    uint64_t nc = n;
+    uint64_t i = 0;
+    float max = -INFINITY;
+
+#if defined(__AVX512F__) && defined(__GEN_AVX512__)
+    const uint64_t xn = (nc & ~15ULL);
+    if (xn) {
+        __m512 maxv = _mm512_set1_ps(max);
+        for (; i < xn; i += 16) {
+            __m512 xv = _mm512_loadu_ps(x + i);
+            maxv = _mm512_max_ps(maxv, xv);
+        }
+        alignas(64) float tmp[16];
+        _mm512_store_ps(tmp, maxv);
+        for (int j = 0; j < 16; ++j) {
+            max = MAX(max, tmp[j]);
+        }
+    }
+
+    if (nc & 15ULL) {
+        do {
+            max = MAX(max, x[i]);
+            i += 1;
+        } while (i < nc);
+    }
+#elif defined(__AVX2__)
+    const uint64_t xn = (nc & ~7ULL);
+    if (xn) {
+        __m256 maxv = _mm256_set1_ps(max);
+        for (; i < xn; i += 8) {
+            __m256 xv = _mm256_loadu_ps(x + i);
+            maxv = _mm256_max_ps(maxv, xv);
+        }
+        alignas(32) float tmp[8];
+        _mm256_store_ps(tmp, maxv);
+        for (int j = 0; j < 8; ++j) {
+            max = MAX(max, tmp[j]);
+        }
+    }
+
+    if (nc & 7ULL) {
+        do {
+            max = MAX(max, x[i]);
+            i += 1;
+        } while (i < nc);
+    }
+#else
+    for (; i < nc; ++i) {
+        max = MAX(max, x[i]);
+    }
+#endif
+
+    *s = max;
+}
+
+static inline bool ggml_b612_fa_use_f16_dot() {
+    static int use_f16_dot = -1;
+    if (use_f16_dot == -1) {
+        use_f16_dot = getenv("GGML_B612_FA_DOT_F16") ? 1 : 0;
+    }
+    return use_f16_dot != 0;
+}
+
+static inline bool ggml_b612_fa_use_scalar_mad() {
+    static int use_scalar_mad = -1;
+    if (use_scalar_mad == -1) {
+        use_scalar_mad = getenv("GGML_B612_FA_MAD_SCALAR") ? 1 : 0;
+    }
+    return use_scalar_mad != 0;
+}
+
+static inline bool ggml_b612_fa_use_v_f32_accum() {
+    static int use_v_f32_accum = -1;
+    if (use_v_f32_accum == -1) {
+        // Default ON: FP32 accumulation for F16 V in FA is significantly faster on this branch.
+        // Overrides:
+        // - GGML_B612_FA_V_F32=1 forces FP32 accumulation
+        // - GGML_B612_FA_V_F16=1 forces legacy F16 accumulation
+        if (getenv("GGML_B612_FA_V_F16")) {
+            use_v_f32_accum = 0;
+        } else {
+            use_v_f32_accum = 1;
+        }
+        if (getenv("GGML_B612_FA_V_F32")) {
+            use_v_f32_accum = 1;
+        }
+    }
+    return use_v_f32_accum != 0;
+}
+
+static inline void ggml_b612_fa_mad_f32_scalar(const int n, float * dst, const float * src, const float v) {
+    for (int i = 0; i < n; ++i) {
+        dst[i] += src[i] * v;
+    }
+}
+
+static inline void ggml_b612_fa_mad_f16_scalar(const int n, ggml_fp16_t * dst, const ggml_fp16_t * src, const float v) {
+    for (int i = 0; i < n; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(dst[i]);
+        const float s = GGML_CPU_FP16_TO_FP32(src[i]);
+        dst[i] = GGML_CPU_FP32_TO_FP16(d + s * v);
+    }
+}
+
+// b612 baseline flash-attn path copied from b612/ops-b612.cpp for perf A/B.
+// Enabled via GGML_B612_FA_IMPL=b612 in ggml_compute_forward_flash_attn_ext().
+
+static void ggml_compute_forward_flash_attn_ext_f16_b612(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t N  = neq1;
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == N);
+
+    GGML_ASSERT(nbq0 == ggml_type_size(q->type));
+    GGML_ASSERT(nbk0 == ggml_type_size(k->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+
+    GGML_ASSERT(neq0 == DK);
+    GGML_ASSERT(nek0 == DK);
+    GGML_ASSERT(nev0 == DV);
+    GGML_ASSERT(neq1 == N);
+
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rk3 = neq3/nek3;
+    const int64_t rv2 = neq2/nev2;
+    const int64_t rv3 = neq3/nev3;
+
+    const int nr = neq1*neq2*neq3;
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+
+    GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
+    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int iq3 = ir/(neq2*neq1);
+        const int iq2 = (ir - iq3*neq2*neq1)/neq1;
+        const int iq1 = (ir - iq3*neq2*neq1 - iq2*neq1);
+
+        const uint32_t h = iq2;
+        const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+
+        float S = 0.0f;
+        float M = -INFINITY;
+
+        float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
+        float       * V32   =                 (VKQ32 + 1*DV);
+        ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV);
+        ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV);
+
+        const bool fa_v_f32_accum = ggml_b612_fa_use_v_f32_accum();
+        if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
+            memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
+        } else {
+            memset(VKQ32, 0, DV*sizeof(float));
+        }
+
+        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+
+        const int ik3 = iq3 / rk3;
+        const int ik2 = iq2 / rk2;
+        const int iv3 = iq3 / rv3;
+        const int iv2 = iq2 / rv2;
+
+        const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+        q_to_vec_dot(pq, Q_q, DK);
+
+        for (int64_t ic = 0; ic < nek1; ++ic) {
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+
+            float s;
+            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            if (ggml_b612_fa_use_f16_dot() && k->type == GGML_TYPE_F16) {
+                ggml_vec_dot_f16(DK, &s, 0, (ggml_fp16_t *) k_data, 0, Q_q, 0, 1);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
+
+            s = s*scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap*tanhf(s);
+            }
+            s += mv;
+
+            const float Mold = M;
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+
+            if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
+                if (s > M) {
+                    M = s;
+                    ms = expf(Mold - M);
+                    ggml_vec_scale_f16(DV, VKQ16, ms);
+                } else {
+                    vs = expf(s - M);
+                }
+                if (ggml_b612_fa_use_scalar_mad()) {
+                    ggml_b612_fa_mad_f16_scalar(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+                } else {
+                    ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+                }
+            } else {
+                if (s > M) {
+                    M = s;
+                    ms = expf(Mold - M);
+                    ggml_vec_scale_f32(DV, VKQ32, ms);
+                } else {
+                    vs = expf(s - M);
+                }
+
+                if (v->type == GGML_TYPE_F16) {
+#if defined(GGML_B612)
+                    ggml_fp16_to_fp32_row_cpu((const ggml_fp16_t *) v_data, V32, DV);
+#else
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) v_data, V32, DV);
+#endif
+                    if (ggml_b612_fa_use_scalar_mad()) {
+                        ggml_b612_fa_mad_f32_scalar(DV, VKQ32, V32, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    }
+                } else if (v_to_float) {
+                    v_to_float(v_data, V32, DV);
+                    if (ggml_b612_fa_use_scalar_mad()) {
+                        ggml_b612_fa_mad_f32_scalar(DV, VKQ32, V32, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    }
+                } else {
+                    if (ggml_b612_fa_use_scalar_mad()) {
+                        ggml_b612_fa_mad_f32_scalar(DV, VKQ32, (const float *) v_data, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                    }
+                }
+            }
+
+            S = S*ms + vs;
+        }
+
+        if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
+            for (int64_t d = 0; d < DV; ++d) {
+                VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+            }
+        }
+
+        if (sinks) {
+            const float s = ((float *)((char *) sinks->data))[h];
+
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            if (s > M) {
+                ms = expf(M - s);
+                ggml_vec_scale_f32(DV, VKQ32, ms);
+            } else {
+                vs = expf(s - M);
+            }
+
+            S = S*ms + vs;
+        }
+
+        const float S_inv = 1.0f/S;
+        ggml_vec_scale_f32(DV, VKQ32, S_inv);
+
+        const int i1 = iq1;
+        const int i2 = iq2;
+        const int i3 = iq3;
+
+        memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8312,7 +8714,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        const bool fa_v_f32_accum = ggml_b612_fa_use_v_f32_accum();
+        if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -8344,7 +8747,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (ggml_b612_fa_use_f16_dot() && k->type == GGML_TYPE_F16) {
+                ggml_vec_dot_f16(DK, &s, 0, (ggml_fp16_t *) k_data, 0, Q_q, 0, 1);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8361,7 +8768,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -8375,7 +8782,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+                if (ggml_b612_fa_use_scalar_mad()) {
+                    ggml_b612_fa_mad_f16_scalar(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+                } else {
+                    ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+                }
             } else {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
@@ -8390,19 +8801,38 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (v->type == GGML_TYPE_F16) {
+#if defined(GGML_B612)
+                    ggml_fp16_to_fp32_row_cpu((const ggml_fp16_t *) v_data, V32, DV);
+#else
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) v_data, V32, DV);
+#endif
+                    if (ggml_b612_fa_use_scalar_mad()) {
+                        ggml_b612_fa_mad_f32_scalar(DV, VKQ32, V32, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    }
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
-                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    if (ggml_b612_fa_use_scalar_mad()) {
+                        ggml_b612_fa_mad_f32_scalar(DV, VKQ32, V32, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    }
                 } else {
                     // V is F32
-                    ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                    if (ggml_b612_fa_use_scalar_mad()) {
+                        ggml_b612_fa_mad_f32_scalar(DV, VKQ32, (const float *) v_data, vs);
+                    } else {
+                        ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                    }
                 }
             }
 
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -8522,6 +8952,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     int ith = params->ith;
+    static int b612_fa_vec_mode = -1;
+    if (b612_fa_vec_mode == -1) {
+        b612_fa_vec_mode = getenv("GGML_B612_FA_VEC_B612") ? 1 : 0;
+    }
 
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
@@ -8661,7 +9095,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 float * kq_row = KQ + tq * KV_TILE_SZ;
 
                 float tile_max;
-                ggml_vec_max_f32(KV_TILE_SZ, &tile_max, kq_row);
+                if (b612_fa_vec_mode) {
+                    ggml_b612_fa_max_f32(KV_TILE_SZ, &tile_max, kq_row);
+                } else {
+                    ggml_vec_max_f32(KV_TILE_SZ, &tile_max, kq_row);
+                }
 
                 if (tile_max == -INFINITY) {
                     skip[tq] = true;
@@ -8679,7 +9117,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 M[tq] = Mnew;
 
 
-                S[tq] += ggml_vec_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
+                if (b612_fa_vec_mode) {
+                    S[tq] += ggml_b612_fa_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
+                } else {
+                    S[tq] += ggml_vec_soft_max_f32(KV_TILE_SZ, kq_row, kq_row, Mnew);
+                }
             }
 
             // V accumulation: VKQ32 += softmax(KQ) * V
@@ -8687,7 +9129,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
                 if (kv_type == GGML_TYPE_F16) {
+#if defined(GGML_B612)
+                    ggml_fp16_to_fp32_row_cpu((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+#else
                     ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+#endif
                 } else {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
                 }
@@ -8854,8 +9300,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
-    const bool use_ref = params->use_ref;
+    // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking).
+    // For perf A/B in b612 merge work, allow an env override to force the legacy path at runtime.
+    static int b612_force_legacy_fa = -1;
+    if (b612_force_legacy_fa == -1) {
+        b612_force_legacy_fa = getenv("GGML_B612_FA_LEGACY") ? 1 : 0;
+    }
+    const bool use_ref = params->use_ref || (b612_force_legacy_fa != 0);
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
@@ -8943,12 +9394,45 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // b612 FA runtime env controls (ops.cpp):
+    // Core path selector:
+    //   GGML_B612_FA_IMPL=b612      -> force b612 FA path for all calls
+    //   GGML_B612_FA_IMPL=upstream  -> force upstream FA path for all calls
+    //   GGML_B612_FA_IMPL unset     -> hybrid default (b612 for decode-shaped, upstream for prefill-shaped)
+    // Legacy/reference override:
+    //   GGML_B612_FA_LEGACY=1       -> force legacy non-tiled FA path in upstream FA function
+    // Experimental A/B knobs (FA-only):
+    //   GGML_B612_FA_V_F32=1        -> force FP32 V accumulation (this is also default now)
+    //   GGML_B612_FA_V_F16=1        -> force legacy F16 V accumulation (opt-out from default)
+    //   GGML_B612_FA_DOT_F16=1      -> force ggml_vec_dot_f16 path when K is F16
+    //   GGML_B612_FA_MAD_SCALAR=1   -> force scalar MAD helper instead of vector MAD helper
+    //   GGML_B612_FA_VEC_B612=1     -> force b612-style max/softmax helpers in tiled FA
+    static int fa_impl_mode = -1; // 0=hybrid, 1=b612, 2=upstream
+    if (fa_impl_mode == -1) {
+        const char * fa_impl = getenv("GGML_B612_FA_IMPL");
+        if (fa_impl && strcmp(fa_impl, "b612") == 0) {
+            fa_impl_mode = 1;
+        } else if (fa_impl && strcmp(fa_impl, "upstream") == 0) {
+            fa_impl_mode = 2;
+        } else {
+            fa_impl_mode = 0;
+        }
+    }
+
+    const ggml_tensor * q = dst->src[0];
+    const bool decode_shape = (q->ne[1] == 1 && q->ne[3] == 1);
+    const bool use_b612_fa = (fa_impl_mode == 1) || (fa_impl_mode == 0 && decode_shape);
+
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
             {
                 // uses F32 accumulators
-                ggml_compute_forward_flash_attn_ext_f16(params, dst);
+                if (use_b612_fa) {
+                    ggml_compute_forward_flash_attn_ext_f16_b612(params, dst);
+                } else {
+                    ggml_compute_forward_flash_attn_ext_f16(params, dst);
+                }
             } break;
         default:
             {

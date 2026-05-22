@@ -94,6 +94,12 @@
 #define UNUSED GGML_UNUSED
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
 
+void ggml_vec_set_f32(const uint64_t n, float * x, const float v) {
+    for (uint64_t i = 0; i < n; ++i) {
+        x[i] = v;
+    }
+}
+
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
 
@@ -236,6 +242,22 @@ void dequantize_row_q4_K_cpu(const block_q4_K * restrict x, float * restrict y, 
 void dequantize_row_q6_K_cpu(const block_q6_K * restrict x, float * restrict y, int64_t k);
 void dequantize_row_q8_0_cpu(const block_q8_0 * restrict x, float * restrict y, int64_t k);
 void dequantize_row_q8_K_cpu(const block_q8_K * restrict x, float * restrict y, int64_t k);
+
+void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
+    ggml_fp16_to_fp32_row_cpu(x, y, n);
+}
+
+void ggml_cpu_fp32_to_fp16(const float * x, ggml_fp16_t * y, int64_t n) {
+    ggml_fp32_to_fp16_row_cpu(x, y, n);
+}
+
+void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
+    ggml_bf16_to_fp32_row_cpu(x, y, n);
+}
+
+void ggml_cpu_fp32_to_bf16(const float * x, ggml_bf16_t * y, int64_t n) {
+    ggml_fp32_to_bf16_row_cpu(x, y, n);
+}
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
@@ -4648,6 +4670,34 @@ static void ggml_compute_forward_mul_mat_id(
 // ggml_compute_forward_permute (NOP)       -> ops.cpp
 
 // ggml_compute_forward_transpose (NOP)     -> ops.cpp
+
+void ggml_compute_forward_reshape(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    UNUSED(params);
+    UNUSED(dst);
+}
+
+void ggml_compute_forward_view(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    UNUSED(params);
+    UNUSED(dst);
+}
+
+void ggml_compute_forward_permute(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    UNUSED(params);
+    UNUSED(dst);
+}
+
+void ggml_compute_forward_transpose(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    UNUSED(params);
+    UNUSED(dst);
+}
 
 // ggml_compute_forward_get_rows            -> ops.cpp
 

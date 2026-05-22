@@ -352,6 +352,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Stop generation when '}' is encountered (for JSON responses)
+    params.stop_char = '}';
+
     int prompt_index = 1;
     while (custom_prompts_it != custom_prompts.end())
     {
