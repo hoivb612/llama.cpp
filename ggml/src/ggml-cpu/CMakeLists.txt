@@ -54,6 +54,22 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.cpp
         )
 
+    if (GGML_B612_REPACK)
+        if (GGML_SYSTEM_ARCH STREQUAL "x86")
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/ggml-cpu-repack.c
+            )
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_B612_REPACK_CORE)
+            if (MSVC)
+                set_source_files_properties(ggml-cpu/ggml-cpu-repack.c PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+            else()
+                set_source_files_properties(ggml-cpu/ggml-cpu-repack.c PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mavx512bw;-mavx512dq;-mavx512vnni")
+            endif()
+        else()
+            message(STATUS "GGML_B612_REPACK: non-x86 build, enabling API-only mode")
+        endif()
+    endif()
+
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 

@@ -429,7 +429,25 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        // Xbox repack specific quant types (merged into ggml_type)
+        GGML_TYPE_Q8_0_x8        = 42, // linkage type
+        GGML_TYPE_Q8_0_Q8_0_x8   = 43, // repacked type
+        GGML_TYPE_Q2_K_x8        = 44,
+        GGML_TYPE_Q2_K_Q8_K_x8   = 45,
+        GGML_TYPE_Q3_K_x8        = 46,
+        GGML_TYPE_Q3_K_Q8_K_x8   = 47,
+        GGML_TYPE_Q4_K_x8        = 48, // linkage type
+        GGML_TYPE_Q4_K_Q8_K_x8   = 49, // repacked type
+        GGML_TYPE_Q6_K_x8        = 50, // linkage type
+        GGML_TYPE_Q6_K_Q8_K_x8   = 51, // repacked type
+        GGML_TYPE_Q4_0_x8        = 52, // linkage type
+        GGML_TYPE_Q4_0_Q8_0_x8   = 53, // repacked type
+        // GGML repack types used for stats/tracing
+        GGML_TYPE_Q2_K_8_8       = 54,
+        GGML_TYPE_Q3_K_8_8       = 55,
+        GGML_TYPE_Q4_K_8_8       = 56,
+        GGML_TYPE_Q8_0_8_8       = 57,
+        GGML_TYPE_COUNT          = 58,
     };
 
     // precision
@@ -2839,6 +2857,19 @@ extern "C" {
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+
+    //
+    // tensor repack mode
+    //
+    typedef enum {
+        GGML_TENSOR_REPACK_MODE_NONE               = 0,
+        GGML_TENSOR_REPACK_MODE_GGML               = 1, // upstream GGML repack path
+        GGML_TENSOR_REPACK_MODE_XBOX               = 2, // b612 repack path
+        GGML_TENSOR_REPACK_MODE_XBCG               = 3, // b612 callgraph repack path
+        GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 4, // b612 single-thread repack
+        GGML_TENSOR_MULMAT_MODE_XBOX               = 5, // b612 mulmat path without repack
+        GGML_TENSOR_REPACK_MODE_MAX                = 6
+    } ggml_tensor_repack_mode_t;
 
 #ifdef  __cplusplus
 }

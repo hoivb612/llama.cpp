@@ -1538,6 +1538,9 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
+    LLAMA_API void                           llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t mode);
+    LLAMA_API void                           llama_repack_tensor_callgraph(struct ggml_cgraph * cgraph);
+
     //
     // training
     //

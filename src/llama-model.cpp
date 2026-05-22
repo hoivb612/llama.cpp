@@ -876,6 +876,26 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     return buft_list;
 }
 
+#if defined(GGML_B612_REPACK_CORE)
+static void llama_model_repack_tensor_callgraph(struct ggml_cgraph * gf) {
+    if (gf == nullptr) {
+        return;
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        return;
+    }
+
+    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    using repack_callgraph_t = void (*)(struct ggml_cgraph *);
+    auto * repack_callgraph_fn = (repack_callgraph_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_repack_tensor_callgraph");
+    if (repack_callgraph_fn) {
+        repack_callgraph_fn(gf);
+    }
+}
+#endif
+
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
@@ -2203,8 +2223,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
     llm->res->set_outputs();
+    ggml_cgraph * gf = llm->res->get_gf();
+#if defined(GGML_B612_REPACK_CORE)
+    llama_model_repack_tensor_callgraph(gf);
+#endif // GGML_B612_REPACK_CORE
 
-    return llm->res->get_gf();
+    return gf;
 }
 
 

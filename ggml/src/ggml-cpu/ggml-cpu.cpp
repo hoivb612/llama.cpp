@@ -675,6 +675,18 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_threadpool;
     }
 
+    if (strcmp(name, "ggml_cpu_allow_tensor_repack") == 0) {
+        return (void *)ggml_cpu_allow_tensor_repack;
+    }
+
+    if (strcmp(name, "ggml_cpu_set_tensor_repack_mode") == 0) {
+        return (void *)ggml_cpu_set_tensor_repack_mode;
+    }
+
+    if (strcmp(name, "ggml_cpu_repack_tensor_callgraph") == 0) {
+        return (void *)ggml_cpu_repack_tensor_callgraph;
+    }
+
     return NULL;
 
     GGML_UNUSED(reg);

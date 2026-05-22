@@ -1,5 +1,5 @@
 llama_add_compile_flags()
-
+    add_compile_definitions(GGML_B612_REPACK_CORE)
 #
 # libraries
 #

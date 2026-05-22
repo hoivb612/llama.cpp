@@ -162,6 +162,12 @@ bool llm_initialize(
     // init Llama backend
     llama_backend_init();
 
+    // tensor repack mode: 0=none, 1=ggml, 2=xbox, 3=xbcg, 4=xbox-st, 5=mulmat-xbox
+    llama_set_tensor_repack_mode((ggml_tensor_repack_mode_t) params.tensor_repack_mode);
+    if (params.verbose >= 1) {
+        printf("%s: tensor_repack_mode = %d\n", __func__, params.tensor_repack_mode);
+    }
+
     // Control the default verbosity for llama.cpp
     llama_log_set(default_log_callback, &(params.verbose));
 
