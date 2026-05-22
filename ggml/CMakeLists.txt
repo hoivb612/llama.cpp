@@ -150,6 +150,7 @@ message(DEBUG "INS_ENB             : ${INS_ENB}")
 
 option(GGML_CPU_HBM          "ggml: use memkind for CPU HBM" OFF)
 option(GGML_CPU_REPACK       "ggml: use runtime weight conversion of Q4_0 to Q4_X_X" ON)
+option(GGML_B612_REPACK      "ggml: enable b612 repack code paths" ON)
 option(GGML_CPU_KLEIDIAI     "ggml: use KleidiAI optimized kernels if applicable" OFF)
 option(GGML_SSE42            "ggml: enable SSE 4.2"          ${INS_ENB})
 option(GGML_AVX              "ggml: enable AVX"              ${INS_ENB})
@@ -188,6 +189,10 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
+
+if (GGML_B612_REPACK)
+    add_compile_definitions(GGML_B612_REPACK)
+endif()
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)

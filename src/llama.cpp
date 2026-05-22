@@ -117,6 +117,48 @@ void llama_backend_free(void) {
     ggml_quantize_free();
 }
 
+#if defined(GGML_B612_REPACK_CORE)
+void llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t mode) {
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        return;
+    }
+
+    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    using set_repack_mode_t = void (*)(ggml_tensor_repack_mode_t);
+    auto * set_repack_mode_fn = (set_repack_mode_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_set_tensor_repack_mode");
+    if (set_repack_mode_fn) {
+        set_repack_mode_fn(mode);
+    }
+}
+
+void llama_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
+    if (cgraph == nullptr) {
+        return;
+    }
+
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        return;
+    }
+
+    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    using repack_callgraph_t = void (*)(struct ggml_cgraph *);
+    auto * repack_callgraph_fn = (repack_callgraph_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_cpu_repack_tensor_callgraph");
+    if (repack_callgraph_fn) {
+        repack_callgraph_fn(cgraph);
+    }
+}
+#endif // GGML_B612_REPACK_CORE
+
 int64_t llama_time_us(void) {
     return ggml_time_us();
 }

@@ -146,6 +146,36 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    GGML_BACKEND_API bool ggml_cpu_allow_tensor_repack();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_ggml();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox_callgraph();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox_single_thread();
+    GGML_BACKEND_API bool ggml_cpu_tensor_mulmat_mode_xbox();
+
+    typedef enum ggml_cpu_repack_type {
+        GGML_CPU_REPACK_TYPE_NONE = 0,
+        // Alias to merged ggml_type repack values.
+        GGML_CPU_REPACK_TYPE_Q4_0_X8      = GGML_TYPE_Q4_0_x8,
+        GGML_CPU_REPACK_TYPE_Q4_0_Q8_0_x8 = GGML_TYPE_Q4_0_Q8_0_x8,
+        GGML_CPU_REPACK_TYPE_Q2_K_X8      = GGML_TYPE_Q2_K_x8,
+        GGML_CPU_REPACK_TYPE_Q2_K_Q8_K_x8 = GGML_TYPE_Q2_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q3_K_X8      = GGML_TYPE_Q3_K_x8,
+        GGML_CPU_REPACK_TYPE_Q3_K_Q8_K_x8 = GGML_TYPE_Q3_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q4_K_X8      = GGML_TYPE_Q4_K_x8,
+        GGML_CPU_REPACK_TYPE_Q4_K_Q8_K_x8 = GGML_TYPE_Q4_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q6_K_X8      = GGML_TYPE_Q6_K_x8,
+        GGML_CPU_REPACK_TYPE_Q6_K_Q8_K_x8 = GGML_TYPE_Q6_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q8_0_X8      = GGML_TYPE_Q8_0_x8,
+        GGML_CPU_REPACK_TYPE_Q8_0_Q8_0_x8 = GGML_TYPE_Q8_0_Q8_0_x8,
+        GGML_CPU_REPACK_TYPE_COUNT        = GGML_TYPE_COUNT,
+    } ggml_cpu_repack_type_t;
+
+    GGML_BACKEND_API void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode);
+    GGML_BACKEND_API void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph);
+
+    extern ggml_tensor_repack_mode_t g_tensor_repack_mode;
+
 #ifdef __cplusplus
 }
 #endif

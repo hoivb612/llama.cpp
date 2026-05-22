@@ -1333,6 +1333,17 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
+        bool copy_on_write = false;
+#if defined(GGML_B612_REPACK_CORE)
+        if (auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            if (auto * reg = ggml_backend_dev_backend_reg(dev)) {
+                auto * allow_repack_fn = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_allow_tensor_repack");
+                if (allow_repack_fn) {
+                    copy_on_write = allow_repack_fn();
+                }
+            }
+        }
+#endif // GGML_B612_REPACK_CORE
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (const auto & file : files) {
@@ -1347,7 +1358,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa, copy_on_write);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
