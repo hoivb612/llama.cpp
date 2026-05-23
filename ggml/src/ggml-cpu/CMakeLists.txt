@@ -49,7 +49,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             set(GGML_SOURCES_B612 ggml-cpu/b612-za/ggml-cpu-b612-za.c)
             target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu/b612)
         else()
-            set(GGML_SOURCES_B612 ggml-cpu/b612/ggml-cpu-b612.c)
+            set(GGML_SOURCES_B612
+                ggml-cpu/ggml-cpu.c
+                ggml-cpu/b612/ggml-cpu-b612.c
+            )
         endif()
     endif()
     if (GGML_B612)

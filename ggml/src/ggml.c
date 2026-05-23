@@ -4354,6 +4354,10 @@ struct ggml_tensor * ggml_get_rows(
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
+#if defined(GGML_B612)
+    // GET_ROWS requires canonical quant formats; prevent repack/type-switch of its source tensor.
+    ggml_set_no_repack(a);
+#endif
 
     return result;
 }
@@ -8112,6 +8116,10 @@ void ggml_set_loss(struct ggml_tensor * tensor) {
 
 void ggml_set_duplicated(struct ggml_tensor * tensor) {
     tensor->flags |= GGML_TENSOR_FLAG_DUP;
+}
+
+void ggml_set_no_repack(struct ggml_tensor * tensor) {
+    tensor->flags |= GGML_TENSOR_FLAG_NO_REPACK;
 }
 
 #endif

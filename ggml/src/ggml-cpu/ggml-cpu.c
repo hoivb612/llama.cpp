@@ -15,6 +15,10 @@
 #include "ggml.h"
 #include "common.h"
 
+#if defined(GGML_B612)
+bool ggml_cpu_mul_mat_override(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -2095,7 +2099,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                ggml_compute_forward_mul_mat(params, tensor);
+                bool handled = false;
+#if defined(GGML_B612)
+                handled = ggml_cpu_mul_mat_override(params, tensor);
+#endif
+                if (!handled) {
+                    ggml_compute_forward_mul_mat(params, tensor);
+                }
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

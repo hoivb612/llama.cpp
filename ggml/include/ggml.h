@@ -685,7 +685,8 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
 #ifdef GGML_B612
-        GGML_TENSOR_FLAG_DUP     = 32, // ...is duplicated - cannot be changed (e.g. repacking) 
+        GGML_TENSOR_FLAG_DUP       = 32, // ...data is duplicated for mutable transforms
+        GGML_TENSOR_FLAG_NO_REPACK = 64, // ...must not be repacked / have type switched to repack variants
 #endif  
     };
 
@@ -923,6 +924,7 @@ extern "C" {
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
 #ifdef GGML_B612
     GGML_API void ggml_set_duplicated(struct ggml_tensor * tensor);
+    GGML_API void ggml_set_no_repack(struct ggml_tensor * tensor);
 #endif
 
     //
