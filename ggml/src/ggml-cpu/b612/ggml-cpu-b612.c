@@ -18,14 +18,17 @@
 #include <alloca.h>
 #endif
 
-// compat globals consumed by ggml-cpu-repack.c
-int mul_mat_repack_duplicate_tensor_count = 0;
-int64_t mul_mat_repack_duplicate_tensor_total_size = 0;
-int mul_mat_repack_failed_count = 0;
-int mul_mat_repack_count = 0;
-int64_t mul_mat_repack_time_us = 0;
-int64_t mul_mat_repack_time_current_op_us = 0;
-int mul_mat_repack_shared = 0;
+// counters are owned by ggml-cpu.c for unified GGML_XBOX_PERF reporting
+extern int mul_mat_repack_duplicate_tensor_count;
+extern int64_t mul_mat_repack_duplicate_tensor_total_size;
+extern int mul_mat_repack_failed_count;
+extern int mul_mat_repack_count;
+extern int64_t mul_mat_repack_time_us;
+extern int64_t mul_mat_repack_time_current_op_us;
+extern int mul_mat_repack_shared;
+extern int mul_mat_repack_callgraph_count;
+extern int64_t mul_mat_repack_early_time_us;
+extern int mul_mat_repack_early_count;
 
 extern int32_t vec_dot_type_counts[GGML_TYPE_COUNT];
 extern int64_t vec_dot_type_conversion_time[GGML_TYPE_COUNT];
@@ -46,120 +49,6 @@ typedef struct {
     int64_t max_time;
 } quant_type_info;
 extern quant_type_info quant_type_row_size[GGML_TYPE_COUNT];
-
-static const struct ggml_type_traits_cpu ggml_b612_q8_0_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = NULL,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q8_0_q8_0_x8,
-    .vec_dot_type             = GGML_TYPE_Q8_0_Q8_0_x8,
-    .nrows                    = 1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q8_0_q8_0_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = (ggml_from_float_t) quantize_row_q8_0_x8,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q8_0_q8_0_x8,
-    .vec_dot_type             = GGML_TYPE_Q8_0_Q8_0_x8,
-    .nrows                    = -1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q2_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = NULL,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q2_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
-    .nrows                    = 1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q2_k_q8_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = (ggml_from_float_t) quantize_row_q236_k_q8_k_x8,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q2_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
-    .nrows                    = -1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q3_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = NULL,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q3_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
-    .nrows                    = 1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q3_k_q8_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = (ggml_from_float_t) quantize_row_q236_k_q8_k_x8,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q3_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
-    .nrows                    = -1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q4_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = NULL,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
-    .nrows                    = 1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q4_k_q8_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = (ggml_from_float_t) quantize_row_q4_k_q8_k_x8,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
-    .nrows                    = -1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q6_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = NULL,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q6_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q6_K_Q8_K_x8,
-    .nrows                    = 1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q6_k_q8_k_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = (ggml_from_float_t) quantize_row_q236_k_q8_k_x8,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q6_k_q8_k_x8,
-    .vec_dot_type             = GGML_TYPE_Q6_K_Q8_K_x8,
-    .nrows                    = -1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q4_0_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = NULL,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_0_q8_0_x8,
-    .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
-    .nrows                    = 1,
-};
-
-static const struct ggml_type_traits_cpu ggml_b612_q4_0_q8_0_x8_type_traits = {
-    .to_float                 = NULL,
-    .from_float               = (ggml_from_float_t) quantize_row_q8_0_x8,
-    .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_0_q8_0_x8,
-    .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
-    .nrows                    = -1,
-};
-
-static const struct ggml_type_traits_cpu * ggml_b612_get_type_traits_cpu(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q8_0_x8:         return &ggml_b612_q8_0_x8_type_traits;
-        case GGML_TYPE_Q8_0_Q8_0_x8:    return &ggml_b612_q8_0_q8_0_x8_type_traits;
-        case GGML_TYPE_Q2_K_x8:         return &ggml_b612_q2_k_x8_type_traits;
-        case GGML_TYPE_Q2_K_Q8_K_x8:    return &ggml_b612_q2_k_q8_k_x8_type_traits;
-        case GGML_TYPE_Q3_K_x8:         return &ggml_b612_q3_k_x8_type_traits;
-        case GGML_TYPE_Q3_K_Q8_K_x8:    return &ggml_b612_q3_k_q8_k_x8_type_traits;
-        case GGML_TYPE_Q4_K_x8:         return &ggml_b612_q4_k_x8_type_traits;
-        case GGML_TYPE_Q4_K_Q8_K_x8:    return &ggml_b612_q4_k_q8_k_x8_type_traits;
-        case GGML_TYPE_Q6_K_x8:         return &ggml_b612_q6_k_x8_type_traits;
-        case GGML_TYPE_Q6_K_Q8_K_x8:    return &ggml_b612_q6_k_q8_k_x8_type_traits;
-        case GGML_TYPE_Q4_0_x8:         return &ggml_b612_q4_0_x8_type_traits;
-        case GGML_TYPE_Q4_0_Q8_0_x8:    return &ggml_b612_q4_0_q8_0_x8_type_traits;
-        default:                        return ggml_get_type_traits_cpu(type);
-    }
-}
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -364,14 +253,16 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
 }
 
 void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
-    if ((g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_NONE) ||
-        (g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_GGML)) {
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
         return;
     }
 
     ggml_repack_scan_aliased_data_pointers(cgraph);
 
     struct ggml_tensor * const * tensors = cgraph->nodes;
+    if (cgraph->n_nodes != 0) {
+        mul_mat_repack_callgraph_count += 1;
+    }
     for (uint32_t node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * tensor = tensors[node_n];
         if (tensor->is_skipped || tensor->op != GGML_OP_MUL_MAT) {
@@ -385,10 +276,13 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
             continue;
         }
 
+        const int64_t repack_t0 = ggml_time_us();
         const enum ggml_type src0_type = src0->type;
         const enum ggml_type new_type = ggml_repack_tensor_single_thread(NULL, src0);
         if (new_type != src0_type) {
             src0->type = new_type;
+            mul_mat_repack_early_count += 1;
+            mul_mat_repack_early_time_us += ggml_time_us() - repack_t0;
         }
     }
 }
@@ -466,7 +360,7 @@ static void ggml_compute_forward_mul_mat_xbox(
     const int64_t nr0 = ne01;
     const int64_t nr1 = ne1 * ne12 * ne13;
 
-    const struct ggml_type_traits_cpu * const src0_traits = ggml_b612_get_type_traits_cpu(src0_type);
+    const struct ggml_type_traits_cpu * const src0_traits = ggml_get_type_traits_cpu(src0_type);
     GGML_ASSERT(src0_traits != NULL);
     GGML_ASSERT(src0_traits->vec_dot != NULL);
 
@@ -474,7 +368,7 @@ static void ggml_compute_forward_mul_mat_xbox(
     enum ggml_type const vec_dot_type = src0_traits->vec_dot_type;
     GGML_ASSERT(vec_dot_type >= 0 && vec_dot_type < GGML_TYPE_COUNT);
 
-    const struct ggml_type_traits_cpu * const vec_dot_traits = ggml_b612_get_type_traits_cpu(vec_dot_type);
+    const struct ggml_type_traits_cpu * const vec_dot_traits = ggml_get_type_traits_cpu(vec_dot_type);
     GGML_ASSERT(vec_dot_traits != NULL);
 
     const bool init_mat = (vec_dot_type != src1_type);

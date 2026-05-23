@@ -2276,6 +2276,9 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+#if defined(GGML_XBOX_PERF) && defined(GGML_B612)
+    llama_repack_tensor_callgraph(gf);
+#endif
 
     this->n_outputs = save_n_outputs;
 

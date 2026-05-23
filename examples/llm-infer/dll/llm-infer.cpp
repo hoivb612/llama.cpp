@@ -315,13 +315,13 @@ bool llm_initialize(
             llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
             break;
         case 3:
-            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBCG);
             break;
         case 4:
-            llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
             break;
         case 5:
-            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBCG);
+            llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
             break;
         default: 
             break;
@@ -1123,13 +1123,13 @@ bool embed_initialize(
             llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX);
             break;
         case 3:
-            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBCG);
             break;
         case 4:
-            llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
+            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD);
             break;
         case 5:
-            llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBCG);
+            llama_set_tensor_repack_mode(GGML_TENSOR_MULMAT_MODE_XBOX);
             break;
         default: 
             break;

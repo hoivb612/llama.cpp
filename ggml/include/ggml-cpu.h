@@ -150,6 +150,17 @@ extern "C" {
     GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox_callgraph();
     GGML_BACKEND_API void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t);
     GGML_BACKEND_API void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph *cgraph);
+
+    extern int64_t mul_mat_repack_time_us;
+    extern int64_t mul_mat_repack_time_current_op_us;
+    extern int mul_mat_repack_count;
+    extern int mul_mat_repack_shared;
+    extern int mul_mat_repack_duplicate_tensor_count;
+    extern int64_t mul_mat_repack_duplicate_tensor_total_size;
+    extern int mul_mat_repack_failed_count;
+    extern int mul_mat_repack_callgraph_count;
+    extern int64_t mul_mat_repack_early_time_us;
+    extern int mul_mat_repack_early_count;
 #endif // GGML_XBOX_PERF
 
 #ifdef GGML_B612

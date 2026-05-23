@@ -14,6 +14,9 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#if defined(GGML_B612)
+#include "ggml-cpu-repack.h"
+#endif
 
 #if defined(GGML_B612)
 bool ggml_cpu_mul_mat_override(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -404,6 +407,74 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+#ifdef GGML_B612
+    [GGML_TYPE_Q4_0_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_0_q8_0_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_0_Q8_0_x8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q8_0_x8,
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_0_q8_0_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
+        .nrows                    = -1,
+    },
+    [GGML_TYPE_Q8_0_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q8_0_q8_0_x8,
+        .vec_dot_type             = GGML_TYPE_Q8_0_Q8_0_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q8_0_Q8_0_x8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q8_0_x8,
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q8_0_q8_0_x8,
+        .vec_dot_type             = GGML_TYPE_Q8_0_Q8_0_x8,
+        .nrows                    = -1,
+    },
+    [GGML_TYPE_Q2_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q2_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q236_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q2_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q2_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+    [GGML_TYPE_Q3_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q3_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q3_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q236_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q3_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q3_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+    [GGML_TYPE_Q4_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q4_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q4_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+    [GGML_TYPE_Q6_K_x8] = {
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q6_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q6_K_Q8_K_x8,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q6_K_Q8_K_x8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q236_k_q8_k_x8,
+        .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q6_k_q8_k_x8,
+        .vec_dot_type             = GGML_TYPE_Q6_K_Q8_K_x8,
+        .nrows                    = -1,
+    },
+#endif
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -517,6 +588,16 @@ int64_t vec_dot_type_times[GGML_TYPE_COUNT] = {0};
 int64_t vec_dot_type_conversion_time[GGML_TYPE_COUNT] = {0};
 int32_t vec_dot_src0_counts[GGML_TYPE_COUNT] = {0};
 int64_t vec_dot_src0_time[GGML_TYPE_COUNT] = {0};
+int64_t mul_mat_repack_time_us = 0;
+int64_t mul_mat_repack_time_current_op_us = 0;
+int mul_mat_repack_count = 0;
+int mul_mat_repack_shared = 0;
+int mul_mat_repack_duplicate_tensor_count = 0;
+int64_t mul_mat_repack_duplicate_tensor_total_size = 0;
+int mul_mat_repack_failed_count = 0;
+int mul_mat_repack_callgraph_count = 0;
+int64_t mul_mat_repack_early_time_us = 0;
+int mul_mat_repack_early_count = 0;
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
 int openMP_compute_runs = 0;
@@ -662,6 +743,49 @@ void ggml_cpu_print_tensor_op_perf() {
            total_count,
            (double)(total_time) / (1000. * 1000.),
            total_percent);
+
+    // matmul init conversions
+    printf("total number of mul_mat init conversions %d\n", (int)(vec_dot_type_counts[GGML_TYPE_Q8_0] + vec_dot_type_counts[GGML_TYPE_Q8_K]));
+    printf("total elapsed init conversion time %5.2fsec\n", (double)(vec_dot_type_conversion_time[GGML_TYPE_Q8_0] + vec_dot_type_conversion_time[GGML_TYPE_Q8_K]) / (1000. * 1000.));
+    if ((vec_dot_type_counts[GGML_TYPE_Q8_0] + vec_dot_type_counts[GGML_TYPE_Q8_K]) > 0) {
+        printf("average init conversion time %5.2fus\n\n",
+               (double)(vec_dot_type_conversion_time[GGML_TYPE_Q8_0] + vec_dot_type_conversion_time[GGML_TYPE_Q8_K]) /
+               (double)(vec_dot_type_counts[GGML_TYPE_Q8_0] + vec_dot_type_counts[GGML_TYPE_Q8_K]));
+    } else {
+        printf("\n");
+    }
+
+    // repack conversions
+    printf("total number of mul_mat repack (pre-compute-forward) conversions %d\n", mul_mat_repack_early_count);
+    if (mul_mat_repack_early_count != 0) {
+        printf("total number of callgraph repack %d\n", mul_mat_repack_callgraph_count);
+        printf("total elapsed pre-compute-forward repack conversion time %5.2fsec\n",
+               (double) mul_mat_repack_early_time_us / (1000. * 1000.));
+        printf("average conversion time per repack %5.2fus\n",
+               (double) mul_mat_repack_early_time_us / (double) mul_mat_repack_early_count);
+        printf("Total FAILED repack count %d\n\n", mul_mat_repack_failed_count);
+    } else {
+        printf("\n");
+    }
+
+    printf("total number of mul_mat repack (inline-compute-forward) conversions %d\n", mul_mat_repack_count);
+    if (mul_mat_repack_count != 0) {
+        printf("total elapsed repack conversion time %5.2fsec\n",
+               (double) mul_mat_repack_time_us / (1000. * 1000.));
+        printf("average repack conversion time per repack %5.2fus\n",
+               (double) mul_mat_repack_time_us / (double) mul_mat_repack_count);
+        printf("total shared repack conversions %d\n", mul_mat_repack_shared);
+        printf("total number of FAILED mul_mat repack conversions %d\n\n", mul_mat_repack_failed_count);
+    } else {
+        printf("\n");
+    }
+
+    if (mul_mat_repack_duplicate_tensor_count != 0) {
+        printf("total number of mul_mat repack tensor with duplicated memory buffers %d\n",
+               mul_mat_repack_duplicate_tensor_count);
+        printf("total memory allocated for duplicated mul_mat repack tensor %5.2f MB\n\n",
+               (double) mul_mat_repack_duplicate_tensor_total_size / (1024.0 * 1024.0));
+    }
 
     //
     // Scan through all the quant types looking for types that have a non-zero
