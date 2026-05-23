@@ -393,8 +393,7 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
         return;
     }
 
-    if ((g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_NONE) ||
-        (g_tensor_repack_mode == GGML_TENSOR_REPACK_MODE_GGML)) {
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
         return;
     }
 
