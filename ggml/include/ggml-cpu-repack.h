@@ -43,11 +43,11 @@ ggml_repack_tensor(
     struct ggml_tensor *tensor);
 
 void
-ggml_wait_for_done(
+ggml_wait_for_done_xbox(
     const struct ggml_compute_params * params);
 
 void
-ggml_wait_to_finalize(
+ggml_wait_to_finalize_xbox(
     const struct ggml_compute_params * params);
 
 // vec_dot routines for Xbox repacked tensors

@@ -425,6 +425,7 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
         const enum ggml_type src1_type = src1->type;
 
         if (src1_type == GGML_TYPE_F32 &&
+            !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK) &&
             (src0_type == GGML_TYPE_Q4_0 ||
              src0_type == GGML_TYPE_Q8_0 ||
              src0_type == GGML_TYPE_Q2_K ||
@@ -2055,6 +2056,7 @@ static void ggml_compute_forward_mul_mat_xbox(
     if (ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
 
         if ((src1_type == GGML_TYPE_F32) &&
+            !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK) &&
             ((src0_type == GGML_TYPE_Q4_0) ||
              (src0_type == GGML_TYPE_Q8_0) || 
              (src0_type == GGML_TYPE_Q2_K) || 
@@ -2109,6 +2111,7 @@ static void ggml_compute_forward_mul_mat_xbox(
     } else if (ggml_cpu_tensor_repack_mode_xbox()) {
     
         if ((src1_type == GGML_TYPE_F32) &&
+            !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK) &&
             ((src0_type == GGML_TYPE_Q4_0) ||
              (src0_type == GGML_TYPE_Q8_0) || 
              (src0_type == GGML_TYPE_Q2_K) || 

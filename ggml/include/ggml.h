@@ -664,6 +664,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_NO_REPACK = 32, // ...must not be repacked / type-switched to repack variants
     };
 
     enum ggml_tri_type {
@@ -889,6 +890,7 @@ extern "C" {
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
+    GGML_API void ggml_set_no_repack(struct ggml_tensor * tensor);
 
     //
     // operations on tensors with backpropagation

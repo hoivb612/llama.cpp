@@ -3966,6 +3966,8 @@ struct ggml_tensor * ggml_get_rows(
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
+    // GET_ROWS expects canonical quant formats for src0.
+    ggml_set_no_repack(a);
 
     return result;
 }
@@ -7718,6 +7720,10 @@ void ggml_set_loss(struct ggml_tensor * tensor) {
     GGML_ASSERT(ggml_is_scalar(tensor));
     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
     tensor->flags |= GGML_TENSOR_FLAG_LOSS;
+}
+
+void ggml_set_no_repack(struct ggml_tensor * tensor) {
+    tensor->flags |= GGML_TENSOR_FLAG_NO_REPACK;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
