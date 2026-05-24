@@ -4556,7 +4556,6 @@ ggml_repack_tensor (
         ggml_wait_for_done_xbox(params);
     }
 
-
     //
     // Make transformed quant based on current type.
     //

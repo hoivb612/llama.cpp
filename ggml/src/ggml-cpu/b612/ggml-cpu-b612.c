@@ -87,32 +87,6 @@ void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
 }
 
 void ggml_wait_for_done_xbox(const struct ggml_compute_params * params) {
-#if defined(CP_VERSION)
-
-    const int n_tasks = params->nth;
-    if (n_tasks == 1 || params->barrier == NULL || params->generation == NULL) {
-        return;
-    }
-
-    xb_atomic_int * barrier = (xb_atomic_int *) params->barrier;
-    xb_atomic_int * generation = (xb_atomic_int *) params->generation;
-
-    const int generation_old = (int) *generation;
-    if (xb_atomic_fetch_add(barrier, 1) == (n_tasks - 1)) {
-        *barrier = 0;
-        xb_atomic_fetch_add(generation, 1);
-    } else {
-        while ((int) *generation == generation_old) {
-#if defined(_WIN32)
-            YieldProcessor();
-#else
-            sched_yield();
-#endif
-        }
-    }
-
-#else // CP_VERSION
-
     //
     // If the number of tasks is not one, then wait for all tasks to arrive.
     //
@@ -153,29 +127,9 @@ void ggml_wait_for_done_xbox(const struct ggml_compute_params * params) {
             } while (*generation == generation_old);
         }
     }
-
-#endif // CP_VERSION
 }
 
 void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params) {
-#if defined(CP_VERSION)
-
-    const int n_tasks = params->nth;
-    if (n_tasks == 1 || params->barrier == NULL) {
-        return;
-    }
-
-    xb_atomic_int * barrier = (xb_atomic_int *) params->barrier;
-    while ((int) *barrier != (n_tasks - 1)) {
-#if defined(_WIN32)
-        YieldProcessor();
-#else
-        sched_yield();
-#endif
-    }
-
-#else // CP_VERSION
-
     //
     // If the number of tasks is not one, then wait for other tasks to arrive.
     //
@@ -198,8 +152,6 @@ void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params) {
 #endif
         } while (*barrier != (n_tasks - 1));
     }
-
-#endif // CP_VERSION
 }
 
 bool ggml_cpu_tensor_repack_mode_xbox_callgraph(void) {
@@ -212,6 +164,17 @@ bool ggml_cpu_tensor_repack_mode_xbox_single_thread(void) {
 
 bool ggml_cpu_tensor_mulmat_mode_xbox(void) {
     return g_tensor_repack_mode == GGML_TENSOR_MULMAT_MODE_XBOX;
+}
+
+static bool ggml_cpu_repack_trace_enabled(void) {
+    static bool inited = false;
+    static bool enabled = false;
+    if (!inited) {
+        const char * env = getenv("GGML_B612_REPACK_TRACE");
+        enabled = env != NULL && atoi(env) != 0;
+        inited = true;
+    }
+    return enabled;
 }
 
 typedef struct {
@@ -337,6 +300,10 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
             for (uint32_t c = 0; c < n_candidates; c++) {
                 if (ggml_b612_ranges_overlap(candidates[c].begin, candidates[c].end, src_begin, src_end)) {
                 #if !defined(REPACK_ALIASED_TENSORS)
+                    // set the flag for repacking code to duplicate this tensor's data before
+                    // repacking, to avoid in-place corrupting the data still needed by other ops
+                    // sharing the same data buffer. This is more convenient than scanning every 
+                    // tensor for sharing data (REPACK_ALIASED_TENSORS)
                     candidates[c].tensor->flags |= GGML_TENSOR_FLAG_DUP;
                 #else // REPACK_ALIASED_TENSORS
                     bool already_aliased = false;
@@ -424,11 +391,28 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
 }
 
 void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
-    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
+    //
+    // Alias scan must run for all xbox-style modes so that tensors whose data
+    // is shared with non-MUL_MAT ops get marked GGML_TENSOR_FLAG_DUP. Without
+    // this, in-place repack (xbox / xbox-st) would corrupt the data still
+    // needed by the aliased op.
+    //
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG &&
+        g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBOX &&
+        g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD) {
         return;
     }
 
     ggml_repack_scan_aliased_data_pointers(cgraph);
+
+    //
+    // Only XBCG performs the actual repack at graph-build time. The xbox /
+    // xbox-st modes repack inline during compute_forward; the alias scan
+    // above is the only thing needed at this point for those modes.
+    //
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
+        return;
+    }
 
     struct ggml_tensor * const * tensors = cgraph->nodes;
     if (cgraph->n_nodes != 0) {
@@ -455,6 +439,18 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
             mul_mat_repack_early_count += 1;
             mul_mat_repack_early_time_us += ggml_time_us() - repack_t0;
         }
+    }
+
+    static bool already_printed = false;
+    if (!already_printed && ggml_cpu_repack_trace_enabled()) {
+        already_printed = true;
+        fprintf(stderr,
+                "[b612-repack] %s: nodes=%u repacked=%lld dup=%d fail=%d\n",
+                __func__,
+                cgraph->n_nodes,
+                (long long) mul_mat_repack_early_count,
+                (int) mul_mat_repack_duplicate_tensor_count,
+                (int) mul_mat_repack_failed_count);
     }
 }
 
