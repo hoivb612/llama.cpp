@@ -2109,8 +2109,71 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
+#ifdef GGML_XBOX_PERF
+        int64_t vec_dot_t0 = ggml_time_us();
+#endif
+
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+
+#ifdef GGML_XBOX_PERF
+        // if successful then it is one of the GGML repacked computation
+        if ((tensor->op == GGML_OP_MUL_MAT) && !params->ith) {
+            enum ggml_type repack_type = GGML_TYPE_COUNT;
+            const struct ggml_tensor * src0 = tensor->src[0];
+            const enum ggml_type src0_type = src0->type;
+            switch (src0_type) {
+                case GGML_TYPE_Q2_K:
+                    repack_type = GGML_TYPE_Q2_K_8_8;
+                    break;                
+                case GGML_TYPE_Q4_0:
+                    repack_type = GGML_TYPE_Q4_0_8_8;
+                    break;
+                case GGML_TYPE_Q4_K:
+                    repack_type = GGML_TYPE_Q4_K_8_8;
+                    break;
+                default: 
+                    repack_type = src0->type;
+                    break;
+            }
+            // note: the collected time includes both the conversion and vec_dot time
+            // and Q4_0_8_8 is used as a bucket for these repacked types: Q4_0_8_8 and
+            // Q4_K_8_8
+            const int64_t vec_dot_time = ggml_time_us() - vec_dot_t0;
+            vec_dot_src0_time[repack_type] += vec_dot_time;
+            vec_dot_src0_counts[repack_type] += 1;
+            if (src0->type == GGML_TYPE_Q4_0) {
+                vec_dot_type_counts[GGML_TYPE_Q8_0] += 1;
+            } else if (src0->type == GGML_TYPE_Q4_K) {
+                vec_dot_type_counts[GGML_TYPE_Q8_K] += 1;
+            } else if (src0->type == GGML_TYPE_Q2_K) {
+                vec_dot_type_counts[GGML_TYPE_Q8_K] += 1;
+            }
+
+            uint64_t bucket_index = ggml_row_size(repack_type, src0->ne[0]);
+            quant_type_info *quant_type_info_data = &(quant_type_row_size[repack_type]);
+            if (bucket_index > ARRAYSIZE(quant_type_info_data->counts)) {
+                bucket_index = ARRAYSIZE(quant_type_info_data->counts);
+            }
+            quant_type_info_data->total_count += 1;
+            quant_type_info_data->counts[bucket_index - 1] += 1;
+            quant_type_info_data->times[bucket_index - 1] += vec_dot_time;
+            if (vec_dot_time > quant_type_info_data->times_max[bucket_index - 1]) {
+                // save the new max time for this bucket
+                quant_type_info_data->times_max[bucket_index - 1] = vec_dot_time;
+            }
+            if (vec_dot_time > quant_type_info_data->max_time) {
+                // save the new max time for this dimension size
+                quant_type_info_data->max_time = vec_dot_time;
+                quant_type_info_data->max_ne00 = (int32_t) src0->ne[0];
+                quant_type_info_data->max_ne01 = (int32_t) src0->ne[1];
+                const struct ggml_tensor * src1 = tensor->src[1];
+                quant_type_info_data->max_ne10 = (int32_t) src1->ne[0];
+                quant_type_info_data->max_ne11 = (int32_t) src1->ne[1];
+            }
+        }
+#endif // GGML_XBOX_PERF
+
         return;
     }
 
