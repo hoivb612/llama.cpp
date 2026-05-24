@@ -4126,18 +4126,6 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 // Start processing new graph
 static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
 {
-#if defined(GGML_B612_REPACK_CORE)
-    if (ggml_cpu_repack_trace_enabled()) {
-        fprintf(stderr,
-                "[b612-repack] %s: nodes=%u repacked=%lld dup=%d fail=%d\n",
-                __func__,
-                cgraph->n_nodes,
-                (long long) mul_mat_repack_early_count,
-                (int) mul_mat_repack_duplicate_tensor_count,
-                (int) mul_mat_repack_failed_count);
-    }
-#endif // GGML_B612_REPACK_CORE
-
     // Always take the mutex here because the worker threads are doing hybrid poll/wait
 
     ggml_mutex_lock(&threadpool->mutex);
