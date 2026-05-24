@@ -109,17 +109,6 @@ int mul_mat_repack_failed_count = 0;
 int mul_mat_repack_duplicate_tensor_count = 0;
 int64_t mul_mat_repack_duplicate_tensor_total_size = 0;
 
-#define GGML_REPACK_TRACKED_TENSORS_MAX 2048
-
-static struct {
-    const struct ggml_tensor * tensor;
-    ggml_cpu_repack_type_t type;
-} g_repack_kinds[GGML_REPACK_TRACKED_TENSORS_MAX];
-
-static size_t g_repack_types_count = 0;
-static uint64_t g_repack_type_hits[GGML_CPU_REPACK_TYPE_COUNT];
-static bool g_repack_type_seen[GGML_CPU_REPACK_TYPE_COUNT];
-
 static bool ggml_cpu_repack_trace_enabled(void) {
     static bool inited = false;
     static bool enabled = false;
@@ -150,36 +139,13 @@ static const char * ggml_cpu_repack_type_name(ggml_cpu_repack_type_t type) {
     }
 }
 
-static void ggml_cpu_clear_tensor_repack_type_map(void) {
-    g_repack_types_count = 0;
-    memset(g_repack_type_hits, 0, sizeof(g_repack_type_hits));
-    memset(g_repack_type_seen, 0, sizeof(g_repack_type_seen));
-}
-
-static void ggml_cpu_set_tensor_repack_type(const struct ggml_tensor * tensor, ggml_cpu_repack_type_t type) {
-    for (size_t i = 0; i < g_repack_types_count; ++i) {
-        if (g_repack_kinds[i].tensor == tensor) {
-            g_repack_kinds[i].type = type;
-            return;
-        }
-    }
-
-    if (g_repack_types_count < GGML_REPACK_TRACKED_TENSORS_MAX) {
-        g_repack_kinds[g_repack_types_count].tensor = tensor;
-        g_repack_kinds[g_repack_types_count].type = type;
-        g_repack_types_count++;
-    } else {
-        mul_mat_repack_failed_count += 1;
-    }
-}
-
-static ggml_cpu_repack_type_t ggml_cpu_get_tensor_repack_type(const struct ggml_tensor * tensor) {
-    for (size_t i = 0; i < g_repack_types_count; ++i) {
-        if (g_repack_kinds[i].tensor == tensor) {
-            return g_repack_kinds[i].type;
-        }
-    }
-    return GGML_CPU_REPACK_TYPE_NONE;
+static inline bool ggml_b612_repackable_type(enum ggml_type t) {
+    return t == GGML_TYPE_Q4_0 ||
+           t == GGML_TYPE_Q8_0 ||
+           t == GGML_TYPE_Q2_K ||
+           t == GGML_TYPE_Q3_K ||
+           t == GGML_TYPE_Q4_K ||
+           t == GGML_TYPE_Q6_K;
 }
 
 bool ggml_cpu_allow_tensor_repack(void) {
@@ -210,29 +176,58 @@ void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode) {
     GGML_ASSERT(repack_mode >= GGML_TENSOR_REPACK_MODE_NONE);
     GGML_ASSERT(repack_mode <  GGML_TENSOR_REPACK_MODE_MAX);
     g_tensor_repack_mode = repack_mode;
-    ggml_cpu_clear_tensor_repack_type_map();
     if (ggml_cpu_repack_trace_enabled()) {
-        fprintf(stderr, "[b612-repack] %s: mode=%d tracked=%zu\n", __func__, (int) repack_mode, g_repack_types_count);
+        fprintf(stderr, "[b612-repack] %s: requested repack mode=%d\n", __func__, (int) repack_mode);
     }
 }
 
 typedef struct {
     void * data;
+    uintptr_t begin;
+    uintptr_t end;
     struct ggml_tensor * tensor;
 } repack_candidate_t;
 
+static inline bool ggml_b612_tensor_data_range(const struct ggml_tensor * tensor, uintptr_t * begin, uintptr_t * end) {
+    if (tensor == NULL || tensor->data == NULL) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0) {
+        return false;
+    }
+
+    const uintptr_t start = (uintptr_t) tensor->data;
+    const uintptr_t stop = start + nbytes;
+    if (stop <= start) {
+        return false;
+    }
+
+    *begin = start;
+    *end = stop;
+    return true;
+}
+
+static inline bool ggml_b612_ranges_overlap(uintptr_t a_begin, uintptr_t a_end, uintptr_t b_begin, uintptr_t b_end) {
+    return a_begin < b_end && b_begin < a_end;
+}
+
 static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) {
     #define MAX_REPACK_CANDIDATES 512
-    #define MAX_REPACK_ALIASES    512
-    #define MAX_REPACK_TENSORS    1024
 
     repack_candidate_t candidates[MAX_REPACK_CANDIDATES];
     uint32_t n_candidates = 0;
+
+#if defined(REPACK_ALIASED_TENSORS)
+    #define MAX_REPACK_ALIASES    512
+    #define MAX_REPACK_TENSORS    1024
 
     void * aliased_data[MAX_REPACK_ALIASES];
     uint32_t n_aliased = 0;
     struct ggml_tensor * duplicated_tensors[MAX_REPACK_TENSORS];
     uint32_t n_duplicated = 0;
+#endif // REPACK_ALIASED_TENSORS
 
     struct ggml_tensor * const * tensors = cgraph->nodes;
     const uint32_t n_nodes = cgraph->n_nodes;
@@ -243,20 +238,18 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
 
     for (uint32_t node_n = 0; node_n < n_nodes; node_n++) {
         struct ggml_tensor * tensor = tensors[node_n];
-
         if (tensor->op != GGML_OP_MUL_MAT) {
             continue;
         }
 
         struct ggml_tensor * src0 = tensor->src[0];
-        if (src0 == NULL || src0->data == NULL) {
+        if (src0 == NULL || src0->data == NULL || !ggml_b612_repackable_type(src0->type)) {
             continue;
         }
 
-        enum ggml_type t = src0->type;
-        if (t != GGML_TYPE_Q4_0 && t != GGML_TYPE_Q8_0 &&
-            t != GGML_TYPE_Q2_K && t != GGML_TYPE_Q3_K &&
-            t != GGML_TYPE_Q4_K && t != GGML_TYPE_Q6_K) {
+        uintptr_t src0_begin = 0;
+        uintptr_t src0_end = 0;
+        if (!ggml_b612_tensor_data_range(src0, &src0_begin, &src0_end)) {
             continue;
         }
 
@@ -269,7 +262,9 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
             }
         }
         if (!found && n_candidates < MAX_REPACK_CANDIDATES) {
-            candidates[n_candidates].data   = src0->data;
+            candidates[n_candidates].data = src0->data;
+            candidates[n_candidates].begin = src0_begin;
+            candidates[n_candidates].end = src0_end;
             candidates[n_candidates].tensor = src0;
             n_candidates++;
         }
@@ -280,8 +275,8 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
     }
 
     //
-    // Pass 2: scan non-MUL_MAT ops. If any src tensor's data pointer
-    // matches a repack candidate, mark that candidate as DUP.
+    // Pass 2: scan non-MUL_MAT ops. If any src tensor overlaps a
+    // repack candidate range, mark that candidate for duplication.
     //
 
     for (uint32_t node_n = 0; node_n < n_nodes; node_n++) {
@@ -300,9 +295,21 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
                 continue;
             }
 
-            for (uint32_t c = 0; c < n_candidates; c++) {
-                if (candidates[c].data == src->data) {
+            uintptr_t src_begin = 0;
+            uintptr_t src_end = 0;
+            if (!ggml_b612_tensor_data_range(src, &src_begin, &src_end)) {
+                continue;
+            }
 
+            for (uint32_t c = 0; c < n_candidates; c++) {
+                if (ggml_b612_ranges_overlap(candidates[c].begin, candidates[c].end, src_begin, src_end)) {
+                #if !defined(REPACK_ALIASED_TENSORS)
+                    // set the flag for repacking code to duplicate this tensor's data before
+                    // repacking, to avoid in-place corrupting the data still needed by other ops
+                    // sharing the same data buffer. This is more convenient than scanning every 
+                    // tensor for sharing data (REPACK_ALIASED_TENSORS)
+                    candidates[c].tensor->flags |= GGML_TENSOR_FLAG_DUP;
+                #else // REPACK_ALIASED_TENSORS
                     bool already_aliased = false;
                     for (uint32_t a = 0; a < n_aliased; ++a) {
                         if (aliased_data[a] == candidates[c].data) {
@@ -313,6 +320,7 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
                     if (!already_aliased && n_aliased < MAX_REPACK_ALIASES) {
                         aliased_data[n_aliased++] = candidates[c].data;
                     }
+                #endif // REPACK_ALIASED_TENSORS
 
                     // remove from candidates to avoid redundant checks
                     candidates[c] = candidates[n_candidates - 1];
@@ -321,12 +329,12 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
                 }
             }
         }
-
         if (n_candidates == 0) {
             break;
         }
     }
 
+#if defined(REPACK_ALIASED_TENSORS)
     if (n_aliased > 0) {
         for (uint32_t node_n = 0; node_n < n_nodes; ++node_n) {
             struct ggml_tensor * tensor = tensors[node_n];
@@ -381,36 +389,39 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
 
     #undef MAX_REPACK_TENSORS
     #undef MAX_REPACK_ALIASES
+#endif // REPACK_ALIASED_TENSORS
+
     #undef MAX_REPACK_CANDIDATES
 }
 
 void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
-    const int64_t old_early_count = mul_mat_repack_early_count;
-    const int old_dup_count = mul_mat_repack_duplicate_tensor_count;
-    const int old_fail_count = mul_mat_repack_failed_count;
-
-    if (cgraph == NULL) {
-        return;
-    }
-
-    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
+    //
+    // Alias scan must run for all xbox-style modes so that tensors whose data
+    // is shared with non-MUL_MAT ops get marked GGML_TENSOR_FLAG_DUP. Without
+    // this, in-place repack (xbox / xbox-st) would corrupt the data still
+    // needed by the aliased op.
+    //
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG &&
+        g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBOX &&
+        g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD) {
         return;
     }
 
     ggml_repack_scan_aliased_data_pointers(cgraph);
 
     //
-    // Early single-threaded repack of all MUL_MAT weight tensors.
-    // This runs for ALL repack modes so the first MUL_MAT compute
-    // doesn't pay the repack cost.  For XBOX/XBOX_SINGLE_THREAD modes,
-    // the inline repack code will see the type already changed and skip.
+    // Only XBCG performs the actual repack at graph-build time. The xbox /
+    // xbox-st modes repack inline during compute_forward; the alias scan
+    // above is the only thing needed at this point for those modes.
     //
+    if (g_tensor_repack_mode != GGML_TENSOR_REPACK_MODE_XBCG) {
+        return;
+    }
 
     struct ggml_tensor * const * tensors = cgraph->nodes;
     if (cgraph->n_nodes != 0) {
-        mul_mat_repack_callgraph_count++;
+        mul_mat_repack_callgraph_count += 1;
     }
-
     for (uint32_t node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * tensor = tensors[node_n];
         if (tensor->op != GGML_OP_MUL_MAT) {
@@ -419,41 +430,31 @@ void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
 
         struct ggml_tensor * src0 = tensor->src[0];
         const struct ggml_tensor * src1 = tensor->src[1];
+        if (src0 == NULL || src1 == NULL || src1->type != GGML_TYPE_F32 ||
+            !ggml_b612_repackable_type(src0->type) || (src0->flags & GGML_TENSOR_FLAG_NO_REPACK)) {
+            continue;
+        }
 
-        enum ggml_type src0_type = src0->type;
-        const enum ggml_type src1_type = src1->type;
-
-        if (src1_type == GGML_TYPE_F32 &&
-            !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK) &&
-            (src0_type == GGML_TYPE_Q4_0 ||
-             src0_type == GGML_TYPE_Q8_0 ||
-             src0_type == GGML_TYPE_Q2_K ||
-             src0_type == GGML_TYPE_Q3_K ||
-             src0_type == GGML_TYPE_Q4_K ||
-             src0_type == GGML_TYPE_Q6_K)) {
-            const int64_t repack_t0 = ggml_time_us();
-
-            src0_type = ggml_repack_tensor_single_thread(NULL, src0);
-
-            // for single thread just accumulate as there is no contention
-            if (src0_type != src0->type) {
-                // refresh the tensor with the new type
-                src0->type = src0_type;
-
-                mul_mat_repack_early_count += 1;
-                mul_mat_repack_early_time_us += ggml_time_us() - repack_t0;
-            }
+        const int64_t repack_t0 = ggml_time_us();
+        const enum ggml_type src0_type = src0->type;
+        const enum ggml_type new_type = ggml_repack_tensor_single_thread(NULL, src0);
+        if (new_type != src0_type) {
+            src0->type = new_type;
+            mul_mat_repack_early_count += 1;
+            mul_mat_repack_early_time_us += ggml_time_us() - repack_t0;
         }
     }
 
-    if (ggml_cpu_repack_trace_enabled()) {
+    static bool already_printed = false;
+    if (!already_printed && ggml_cpu_repack_trace_enabled()) {
+        already_printed = true;
         fprintf(stderr,
                 "[b612-repack] %s: nodes=%u repacked=%lld dup=%d fail=%d\n",
                 __func__,
                 cgraph->n_nodes,
-                (long long) (mul_mat_repack_early_count - old_early_count),
-                (int) (mul_mat_repack_duplicate_tensor_count - old_dup_count),
-                (int) (mul_mat_repack_failed_count - old_fail_count));
+                (long long) mul_mat_repack_early_count,
+                (int) mul_mat_repack_duplicate_tensor_count,
+                (int) mul_mat_repack_failed_count);
     }
 }
 
@@ -2020,34 +2021,6 @@ static void ggml_compute_forward_mul_mat_xbox(
     enum ggml_type src0_type = src0->type;
     const enum ggml_type src1_type = src1->type;
 
-#if 0
-    if (ggml_is_xbox_repack_candidate(src0, src1) &&
-        ggml_cpu_get_tensor_repack_type(src0) == GGML_CPU_REPACK_TYPE_NONE) {
-        if (ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
-            if (ith == 0) {
-                const int64_t repack_t0 = ggml_time_us();
-                const ggml_cpu_repack_type_t repack_type = ggml_repack_tensor_single_thread(params, src0);
-                if (repack_type != GGML_CPU_REPACK_TYPE_NONE) {
-                    ggml_cpu_set_tensor_repack_type(src0, repack_type);
-                    mul_mat_repack_early_count += 1;
-                    mul_mat_repack_early_time_us += ggml_time_us() - repack_t0;
-                }
-            }
-            ggml_barrier(params->threadpool);
-        } else if (ggml_cpu_tensor_repack_mode_xbox()) {
-            const ggml_cpu_repack_type_t repack_type = ggml_cpu_repack_type_from_tensor_type(src0->type);
-            const int64_t repack_t0 = ith == 0 ? ggml_time_us() : 0;
-            ggml_repack_tensor(params, src0);
-            if (ith == 0 && repack_type != GGML_CPU_REPACK_TYPE_NONE) {
-                ggml_cpu_set_tensor_repack_type(src0, repack_type);
-                mul_mat_repack_early_count += 1;
-                mul_mat_repack_early_time_us += ggml_time_us() - repack_t0;
-            }
-        }
-    }
-
-#else
-
     //
     // Check if an attempt should be made to repack the src0 tensor
     //
@@ -2172,8 +2145,6 @@ static void ggml_compute_forward_mul_mat_xbox(
     }
 
     // repacking if any is done at this point with new src0_type
-
-#endif  // 0
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -4155,6 +4126,18 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 // Start processing new graph
 static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
 {
+#if defined(GGML_B612_REPACK_CORE)
+    if (ggml_cpu_repack_trace_enabled()) {
+        fprintf(stderr,
+                "[b612-repack] %s: nodes=%u repacked=%lld dup=%d fail=%d\n",
+                __func__,
+                cgraph->n_nodes,
+                (long long) mul_mat_repack_early_count,
+                (int) mul_mat_repack_duplicate_tensor_count,
+                (int) mul_mat_repack_failed_count);
+    }
+#endif // GGML_B612_REPACK_CORE
+
     // Always take the mutex here because the worker threads are doing hybrid poll/wait
 
     ggml_mutex_lock(&threadpool->mutex);
@@ -4277,7 +4260,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
-    int n_threads                               = cplan->n_threads;
+    int n_threads = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     bool disposable_threadpool = false;

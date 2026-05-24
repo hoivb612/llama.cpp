@@ -664,7 +664,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_NO_REPACK = 32, // ...must not be repacked / type-switched to repack variants
+        GGML_TENSOR_FLAG_DUP       = 32, // ...data is duplicated for mutable transforms (b612 repack)
+        GGML_TENSOR_FLAG_NO_REPACK = 64, // ...must not be repacked / have type switched to repack variants (b612 repack)
     };
 
     enum ggml_tri_type {

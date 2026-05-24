@@ -4398,25 +4398,30 @@ ggml_repack_tensor_single_thread (
         return type;
     }
 
-#if 0
-    if (tensor->flags & GGML_TENSOR_FLAG_DUP) 
-    {
+    if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
         //
-        // Duplication is active meaning there is a copy of the 
+        // Duplication is active meaning there is a copy of the
         // tensor data being used by some other OPs. Allocate
-        // a new buffer for this specific instance for repacking so 
+        // a new buffer for this specific instance for repacking so
         // the original copy remains intact for the other OPs.
         //
         size_t tensor_size = ggml_nbytes(tensor);
-        char *duplicate_data = (char *)malloc(tensor_size);
-        memcpy(duplicate_data, tensor->data, tensor_size);
+        char * duplicate_data = (char *) malloc(tensor_size);
+        if (duplicate_data == NULL) {
+            if (ith == 0) {
+                mul_mat_repack_failed_count += 1;
+            }
+            return type;
+        }
 
+        memcpy(duplicate_data, tensor->data, tensor_size);
         tensor->data = duplicate_data;
 
-        mul_mat_repack_duplicate_tensor_count += 1;
-        mul_mat_repack_duplicate_tensor_total_size += tensor_size;
+        if (ith == 0) {
+            mul_mat_repack_duplicate_tensor_count += 1;
+            mul_mat_repack_duplicate_tensor_total_size += tensor_size;
+        }
     }
-#endif
 
     //
     // Make transformed quant based on current type.
@@ -4525,16 +4530,18 @@ ggml_repack_tensor (
     // ggml_repack_scan_aliased_data_pointers at graph build time),
     // allocate a new buffer so the original data remains intact.
     //
-#if 0
-    if (tensor->flags & GGML_TENSOR_FLAG_DUP) 
-    {
+    if (tensor->flags & GGML_TENSOR_FLAG_DUP) {
         if (!ith) {
             size_t tensor_size = ggml_nbytes(tensor);
             char *duplicate_data = (char *)malloc(tensor_size);
+            if (duplicate_data == NULL) {
+                mul_mat_repack_failed_count += 1;
+                return;
+            }
             memcpy(duplicate_data, tensor->data, tensor_size);
 
             //
-            // wait for all threads to arrive before we change tensor->data
+            // wait for all threads to arrive before we publis tensor->data
             //
             ggml_wait_to_finalize_xbox(params);
             tensor->data = duplicate_data;
@@ -4548,7 +4555,6 @@ ggml_repack_tensor (
         //
         ggml_wait_for_done_xbox(params);
     }
-#endif
 
     //
     // Make transformed quant based on current type.
