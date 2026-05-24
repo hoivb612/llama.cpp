@@ -87,6 +87,8 @@ void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
 }
 
 void ggml_wait_for_done_xbox(const struct ggml_compute_params * params) {
+#if defined(CP_VERSION)
+
     const int n_tasks = params->nth;
     if (n_tasks == 1 || params->barrier == NULL || params->generation == NULL) {
         return;
@@ -108,9 +110,56 @@ void ggml_wait_for_done_xbox(const struct ggml_compute_params * params) {
 #endif
         }
     }
+
+#else // CP_VERSION
+
+    //
+    // If the number of tasks is not one, then wait for all tasks to arrive.
+    //
+
+    int n_tasks = params->nth;
+    if (n_tasks != 1) {
+
+        xb_atomic_int * barrier = params->barrier;
+        xb_atomic_int * generation = params->generation;
+    
+        //
+        // Capture the current barrier generation, add one to the barrier value and
+        // check if this is the last task to arrive.
+        //
+    
+        int generation_old = *generation;
+        if (xb_atomic_fetch_add(barrier, 1) == (n_tasks - 1)) {
+    
+            //
+            // This is the last task - reset barrier and increment the generation.
+            //
+    
+            *barrier = 0;
+            xb_atomic_fetch_add(generation, 1);
+    
+        } else {
+    
+            //
+            // Wait for other tasks, i.e., the generation number to change.
+            //
+
+            do {
+#if defined(_WIN32)
+                YieldProcessor();
+#else
+                sched_yield();
+#endif
+            } while (*generation == generation_old);
+        }
+    }
+
+#endif // CP_VERSION
 }
 
 void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params) {
+#if defined(CP_VERSION)
+
     const int n_tasks = params->nth;
     if (n_tasks == 1 || params->barrier == NULL) {
         return;
@@ -124,6 +173,33 @@ void ggml_wait_to_finalize_xbox(const struct ggml_compute_params * params) {
         sched_yield();
 #endif
     }
+
+#else // CP_VERSION
+
+    //
+    // If the number of tasks is not one, then wait for other tasks to arrive.
+    //
+
+    int n_tasks = params->nth;
+    if (n_tasks != 1) {
+
+        xb_atomic_int * barrier = params->barrier;
+    
+        //
+        // Wait until there is only one task left, i.e., the one executing this
+        // code.
+        //
+    
+        do {
+#if defined(_WIN32)
+            YieldProcessor();
+#else
+            sched_yield();
+#endif
+        } while (*barrier != (n_tasks - 1));
+    }
+
+#endif // CP_VERSION
 }
 
 bool ggml_cpu_tensor_repack_mode_xbox_callgraph(void) {
@@ -172,11 +248,26 @@ static inline bool ggml_b612_ranges_overlap(uintptr_t a_begin, uintptr_t a_end, 
 
 static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) {
     #define MAX_REPACK_CANDIDATES 512
+
     repack_candidate_t candidates[MAX_REPACK_CANDIDATES];
     uint32_t n_candidates = 0;
 
+#if defined(REPACK_ALIASED_TENSORS)
+    #define MAX_REPACK_ALIASES    512
+    #define MAX_REPACK_TENSORS    1024
+
+    void * aliased_data[MAX_REPACK_ALIASES];
+    uint32_t n_aliased = 0;
+    struct ggml_tensor * duplicated_tensors[MAX_REPACK_TENSORS];
+    uint32_t n_duplicated = 0;
+#endif // REPACK_ALIASED_TENSORS
+
     struct ggml_tensor * const * tensors = cgraph->nodes;
     const uint32_t n_nodes = cgraph->n_nodes;
+
+    //
+    // Pass 1: collect unique data pointers from repackable MUL_MAT src[0].
+    //
 
     for (uint32_t node_n = 0; node_n < n_nodes; node_n++) {
         struct ggml_tensor * tensor = tensors[node_n];
@@ -195,6 +286,7 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
             continue;
         }
 
+        // deduplicate by data pointer
         bool found = false;
         for (uint32_t c = 0; c < n_candidates; c++) {
             if (candidates[c].data == src0->data) {
@@ -215,8 +307,14 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
         return;
     }
 
+    //
+    // Pass 2: scan non-MUL_MAT ops. If any src tensor overlaps a
+    // repack candidate range, mark that candidate for duplication.
+    //
+
     for (uint32_t node_n = 0; node_n < n_nodes; node_n++) {
         struct ggml_tensor * tensor = tensors[node_n];
+
         if (tensor->is_skipped || tensor->op == GGML_OP_MUL_MAT) {
             continue;
         }
@@ -238,7 +336,22 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
 
             for (uint32_t c = 0; c < n_candidates; c++) {
                 if (ggml_b612_ranges_overlap(candidates[c].begin, candidates[c].end, src_begin, src_end)) {
+                #if !defined(REPACK_ALIASED_TENSORS)
                     candidates[c].tensor->flags |= GGML_TENSOR_FLAG_DUP;
+                #else // REPACK_ALIASED_TENSORS
+                    bool already_aliased = false;
+                    for (uint32_t a = 0; a < n_aliased; ++a) {
+                        if (aliased_data[a] == candidates[c].data) {
+                            already_aliased = true;
+                            break;
+                        }
+                    }
+                    if (!already_aliased && n_aliased < MAX_REPACK_ALIASES) {
+                        aliased_data[n_aliased++] = candidates[c].data;
+                    }
+                #endif // REPACK_ALIASED_TENSORS
+
+                    // remove from candidates to avoid redundant checks
                     candidates[c] = candidates[n_candidates - 1];
                     n_candidates--;
                     break;
@@ -249,6 +362,64 @@ static void ggml_repack_scan_aliased_data_pointers(struct ggml_cgraph * cgraph) 
             break;
         }
     }
+
+#if defined(REPACK_ALIASED_TENSORS)
+    if (n_aliased > 0) {
+        for (uint32_t node_n = 0; node_n < n_nodes; ++node_n) {
+            struct ggml_tensor * tensor = tensors[node_n];
+            if (tensor->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+
+            struct ggml_tensor * src0 = tensor->src[0];
+            if (src0 == NULL || src0->data == NULL) {
+                continue;
+            }
+
+            bool needs_duplicate = false;
+            for (uint32_t a = 0; a < n_aliased; ++a) {
+                if (aliased_data[a] == src0->data) {
+                    needs_duplicate = true;
+                    break;
+                }
+            }
+            if (!needs_duplicate) {
+                continue;
+            }
+
+            bool already_duplicated = false;
+            for (uint32_t d = 0; d < n_duplicated; ++d) {
+                if (duplicated_tensors[d] == src0) {
+                    already_duplicated = true;
+                    break;
+                }
+            }
+            if (already_duplicated) {
+                continue;
+            }
+
+            const size_t tensor_size = ggml_nbytes(src0);
+            char * duplicate_data = (char *) malloc(tensor_size);
+            if (duplicate_data == NULL) {
+                mul_mat_repack_failed_count += 1;
+                continue;
+            }
+            memcpy(duplicate_data, src0->data, tensor_size);
+            src0->data = duplicate_data;
+
+            mul_mat_repack_duplicate_tensor_count += 1;
+            mul_mat_repack_duplicate_tensor_total_size += tensor_size;
+
+            if (n_duplicated < MAX_REPACK_TENSORS) {
+                duplicated_tensors[n_duplicated++] = src0;
+            }
+        }
+    }
+
+    #undef MAX_REPACK_TENSORS
+    #undef MAX_REPACK_ALIASES
+#endif // REPACK_ALIASED_TENSORS
+
     #undef MAX_REPACK_CANDIDATES
 }
 
@@ -301,13 +472,29 @@ static void ggml_compute_forward_mul_mat_xbox(
     const enum ggml_type src1_type = src1->type;
 
     if (ggml_cpu_tensor_repack_mode_xbox_single_thread()) {
-        if (src1_type == GGML_TYPE_F32 && ggml_b612_repackable_type(src0_type) && !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK)) {
+        if (src1_type == GGML_TYPE_F32 && ggml_b612_repackable_type(src0_type) && 
+            !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK)) {
             if (ith == 0) {
                 const int64_t repack_t0 = ggml_time_us();
+
+                //
+                // N.B. If the repack is successful, then the repack type is returned.
+                //      Otherwise, the original type is returned.
+
                 src0_type = ggml_repack_tensor_single_thread(params, src0);
+
+                //
+                // Wait for all other threads to arrive at the barrier below before
+                // potentially changing the src0 type.
+                //
+                // N.B. The tensor type cannot be changed until it is guaranteed that
+                //      all other threads are waiting on the barrier below.
+                //
+
                 ggml_wait_to_finalize_xbox(params);
                 src0->type = src0_type;
 
+                // for single thread just accumulate as there is no contention
                 mul_mat_repack_count += 1;
                 mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
                 mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
@@ -316,9 +503,26 @@ static void ggml_compute_forward_mul_mat_xbox(
             ggml_wait_for_done_xbox(params);
         }
 
+        //
+        // Refresh for all threads in case the type has changed through repacking.
+        //
+        // N.B. All repacked tensors require exactly the same amount of memory as their
+        //      unpacked type.
+        //
+
         src0_type = src0->type;
+
     } else if (ggml_cpu_tensor_repack_mode_xbox()) {
-        if (src1_type == GGML_TYPE_F32 && ggml_b612_repackable_type(src0_type) && !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK)) {
+        if (src1_type == GGML_TYPE_F32 && ggml_b612_repackable_type(src0_type) && 
+            !(src0->flags & GGML_TENSOR_FLAG_NO_REPACK)) {
+
+            //
+            // Attempt to repack tensor.
+            //
+            // N.B. If the tensor is repacked, then the tensor type is changed to
+            //      the new repack type.
+            //
+
             int64_t repack_t0 = 0;
             if (ith == 0) {
                 repack_t0 = ggml_time_us();
@@ -332,17 +536,42 @@ static void ggml_compute_forward_mul_mat_xbox(
                     mul_mat_repack_time_current_op_us = ggml_time_us() - repack_t0;
                     mul_mat_repack_time_us += mul_mat_repack_time_current_op_us;
                 }
-            } else if (src0_type != src0->type) {
-                mul_mat_repack_shared += 1;
+
+            } else {
+                if (src0_type != src0->type) {
+                    // 
+                    // this thread does participate in repacking but not the 
+                    // main driver thread (ith == 0)
+                    // 
+                    mul_mat_repack_shared += 1;
+                }
             }
+
+            //
+            // Refresh src0_type in case the type changed during repack.
+            //
+            
+#if 0   
+            if (strcmp(src0->name, "token_embd.weight") == 0) {
+                printf("Switching type for src0 [%p]['%s'] - from [%d] to type [%d]\n"
+                       "                   src1 [%p]['%s'] - type [%d] \n"
+                       "                   dst  [%p]['%s'] - type [%d] \n",
+                src0, src0->name, src0_type, src0->type,
+                src1, src1->name, src1->type,
+                dst, dst->name, dst->type);
+            }
+#endif  
 
             src0_type = src0->type;
         }
+
     } else {
-        GGML_ASSERT(ggml_cpu_tensor_mulmat_mode_xbox() || ggml_cpu_tensor_repack_mode_xbox_callgraph());
+        GGML_ASSERT(ggml_cpu_tensor_mulmat_mode_xbox() || 
+                    ggml_cpu_tensor_repack_mode_xbox_callgraph());
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
     const bool src1_cont = ggml_is_contiguous(src1);
 
     GGML_ASSERT(ne0 == ne01);
@@ -350,31 +579,34 @@ static void ggml_compute_forward_mul_mat_xbox(
     GGML_ASSERT(ne2 == ne12);
     GGML_ASSERT(ne3 == ne13);
 
+    GGML_ASSERT(ggml_cpu_allow_tensor_repack() || (nb00 == ggml_type_size(src0_type)));
+    GGML_ASSERT(ggml_cpu_allow_tensor_repack() || (nb10 == ggml_type_size(src1_type)));
+
     GGML_ASSERT(nb0 == sizeof(float));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    const int64_t r2 = ne12 / ne02;
-    const int64_t r3 = ne13 / ne03;
+    const int64_t r2 = ne12/ne02;
+    const int64_t r3 = ne13/ne03;
+
     const int64_t nr0 = ne01;
-    const int64_t nr1 = ne1 * ne12 * ne13;
+    const int64_t nr1 = ne1*ne12*ne13;
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
 
     const struct ggml_type_traits_cpu * const src0_traits = ggml_get_type_traits_cpu(src0_type);
     GGML_ASSERT(src0_traits != NULL);
     GGML_ASSERT(src0_traits->vec_dot != NULL);
-
     ggml_vec_dot_t const vec_dot = src0_traits->vec_dot;
     enum ggml_type const vec_dot_type = src0_traits->vec_dot_type;
     GGML_ASSERT(vec_dot_type >= 0 && vec_dot_type < GGML_TYPE_COUNT);
 
-    const struct ggml_type_traits_cpu * const vec_dot_traits = ggml_get_type_traits_cpu(vec_dot_type);
-    GGML_ASSERT(vec_dot_traits != NULL);
-
     const bool init_mat = (vec_dot_type != src1_type);
-    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-    char * wdata = src1->data;
 
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+    char * wdata = (char *) src1->data;
     int64_t vec_dot_src0_t0 = 0;
     if (ith == 0) {
         vec_dot_src0_t0 = ggml_time_us();
@@ -382,17 +614,22 @@ static void ggml_compute_forward_mul_mat_xbox(
     }
 
     int64_t time_for_float_conversion = 0;
+
     if (init_mat) {
-        GGML_ASSERT(vec_dot_traits->from_float != NULL);
-        GGML_ASSERT(src1_type == GGML_TYPE_F32);
         wdata = params->wdata;
-        GGML_ASSERT(params->wsize >= ne11 * ne12 * ne13 * row_size);
+
+        GGML_ASSERT(params->wsize >= ne11*ne12*ne13*row_size);
+        GGML_ASSERT(src1_type == GGML_TYPE_F32);
+
+        const struct ggml_type_traits_cpu * const vec_dot_traits = ggml_get_type_traits_cpu(vec_dot_type);
+        GGML_ASSERT(vec_dot_traits != NULL);
+        GGML_ASSERT(vec_dot_traits->from_float != NULL);
+        ggml_from_float_t const from_float_to_vec_dot = vec_dot_traits->from_float;
 
         if (ith == 0) {
             time_for_float_conversion = ggml_time_us();
         }
 
-        ggml_from_float_t const from_float_to_vec_dot = vec_dot_traits->from_float;
         const int64_t rows_per_thread = (ne11 + nth - 1) / nth;
         const int64_t start_row = rows_per_thread * ith;
         const int64_t end_row = MIN(start_row + rows_per_thread, ne11);
@@ -402,7 +639,7 @@ static void ggml_compute_forward_mul_mat_xbox(
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 char * row_base = row_data + (((i12 * ne11) + start_row) * row_size);
                 for (int64_t i11 = start_row; i11 < end_row; ++i11) {
-                    from_float_to_vec_dot((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11), row_base, ne10);
+                    from_float_to_vec_dot((float *)((char *)src1->data + i13*nb13 + i12*nb12 + i11*nb11), row_base, ne10);
                     row_base += row_size;
                 }
             }
@@ -426,6 +663,7 @@ static void ggml_compute_forward_mul_mat_xbox(
         src0_rpc = (nr0 + nth - 1) / nth;
         ir010 = src0_rpc * ith;
         ir011 = MIN(ir010 + src0_rpc, nr0);
+
         ir110 = 0;
         ir111 = nr1;
     } else {
@@ -442,10 +680,29 @@ static void ggml_compute_forward_mul_mat_xbox(
         return;
     }
 
-    size_t src0_row_size = ggml_row_size(src0_type, ne00);
-    int64_t blck0_factor = (int64_t) ((l1d_cache_size + (src0_row_size / 2) - row_size) / src0_row_size);
-    blck0_factor = MAX((int64_t) 1, blck0_factor);
-    blck0_factor = MAX(blck0_factor, (int64_t) nth * 2);
+    //
+    // Compute the dot matric multiply using tiling.
+    //
+    // The general algorithm is to perform the dot product on one column from src1
+    // on all the rows in src0, then move on to the next src1 column. This is not,
+    // however, very cache friendly. The strategy used to make this more efficient
+    // is to break up the dot product into tiles. Basically a tile is sized to fit
+    // a contigous set of src0 rows in the l1d-cache.
+    //
+    // Always compute the block factor based on the src0 row size. This is the data
+    // that is repeated referenced for one tile block iteration of the src1 loop.
+    //
+    // N.B. It makes no difference which operand (src0 or src1) has the most rows. The
+    //      src0 loop is the data that gets continually referenced as the src1 loop
+    //      sequences through scr0 tile blocks.
+    //
+
+    const size_t l1d_cache_size_local = 48ull * 1024ull;
+
+    const size_t src0_row_size = ggml_row_size(src0_type, ne00);
+    int64_t blck0_factor = (int64_t) ((l1d_cache_size_local + (src0_row_size / 2) - row_size) / src0_row_size);
+    blck0_factor = MAX(1, blck0_factor);
+    blck0_factor = MAX(blck0_factor, nth * 2);
     blck0_factor = MIN(blck0_factor, src0_rpc);
 
     if (ith == 0) {
@@ -453,17 +710,40 @@ static void ggml_compute_forward_mul_mat_xbox(
         if (bucket_index > ARRAYSIZE(quant_type_row_size[src0_type].counts)) {
             bucket_index = ARRAYSIZE(quant_type_row_size[src0_type].counts);
         }
-
         quant_type_row_size[src0_type].total_count += 1;
         quant_type_row_size[src0_type].counts[bucket_index - 1] += 1;
         quant_type_row_size[src0_type].conversion_from_float_times[bucket_index - 1] += time_for_float_conversion;
     }
 
-    char * dst_data = dst->data;
+    //
+    // This loop breaks up src0 rows into tile blocks that fit in the l1d-cache.
+    // The number of rows in a tile is the blocking factor.
+    //
+
+    char * dst_data = (char *) dst->data;
+
+    const struct ggml_type_traits_cpu * const vec_dot_traits = ggml_get_type_traits_cpu(vec_dot_type);
+    GGML_ASSERT(vec_dot_traits != NULL);
+
+    //
+    // Split the multirow code from the single row code. The multirow code only
+    // contains the repacked quant types and much more is known about the memory
+    // layout of these types. This enables superfluous overhead to be ommitted.
+    //
 
     if (vec_dot_traits->nrows == -1) {
-        const char * src0_row = src0->data;
-        const char * src1_col = wdata + (row_size * ir110);
+
+        //
+        // Compute the dot product of the selected set of src1 columns versus a tile
+        // block of src0 rows.
+        //
+        // N.B. ir110 - ir111 is the set of selected columns.
+        //
+        // N.B. ir010 - ir011 is the set of selected rows.
+        //
+
+        const char * src0_row = (const char *) src0->data;
+        const char * src1_col = (const char *) wdata + (row_size * ir110);
         float * dst_col = (float *)(dst_data + (ir110 * nb1));
 
         for (int64_t iir0 = ir010; iir0 < ir011; iir0 += blck0_factor) {
@@ -477,8 +757,14 @@ static void ggml_compute_forward_mul_mat_xbox(
                     ir111 - ir110,
                     limit0 - iir0);
         }
+
     } else {
         for (int64_t iir0 = ir010; iir0 < ir011; iir0 += blck0_factor) {
+
+            //
+            // This loop sequences through all the src1 columns.
+            //
+
             for (int64_t ir1 = ir110; ir1 < ir111; ++ir1) {
                 const int64_t i13 = (ir1/(ne12*ne1));
                 const int64_t i12 = (ir1 - i13*ne12*ne1)/ne1;
@@ -486,14 +772,26 @@ static void ggml_compute_forward_mul_mat_xbox(
 
                 const int64_t i03 = i13/r3;
                 const int64_t i02 = i12/r2;
+
                 const char * src0_row = (const char *) src0->data + (0 + i02*nb02 + i03*nb03);
 
-                const char * src1_col = wdata +
+                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                //       the original src1 data pointer, so we should index using the indices directly
+                // TODO: this is a bit of a hack, we should probably have a better way to handle this
+
+                const char * src1_col = (const char *) wdata +
                     (src1_cont || init_mat
                      ? (i11      + i12*ne11 + i13*ne12*ne11)*row_size
                      : (i11*nb11 + i12*nb12 + i13*nb13));
 
                 float * dst_col = (float *)(dst_data + (i11*nb1 + i12*nb2 + i13*nb3));
+
+                //
+                // This loop computes the dot product of one src1 column versus a tile block of
+                // src0 rows.
+                //
+
                 const int64_t limit0 = MIN(iir0 + blck0_factor, ir011);
                 for (int64_t ir0 = iir0; ir0 < limit0; ++ir0) {
                     vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);

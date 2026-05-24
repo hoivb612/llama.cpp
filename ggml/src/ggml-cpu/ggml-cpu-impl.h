@@ -28,7 +28,7 @@ struct ggml_compute_params {
     // use reference implementation
     bool use_ref;
 
-#ifdef GGML_XBOX_PERF
+#ifdef GGML_B612
     // required for tensor repack logic
     void * barrier;
     void * generation;

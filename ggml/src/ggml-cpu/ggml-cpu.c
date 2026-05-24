@@ -407,6 +407,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_I32] = {
+        .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
 #ifdef GGML_B612
     [GGML_TYPE_Q4_0_x8] = {
         .vec_dot                  = (ggml_vec_dot_t) xx_vec_dot_q4_0_q8_0_x8,
@@ -475,9 +478,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = -1,
     },
 #endif
-    [GGML_TYPE_I32] = {
-        .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
-    },
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
@@ -555,6 +555,12 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+#if defined(GGML_B612)
+    atomic_int GGML_CACHE_ALIGN barrier_tb; // tensor barrier
+    atomic_int GGML_CACHE_ALIGN generation_tb; // tensor generation
+    atomic_int GGML_CACHE_ALIGN barrier_db; // dispatch barrier
+    atomic_int GGML_CACHE_ALIGN generation_db; // dispatch generation
+#endif
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -3433,6 +3439,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.barrier    =*/ (void *)&(tp->barrier_tb),
+        /*.generation =*/ (void *)&(tp->generation_tb)
     };
 
 #ifdef GGML_USE_OPENMP
@@ -3681,6 +3689,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;
+#ifdef GGML_B612
+        threadpool->barrier_tb       = 0;
+        threadpool->barrier_db       = 0;
+        threadpool->generation_tb    = 0;
+        threadpool->generation_db    = 0;
+#endif // GGML_B612
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;
