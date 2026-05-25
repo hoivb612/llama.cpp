@@ -292,6 +292,8 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
 
+option(GGML_RYZENAI                         "ggml: use AMD Ryzen AI NPU (XDNA)"               OFF)
+
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
@@ -372,6 +374,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-webgpu.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
+    include/ggml-ryzenai.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
