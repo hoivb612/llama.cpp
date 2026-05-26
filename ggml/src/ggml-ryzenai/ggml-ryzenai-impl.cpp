@@ -156,12 +156,16 @@ public:
 
 // Per-call timing counters for the NPU mul_mat hot path. Enabled at runtime
 // via env var GGML_RYZENAI_STATS=1. Prints a summary at process exit.
+// Execute time is split by M bucket because per-call cost is dominated by
+// fixed overhead at M=1 and by per-row compute at M>1; lumping them into
+// one average is misleading.
 struct RyzenAIStats {
     std::atomic<uint64_t> calls{0};
     std::atomic<uint64_t> calls_m_eq_1{0};
     std::atomic<uint64_t> calls_m_gt_1{0};
     std::atomic<uint64_t> us_convert{0};
-    std::atomic<uint64_t> us_execute{0};
+    std::atomic<uint64_t> us_execute_m_eq_1{0};
+    std::atomic<uint64_t> us_execute_m_gt_1{0};
     std::atomic<uint64_t> us_alloc{0};
     std::atomic<uint64_t> bytes_activations{0};
     bool enabled = false;
@@ -173,25 +177,34 @@ struct RyzenAIStats {
 
     ~RyzenAIStats() {
         if (!enabled || calls.load() == 0) return;
-        uint64_t n = calls.load();
-        uint64_t conv = us_convert.load();
-        uint64_t exe  = us_execute.load();
-        uint64_t alc  = us_alloc.load();
+        uint64_t n     = calls.load();
+        uint64_t n_eq1 = calls_m_eq_1.load();
+        uint64_t n_gt1 = calls_m_gt_1.load();
+        uint64_t conv  = us_convert.load();
+        uint64_t exe_1 = us_execute_m_eq_1.load();
+        uint64_t exe_n = us_execute_m_gt_1.load();
+        uint64_t exe   = exe_1 + exe_n;
+        uint64_t alc   = us_alloc.load();
         uint64_t total = conv + exe + alc;
+        auto pct = [&](uint64_t v) { return total ? 100.0 * v / total : 0.0; };
         std::fprintf(stderr,
             "\n[ggml-ryzenai stats]\n"
-            "  calls           = %llu  (M=1: %llu, M>1: %llu)\n"
-            "  alloc bf16 buf  = %8.2f ms  (%5.2f%%, avg %6.2f us/call)\n"
-            "  F32->BF16 conv  = %8.2f ms  (%5.2f%%, avg %6.2f us/call)\n"
-            "  NPU execute()   = %8.2f ms  (%5.2f%%, avg %6.2f us/call)\n"
-            "  total measured  = %8.2f ms\n"
-            "  activations DMA = %8.2f MB\n",
+            "  calls               = %llu  (M=1: %llu, M>1: %llu)\n"
+            "  alloc bf16 buf      = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
+            "  F32->BF16 conv      = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
+            "  NPU execute() M=1   = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
+            "  NPU execute() M>1   = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
+            "  NPU execute() total = %8.2f ms  (%5.2f%%)\n"
+            "  total measured      = %8.2f ms\n"
+            "  activations DMA     = %8.2f MB\n",
             (unsigned long long) n,
-            (unsigned long long) calls_m_eq_1.load(),
-            (unsigned long long) calls_m_gt_1.load(),
-            alc  / 1000.0, total ? 100.0 * alc  / total : 0.0, n ? (double) alc  / n : 0.0,
-            conv / 1000.0, total ? 100.0 * conv / total : 0.0, n ? (double) conv / n : 0.0,
-            exe  / 1000.0, total ? 100.0 * exe  / total : 0.0, n ? (double) exe  / n : 0.0,
+            (unsigned long long) n_eq1,
+            (unsigned long long) n_gt1,
+            alc   / 1000.0, pct(alc),   n     ? (double) alc   / n     : 0.0,
+            conv  / 1000.0, pct(conv),  n     ? (double) conv  / n     : 0.0,
+            exe_1 / 1000.0, pct(exe_1), n_eq1 ? (double) exe_1 / n_eq1 : 0.0,
+            exe_n / 1000.0, pct(exe_n), n_gt1 ? (double) exe_n / n_gt1 : 0.0,
+            exe   / 1000.0, pct(exe),
             total / 1000.0,
             bytes_activations.load() / (1024.0 * 1024.0));
     }
@@ -435,14 +448,16 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
 
     if (stats.enabled) {
         stats.calls.fetch_add(1, std::memory_order_relaxed);
+        uint64_t exe_us = (uint64_t)(t3 - t2);
         if (ne11 == 1) {
             stats.calls_m_eq_1.fetch_add(1, std::memory_order_relaxed);
+            stats.us_execute_m_eq_1.fetch_add(exe_us, std::memory_order_relaxed);
         } else {
             stats.calls_m_gt_1.fetch_add(1, std::memory_order_relaxed);
+            stats.us_execute_m_gt_1.fetch_add(exe_us, std::memory_order_relaxed);
         }
         stats.us_alloc.fetch_add((uint64_t)(t1 - t0), std::memory_order_relaxed);
         stats.us_convert.fetch_add((uint64_t)(t2 - t1), std::memory_order_relaxed);
-        stats.us_execute.fetch_add((uint64_t)(t3 - t2), std::memory_order_relaxed);
         stats.bytes_activations.fetch_add((uint64_t)(n_elem * sizeof(int16_t)), std::memory_order_relaxed);
     }
 
