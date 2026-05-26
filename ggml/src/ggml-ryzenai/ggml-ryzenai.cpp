@@ -109,8 +109,16 @@ void ggml_backend_ryzenai_set_n_threads(ggml_backend_t backend_ryzenai, int n_th
     ctx->n_threads = n_threads;
 }
 
+static void ggml_ryzenai_preload_weights_cgraph(struct ggml_cgraph * cgraph);
+
 void ggml_backend_ryzenai_preload_weights(ggml_backend_t backend_ryzenai, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(ggml_backend_is_ryzenai(backend_ryzenai));
+    ggml_ryzenai_preload_weights_cgraph(cgraph);
+}
+
+// no-backend-handle variant exposed via get_proc_address so llama.cpp can
+// reach it the same way it reaches ggml_cpu_repack_tensor_callgraph
+static void ggml_ryzenai_preload_weights_cgraph(struct ggml_cgraph * cgraph) {
     if (cgraph == NULL) {
         return;
     }
@@ -261,6 +269,9 @@ static void * ggml_backend_ryzenai_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (std::strcmp(name, "ggml_backend_ryzenai_preload_weights") == 0) {
         return (void *) ggml_backend_ryzenai_preload_weights;
+    }
+    if (std::strcmp(name, "ggml_ryzenai_preload_weights_cgraph") == 0) {
+        return (void *) ggml_ryzenai_preload_weights_cgraph;
     }
     return NULL;
 }

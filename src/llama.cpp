@@ -159,6 +159,35 @@ void llama_repack_tensor_callgraph(struct ggml_cgraph * cgraph) {
 }
 #endif // GGML_B612_REPACK_CORE
 
+void llama_ryzenai_preload_weights(struct ggml_cgraph * cgraph) {
+    if (cgraph == nullptr) {
+        return;
+    }
+
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
+
+    // Find the RyzenAI backend by name; absent on builds without GGML_RYZENAI=ON.
+    ggml_backend_reg_t ryzenai_reg = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (reg && std::strcmp(ggml_backend_reg_name(reg), "RyzenAI") == 0) {
+            ryzenai_reg = reg;
+            break;
+        }
+    }
+    if (ryzenai_reg == nullptr) {
+        return;
+    }
+
+    using preload_fn_t = void (*)(struct ggml_cgraph *);
+    auto * preload_fn = (preload_fn_t) ggml_backend_reg_get_proc_address(ryzenai_reg, "ggml_ryzenai_preload_weights_cgraph");
+    if (preload_fn) {
+        preload_fn(cgraph);
+    }
+}
+
 int64_t llama_time_us(void) {
     return ggml_time_us();
 }
