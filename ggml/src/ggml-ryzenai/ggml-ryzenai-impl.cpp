@@ -269,18 +269,44 @@ void ggml_ryzenai_impl_init(void) {
     initialized = true;
 }
 
+// Minimum M dimension (number of activation tokens) required to claim
+// MUL_MAT for the NPU. Read once from env var GGML_RYZENAI_MIN_M.
+//
+// Rationale: NPU execute() has ~2 ms of fixed per-call overhead
+// (kernel launch + DMA descriptor setup + AIE program start + completion
+// signal) regardless of M. At M=1 (decode), arithmetic intensity is so
+// low that CPU AVX-512 + Q4_0 repack consistently beats the NPU by 2-4x.
+// At M>=16 the NPU starts to amortize this overhead and pulls ahead.
+//
+// Default = 2 (skip M=1 decode, run everything else on NPU). Set to 1
+// to claim everything (legacy behavior), or a higher value to be more
+// conservative.
+static int ryzenai_min_m() {
+    static int cached = []() {
+        const char * env = std::getenv("GGML_RYZENAI_MIN_M");
+        if (env && env[0] != '\0') {
+            int v = std::atoi(env);
+            if (v >= 1) return v;
+        }
+        return 2; // default: skip decode (M=1), keep prefill / batched
+    }();
+    return cached;
+}
+
 bool ggml_ryzenai_impl_can_mul_mat(const struct ggml_tensor * src0,
                                    const struct ggml_tensor * src1,
                                    const struct ggml_tensor * dst) {
     const int64_t ne3 = dst->ne[3];
     const int64_t ne2 = dst->ne[2];
     const int64_t ne0 = dst->ne[0];
+    const int64_t M   = src1->ne[1];
 
     return src0->type == GGML_TYPE_Q4_0 &&
            ggml_is_contiguous(src1) && src1->type == GGML_TYPE_F32 &&
            dst->type == GGML_TYPE_F32 &&
            ne3 == 1 && ne2 == 1 &&
-           ne0 >= 4096;
+           ne0 >= 4096 &&
+           M >= ryzenai_min_m();
 }
 
 // Software emulation path: dequantize Q4_0 and do a plain GEMM. Only used
