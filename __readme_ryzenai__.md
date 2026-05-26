@@ -659,6 +659,20 @@ C:\llama.cpp\b612_052026\build.ryzenai>git branch
   hv/b612_052026
 * hv/b612_052026_ryzenai
 
+C:\llama.cpp\b612_052026\build.ryzenai>conda env list (this is RyzenAI-v-1.6)
+
+# conda environments:
+#
+                       C:\ProgramData\anaconda3
+                     * C:\ProgramData\anaconda3\envs\ryzenai-transformers
+                       C:\ProgramData\miniconda3
+                       c:\ProgramData\anaconda3\envs\ryzen-ai-1.2.0
+                       c:\ProgramData\anaconda3\envs\ryzen-ai-1.6.0
+base                   c:\llama.cpp\miniforge3
+
+
+C:\llama.cpp\b612_052026\build.ryzenai>conda activate C:\ProgramData\anaconda3\envs\ryzenai-transformers
+
 C:\llama.cpp\b612_052026\build.ryzenai>cmake .. -DGGML_RYZENAI=ON -DRyzenAI_DIR=C:/ProgramData/anaconda3/envs/ryzenai-transformers/Lib/cmake/ryzenai -DXRT_DIR=c:/llama.cpp/Ryzen/example/transformers/third_party/xrt-ipu/xrt/share/cmake/XRT                                
 
 C:\llama.cpp\b612_052026\build.ryzenai>cmake --build . --config RelWithDebInfo --target minslm-cli  
