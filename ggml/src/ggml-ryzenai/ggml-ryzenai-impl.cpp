@@ -15,10 +15,12 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <mutex>
 #include <string_view>
@@ -117,6 +119,54 @@ public:
 
 #endif // !RYZENAI_EMULATION
 
+// Per-call timing counters for the NPU mul_mat hot path. Enabled at runtime
+// via env var GGML_RYZENAI_STATS=1. Prints a summary at process exit.
+struct RyzenAIStats {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> calls_m_eq_1{0};
+    std::atomic<uint64_t> calls_m_gt_1{0};
+    std::atomic<uint64_t> us_convert{0};
+    std::atomic<uint64_t> us_execute{0};
+    std::atomic<uint64_t> us_alloc{0};
+    std::atomic<uint64_t> bytes_activations{0};
+    bool enabled = false;
+
+    RyzenAIStats() {
+        const char * env = std::getenv("GGML_RYZENAI_STATS");
+        enabled = env && env[0] != '0' && env[0] != '\0';
+    }
+
+    ~RyzenAIStats() {
+        if (!enabled || calls.load() == 0) return;
+        uint64_t n = calls.load();
+        uint64_t conv = us_convert.load();
+        uint64_t exe  = us_execute.load();
+        uint64_t alc  = us_alloc.load();
+        uint64_t total = conv + exe + alc;
+        std::fprintf(stderr,
+            "\n[ggml-ryzenai stats]\n"
+            "  calls           = %llu  (M=1: %llu, M>1: %llu)\n"
+            "  alloc bf16 buf  = %8.2f ms  (%5.2f%%, avg %6.2f us/call)\n"
+            "  F32->BF16 conv  = %8.2f ms  (%5.2f%%, avg %6.2f us/call)\n"
+            "  NPU execute()   = %8.2f ms  (%5.2f%%, avg %6.2f us/call)\n"
+            "  total measured  = %8.2f ms\n"
+            "  activations DMA = %8.2f MB\n",
+            (unsigned long long) n,
+            (unsigned long long) calls_m_eq_1.load(),
+            (unsigned long long) calls_m_gt_1.load(),
+            alc  / 1000.0, total ? 100.0 * alc  / total : 0.0, n ? (double) alc  / n : 0.0,
+            conv / 1000.0, total ? 100.0 * conv / total : 0.0, n ? (double) conv / n : 0.0,
+            exe  / 1000.0, total ? 100.0 * exe  / total : 0.0, n ? (double) exe  / n : 0.0,
+            total / 1000.0,
+            bytes_activations.load() / (1024.0 * 1024.0));
+    }
+};
+
+static RyzenAIStats & ryzenai_stats() {
+    static RyzenAIStats s;
+    return s;
+}
+
 #ifndef RYZENAI_EMULATION
 
 // Internal: ensure a qlinear_2 instance exists in the singleton map for this
@@ -180,6 +230,13 @@ void ggml_ryzenai_impl_init(void) {
     static bool initialized = false;
     if (initialized) {
         return;
+    }
+    // Force-construct the stats singleton early so the GGML_RYZENAI_STATS
+    // env var is read before any matmul calls and the dtor prints the
+    // summary at process exit.
+    auto & stats = ryzenai_stats();
+    if (stats.enabled) {
+        GGML_LOG_INFO("ggml-ryzenai: per-call stats enabled (GGML_RYZENAI_STATS=1)\n");
     }
 #ifdef RYZENAI_EMULATION
     GGML_LOG_WARN("==================================================================\n");
@@ -286,6 +343,7 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
     GGML_TENSOR_BINARY_OP_LOCALS
 
     auto & ctx = RyzenAIContext::get();
+    auto & stats = ryzenai_stats();
 
     // Lazy fallback in case preload_weights wasn't called for this tensor.
     ctx.lock();
@@ -294,18 +352,40 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
 
     auto key = std::string_view(src0->name);
 
-    // Convert F32 activations to bfloat16 for the NPU kernel.
+    const int64_t n_elem = ggml_nelements(src1);
+
+    // ---- segment 1: allocate BF16 activation buffer ----
+    int64_t t0 = stats.enabled ? ggml_time_us() : 0;
+    std::vector<int16_t> bf16_inputs(n_elem);
+    int64_t t1 = stats.enabled ? ggml_time_us() : 0;
+
+    // ---- segment 2: F32 -> BF16 conversion (CPU AVX-512) ----
     const static bool use_avx = ryzenai::check_avx512_and_bf16_support();
-    std::vector<int16_t> bf16_inputs(ggml_nelements(src1));
     ryzenai::float_buffer_to_bfloat16((float *) src1->data,
-                                      ggml_nelements(src1),
+                                      n_elem,
                                       (uint16_t *) bf16_inputs.data(),
                                       use_avx);
+    int64_t t2 = stats.enabled ? ggml_time_us() : 0;
 
+    // ---- segment 3: NPU execute (DMA + compute + writeback) ----
     RYZ_TRY_CATCH(ctx.map.at(key).execute(
         bf16_inputs.data(),
         std::make_tuple((int) ne11, (int) ne10),
         (float *) dst->data);)
+    int64_t t3 = stats.enabled ? ggml_time_us() : 0;
+
+    if (stats.enabled) {
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        if (ne11 == 1) {
+            stats.calls_m_eq_1.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            stats.calls_m_gt_1.fetch_add(1, std::memory_order_relaxed);
+        }
+        stats.us_alloc.fetch_add((uint64_t)(t1 - t0), std::memory_order_relaxed);
+        stats.us_convert.fetch_add((uint64_t)(t2 - t1), std::memory_order_relaxed);
+        stats.us_execute.fetch_add((uint64_t)(t3 - t2), std::memory_order_relaxed);
+        stats.bytes_activations.fetch_add((uint64_t)(n_elem * sizeof(int16_t)), std::memory_order_relaxed);
+    }
 
     GGML_UNUSED(nb01); GGML_UNUSED(nb02); GGML_UNUSED(nb03);
     GGML_UNUSED(ne00); GGML_UNUSED(ne01); GGML_UNUSED(ne02); GGML_UNUSED(ne03);
