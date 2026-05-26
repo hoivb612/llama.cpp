@@ -46,31 +46,9 @@
 
 namespace {
 
-// Transpose the two innermost dimensions of a [ne00, ne01, ne02, ne03] tensor.
-template <typename T>
-std::vector<T> transpose_inner(const std::vector<T> & tensor,
-                               const std::tuple<int, int, int, int> & shapes) {
-    const auto & [ne00, ne01, ne02, ne03] = shapes;
-
-    std::vector<T> out(static_cast<size_t>(ne00) * ne01 * ne02 * ne03);
-
-    const int64_t s3 = static_cast<int64_t>(ne00) * ne01 * ne02;
-    const int64_t s2 = static_cast<int64_t>(ne00) * ne01;
-
-    for (int64_t b3 = 0; b3 < ne03; ++b3) {
-        for (int64_t b2 = 0; b2 < ne02; ++b2) {
-            for (int64_t i = 0; i < ne01; ++i) {
-                for (int64_t j = 0; j < ne00; ++j) {
-                    out[b3 * s3 + b2 * s2 + j * ne01 + i] =
-                        tensor[b3 * s3 + b2 * s2 + i * ne00 + j];
-                }
-            }
-        }
-    }
-    return out;
-}
-
 // Q4_0 row unpack: two int4 weights per byte. Q4_0 zero-point is always 8.
+// Used by the EMU path only; the real NPU path uses the fused unpack+transpose
+// below to avoid materializing the row-major intermediate.
 void unpack_row_q4_0(const char * xx, int k,
                      std::vector<int8_t> & weights,
                      std::vector<int8_t> & /*zeros*/,
@@ -88,6 +66,63 @@ void unpack_row_q4_0(const char * xx, int k,
         }
         for (int j = 0; j < qk / 2; ++j) {
             weights.push_back(x[i].qs[j] >> 4);
+        }
+    }
+}
+
+// Fused Q4_0 unpack + transpose for the NPU upload path.
+//
+// qlinear_2::initialize_weights_int4 wants int4 weights laid out so the K
+// dimension (ne00) is contiguous in the outer index, i.e. column-major in
+// (ne00, ne01) terms. ggml's Q4_0 is row-major. The previous implementation
+// did: unpack_row_q4_0 → row-major int8 vector → transpose_inner → transposed
+// int8 vector, materializing two ~1-byte/weight intermediates plus a separate
+// scales/transposed-scales pair.
+//
+// This fused walker writes int4 weights (as int8, range 0..15) and fp32 scales
+// directly into the final transposed layout in one pass. Memory cost is
+// exactly one output for each, no intermediates. The qlinear_2 BO consumed
+// from these buffers, after which the caller frees both (see comment in
+// ensure_op_for_weight_locked).
+static void unpack_q4_0_transposed(const struct ggml_tensor * src0,
+                                   int8_t * weights_T,
+                                   float  * scales_T) {
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+    const size_t  nb01 = src0->nb[1];
+    const size_t  nb02 = src0->nb[2];
+    const size_t  nb03 = src0->nb[3];
+
+    GGML_ASSERT(ne00 % QK4_0 == 0);
+    const int64_t nblocks_per_row = ne00 / QK4_0;
+
+    // Strides for the transposed output (outer two dims swapped).
+    const int64_t w_s2 = ne00 * ne01;
+    const int64_t w_s3 = w_s2 * ne02;
+    const int64_t s_s2 = nblocks_per_row * ne01;
+    const int64_t s_s3 = s_s2 * ne02;
+
+    const char * base = (const char *) src0->data;
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i01 = 0; i01 < ne01; ++i01) {
+                const block_q4_0 * row = (const block_q4_0 *)
+                    (base + i01 * nb01 + i02 * nb02 + i03 * nb03);
+                int8_t * w_batch = weights_T + i03 * w_s3 + i02 * w_s2;
+                float  * s_batch = scales_T  + i03 * s_s3 + i02 * s_s2;
+                for (int64_t g = 0; g < nblocks_per_row; ++g) {
+                    s_batch[g * ne01 + i01] = GGML_FP16_TO_FP32(row[g].d);
+                    const int64_t col_lo = g * QK4_0;
+                    const int64_t col_hi = col_lo + QK4_0 / 2;
+                    for (int j = 0; j < QK4_0 / 2; ++j) {
+                        const uint8_t b = (uint8_t) row[g].qs[j];
+                        w_batch[(col_lo + j) * ne01 + i01] = (int8_t) (b & 0xF);
+                        w_batch[(col_hi + j) * ne01 + i01] = (int8_t) (b >> 4);
+                    }
+                }
+            }
         }
     }
 }
@@ -173,6 +208,14 @@ static RyzenAIStats & ryzenai_stats() {
 // weight tensor; create + initialize it from the Q4_0 data on first call.
 // Returns true if a new instance was created, false if already cached.
 // Caller must hold the context lock.
+//
+// Memory note: qlinear_2::initialize_weights_int4 copies/formats/tiles the
+// input buffers into NPU-side xrt::bo objects. After that call returns,
+// the host-side scratch (weights, scales, zeros, bias) is no longer
+// referenced by qlinear_2 (verified against qlinear_2.hpp v1.6 — the only
+// weight storage is `std::vector<xrt::bo> weights_bo_`; execute() reads
+// from BO references and never re-touches the input pointers). We therefore
+// scope the scratch tightly so it is destroyed before the function returns.
 static bool ensure_op_for_weight_locked(RyzenAIContext & ctx,
                                         const struct ggml_tensor * src0) {
     auto key = std::string_view(src0->name);
@@ -182,45 +225,35 @@ static bool ensure_op_for_weight_locked(RyzenAIContext & ctx,
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
-    const size_t  nb01 = src0->nb[1];
-    const size_t  nb02 = src0->nb[2];
-    const size_t  nb03 = src0->nb[3];
 
     RYZ_TRY_CATCH(ctx.map.emplace(
         std::piecewise_construct,
         std::forward_as_tuple(key),
         std::forward_as_tuple("bfloat16", "uint4", "float32"));)
 
-    std::vector<int8_t> weights;
-    weights.reserve(ggml_nelements(src0));
-    std::vector<int8_t> zeros(ggml_nelements(src0) / 32, 8);
-    std::vector<float> scales;
-    scales.reserve(ggml_nelements(src0) / 32);
-    std::vector<float> bias(ne01, 0.0f);
+    {
+        // Single fused pass: unpack Q4_0 directly into the transposed layout
+        // qlinear_2 expects. Eliminates the row-major-int8 + transposed-int8
+        // + row-major-fp32 + transposed-fp32 intermediates of the legacy
+        // unpack_row_q4_0 + transpose_inner pipeline.
+        const int64_t N = ggml_nelements(src0);
+        std::vector<int8_t> weights_T((size_t) N);
+        std::vector<float>  scales_T((size_t) N / QK4_0);
+        std::vector<int8_t> zeros((size_t) N / QK4_0, 8);
+        std::vector<float>  bias((size_t) ne01, 0.0f);
 
-    void * w = src0->data;
-    for (int64_t i03 = 0; i03 < ne03; ++i03) {
-        for (int64_t i02 = 0; i02 < ne02; ++i02) {
-            for (int64_t i01 = 0; i01 < ne01; ++i01) {
-                unpack_row_q4_0((const char *) w + i01 * nb01 + i02 * nb02 + i03 * nb03,
-                                ne00, weights, zeros, scales);
-            }
-        }
+        unpack_q4_0_transposed(src0, weights_T.data(), scales_T.data());
+
+        // See note in ggml_ryzenai_impl_mul_mat_npu about the transpose trick.
+        auto w_shape = std::make_tuple((int) ne00, (int) ne01);
+
+        RYZ_TRY_CATCH(ctx.map.at(key).initialize_weights_int4(
+            weights_T.data(), zeros.data(), scales_T.data(),
+            bias.data(), w_shape);)
+
+        // weights_T, scales_T, zeros, bias destroyed here; their backing
+        // pages are released before the next tensor is uploaded.
     }
-
-    // See note in ggml_ryzenai_impl_mul_mat_npu about the transpose trick.
-    auto transposed_weights = transpose_inner(weights,
-        std::make_tuple((int) ne00, (int) ne01, (int) ne02, (int) ne03));
-    auto transposed_scales  = transpose_inner(scales,
-        std::make_tuple((int) (ne00 / 32), (int) ne01, (int) ne02, (int) ne03));
-
-    auto w_shape = std::make_tuple((int) ne00, (int) ne01);
-
-    RYZ_TRY_CATCH(ctx.map.at(key).initialize_weights_int4(
-        transposed_weights.data(), zeros.data(), transposed_scales.data(),
-        bias.data(), w_shape);)
     return true;
 }
 
