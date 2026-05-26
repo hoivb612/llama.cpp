@@ -122,7 +122,8 @@ static void ggml_ryzenai_preload_weights_cgraph(struct ggml_cgraph * cgraph) {
     if (cgraph == NULL) {
         return;
     }
-    int preloaded = 0;
+    int uploaded = 0;
+    int eligible = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
@@ -133,10 +134,15 @@ static void ggml_ryzenai_preload_weights_cgraph(struct ggml_cgraph * cgraph) {
         if (!ggml_ryzenai_impl_can_mul_mat(src0, src1, node)) {
             continue;
         }
-        ggml_ryzenai_impl_preload_weight(src0, src1, node);
-        preloaded++;
+        eligible++;
+        if (ggml_ryzenai_impl_preload_weight(src0, src1, node)) {
+            uploaded++;
+        }
     }
-    GGML_LOG_INFO("ggml-ryzenai: preloaded %d weight tensor(s)\n", preloaded);
+    if (uploaded > 0) {
+        GGML_LOG_INFO("ggml-ryzenai: preloaded %d new weight tensor(s) (%d eligible in cgraph)\n",
+                      uploaded, eligible);
+    }
 }
 
 // ----- device interface -----

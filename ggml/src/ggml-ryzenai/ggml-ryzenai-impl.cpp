@@ -121,12 +121,13 @@ public:
 
 // Internal: ensure a qlinear_2 instance exists in the singleton map for this
 // weight tensor; create + initialize it from the Q4_0 data on first call.
+// Returns true if a new instance was created, false if already cached.
 // Caller must hold the context lock.
-static void ensure_op_for_weight_locked(RyzenAIContext & ctx,
+static bool ensure_op_for_weight_locked(RyzenAIContext & ctx,
                                         const struct ggml_tensor * src0) {
     auto key = std::string_view(src0->name);
     if (ctx.map.count(key) != 0) {
-        return;
+        return false;
     }
 
     const int64_t ne00 = src0->ne[0];
@@ -170,6 +171,7 @@ static void ensure_op_for_weight_locked(RyzenAIContext & ctx,
     RYZ_TRY_CATCH(ctx.map.at(key).initialize_weights_int4(
         transposed_weights.data(), zeros.data(), transposed_scales.data(),
         bias.data(), w_shape);)
+    return true;
 }
 
 #endif // !RYZENAI_EMULATION
@@ -311,17 +313,20 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
 
 #endif // !RYZENAI_EMULATION
 
-void ggml_ryzenai_impl_preload_weight(const struct ggml_tensor * src0,
+bool ggml_ryzenai_impl_preload_weight(const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1,
                                       const struct ggml_tensor * dst) {
     if (!ggml_ryzenai_impl_can_mul_mat(src0, src1, dst)) {
-        return;
+        return false;
     }
 #ifndef RYZENAI_EMULATION
     auto & ctx = RyzenAIContext::get();
     ctx.lock();
-    ensure_op_for_weight_locked(ctx, src0);
+    bool created = ensure_op_for_weight_locked(ctx, src0);
     ctx.unlock();
+    return created;
+#else
+    return false;
 #endif
 }
 

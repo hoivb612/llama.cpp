@@ -14,9 +14,9 @@ void ggml_ryzenai_impl_init(void);
 
 // Pre-construct + upload the per-weight qlinear_2 instance for one src0
 // tensor so the next mul_mat on it skips the unpack/transpose/DMA path.
-// No-op if the tensor is already cached or does not pass can_mul_mat
-// against the supplied template src1 / dst.
-void ggml_ryzenai_impl_preload_weight(const struct ggml_tensor * src0,
+// Returns true if an upload actually happened, false if the tensor was
+// already cached or did not pass can_mul_mat against src1/dst.
+bool ggml_ryzenai_impl_preload_weight(const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1,
                                       const struct ggml_tensor * dst);
 
