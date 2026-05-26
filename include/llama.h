@@ -1541,6 +1541,10 @@ extern "C" {
     LLAMA_API void                           llama_set_tensor_repack_mode(ggml_tensor_repack_mode_t mode);
     LLAMA_API void                           llama_repack_tensor_callgraph(struct ggml_cgraph * cgraph);
 
+    // RyzenAI NPU: eagerly upload all eligible weight tensors referenced by cgraph
+    // to the NPU. Safe no-op when the RyzenAI backend is not registered.
+    LLAMA_API void                           llama_ryzenai_preload_weights(struct ggml_cgraph * cgraph);
+
     //
     // training
     //
