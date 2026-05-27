@@ -757,7 +757,9 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
 
         if (!drivers_top.empty()) {
             printf(" Top drivers / kernel modules by image size (%zu loaded)\n", drivers_top.size());
-            int shown = (int)std::min<size_t>(drivers_top.size(), 15);
+            int shown = opts.show_all_procs
+                          ? (int)drivers_top.size()
+                          : (int)std::min<size_t>(drivers_top.size(), 15);
             for (int i = 0; i < shown; ++i) {
                 std::string orig = hotpatch_original(drivers_top[i].name);
                 if (!orig.empty()) {
@@ -1106,7 +1108,8 @@ static void print_usage() {
         "Options:\n"
         "  --json              emit JSON instead of human-readable text\n"
         "  --top N             show top N processes by working set (default 30)\n"
-        "  --all               show all processes (overrides --top)\n"
+        "  --all               show all processes and all loaded drivers (overrides --top\n"
+        "                      and lifts the default driver-list cap)\n"
         "  --processes-only    only print the process table\n"
         "  --no-processes      omit the process table\n"
         "  -h, --help          show this help and exit\n"
@@ -1166,9 +1169,9 @@ int main(int argc, char ** argv) {
     std::vector<DriverInfo> drivers = collect_drivers();
     std::sort(drivers.begin(), drivers.end(),
               [](const DriverInfo & a, const DriverInfo & b) { return a.image_size > b.image_size; });
-    // Cap the human display to 15; JSON receives all of them.
+    // Cap to 64 by default; --all lifts the cap so JSON / human get every driver.
     std::vector<DriverInfo> drivers_top = drivers;
-    if (drivers_top.size() > 64) drivers_top.resize(64);
+    if (!opts.show_all_procs && drivers_top.size() > 64) drivers_top.resize(64);
 
     if (opts.json) {
         print_json(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
