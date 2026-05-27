@@ -777,6 +777,39 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
         }
     }
 
+ /* 
+ Working Set (WS) = All physical RAM pages currently mapped to the process — includes:
+   - Private pages (heap, stack, allocations)
+   - Shared pages (DLLs like ntdll.dll, kernel32.dll, mapped files, shared sections)
+  Private Bytes = Only pages exclusively owned by this process — cannot be shared with other processes.
+  The difference (WS − Private) ≈ shared memory — primarily loaded DLLs and memory-mapped files.
+
+  Example:
+   svchost.exe  WS=42.7 MB  Private=9.9 MB  → ~32.8 MB shared (DLLs, etc.)
+   MsMpEng.exe  WS=220 MB   Private=533 MB  → Private > WS!
+  When Private > WS (like Defender), it means the process has allocated more private memory than 
+  is currently resident in RAM — some private pages have been paged out to the pagefile or are in 
+  modified/standby lists. The WS only counts what's physically in RAM right now.
+
+  The "PageFile" column is actually reporting commit charge (also called "pagefile usage" in Windows APIs), 
+  not actual bytes written to the pagefile.
+
+  Commit charge = the total amount of virtual address space the OS has promised to back with storage if needed. 
+  For private memory, this equals Private Bytes exactly, because:
+   - Every private allocation must be committed (backed by either RAM or pagefile)
+   - Shared pages (DLLs) are backed by their file on disk, not the pagefile — so they don't count
+
+  That's why PageFile == Private in every row. They're the same metric viewed from two angles:
+  ┌──────────────┬─────────────────────────────────────────────────────────────────────────────┐
+  │ Private      │ "How much memory does only this process own?"                               │
+  ├──────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ PageFile     │ "How much pagefile space is reserved to back this process's private pages?" │
+  └──────────────┴─────────────────────────────────────────────────────────────────────────────┘
+
+  And notably, if pagefile.sys shows 0 bytes actually used — then nothing has been paged out yet. 
+  The "PageFile" column per-process is the reservation, not actual I/O to disk.
+  */
+
     if (!opts.no_processes) {
         size_t to_show = opts.show_all_procs ? procs_sorted.size()
                                               : std::min<size_t>(procs_sorted.size(), (size_t)opts.top_n);
