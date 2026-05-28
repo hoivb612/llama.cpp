@@ -1062,3 +1062,186 @@ during decode.
   scenarios (gaming, multi-process) where the 8 cores AMD
   benchmarks against aren't actually available. There, even a
   partial NPU contribution is a net win.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+---
+
+# Architecture: how MLADF, xclbin, XRT, and our backend fit together
+
+This is the stack our `ggml-ryzenai` backend sits in. Boxes are
+software layers (top = our code, bottom = silicon). Vertical arrows
+are calls; horizontal arrows are data movement.
+
+```
++--------------------------------------------------------------------------+
+|  llama.cpp graph (ggml_cgraph)                                           |
+|  ggml_tensor src0 (Q4_0 weight)  + src1 (F32 act)  -> dst (F32)          |
++----------------------------------|---------------------------------------+
+                                   | ggml_backend_sched dispatches
+                                   v
++--------------------------------------------------------------------------+
+|  ggml-ryzenai backend  (ggml/src/ggml-ryzenai/)                          |
+|                                                                          |
+|  - can_mul_mat()        : eligibility check (Q4_0, dims, M>=MIN_M)       |
+|  - preload_weight()     : unpack Q4_0 -> transposed int4 + fp32 scales   |
+|                           (fused, single pass; scratch freed eagerly)    |
+|  - mul_mat_npu() hot path:                                               |
+|        1. allocate bf16 staging buf for activations                      |
+|        2. F32 -> BF16 conversion (CPU AVX-512)                           |
+|        3. qlinear_2.execute()             <----- NPU dispatch            |
+|        4. [MLADF only] BF16 -> F32 output conversion                     |
+|  - RyzenAIContext: per-tensor qlinear_2 instances, lifetime owned        |
+|  - env: GGML_RYZENAI_MIN_M, GGML_RYZENAI_MLADF, GGML_RYZENAI_STATS       |
++----------------------------------|---------------------------------------+
+                                   | C++ template call
+                                   v
++--------------------------------------------------------------------------+
+|  qlinear_2  (AMD RyzenAI SDK, header-only template)                      |
+|  qlinear_2<InT=int16_t, WtT=int8_t, AccT, OutT>                          |
+|                                                                          |
+|  Constructor takes runtime dtype strings + reads env vars:               |
+|     DEVICE = "stx"                                                       |
+|     MLADF  = "" | "4x4" | "2x4x4"                                        |
+|                                                                          |
+|  These pick the xclbin filename from a string-keyed table:               |
+|                                                                          |
+|   +-------------------+------------------------------------------------+ |
+|   |  MLADF env var    |  xclbin loaded                                 | |
+|   +-------------------+------------------------------------------------+ |
+|   |  (unset)          |  gemm_4x4_a16fw4acc32f.xclbin                  | |
+|   |  4x4              |  mladf_gemm_4x4_a16fw4acc16f.xclbin            | |
+|   |  2x4x4            |  mladf_gemm_2x4x4_a16fw4acc16f.xclbin          | |
+|   +-------------------+------------------------------------------------+ |
+|                                                                          |
+|  weights_bo_  : std::vector<xrt::bo>   <-- NPU-side packed weights       |
+|  initialize_weights_int4() : host scratch -> BO, then host can free      |
+|  execute()    : stage activations -> NPU compute -> writeback            |
++----------------------------------|---------------------------------------+
+                                   | XRT C++ API
+                                   v
++--------------------------------------------------------------------------+
+|  XRT  (Xilinx Runtime, xrt_coreutil.dll)                                 |
+|                                                                          |
+|  xrt::device   -> opens NPU device handle                                |
+|  xrt::xclbin   -> loads kernel binary onto NPU                           |
+|  xrt::kernel   -> handle for one kernel entry point                      |
+|  xrt::bo       -> DMA-mapped buffer (host <-> NPU memory)                |
+|  xrt::run      -> a single dispatch (start / wait / get_state)           |
++----------------------------------|---------------------------------------+
+                                   | Driver ioctl / shared memory
+                                   v
++--------------------------------------------------------------------------+
+|  AMDXDNA driver (Windows: amdxdna.sys)                                   |
+|  - Submits command packets to NPU hardware queue                         |
+|  - Manages NPU memory partitions                                         |
+|  - Routes interrupts back to userspace XRT                               |
++----------------------------------|---------------------------------------+
+                                   |
+                                   v
++--------------------------------------------------------------------------+
+|  Strix HX 370 NPU silicon  (XDNA2 / AIE-ML architecture)                 |
+|                                                                          |
+|  +----------------------------------------------------------------+      |
+|  | SHIM row     | DMA to/from system memory                       |      |
+|  +----------------------------------------------------------------+      |
+|  | MEM tile row | L2 scratchpad (SRAM)                            |      |
+|  +----------------------------------------------------------------+      |
+|  | AIE-ML grid  | 4x4 = 16 cores  (gemm_4x4_*, mladf_4x4_*)       |      |
+|  |              | OR                                              |      |
+|  |              | 2x(4x4) = 32 cores (mladf_2x4x4_*)              |      |
+|  | per core: VLIW + vector unit, local SRAM, stream switch        |      |
+|  +----------------------------------------------------------------+      |
++--------------------------------------------------------------------------+
+```
+
+## What MLADF actually changes
+
+MLADF (ML-Accelerated Dataflow) is a different mapping of GEMM onto
+the AIE-ML grid. Three things change vs the default kernel:
+
+1. **Tile geometry**
+   - default `gemm_4x4_*`: 16 AIE cores arranged 4x4
+   - `mladf_4x4_*`        : 16 AIE cores, different tile shape and
+                            dataflow tuned for LLM matmul aspect ratios
+   - `mladf_2x4x4_*`      : **32 AIE cores** (two 4x4 groups working in
+                            parallel on different blocks of one matmul)
+
+2. **Output dtype**
+   - default: bf16 -> fp32 inside NPU, fp32 written back to host
+   - mladf  : bf16 -> bf16 written back (half the writeback bandwidth)
+   - Our backend must do BF16 -> F32 on CPU before handing to ggml
+
+3. **No host-side accumulation along K**
+   - The kernel does full K accumulation in NPU SRAM, no chunking
+     across multiple AIE dispatches
+   - Simplifies driving the kernel but requires K to fit in the
+     mapped tile shape
+
+The 2x4x4 variant is the headline: **doubling core count** with the
+same xclbin loader code. Strix HX has the silicon; we just have to
+ask for it via the right xclbin.
+
+## What we still do not control
+
+Layers below qlinear_2's xclbin selection are sealed AMD/Xilinx
+artifacts:
+
+- The `.xclbin` itself is a packaged set of AIE micro-code + DMA
+  descriptors + stream-switch routing tables. Building a new one
+  requires the MLIR-AIE / IRON toolchain (open source, but a
+  multi-week investment).
+- The XRT runtime and amdxdna driver are AMD-shipped binaries.
+
+What we DO control:
+
+- Which xclbin we ask qlinear_2 to load (via DEVICE / MLADF env)
+- Whether dispatches are synchronous or pipelined
+  (potential future change to use xrt::run::start() async pattern)
+- How we batch ggml ops into qlinear_2 calls
+- Whether we feed bf16-out or fp32-out (MLADF requires bf16-out)
+- The Q4_0 -> int4 + scales unpack format (already optimized)
+
+## Usage: enabling MLADF in the ggml-ryzenai backend
+
+The patch wires `GGML_RYZENAI_MLADF` to qlinear_2's MLADF/DEVICE env vars
+and instantiates `qlinear_2<int16_t, int8_t, int16_t, int16_t>` (bf16 out)
+instead of the default `<int16_t, int8_t, float, float>` (fp32 out). A
+BF16 -> F32 conversion is added on the host before writeback to ggml.
+
+```cmd
+:: default path (unchanged from before)
+minslm-cli -m model.gguf -p "hi" -n 64
+
+:: MLADF, 16 cores, bf16 output
+set GGML_RYZENAI_MLADF=4x4
+minslm-cli -m model.gguf -p "hi" -n 64
+
+:: MLADF, 32 cores (Strix only — needs 4-col AIE-ML grid x 2)
+set GGML_RYZENAI_MLADF=2x4x4
+minslm-cli -m model.gguf -p "hi" -n 64
+
+:: turn on per-call stats to compare
+set GGML_RYZENAI_STATS=1
+```
+
+Prereqs already required by the SDK and unchanged by this patch:
+
+- `PYTORCH_AIE_PATH` must point at the RyzenAI SDK install root so
+  qlinear_2 can locate xclbins under `xclbin/stx/`
+- AMD XRT runtime + amdxdna driver installed; xrt_coreutil.dll on PATH
+- Strix HX 370 (or any XDNA2 part with the 4-col AIE-ML grid for 2x4x4)
+
+What the stats summary adds:
+
+```
+[ggml-ryzenai stats]
+  BF16->F32 out conv  =   xx.xx ms  ( y.yy%, avg z.zz us/call)
+```
+
+This is the only host-side cost MLADF adds. If the line shows >5% of
+total it's a hint to vectorize the conversion (AVX-512 `_mm512_slli_epi32`
+on `cvtepu16_epi32` — left as future work).
+
+If `GGML_RYZENAI_MLADF` is set to anything other than `4x4` or `2x4x4`
+the backend logs a warning and silently falls back to the default path.
