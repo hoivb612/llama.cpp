@@ -1075,79 +1075,79 @@ are calls; horizontal arrows are data movement.
 
 ```
 +--------------------------------------------------------------------------+
-|  llama.cpp graph (ggml_cgraph)                                            |
-|  ggml_tensor src0 (Q4_0 weight)  + src1 (F32 act)  -> dst (F32)           |
+|  llama.cpp graph (ggml_cgraph)                                           |
+|  ggml_tensor src0 (Q4_0 weight)  + src1 (F32 act)  -> dst (F32)          |
 +----------------------------------|---------------------------------------+
                                    | ggml_backend_sched dispatches
                                    v
 +--------------------------------------------------------------------------+
 |  ggml-ryzenai backend  (ggml/src/ggml-ryzenai/)                          |
 |                                                                          |
-|  - can_mul_mat()        : eligibility check (Q4_0, dims, M>=MIN_M)        |
-|  - preload_weight()     : unpack Q4_0 -> transposed int4 + fp32 scales    |
-|                           (fused, single pass; scratch freed eagerly)     |
-|  - mul_mat_npu() hot path:                                                |
-|        1. allocate bf16 staging buf for activations                       |
-|        2. F32 -> BF16 conversion (CPU AVX-512)                            |
-|        3. qlinear_2.execute()             <----- NPU dispatch             |
-|        4. [MLADF only] BF16 -> F32 output conversion                      |
-|  - RyzenAIContext: per-tensor qlinear_2 instances, lifetime owned         |
-|  - env: GGML_RYZENAI_MIN_M, GGML_RYZENAI_MLADF, GGML_RYZENAI_STATS        |
+|  - can_mul_mat()        : eligibility check (Q4_0, dims, M>=MIN_M)       |
+|  - preload_weight()     : unpack Q4_0 -> transposed int4 + fp32 scales   |
+|                           (fused, single pass; scratch freed eagerly)    |
+|  - mul_mat_npu() hot path:                                               |
+|        1. allocate bf16 staging buf for activations                      |
+|        2. F32 -> BF16 conversion (CPU AVX-512)                           |
+|        3. qlinear_2.execute()             <----- NPU dispatch            |
+|        4. [MLADF only] BF16 -> F32 output conversion                     |
+|  - RyzenAIContext: per-tensor qlinear_2 instances, lifetime owned        |
+|  - env: GGML_RYZENAI_MIN_M, GGML_RYZENAI_MLADF, GGML_RYZENAI_STATS       |
 +----------------------------------|---------------------------------------+
                                    | C++ template call
                                    v
 +--------------------------------------------------------------------------+
-|  qlinear_2  (AMD RyzenAI SDK, header-only template)                       |
-|  qlinear_2<InT=int16_t, WtT=int8_t, AccT, OutT>                           |
+|  qlinear_2  (AMD RyzenAI SDK, header-only template)                      |
+|  qlinear_2<InT=int16_t, WtT=int8_t, AccT, OutT>                          |
 |                                                                          |
-|  Constructor takes runtime dtype strings + reads env vars:                |
+|  Constructor takes runtime dtype strings + reads env vars:               |
 |     DEVICE = "stx"                                                       |
 |     MLADF  = "" | "4x4" | "2x4x4"                                        |
 |                                                                          |
-|  These pick the xclbin filename from a string-keyed table:                |
+|  These pick the xclbin filename from a string-keyed table:               |
 |                                                                          |
-|   +-------------------+-------------------------------------------------+ |
-|   |  MLADF env var    |  xclbin loaded                                  | |
-|   +-------------------+-------------------------------------------------+ |
-|   |  (unset)          |  gemm_4x4_a16fw4acc32f.xclbin                   | |
-|   |  4x4              |  mladf_gemm_4x4_a16fw4acc16f.xclbin             | |
-|   |  2x4x4            |  mladf_gemm_2x4x4_a16fw4acc16f.xclbin           | |
-|   +-------------------+-------------------------------------------------+ |
+|   +-------------------+------------------------------------------------+ |
+|   |  MLADF env var    |  xclbin loaded                                 | |
+|   +-------------------+------------------------------------------------+ |
+|   |  (unset)          |  gemm_4x4_a16fw4acc32f.xclbin                  | |
+|   |  4x4              |  mladf_gemm_4x4_a16fw4acc16f.xclbin            | |
+|   |  2x4x4            |  mladf_gemm_2x4x4_a16fw4acc16f.xclbin          | |
+|   +-------------------+------------------------------------------------+ |
 |                                                                          |
-|  weights_bo_  : std::vector<xrt::bo>   <-- NPU-side packed weights        |
-|  initialize_weights_int4() : host scratch -> BO, then host can free       |
-|  execute()    : stage activations -> NPU compute -> writeback             |
+|  weights_bo_  : std::vector<xrt::bo>   <-- NPU-side packed weights       |
+|  initialize_weights_int4() : host scratch -> BO, then host can free      |
+|  execute()    : stage activations -> NPU compute -> writeback            |
 +----------------------------------|---------------------------------------+
                                    | XRT C++ API
                                    v
 +--------------------------------------------------------------------------+
-|  XRT  (Xilinx Runtime, xrt_coreutil.dll)                                  |
+|  XRT  (Xilinx Runtime, xrt_coreutil.dll)                                 |
 |                                                                          |
-|  xrt::device   -> opens NPU device handle                                 |
-|  xrt::xclbin   -> loads kernel binary onto NPU                            |
-|  xrt::kernel   -> handle for one kernel entry point                       |
-|  xrt::bo       -> DMA-mapped buffer (host <-> NPU memory)                 |
-|  xrt::run      -> a single dispatch (start / wait / get_state)            |
+|  xrt::device   -> opens NPU device handle                                |
+|  xrt::xclbin   -> loads kernel binary onto NPU                           |
+|  xrt::kernel   -> handle for one kernel entry point                      |
+|  xrt::bo       -> DMA-mapped buffer (host <-> NPU memory)                |
+|  xrt::run      -> a single dispatch (start / wait / get_state)           |
 +----------------------------------|---------------------------------------+
                                    | Driver ioctl / shared memory
                                    v
 +--------------------------------------------------------------------------+
-|  AMDXDNA driver (Windows: amdxdna.sys)                                    |
-|  - Submits command packets to NPU hardware queue                          |
-|  - Manages NPU memory partitions                                          |
-|  - Routes interrupts back to userspace XRT                                |
+|  AMDXDNA driver (Windows: amdxdna.sys)                                   |
+|  - Submits command packets to NPU hardware queue                         |
+|  - Manages NPU memory partitions                                         |
+|  - Routes interrupts back to userspace XRT                               |
 +----------------------------------|---------------------------------------+
                                    |
                                    v
 +--------------------------------------------------------------------------+
-|  Strix HX 370 NPU silicon  (XDNA2 / AIE-ML architecture)                  |
+|  Strix HX 370 NPU silicon  (XDNA2 / AIE-ML architecture)                 |
 |                                                                          |
 |  +----------------------------------------------------------------+      |
 |  | SHIM row     | DMA to/from system memory                       |      |
 |  +----------------------------------------------------------------+      |
 |  | MEM tile row | L2 scratchpad (SRAM)                            |      |
 |  +----------------------------------------------------------------+      |
-|  | AIE-ML grid  | 4x4 = 16 cores  (gemm_4x4_*, mladf_4x4_*)        |      |
+|  | AIE-ML grid  | 4x4 = 16 cores  (gemm_4x4_*, mladf_4x4_*)       |      |
 |  |              | OR                                              |      |
 |  |              | 2x(4x4) = 32 cores (mladf_2x4x4_*)              |      |
 |  | per core: VLIW + vector unit, local SRAM, stream switch        |      |
