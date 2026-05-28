@@ -312,9 +312,19 @@ static bool ensure_op_for_weight_locked(RyzenAIContext & ctx,
         auto w_shape = std::make_tuple((int) ne00, (int) ne01);
 
         if (mladf) {
-            RYZ_TRY_CATCH(ctx.map_bf16.at(key).initialize_weights_int4(
+            // MLADF requires its own weight tiling + BO allocation path.
+            // The non-mladf initialize_weights_int4 only forwards
+            // set_kernel_shapes_kn -> mladf variant, but the rest of its body
+            // assumes the non-mladf QuantMatrix layout / BO sizes, which is
+            // inconsistent with the mladf kernel shapes and corrupts the
+            // weight buffer. Call the mladf-specific path explicitly.
+            //
+            // group_size = QK4_0 (32) for our Q4_0 weights; the mladf bf16
+            // path supports both group<128 (buff_B1<32,32,32>) and
+            // group>=128 (buff_B2<128,32,128>) tilings, selected internally.
+            RYZ_TRY_CATCH(ctx.map_bf16.at(key).initialize_weights_int4_mladf(
                 weights_T.data(), zeros.data(), scales_T.data(),
-                bias.data(), w_shape);)
+                bias.data(), w_shape, QK4_0);)
         } else {
             RYZ_TRY_CATCH(ctx.map_f32.at(key).initialize_weights_int4(
                 weights_T.data(), zeros.data(), scales_T.data(),
