@@ -280,6 +280,200 @@ So: qlinear_2 is essentially "give the NPU a 4096×N int4 matrix once, then ask 
 
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
+Support Q8_0 with q_linear2
+
+Surprisingly there's no plug-and-play "bf16 × int8" option in the shipped SDK. This makes Q8_0 a bigger lift than I implied earlier. Let me walk through what's actually available.
+
+xclbin naming = <a_dtype><b_dtype><acc_dtype>.xclbin
+
+What we have in xclbin/stx/:
+
+┌────────────────────────────────┬────────────────┬────────────┬────────────┬─────────────────────────────┐
+│ Filename                       │ a (activation) │ b (weight) │ c (output) │ Use                         │
+├────────────────────────────────┼────────────────┼────────────┼────────────┼─────────────────────────────┤
+│ gemm_4x4_a16fw4acc32f.xclbin   │ bf16           │ uint4      │ fp32       │ Q4_0 — current              │
+├────────────────────────────────┼────────────────┼────────────┼────────────┼─────────────────────────────┤
+│ gemm_4x4_a16w8acc64.xclbin     │ int16          │ int8       │ int64      │ Q8_0 candidate              │
+├────────────────────────────────┼────────────────┼────────────┼────────────┼─────────────────────────────┤
+│ gemm_4x4_a8w8acc32.xclbin      │ int8           │ int8       │ int32      │ Smaller activations         │
+├────────────────────────────────┼────────────────┼────────────┼────────────┼─────────────────────────────┤
+│ mladf_*                        │ bf16           │ uint4      │ varies     │ larger/fused matmul kernels │
+└────────────────────────────────┴────────────────┴────────────┴────────────┴─────────────────────────────┘
+
+Notice the gap: there is no a16f_w8 xclbin (bf16 activation × int8 weight). For Q4_0 we got a kernel that takes bf16 in and produces fp32 out — life was easy. For Q8_0 we have to either:
+
+ - Path A: use a16_w8 (int16 activation × int8 weight → int64 output) — need to quantize F32 activations to int16 with a dynamic per-call scale, and dequantize int64 accumulator back to F32 using combined scales. Different math, different code.
+ - Path B: use a8_w8 — even more aggressive (int8 activations). Activations are dynamic and small-dynamic-range so quality loss is real.
+ - Path C: get a new a16f_w8 xclbin — would need AMD to ship one, or build it from AIE-NN. Not user-side work.
+
+What full Q8_0 support actually requires
+
+It's not just "change b_dtype to int8". The list:
+
+ 1. New template instantiation: qlinear_2<int16_t, int8_t, int64_t, float> (or similar — needs verification that int64 accumulator path is wired up for float output).
+ 2. New activation pipeline. Replace the F32→BF16 conversion segment with F32→int16 quantization:
+ - Compute per-call activation scale (max-abs or similar)
+ - Convert F32 → int16 saturating
+ - Track the scale so we can dequantize the output
+ 3. New output pipeline. Replace the "just write fp32 to dst" path with:
+ - int64 accumulator → F32 via dst = acc_int64
+  4. activation_scale
+  * weight_scale
+ - Weight scale is per-32-element (from Q8_0's fp16 scale)
+ - Activation scale is per-call
+ - This is matrix-shaped fp32 output, with per-column weight scales applied
+ 5. New ensure_op_for_weight path for Q8_0. Q8_0 stores int8 weights directly (no nibble unpacking) + one fp16 scale per 32 weights. The "transposed unpack" becomes "transposed copy" — actually simpler than Q4_0.
+ 6. CMake / runtime check that gemm_4x4_a16w8acc64.xclbin is present. Different sentinel.
+ 7. Update can_mul_mat to accept GGML_TYPE_Q8_0 with appropriate constraints.
+ 8. Per-tensor xclbin caching. Currently we eagerly load one xclbin at startup. With Q8_0 mixed in (likely K/V projections in some configs), we may need to lazily load both, or pick the right one based on the model.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Sample build and session run:
+
+C:\llama.cpp\b612_052026\build.ryzenai>git branch
+  hv/b612_052026
+* hv/b612_052026_ryzenai
+
+C:\llama.cpp\b612_052026\build.ryzenai>conda env list (this is RyzenAI-v-1.6)
+
+# conda environments:
+#
+                       C:\ProgramData\anaconda3
+                     * C:\ProgramData\anaconda3\envs\ryzenai-transformers
+                       C:\ProgramData\miniconda3
+                       c:\ProgramData\anaconda3\envs\ryzen-ai-1.2.0
+                       c:\ProgramData\anaconda3\envs\ryzen-ai-1.6.0
+base                   c:\llama.cpp\miniforge3
+
+
+C:\llama.cpp\b612_052026\build.ryzenai>conda activate C:\ProgramData\anaconda3\envs\ryzenai-transformers
+
+C:\llama.cpp\b612_052026\build.ryzenai>cmake .. -DGGML_RYZENAI=ON -DRyzenAI_DIR=C:/ProgramData/anaconda3/envs/ryzenai-transformers/Lib/cmake/ryzenai -DXRT_DIR=c:/llama.cpp/Ryzen/example/transformers/third_party/xrt-ipu/xrt/share/cmake/XRT                                
+
+C:\llama.cpp\b612_052026\build.ryzenai>cmake --build . --config RelWithDebInfo --target minslm-cli  
+
+ Directory of C:\llama.test\RyzenAI
+
+05/25/2026  04:49 PM    <DIR>          .
+04/24/2026  01:22 PM    <DIR>          ..
+10/06/2024  06:08 PM    <DIR>          dll
+05/25/2026  06:13 PM           837,632 ggml-base.dll
+05/25/2026  05:06 PM         1,598,976 ggml-cpu.dll
+05/25/2026  06:13 PM           195,072 ggml-ryzenai.dll
+05/25/2026  05:06 PM           316,416 ggml.dll
+05/25/2026  05:34 PM         3,116,544 llama.dll
+10/10/2024  02:30 PM    <DIR>          llama_cache
+10/18/2024  01:24 PM         3,906,048 llbench.exe
+10/10/2024  02:37 PM         2,872,832 llbench.org
+05/25/2026  05:34 PM           300,032 minslm-cli.exe
+03/01/2025  11:58 AM    <DIR>          models
+10/10/2024  02:27 PM    <DIR>          prompts
+10/10/2024  03:57 PM               362 run_llb.cmd
+10/10/2024  03:51 PM               341 run_tg.cmd
+10/18/2024  01:23 PM         3,227,136 tg.exe
+10/10/2024  02:37 PM         2,194,944 tg.org
+10/06/2024  06:04 PM    <DIR>          xclbin
+              12 File(s)     18,566,335 bytes
+               7 Dir(s)  21,843,542,016 bytes free
+
+C:\llama.test\RyzenAI>minslm-cli.exe models\Phi-3.bin 4 prompts\cpf_2_Phi-3.txt v2
+> Running with custom prompt => [18/18]: [I don't care, go away!]
+...
+load_tensors: releasing mmaps (not needed after tensor copy)
+llama_context: constructing llama_context
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 2048
+llama_context: n_ctx_seq     = 2048
+llama_context: n_batch       = 512
+llama_context: n_ubatch      = 512
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = auto
+llama_context: kv_unified    = false
+llama_context: freq_base     = 10000.0
+llama_context: freq_scale    = 1
+llama_context: n_rs_seq      = 0
+llama_context: n_ctx_seq (2048) < n_ctx_train (4096) -- the full capacity of the model will not be utilized
+ggml-ryzenai: NPU initialized (xclbin loaded)
+set_abort_callback: call
+llama_context:        CPU  output buffer size =     0.12 MiB
+llama_kv_cache: layer   0: dev = CPU
+llama_kv_cache: layer   1: dev = CPU
+llama_kv_cache: layer   2: dev = CPU
+...
+llama_kv_cache: layer  31: dev = CPU
+llama_kv_cache:        CPU KV buffer size =   768.00 MiB
+llama_kv_cache: size =  768.00 MiB (  2048 cells,  32 layers,  1/1 seqs), K (f16):  384.00 MiB, V (f16):  384.00 MiB
+llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 96
+llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 96
+llama_context: enumerating backends
+llama_context: backend_ptrs.size() = 2
+sched_reserve: reserving ...
+sched_reserve: max_nodes = 2328
+sched_reserve: reserving full memory module
+sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+ggml-ryzenai: preloaded 64 new weight tensor(s) (64 eligible in cgraph)
+sched_reserve: Flash Attention was auto, set to enabled
+sched_reserve: resolving fused Gated Delta Net support:
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+graph_reserve: reserving a graph for ubatch with n_tokens =   16, n_seqs =  1, n_outputs =   16
+sched_reserve: fused Gated Delta Net (chunked) enabled
+graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+sched_reserve:        CPU compute buffer size =    98.64 MiB
+sched_reserve: graph nodes  = 999
+sched_reserve: graph splits = 65
+sched_reserve: reserve took 29310.20 ms, sched copies = 1
+
+[main]: n_ctx = 2048, n_threads = 4, gpu_layers = 999
+[main]: flash-attn = auto (runtime-selected)
+[main]: system_info: CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | AVX512 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+...
+> Running with custom prompt => [18/18]: [I don't care, go away!]
+  prefill: 14621.3ms (574 tokens, 39.3 t/s)
+ {
+    "answer": "e. Are you trying to avoid the question?",
+    "justification": "Mara's response indicates she may not want discuss this topic, but it doesn’t directly force her about Izzy."
+}
+  [all token ids (53): 426 13 1678 376 12011 1115 376 29872 29889 4683 366 1811 304 4772 278 1139 29973 613 13 1678 376 5143 2450 1115 376 29924 2518 29915 29879 2933 14088 1183 1122 451 864 5353 445 11261 29892 541 372 1838 30010 29873 4153 4889 902 1048 15674 1537 1213 13 29913]
+  [output hex (196 bytes):]
+    0000: 20 7b 0a 20 20 20 20 22 61 6e 73 77 65 72 22 3a  | {.    "answer":|
+    0010: 20 22 65 2e 20 41 72 65 20 79 6f 75 20 74 72 79  | "e. Are you try|
+    0020: 69 6e 67 20 74 6f 20 61 76 6f 69 64 20 74 68 65  |ing to avoid the|
+    0030: 20 71 75 65 73 74 69 6f 6e 3f 22 2c 0a 20 20 20  | question?",.   |
+    0040: 20 22 6a 75 73 74 69 66 69 63 61 74 69 6f 6e 22  | "justification"|
+    0050: 3a 20 22 4d 61 72 61 27 73 20 72 65 73 70 6f 6e  |: "Mara's respon|
+    0060: 73 65 20 69 6e 64 69 63 61 74 65 73 20 73 68 65  |se indicates she|
+    0070: 20 6d 61 79 20 6e 6f 74 20 77 61 6e 74 20 64 69  | may not want di|
+    0080: 73 63 75 73 73 20 74 68 69 73 20 74 6f 70 69 63  |scuss this topic|
+    0090: 2c 20 62 75 74 20 69 74 20 64 6f 65 73 6e e2 80  |, but it doesn..|
+    00a0: 99 74 20 64 69 72 65 63 74 6c 79 20 66 6f 72 63  |.t directly forc|
+    00b0: 65 20 68 65 72 20 61 62 6f 75 74 20 49 7a 7a 79  |e her about Izzy|
+    00c0: 2e 22 0a 7d                                      |.".}|
+  decode: 6348.6ms (52 tokens, 8.19 t/s)
+  decode (no-TTFT): 6348.5ms (53 tokens, 8.35 t/s) [TTFT 0.1ms]
+
+===== Summary =====
+  prompts:    18
+  tokens gen: 1068
+  avg t/s:    8.29
+  avg t/s (no-TTFT): 8.43
+  avg TTFT:          0.1ms
+  total time: 385.81s
+llama_perf_context_print:        load time =   44746.95 ms
+llama_perf_context_print: prompt eval time =  256322.22 ms / 10347 tokens (   24.77 ms per token,    40.37 tokens per second)
+llama_perf_context_print:        eval time =  128586.53 ms /  1068 runs   (  120.40 ms per token,     8.31 tokens per second)
+llama_perf_context_print:       total time =  415872.67 ms / 11415 tokens
+llama_perf_context_print:    graphs reused =       1050
+process_memory: peak working_set=4915.9 MiB, current working_set=4912.8 MiB, private=4987.8 MiB
+~llama_context:        CPU compute buffer size is  98.6387 MiB, matches expectation of  98.6387 MiB
+~llama_context:        CPU compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
 ---
 
 # qlinear_2: xclbin and DPU .bin location
@@ -651,147 +845,220 @@ log honestly reflects that no work was redone.
 - Transparent CPU fallback when NPU is unavailable (currently we abort
   fail-fast).
 
-+++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-Sample build and session run:
+---
 
-C:\llama.cpp\b612_052026\build.ryzenai>git branch
-  hv/b612_052026
-* hv/b612_052026_ryzenai
+# Prefill vs Decode: same layers, different M
 
-C:\llama.cpp\b612_052026\build.ryzenai>conda env list (this is RyzenAI-v-1.6)
+A common confusion when reasoning about NPU performance is the difference
+between prefill and decode. They use the **same model, same layers, same
+weight tensors**, in the **same sequential order**. The only thing that
+changes is the batch dimension on the activations.
 
-# conda environments:
-#
-                       C:\ProgramData\anaconda3
-                     * C:\ProgramData\anaconda3\envs\ryzenai-transformers
-                       C:\ProgramData\miniconda3
-                       c:\ProgramData\anaconda3\envs\ryzen-ai-1.2.0
-                       c:\ProgramData\anaconda3\envs\ryzen-ai-1.6.0
-base                   c:\llama.cpp\miniforge3
+## Layers are always sequential. Tokens within a step are parallel.
+
+Both prefill and decode walk the layers in the same order:
+`layer 0 → 1 → 2 → ... → 31 → output head`. You cannot start layer N+1
+until layer N's output is ready, because each layer feeds the next.
+
+The difference is **how many tokens flow through each layer per pass**.
+
+## The actual data flow
+
+For a Phi-3-mini layer, the main matmul has shape:
+
+```
+Y = X @ Wᵀ
+where:
+   Wᵀ  has shape (K, N)   ← weight tensor (Q4_0, fixed across all calls)
+   X   has shape (M, K)   ← activations (variable, depends on call)
+   Y   has shape (M, N)   ← output
+```
+
+- `K`, `N` are model dimensions (fixed, e.g. 3072 and 8192)
+- `M` is the number of tokens being processed in this single matmul call
+
+### Prefill case
+
+User submits a 578-token prompt. The model processes those tokens
+**together** in batches:
+
+- `M = 512` for the first chunk, `M = 66` for the remainder
+- Layer 0: `X` has shape `(512, 3072)` → one MUL_MAT call → `Y` has shape `(512, 8192)`
+- Layer 1: same shape in, same shape out
+- ... 32 layers ...
+- Total NPU calls for one prefill chunk: 2 calls/layer × 32 layers = **64 calls** at `M = 512`
+
+The weight `Wᵀ` is read **once per layer** but is reused across all 512
+tokens in `M`. That's the high arithmetic intensity case: each weight
+byte produces 512 multiply-adds before being discarded.
+
+### Decode case
+
+After prefill, we generate output tokens one at a time:
+
+- `M = 1` (just the one new token we're predicting)
+- Layer 0: `X` has shape `(1, 3072)` → one MUL_MAT call → `Y` has shape `(1, 8192)`
+- ... 32 layers ...
+- Total NPU calls per output token: 2 × 32 = **64 calls** at `M = 1`
+
+Same number of calls, same weight tensors, but each call now uses each
+weight byte for only **1 multiply-add**. Arithmetic intensity is `512x`
+lower than prefill.
+
+## Why "shared weights" matters
+
+The weight tensor `Wᵀ` for layer 7's `Wq` (for example) is **the same
+object in memory** whether we're doing prefill or decode. That's why our
+`preload_weights` call during `graph_reserve` covers both paths — we
+upload the same 64 weight tensors once, then both `M = 512` prefill and
+`M = 1` decode matmuls reuse them.
+
+## Why NPU loves prefill and hates decode
+
+The qlinear_2 measurement on Strix HX 370 showed per-call NPU overhead
+(kernel launch + DMA descriptor setup + AIE program start + completion
+signal) is **~2.26 ms regardless of M**:
+
+| Case    | M   | NPU calls per output token | Real compute per call | Useful work per 2 ms overhead |
+|---------|-----|---------------------------|-----------------------|-------------------------------|
+| Prefill | 512 | 64 / 512 = 0.125          | huge                  | excellent — pipeline saturated |
+| Decode  | 1   | 64                        | tiny                  | terrible — pipeline ~empty, overhead dwarfs compute |
+
+For decode, you pay `64 × 2.26 ms = 145 ms` in overhead alone, before any
+compute. For prefill of 512 tokens, the same 64 calls × 2.26 ms is
+spread across 512 tokens, so **0.28 ms/token** in overhead.
+
+## Visual analogy
+
+Think of the NPU pipeline like a long conveyor belt at a factory:
+
+- **Prefill** = 512 boxes arrive in a truck. Load them all onto the belt,
+  belt runs full for a while, 512 boxes come off the other end. Fixed
+  setup + teardown cost is amortized over 512 outputs.
+- **Decode** = 1 box arrives. Spin up the belt, run it (mostly empty), 1
+  box exits, spin it down. Repeat 64 times per output token.
+
+The CPU is more like a hand assembly bench — no startup cost, but
+limited throughput. For 1 box at a time, the bench beats the factory.
+
+## Consequence for our gating heuristic
+
+This is exactly why commit `92e247a15` introduced `GGML_RYZENAI_MIN_M`
+(default = 2). At `M = 1`, the NPU is fundamentally the wrong tool for
+the job on this generation of XDNA. Route decode to the CPU's AVX-512
+Q4_0 GEMV path (which keeps weights in cache and has zero per-call
+overhead) and reserve the NPU for batched prefill where the pipeline can
+actually be filled.
 
 
-C:\llama.cpp\b612_052026\build.ryzenai>conda activate C:\ProgramData\anaconda3\envs\ryzenai-transformers
 
-C:\llama.cpp\b612_052026\build.ryzenai>cmake .. -DGGML_RYZENAI=ON -DRyzenAI_DIR=C:/ProgramData/anaconda3/envs/ryzenai-transformers/Lib/cmake/ryzenai -DXRT_DIR=c:/llama.cpp/Ryzen/example/transformers/third_party/xrt-ipu/xrt/share/cmake/XRT                                
+---
 
-C:\llama.cpp\b612_052026\build.ryzenai>cmake --build . --config RelWithDebInfo --target minslm-cli  
+# Results table: GGML_RYZENAI_MIN_M sweep
 
- Directory of C:\llama.test\RyzenAI
+Phi-3-mini Q4_0, 574-token prompt, 8 threads, Strix HX 370.
 
-05/25/2026  04:49 PM    <DIR>          .
-04/24/2026  01:22 PM    <DIR>          ..
-10/06/2024  06:08 PM    <DIR>          dll
-05/25/2026  06:13 PM           837,632 ggml-base.dll
-05/25/2026  05:06 PM         1,598,976 ggml-cpu.dll
-05/25/2026  06:13 PM           195,072 ggml-ryzenai.dll
-05/25/2026  05:06 PM           316,416 ggml.dll
-05/25/2026  05:34 PM         3,116,544 llama.dll
-10/10/2024  02:30 PM    <DIR>          llama_cache
-10/18/2024  01:24 PM         3,906,048 llbench.exe
-10/10/2024  02:37 PM         2,872,832 llbench.org
-05/25/2026  05:34 PM           300,032 minslm-cli.exe
-03/01/2025  11:58 AM    <DIR>          models
-10/10/2024  02:27 PM    <DIR>          prompts
-10/10/2024  03:57 PM               362 run_llb.cmd
-10/10/2024  03:51 PM               341 run_tg.cmd
-10/18/2024  01:23 PM         3,227,136 tg.exe
-10/10/2024  02:37 PM         2,194,944 tg.org
-10/06/2024  06:04 PM    <DIR>          xclbin
-              12 File(s)     18,566,335 bytes
-               7 Dir(s)  21,843,542,016 bytes free
+| Metric            | MIN_M=1 (legacy, everything to NPU) | MIN_M=2 (default, decode to CPU) | Δ            |
+|-------------------|-------------------------------------|----------------------------------|--------------|
+| Prefill           | 53.3 t/s                            | 51.9 t/s                         | -2.6% (noise)|
+| **Decode**        | **7.93 t/s**                        | **18.82 t/s**                    | **+137%**    |
+| Total wall time   | 18.6 s                              | 14.3 s                           | -23%         |
+| NPU calls         | 4096                                | 124                              | 33x fewer    |
+| NPU execute total | 10.78 s                             | 5.81 s                           | -46%         |
 
-C:\llama.test\RyzenAI>minslm-cli.exe models\Phi-3.bin 4 prompts\cpf_2_Phi-3.txt v2
-> Running with custom prompt => [18/18]: [I don't care, go away!]
-...
-load_tensors: releasing mmaps (not needed after tensor copy)
-llama_context: constructing llama_context
-llama_context: n_seq_max     = 1
-llama_context: n_ctx         = 2048
-llama_context: n_ctx_seq     = 2048
-llama_context: n_batch       = 512
-llama_context: n_ubatch      = 512
-llama_context: causal_attn   = 1
-llama_context: flash_attn    = auto
-llama_context: kv_unified    = false
-llama_context: freq_base     = 10000.0
-llama_context: freq_scale    = 1
-llama_context: n_rs_seq      = 0
-llama_context: n_ctx_seq (2048) < n_ctx_train (4096) -- the full capacity of the model will not be utilized
-ggml-ryzenai: NPU initialized (xclbin loaded)
-set_abort_callback: call
-llama_context:        CPU  output buffer size =     0.12 MiB
-llama_kv_cache: layer   0: dev = CPU
-llama_kv_cache: layer   1: dev = CPU
-llama_kv_cache: layer   2: dev = CPU
-...
-llama_kv_cache: layer  31: dev = CPU
-llama_kv_cache:        CPU KV buffer size =   768.00 MiB
-llama_kv_cache: size =  768.00 MiB (  2048 cells,  32 layers,  1/1 seqs), K (f16):  384.00 MiB, V (f16):  384.00 MiB
-llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 96
-llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 96
-llama_context: enumerating backends
-llama_context: backend_ptrs.size() = 2
-sched_reserve: reserving ...
-sched_reserve: max_nodes = 2328
-sched_reserve: reserving full memory module
-sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
-graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
-ggml-ryzenai: preloaded 64 new weight tensor(s) (64 eligible in cgraph)
-sched_reserve: Flash Attention was auto, set to enabled
-sched_reserve: resolving fused Gated Delta Net support:
-graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
-sched_reserve: fused Gated Delta Net (autoregressive) enabled
-graph_reserve: reserving a graph for ubatch with n_tokens =   16, n_seqs =  1, n_outputs =   16
-sched_reserve: fused Gated Delta Net (chunked) enabled
-graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
-graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
-graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
-sched_reserve:        CPU compute buffer size =    98.64 MiB
-sched_reserve: graph nodes  = 999
-sched_reserve: graph splits = 65
-sched_reserve: reserve took 29310.20 ms, sched copies = 1
+Stats output with default (`MIN_M=2`):
 
-[main]: n_ctx = 2048, n_threads = 4, gpu_layers = 999
-[main]: flash-attn = auto (runtime-selected)
-[main]: system_info: CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | AVX512 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
-...
-> Running with custom prompt => [18/18]: [I don't care, go away!]
-  prefill: 14621.3ms (574 tokens, 39.3 t/s)
- {
-    "answer": "e. Are you trying to avoid the question?",
-    "justification": "Mara's response indicates she may not want discuss this topic, but it doesn’t directly force her about Izzy."
-}
-  [all token ids (53): 426 13 1678 376 12011 1115 376 29872 29889 4683 366 1811 304 4772 278 1139 29973 613 13 1678 376 5143 2450 1115 376 29924 2518 29915 29879 2933 14088 1183 1122 451 864 5353 445 11261 29892 541 372 1838 30010 29873 4153 4889 902 1048 15674 1537 1213 13 29913]
-  [output hex (196 bytes):]
-    0000: 20 7b 0a 20 20 20 20 22 61 6e 73 77 65 72 22 3a  | {.    "answer":|
-    0010: 20 22 65 2e 20 41 72 65 20 79 6f 75 20 74 72 79  | "e. Are you try|
-    0020: 69 6e 67 20 74 6f 20 61 76 6f 69 64 20 74 68 65  |ing to avoid the|
-    0030: 20 71 75 65 73 74 69 6f 6e 3f 22 2c 0a 20 20 20  | question?",.   |
-    0040: 20 22 6a 75 73 74 69 66 69 63 61 74 69 6f 6e 22  | "justification"|
-    0050: 3a 20 22 4d 61 72 61 27 73 20 72 65 73 70 6f 6e  |: "Mara's respon|
-    0060: 73 65 20 69 6e 64 69 63 61 74 65 73 20 73 68 65  |se indicates she|
-    0070: 20 6d 61 79 20 6e 6f 74 20 77 61 6e 74 20 64 69  | may not want di|
-    0080: 73 63 75 73 73 20 74 68 69 73 20 74 6f 70 69 63  |scuss this topic|
-    0090: 2c 20 62 75 74 20 69 74 20 64 6f 65 73 6e e2 80  |, but it doesn..|
-    00a0: 99 74 20 64 69 72 65 63 74 6c 79 20 66 6f 72 63  |.t directly forc|
-    00b0: 65 20 68 65 72 20 61 62 6f 75 74 20 49 7a 7a 79  |e her about Izzy|
-    00c0: 2e 22 0a 7d                                      |.".}|
-  decode: 6348.6ms (52 tokens, 8.19 t/s)
-  decode (no-TTFT): 6348.5ms (53 tokens, 8.35 t/s) [TTFT 0.1ms]
+```
+[ggml-ryzenai stats]
+  calls           = 124  (M=1: 0, M>1: 124)
+  alloc bf16 buf  =    27.45 ms  ( 0.47%, avg 221.38 us/call)
+  F32->BF16 conv  =    14.58 ms  ( 0.25%, avg 117.61 us/call)
+  NPU execute()   =  5806.99 ms  (99.28%, avg 46830.56 us/call)
+  total measured  =  5849.02 ms
+  activations DMA =   208.52 MB
+```
 
-===== Summary =====
-  prompts:    18
-  tokens gen: 1068
-  avg t/s:    8.29
-  avg t/s (no-TTFT): 8.43
-  avg TTFT:          0.1ms
-  total time: 385.81s
-llama_perf_context_print:        load time =   44746.95 ms
-llama_perf_context_print: prompt eval time =  256322.22 ms / 10347 tokens (   24.77 ms per token,    40.37 tokens per second)
-llama_perf_context_print:        eval time =  128586.53 ms /  1068 runs   (  120.40 ms per token,     8.31 tokens per second)
-llama_perf_context_print:       total time =  415872.67 ms / 11415 tokens
-llama_perf_context_print:    graphs reused =       1050
-process_memory: peak working_set=4915.9 MiB, current working_set=4912.8 MiB, private=4987.8 MiB
-~llama_context:        CPU compute buffer size is  98.6387 MiB, matches expectation of  98.6387 MiB
-~llama_context:        CPU compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB
+Notice how the average `NPU execute()` time per call jumped from
+~2.6 ms (at M=1) to ~46.8 ms (at M=512). The wall-clock cost per call
+went up by 18x, but the per-output-token compute went down by 33x
+because each call now produces 512 tokens of output instead of 1.
+This is the dataflow architecture finally being used as intended.
+
+---
+
+# ONNX RyzenAI (AMD official path) head-to-head
+
+AMD ships a separate NPU path through ORT-genai with a custom op
+(`onnx_custom_ops.dll`) and a precompiled model bundle
+(`prefill.bin`, `dd_metastate_Llm_Token_MatMulNBits_2_0.*`).
+That path is closed-source but we can measure it.
+
+Comparison on the exact same prompt (557-token version of
+`single_prompt.txt`, Phi-3-mini-4k, Strix HX 370):
+
+| Metric                  | qlinear_2 (ours, MIN_M=2) | ONNX/AMD       | Ratio (AMD / ours) |
+|-------------------------|---------------------------|----------------|--------------------|
+| Prefill t/s             | 51.9                      | **641.6**      | **12.4x**          |
+| Prefill total           | 11,053 ms                 | 868 ms         | -                  |
+| Decode steady-state     | 18.8 t/s (MIN_M=2)        | 12.6 t/s       | 0.67x (we are faster) |
+| Decode (legacy MIN_M=1) | 7.9 t/s                   | 12.6 t/s       | 1.59x (they win)   |
+| Decode jitter (std-dev) | unmeasured                | ~1.5 ms (2%)   | extremely flat     |
+| Working set peak        | ~4.7 GB (est)             | 6.5 GB         | 1.38x              |
+| Private bytes peak      | -                         | 6.95 GB        | -                  |
+
+## Where AMD's prefill win comes from
+
+Our path makes 124 separate M>1 NPU dispatches per prefill
+(~47 ms each), totalling 5.8 s of pure NPU compute time, plus
+~5 s of host overhead (F32->BF16 staging, transitions, sync) =
+~11 s total.
+
+AMD's prefill is 868 ms total. Even being generous about how
+much of that is NPU vs host, the structural difference is:
+they bundle the per-layer matmuls into far fewer NPU dispatches
+(likely 1 mega-dispatch per layer or per token group, batched
+across Q/K/V/O/gate_up/down). The precompiled
+`dd_metastate_Llm_Token_MatMulNBits_2_0.fconst` (2.04 GB)
+contains all matmul weights pre-arranged for one fused tile graph.
+
+This is a build-time fusion done by their RAI toolchain — not
+something we can replicate at runtime in llama.cpp without
+equivalent tooling. The only available knob on our side is to
+batch dispatches more aggressively in `ggml-ryzenai-impl.cpp`.
+
+## Where AMD's decode win comes from
+
+Our MIN_M=2 default path keeps decode on CPU (18.8 t/s), so we
+already beat AMD's 12.6 t/s on decode by 1.5x in that mode.
+
+For the apples-to-apples comparison of NPU decode only
+(MIN_M=1), AMD wins by 1.59x. The gap is per-token NPU dispatch
+count: our path issues ~64 M=1 dispatches per token (avg 0.77 ms
+each) for ~49 ms of pure NPU + ~77 ms of overhead = ~126 ms.
+Their path appears to do ~32 dispatches (one per layer) with the
+matmuls fused inside each.
+
+## Memory tradeoff
+
+AMD's 6.5 GB working set vs our 4.7 GB is the cost of the
+duplicated weight blobs: `prefill.bin` (2.05 GB) and
+`fconst` (2.04 GB) are two copies of the int4 weights laid out
+differently for prefill vs decode kernels.  Private bytes
+of 6.95 GB are committed up front during prefill and don't grow
+during decode.
+
+## Strategic takeaway
+
+- **Don't try to match AMD's prefill** by hand-fusing operations.
+  Their advantage is a multi-month NPU compiler investment we
+  can't backfill in software. CPU prefill on 8 threads with
+  `--repack-xbox` is 109.8 t/s — slower than NPU but acceptable.
+- **Our decode story is already good** at MIN_M=2 (18.8 t/s,
+  faster than AMD).  Keep CPU on decode by default; only ever
+  send M>1 prefill work to NPU.
+- **The natural niche for our NPU backend** is contended-CPU
+  scenarios (gaming, multi-process) where the 8 cores AMD
+  benchmarks against aren't actually available. There, even a
+  partial NPU contribution is a net win.
