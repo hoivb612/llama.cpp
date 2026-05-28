@@ -131,9 +131,33 @@ static void unpack_q4_0_transposed(const struct ggml_tensor * src0,
 
 #ifndef RYZENAI_EMULATION
 
-using op_t = ryzenai::qlinear_2<int16_t, int8_t, float, float>;
+// Default (non-MLADF) path: F32 input/output accumulator. Loads
+// gemm_4x4_a16fw4acc32f.xclbin (16 AIE cores, fp32 output).
+using op_t_f32  = ryzenai::qlinear_2<int16_t, int8_t, float,   float>;
+
+// MLADF path: BF16 output accumulator. Loads mladf_gemm_{4x4,2x4x4}_a16fw4acc16f.xclbin
+// (16 or 32 AIE cores depending on MLADF env var, bf16 output). qlinear_2
+// requires AccT==OutT for the MLADF code path (qlinear_2.hpp ~L1468).
+using op_t_bf16 = ryzenai::qlinear_2<int16_t, int8_t, int16_t, int16_t>;
+
+// MLADF tile mode selected by GGML_RYZENAI_MLADF env var. Resolved once at
+// init time before any qlinear_2 instance is constructed, because
+// qlinear_2 reads the MLADF / DEVICE env vars in its constructor and bakes
+// the xclbin path into its xrt_context lookup key.
+struct MladfConfig {
+    bool        enabled = false;
+    std::string mode;        // "4x4" or "2x4x4"
+};
+
+static MladfConfig & mladf_config() {
+    static MladfConfig cfg;
+    return cfg;
+}
 
 // Singleton holding all per-weight qlinear_2 instances, keyed by tensor name.
+// Holds two maps because op_t_f32 and op_t_bf16 are different template
+// instantiations (different types); only one is populated per run, picked
+// by mladf_config().enabled at weight-preload time.
 class RyzenAIContext {
     RyzenAIContext() = default;
     RyzenAIContext(const RyzenAIContext &) = delete;
@@ -149,8 +173,19 @@ public:
     void lock()   { mtx_.lock(); }
     void unlock() { mtx_.unlock(); }
 
-    std::unordered_map<std::string_view, op_t> map;
+    std::unordered_map<std::string_view, op_t_f32>  map_f32;
+    std::unordered_map<std::string_view, op_t_bf16> map_bf16;
 };
+
+// Scalar BF16 -> F32 conversion. BF16 is the high 16 bits of an IEEE-754
+// fp32 (sign + 8-bit exp + 7 mantissa bits); convert by shifting left 16.
+// AVX-512 vectorization is a separate, future optimization.
+static inline void bf16_buffer_to_float(const int16_t * in, size_t n, float * out) {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t bits = ((uint32_t)(uint16_t)in[i]) << 16;
+        std::memcpy(&out[i], &bits, sizeof(float));
+    }
+}
 
 #endif // !RYZENAI_EMULATION
 
@@ -164,6 +199,7 @@ struct RyzenAIStats {
     std::atomic<uint64_t> calls_m_eq_1{0};
     std::atomic<uint64_t> calls_m_gt_1{0};
     std::atomic<uint64_t> us_convert{0};
+    std::atomic<uint64_t> us_output_convert{0};
     std::atomic<uint64_t> us_execute_m_eq_1{0};
     std::atomic<uint64_t> us_execute_m_gt_1{0};
     std::atomic<uint64_t> us_alloc{0};
@@ -181,17 +217,19 @@ struct RyzenAIStats {
         uint64_t n_eq1 = calls_m_eq_1.load();
         uint64_t n_gt1 = calls_m_gt_1.load();
         uint64_t conv  = us_convert.load();
+        uint64_t oconv = us_output_convert.load();
         uint64_t exe_1 = us_execute_m_eq_1.load();
         uint64_t exe_n = us_execute_m_gt_1.load();
         uint64_t exe   = exe_1 + exe_n;
         uint64_t alc   = us_alloc.load();
-        uint64_t total = conv + exe + alc;
+        uint64_t total = conv + oconv + exe + alc;
         auto pct = [&](uint64_t v) { return total ? 100.0 * v / total : 0.0; };
         std::fprintf(stderr,
             "\n[ggml-ryzenai stats]\n"
             "  calls               = %llu  (M=1: %llu, M>1: %llu)\n"
             "  alloc bf16 buf      = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
             "  F32->BF16 conv      = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
+            "  BF16->F32 out conv  = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
             "  NPU execute() M=1   = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
             "  NPU execute() M>1   = %8.2f ms  (%5.2f%%, avg %7.2f us/call)\n"
             "  NPU execute() total = %8.2f ms  (%5.2f%%)\n"
@@ -202,6 +240,7 @@ struct RyzenAIStats {
             (unsigned long long) n_gt1,
             alc   / 1000.0, pct(alc),   n     ? (double) alc   / n     : 0.0,
             conv  / 1000.0, pct(conv),  n     ? (double) conv  / n     : 0.0,
+            oconv / 1000.0, pct(oconv), n     ? (double) oconv / n     : 0.0,
             exe_1 / 1000.0, pct(exe_1), n_eq1 ? (double) exe_1 / n_eq1 : 0.0,
             exe_n / 1000.0, pct(exe_n), n_gt1 ? (double) exe_n / n_gt1 : 0.0,
             exe   / 1000.0, pct(exe),
@@ -232,17 +271,29 @@ static RyzenAIStats & ryzenai_stats() {
 static bool ensure_op_for_weight_locked(RyzenAIContext & ctx,
                                         const struct ggml_tensor * src0) {
     auto key = std::string_view(src0->name);
-    if (ctx.map.count(key) != 0) {
-        return false;
+    const bool mladf = mladf_config().enabled;
+
+    if (mladf) {
+        if (ctx.map_bf16.count(key) != 0) return false;
+    } else {
+        if (ctx.map_f32.count(key) != 0)  return false;
     }
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
 
-    RYZ_TRY_CATCH(ctx.map.emplace(
-        std::piecewise_construct,
-        std::forward_as_tuple(key),
-        std::forward_as_tuple("bfloat16", "uint4", "float32"));)
+    if (mladf) {
+        // MLADF: c_dtype must be bfloat16 (qlinear_2.hpp ~L552-553).
+        RYZ_TRY_CATCH(ctx.map_bf16.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(key),
+            std::forward_as_tuple("bfloat16", "uint4", "bfloat16"));)
+    } else {
+        RYZ_TRY_CATCH(ctx.map_f32.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(key),
+            std::forward_as_tuple("bfloat16", "uint4", "float32"));)
+    }
 
     {
         // Single fused pass: unpack Q4_0 directly into the transposed layout
@@ -260,9 +311,15 @@ static bool ensure_op_for_weight_locked(RyzenAIContext & ctx,
         // See note in ggml_ryzenai_impl_mul_mat_npu about the transpose trick.
         auto w_shape = std::make_tuple((int) ne00, (int) ne01);
 
-        RYZ_TRY_CATCH(ctx.map.at(key).initialize_weights_int4(
-            weights_T.data(), zeros.data(), scales_T.data(),
-            bias.data(), w_shape);)
+        if (mladf) {
+            RYZ_TRY_CATCH(ctx.map_bf16.at(key).initialize_weights_int4(
+                weights_T.data(), zeros.data(), scales_T.data(),
+                bias.data(), w_shape);)
+        } else {
+            RYZ_TRY_CATCH(ctx.map_f32.at(key).initialize_weights_int4(
+                weights_T.data(), zeros.data(), scales_T.data(),
+                bias.data(), w_shape);)
+        }
 
         // weights_T, scales_T, zeros, bias destroyed here; their backing
         // pages are released before the next tensor is uploaded.
@@ -292,18 +349,54 @@ void ggml_ryzenai_impl_init(void) {
     GGML_LOG_WARN("  Rebuild with the AMD Ryzen AI SDK installed for real NPU.\n");
     GGML_LOG_WARN("==================================================================\n");
 #else
+    // GGML_RYZENAI_MLADF = "4x4" | "2x4x4" enables the MLADF code path in
+    // qlinear_2. We forward to the SDK's own env vars (MLADF + DEVICE) before
+    // constructing any qlinear_2 instance, because qlinear_2 reads them in
+    // its ctor and bakes the resulting xclbin path into the xrt_context key.
+    //
+    // - 4x4  : 16 AIE cores, mladf_gemm_4x4_a16fw4acc16f.xclbin
+    // - 2x4x4: 32 AIE cores, mladf_gemm_2x4x4_a16fw4acc16f.xclbin (Strix only)
+    //
+    // Unset (default): legacy gemm_4x4_a16fw4acc32f.xclbin (fp32 output, fp32
+    // accumulator). Backward compatible with the original ggml-ryzenai path.
+    {
+        auto & cfg = mladf_config();
+        const char * env = std::getenv("GGML_RYZENAI_MLADF");
+        if (env && env[0] != '\0') {
+            std::string v = env;
+            if (v == "4x4" || v == "2x4x4") {
+                cfg.enabled = true;
+                cfg.mode    = v;
+                _putenv_s("MLADF",  v.c_str());
+                _putenv_s("DEVICE", "stx");
+                GGML_LOG_INFO("ggml-ryzenai: MLADF enabled (mode=%s, DEVICE=stx)\n", v.c_str());
+            } else {
+                GGML_LOG_WARN("ggml-ryzenai: GGML_RYZENAI_MLADF='%s' is not '4x4' or '2x4x4'; "
+                              "falling back to default (fp32-out) path.\n", env);
+            }
+        }
+    }
+
     // Eager xclbin / AIE program load. Constructing a qlinear_2 instance
     // triggers xrt_context::get_instance(XCLBIN_FNAME), which loads the
     // .xclbin onto the NPU and prepares the kernel handles. We discard the
     // sentinel; the singleton xrt_context stays alive for subsequent ops.
+    //
+    // Sentinel dtype must match the dtype tuple we'll use for real weights,
+    // otherwise the MLADF xclbin won't be loaded at init time.
     //
     // Fail-fast: if the NPU driver isn't loaded or the device is missing,
     // the qlinear_2 ctor throws. We let it propagate as an abort so the
     // user sees the failure immediately at backend init time rather than
     // on the first decode step.
     try {
-        op_t sentinel("bfloat16", "uint4", "float32");
-        (void) sentinel;
+        if (mladf_config().enabled) {
+            op_t_bf16 sentinel("bfloat16", "uint4", "bfloat16");
+            (void) sentinel;
+        } else {
+            op_t_f32 sentinel("bfloat16", "uint4", "float32");
+            (void) sentinel;
+        }
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-ryzenai: NPU initialization failed: %s\n", e.what());
         GGML_ABORT("ggml-ryzenai: NPU initialization failed (driver loaded? device present?)");
@@ -416,6 +509,7 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
 
     auto & ctx = RyzenAIContext::get();
     auto & stats = ryzenai_stats();
+    const bool mladf = mladf_config().enabled;
 
     // Lazy fallback in case preload_weights wasn't called for this tensor.
     ctx.lock();
@@ -424,11 +518,14 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
 
     auto key = std::string_view(src0->name);
 
-    const int64_t n_elem = ggml_nelements(src1);
+    const int64_t n_elem     = ggml_nelements(src1);
+    const int64_t n_elem_out = ggml_nelements(dst);
 
-    // ---- segment 1: allocate BF16 activation buffer ----
+    // ---- segment 1: allocate BF16 activation buffer (+ bf16 output if MLADF) ----
     int64_t t0 = stats.enabled ? ggml_time_us() : 0;
     std::vector<int16_t> bf16_inputs(n_elem);
+    std::vector<int16_t> bf16_output;     // unused unless MLADF
+    if (mladf) bf16_output.resize(n_elem_out);
     int64_t t1 = stats.enabled ? ggml_time_us() : 0;
 
     // ---- segment 2: F32 -> BF16 conversion (CPU AVX-512) ----
@@ -440,11 +537,24 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
     int64_t t2 = stats.enabled ? ggml_time_us() : 0;
 
     // ---- segment 3: NPU execute (DMA + compute + writeback) ----
-    RYZ_TRY_CATCH(ctx.map.at(key).execute(
-        bf16_inputs.data(),
-        std::make_tuple((int) ne11, (int) ne10),
-        (float *) dst->data);)
+    if (mladf) {
+        RYZ_TRY_CATCH(ctx.map_bf16.at(key).execute(
+            bf16_inputs.data(),
+            std::make_tuple((int) ne11, (int) ne10),
+            bf16_output.data());)
+    } else {
+        RYZ_TRY_CATCH(ctx.map_f32.at(key).execute(
+            bf16_inputs.data(),
+            std::make_tuple((int) ne11, (int) ne10),
+            (float *) dst->data);)
+    }
     int64_t t3 = stats.enabled ? ggml_time_us() : 0;
+
+    // ---- segment 4 (MLADF only): BF16 -> F32 output conversion ----
+    if (mladf) {
+        bf16_buffer_to_float(bf16_output.data(), (size_t) n_elem_out, (float *) dst->data);
+    }
+    int64_t t4 = stats.enabled ? ggml_time_us() : 0;
 
     if (stats.enabled) {
         stats.calls.fetch_add(1, std::memory_order_relaxed);
@@ -458,6 +568,7 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
         }
         stats.us_alloc.fetch_add((uint64_t)(t1 - t0), std::memory_order_relaxed);
         stats.us_convert.fetch_add((uint64_t)(t2 - t1), std::memory_order_relaxed);
+        stats.us_output_convert.fetch_add((uint64_t)(t4 - t3), std::memory_order_relaxed);
         stats.bytes_activations.fetch_add((uint64_t)(n_elem * sizeof(int16_t)), std::memory_order_relaxed);
     }
 
