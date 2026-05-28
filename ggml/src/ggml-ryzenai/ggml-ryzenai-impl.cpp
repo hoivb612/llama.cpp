@@ -187,6 +187,26 @@ static inline void bf16_buffer_to_float(const int16_t * in, size_t n, float * ou
     }
 }
 
+// Mirror of qlinear_2::set_kernel_shapes_kn_mladf() bfloat16 branch
+// (qlinear_2.hpp ~L782-820). Returns kernel_x_shape_[1] = the K-tile size
+// of the MLADF kernel that will be selected for a weight of shape (w0, w1).
+//
+// MLADF bf16 kernels are sized for Llama-2 dims (K in {4096, 11008}). For
+// models with smaller K (Phi-3: 3072 / 8192) qlinear_2::execute() guards at
+// L1465 (`kernel_x_shape_[1] > a_shape_[1]`) and throws "no accumulation
+// across several AIE calls". We work around by zero-padding the activation
+// K up to this kernel K when calling execute(); weights are already
+// zero-padded in their BO via Utils::ceil_for_me(w_shape, kernel_y_shape),
+// so the dot product is mathematically unchanged.
+static int mladf_kernel_k_for_w_shape(int64_t w0, int64_t w1) {
+    if (w0 > 4096)  return 11008;
+    if (w1 > 22528) return 4096;
+    if (w1 > 12288) return 4096;
+    if (w1 > 4096)  return 4096;
+    if (w1 > 2048)  return 4096;
+    return 256;
+}
+
 #endif // !RYZENAI_EMULATION
 
 // Per-call timing counters for the NPU mul_mat hot path. Enabled at runtime
@@ -531,26 +551,46 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
     const int64_t n_elem     = ggml_nelements(src1);
     const int64_t n_elem_out = ggml_nelements(dst);
 
+    // MLADF: pad activation K up to the kernel's K-tile (qlinear_2 will throw
+    // otherwise; weight BO is already zero-padded so math is unchanged).
+    // src1 layout: [ne11 rows] x [ne10 cols (= K)]. dst layout unchanged.
+    const int64_t k_kernel = mladf ? mladf_kernel_k_for_w_shape(src0->ne[0], src0->ne[1]) : (int64_t) ne10;
+    const bool    pad_k    = mladf && (k_kernel != (int64_t) ne10);
+    const int64_t n_act_padded = pad_k ? ((int64_t) ne11 * k_kernel) : n_elem;
+
     // ---- segment 1: allocate BF16 activation buffer (+ bf16 output if MLADF) ----
     int64_t t0 = stats.enabled ? ggml_time_us() : 0;
-    std::vector<int16_t> bf16_inputs(n_elem);
+    std::vector<int16_t> bf16_inputs((size_t) n_act_padded);  // zero-inited (= padded zeros stay 0)
     std::vector<int16_t> bf16_output;     // unused unless MLADF
-    if (mladf) bf16_output.resize(n_elem_out);
+    if (mladf) bf16_output.resize((size_t) n_elem_out);
     int64_t t1 = stats.enabled ? ggml_time_us() : 0;
 
     // ---- segment 2: F32 -> BF16 conversion (CPU AVX-512) ----
     const static bool use_avx = ryzenai::check_avx512_and_bf16_support();
-    ryzenai::float_buffer_to_bfloat16((float *) src1->data,
-                                      n_elem,
-                                      (uint16_t *) bf16_inputs.data(),
-                                      use_avx);
+    if (pad_k) {
+        // Per-row conversion into a row stride of k_kernel; the tail of each
+        // row (k in [ne10, k_kernel)) was zero-initialized by the vector ctor.
+        const float * src1_f = (const float *) src1->data;
+        for (int64_t m = 0; m < (int64_t) ne11; ++m) {
+            ryzenai::float_buffer_to_bfloat16(
+                const_cast<float *>(src1_f + m * (int64_t) ne10),
+                (size_t) ne10,
+                (uint16_t *) (bf16_inputs.data() + m * k_kernel),
+                use_avx);
+        }
+    } else {
+        ryzenai::float_buffer_to_bfloat16((float *) src1->data,
+                                          n_elem,
+                                          (uint16_t *) bf16_inputs.data(),
+                                          use_avx);
+    }
     int64_t t2 = stats.enabled ? ggml_time_us() : 0;
 
     // ---- segment 3: NPU execute (DMA + compute + writeback) ----
     if (mladf) {
         RYZ_TRY_CATCH(ctx.map_bf16.at(key).execute(
             bf16_inputs.data(),
-            std::make_tuple((int) ne11, (int) ne10),
+            std::make_tuple((int) ne11, (int) k_kernel),
             bf16_output.data());)
     } else {
         RYZ_TRY_CATCH(ctx.map_f32.at(key).execute(
@@ -579,7 +619,7 @@ static void ggml_ryzenai_impl_mul_mat_npu(const struct ggml_tensor * src0,
         stats.us_alloc.fetch_add((uint64_t)(t1 - t0), std::memory_order_relaxed);
         stats.us_convert.fetch_add((uint64_t)(t2 - t1), std::memory_order_relaxed);
         stats.us_output_convert.fetch_add((uint64_t)(t4 - t3), std::memory_order_relaxed);
-        stats.bytes_activations.fetch_add((uint64_t)(n_elem * sizeof(int16_t)), std::memory_order_relaxed);
+        stats.bytes_activations.fetch_add((uint64_t)(n_act_padded * sizeof(int16_t)), std::memory_order_relaxed);
     }
 
     GGML_UNUSED(nb01); GGML_UNUSED(nb02); GGML_UNUSED(nb03);
