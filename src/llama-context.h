@@ -10,7 +10,12 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -133,7 +138,53 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                           bool     apply_mctx = true);
+
+    llm_graph_params graph_params_mtp(
+                llm_graph_result * res,
+              const llama_ubatch & ubatch,
+    const llama_memory_context_i * mctx) const;
+
+    // Gemma4 MTP: greedy multi-step draft using the gemma4_assistant + target KV.
+    // Synchronous facade: when out_logits != NULL falls back to decode_mtp_sync;
+    // otherwise dispatches via decode_mtp_async + decode_mtp_wait.
+    int32_t decode_mtp(
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
+
+    // Async MTP draft pipeline. Submits the request to a dedicated worker thread
+    // that runs the MTP graph on sched_mtp. At most one in-flight request per
+    // context; calling _async with a previous request unwaited returns -7.
+    int32_t decode_mtp_async(
+            llama_seq_id  seq_id,
+            llama_pos     attn_pos,
+            llama_token   last_token,
+            const float * h_prev,
+            int32_t       n_steps);
+
+    // Block until the in-flight MTP request completes.
+    int32_t decode_mtp_wait(
+            llama_token * out_drafts,
+            float       * out_h_prev_last);
+
+    // Synchronous MTP path used when out_logits != NULL (the async worker contract
+    // does not stream per-step logits).
+    int32_t decode_mtp_sync(
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -349,6 +400,53 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Async MTP pipeline. sched_mtp is a dedicated scheduler so the MTP draft
+    // graph can be encoded on a worker thread without contending with the target
+    // sched. gf_res_prev_mtp keeps its own graph cache so reuse across MTP steps
+    // survives target decode calls.
+    ggml_backend_sched_ptr sched_mtp;
+    llm_graph_result_ptr   gf_res_prev_mtp;
+
+    struct mtp_request {
+        llama_seq_id       seq_id     = 0;
+        llama_pos          attn_pos   = 0;
+        llama_token        last_token = 0;
+        std::vector<float> h_prev;
+        int32_t            n_steps    = 0;
+    };
+
+    struct mtp_response {
+        int32_t                  status = 0;
+        std::vector<llama_token> drafts;
+        std::vector<float>       h_prev_last;
+    };
+
+    std::thread                 mtp_worker;
+    std::atomic<bool>           mtp_worker_stop{false};
+    std::mutex                  mtp_mu;
+    std::condition_variable     mtp_cv_request;
+    std::condition_variable     mtp_cv_response;
+    std::optional<mtp_request>  mtp_pending;
+    bool                        mtp_in_flight = false;
+    std::optional<mtp_response> mtp_completed;
+
+    // Serializes shared-backend reconfiguration (set_threadpool_fn, set_n_threads_fns)
+    // between graph_compute and graph_compute_mtp.
+    std::mutex backend_cfg_mu;
+
+    bool ensure_sched_mtp();
+
+    llm_graph_result * process_ubatch_mtp(
+                const llama_ubatch & ubatch,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
+    ggml_status graph_compute_mtp(ggml_cgraph * gf);
+
+    int32_t decode_mtp_run(const mtp_request & req, mtp_response & resp);
+
+    void mtp_worker_loop();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

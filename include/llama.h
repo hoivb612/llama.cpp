@@ -984,6 +984,39 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Gemma 4 MTP: greedy multi-step assistant draft using target KV + last hidden.
+    // h_prev: [n_embd_backbone] floats, overwritten with the last step's projected hidden.
+    // out_drafts: [n_steps] tokens (required).
+    // out_logits: NULL or [n_steps, n_vocab] row-major (sync path captures per-step logits).
+    // out_h_prev_last: NULL or [n_embd_backbone] (mirror of h_prev on return).
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+            llama_seq_id    seq_id,
+            llama_pos       attn_pos,
+            llama_token     last_token,
+            float         * h_prev,
+            int32_t         n_steps,
+            llama_token   * out_drafts,
+            float         * out_logits,
+            float         * out_h_prev_last);
+
+    // Async MTP draft: enqueue request to the dedicated worker thread.
+    // At most one in-flight request per context; second call returns -7.
+    // Caller must keep target KV positions <= attn_pos stable until _wait returns.
+    LLAMA_API int32_t llama_decode_mtp_async(
+            struct llama_context * ctx,
+            llama_seq_id   seq_id,
+            llama_pos      attn_pos,
+            llama_token    last_token,
+            const float  * h_prev,
+            int32_t        n_steps);
+
+    // Block until the in-flight MTP request completes. Copies drafts and last hidden out.
+    LLAMA_API int32_t llama_decode_mtp_wait(
+            struct llama_context * ctx,
+            llama_token  * out_drafts,
+            float        * out_h_prev_last);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

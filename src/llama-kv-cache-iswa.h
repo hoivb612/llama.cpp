@@ -70,6 +70,11 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    // Gemma 4 MTP: build a read-only iswa memory context pointing at the last
+    // populated cell for seq_id in both base and swa caches. Used by
+    // llama_context::decode_mtp_* (no slot allocation, no cache mutation).
+    llama_memory_context_ptr init_mtp(llama_seq_id seq_id, llama_ubatch ubatch);
+
 private:
     const llama_hparams & hparams;
 
