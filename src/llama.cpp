@@ -532,6 +532,93 @@ void llama_model_save_to_file(const struct llama_model * model, const char * pat
 }
 
 //
+// Gemma 4 MTP assistant loading
+//
+
+static bool llama_mtp_vocab_matches(const llama_model & tgt, const llama_model & aux) {
+    const llama_vocab & vt = tgt.vocab;
+    const llama_vocab & va = aux.vocab;
+    if (vt.n_tokens() != va.n_tokens()) {
+        LLAMA_LOG_ERROR("%s: vocab size mismatch (target=%u assistant=%u)\n", __func__, vt.n_tokens(), va.n_tokens());
+        return false;
+    }
+    // skip the first few control tokens (align with speculative MTP vocab check)
+    constexpr int32_t k_check_from = 5;
+    for (uint32_t i = (uint32_t) k_check_from; i < vt.n_tokens(); ++i) {
+        const llama_token id = (llama_token) i;
+        if (std::strcmp(vt.token_get_text(id), va.token_get_text(id)) != 0) {
+            LLAMA_LOG_ERROR("%s: vocab text mismatch at token id %d\n", __func__, (int) id);
+            return false;
+        }
+    }
+    return true;
+}
+
+int32_t llama_model_load_mtp_from_file(struct llama_model * model, const char * path_mtp, struct llama_model_params params) {
+    if (!model || !path_mtp || !path_mtp[0]) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return -1;
+    }
+
+    if (model->arch != LLM_ARCH_GEMMA4) {
+        LLAMA_LOG_ERROR("%s: MTP target must be arch gemma4 (got %s)\n", __func__, llm_arch_name(model->arch));
+        return -2;
+    }
+
+    llama_model * aux = llama_model_load_from_file(path_mtp, params);
+    if (!aux) {
+        LLAMA_LOG_ERROR("%s: failed to load assistant from '%s'\n", __func__, path_mtp);
+        return -3;
+    }
+
+    if (aux->arch != LLM_ARCH_GEMMA4_ASSISTANT) {
+        LLAMA_LOG_ERROR("%s: MTP weights must be arch gemma4_assistant (got %s)\n", __func__, llm_arch_name(aux->arch));
+        llama_model_free(aux);
+        return -4;
+    }
+
+    const auto req_it = aux->gguf_kv.find("gemma4_assistant.requires_target_arch");
+    if (req_it != aux->gguf_kv.end() && req_it->second != "gemma4") {
+        LLAMA_LOG_ERROR("%s: assistant requires_target_arch='%s' (expected gemma4)\n", __func__, req_it->second.c_str());
+        llama_model_free(aux);
+        return -5;
+    }
+
+    if (aux->hparams.n_embd_backbone == 0 || aux->hparams.n_embd_backbone != model->hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: assistant n_embd_backbone %u must match target n_embd %u\n", __func__,
+                aux->hparams.n_embd_backbone, model->hparams.n_embd);
+        llama_model_free(aux);
+        return -6;
+    }
+
+    if (!llama_mtp_vocab_matches(*model, *aux)) {
+        llama_model_free(aux);
+        return -7;
+    }
+
+    model->mtp_assistant.reset(aux);
+    return 0;
+}
+
+const struct llama_model * llama_model_get_mtp_assistant(const struct llama_model * model) {
+    if (!model) {
+        return nullptr;
+    }
+    return model->mtp_assistant.get();
+}
+
+bool llama_model_has_mtp_assistant(const struct llama_model * model) {
+    return llama_model_get_mtp_assistant(model) != nullptr;
+}
+
+uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model) {
+    if (!model || !model->mtp_assistant) {
+        return 0;
+    }
+    return model->mtp_assistant->hparams.n_embd_backbone;
+}
+
+//
 // chat templates
 //
 

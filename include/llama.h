@@ -501,6 +501,26 @@ extern "C" {
             const struct llama_model * model,
                         const char * path_model);
 
+    // Gemma 4 MTP: load a gemma4_assistant GGUF into a gemma4 target.
+    // Call after llama_model_load_from_file, before llama_init_from_model. Returns 0 on success.
+    // Negative return codes:
+    //   -1 invalid argument, -2 target arch != gemma4, -3 assistant load failed,
+    //   -4 assistant arch != gemma4_assistant, -5 requires_target_arch mismatch,
+    //   -6 n_embd_backbone mismatch, -7 vocab mismatch.
+    LLAMA_API int32_t llama_model_load_mtp_from_file(
+            struct llama_model * model,
+            const char * path_mtp,
+            struct llama_model_params params);
+
+    // Returns the nested MTP assistant model attached via llama_model_load_mtp_from_file, or NULL.
+    LLAMA_API const struct llama_model * llama_model_get_mtp_assistant(const struct llama_model * model);
+
+    // True iff a Gemma 4 MTP assistant has been loaded into this target model.
+    LLAMA_API bool llama_model_has_mtp_assistant(const struct llama_model * model);
+
+    // Backbone hidden size advertised by the MTP assistant (0 if no MTP assistant is loaded).
+    LLAMA_API uint32_t llama_model_mtp_n_embd_backbone(const struct llama_model * model);
+
     DEPRECATED(LLAMA_API void llama_free_model(struct llama_model * model),
             "use llama_model_free instead");
 
@@ -571,6 +591,17 @@ extern "C" {
 
     // Returns label of classifier output by index (<n_cls_out). Returns nullptr if no label provided
     LLAMA_API const char * llama_model_cls_label(const struct llama_model * model, uint32_t i);
+
+    // GGUF "general.architecture" string for the model (e.g. "gemma4", "gemma4_assistant").
+    LLAMA_API const char * llama_model_arch_str(const struct llama_model * model);
+
+    // Copy one token embedding row as f32. Supported for F32/F16 token_embd only.
+    // Returns the row width on success, or -1 on error (bad token, buffer too small, or unsupported dtype).
+    LLAMA_API int32_t llama_model_token_embd_row_f32(
+            const struct llama_model * model,
+            llama_token token,
+            float * out,
+            int32_t n_out);
 
     LLAMA_API enum llama_vocab_type llama_vocab_type(const struct llama_vocab * vocab);
 

@@ -19,6 +19,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -135,6 +136,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_gemma3n(params);
         case LLM_ARCH_GEMMA4:
             return new llama_model_gemma4(params);
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            return new llama_model_gemma4_assistant(params);
         case LLM_ARCH_GEMMA_EMBEDDING:
             return new llama_model_gemma_embedding(params);
         case LLM_ARCH_STARCODER2:
@@ -2317,6 +2320,54 @@ const char * llama_model_cls_label(const struct llama_model * model, uint32_t i)
     return nullptr;
 }
 
+const char * llama_model_arch_str(const struct llama_model * model) {
+    return llm_arch_name(model->arch);
+}
+
+int32_t llama_model_token_embd_row_f32(
+        const struct llama_model * model,
+        llama_token token,
+        float * out,
+        int32_t n_out) {
+    if (!model || !model->tok_embd || !out) {
+        return -1;
+    }
+
+    const ggml_tensor * t = model->tok_embd;
+    const int64_t n_embd_row = t->ne[0];
+    const int64_t n_vocab    = t->ne[1];
+
+    if (token < 0 || (int64_t) token >= n_vocab) {
+        return -1;
+    }
+
+    if ((int64_t) n_out < n_embd_row) {
+        return -1;
+    }
+
+    const size_t row_bytes = ggml_row_size(t->type, n_embd_row);
+    const size_t row_offs  = (size_t) token * row_bytes;
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out, row_offs, row_bytes);
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(n_embd_row);
+        ggml_backend_tensor_get(t, tmp.data(), row_offs, row_bytes);
+        ggml_fp16_to_fp32_row(tmp.data(), out, n_embd_row);
+    } else {
+        return -1;
+    }
+
+    const float es = model->hparams.f_embedding_scale;
+    if (es != 0.0f && es != 1.0f) {
+        for (int64_t i = 0; i < n_embd_row; ++i) {
+            out[i] *= es;
+        }
+    }
+
+    return (int32_t) n_embd_row;
+}
+
 // deprecated
 int32_t llama_n_ctx_train(const llama_model * model) {
     return llama_model_n_ctx_train(model);
@@ -2433,6 +2484,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:
