@@ -1183,6 +1183,51 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
+    // Gemma-4 MTP: attach the assistant head (mtp_assistant arch) into the target
+    // model BEFORE the model_only short-circuit, so any caller (server, minslm-cli,
+    // tests) that loads the target sees llama_model_has_mtp_assistant() == true.
+    // The assistant path comes from --mtp-head or --model-draft (both populate
+    // params.speculative.draft.mparams.path). Triggered iff --spec-type includes
+    // draft-mtp. On success, we clear mparams.path so downstream code (e.g. server
+    // ctx_dft creation) does NOT also try to load the same file as a separate
+    // draft model — for gemma4 the assistant lives inside the target.
+    {
+        const bool spec_draft_mtp = std::find(params.speculative.types.begin(),
+                                              params.speculative.types.end(),
+                                              COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                                    != params.speculative.types.end();
+        const std::string mtp_path = params.speculative.draft.mparams.path;
+        if (spec_draft_mtp && !mtp_path.empty()) {
+            common_params p_mtp = params;
+            p_mtp.n_parallel   = 1;
+            p_mtp.devices      = params.speculative.draft.devices;
+            p_mtp.model        = params.speculative.draft.mparams;
+            p_mtp.n_gpu_layers = params.speculative.draft.n_gpu_layers;
+            p_mtp.cache_type_k = params.speculative.draft.cache_type_k;
+            p_mtp.cache_type_v = params.speculative.draft.cache_type_v;
+            if (params.speculative.draft.cpuparams.n_threads > 0) {
+                p_mtp.cpuparams       = params.speculative.draft.cpuparams;
+                p_mtp.cpuparams_batch = params.speculative.draft.cpuparams_batch;
+            }
+            p_mtp.tensor_buft_overrides = params.speculative.draft.tensor_buft_overrides;
+
+            llama_model_params mparams_mtp = common_model_params_to_llama(p_mtp);
+            if (llama_model_load_mtp_from_file(model, mtp_path.c_str(), mparams_mtp) != 0) {
+                // Not fatal: the model may not actually be a gemma4 target. The
+                // dispatcher will fall back to NEXTN (which loads mparams.path as
+                // a separate draft model in the server). Leave mparams.path alone.
+                LOG_INF("%s: --spec-type draft-mtp set but '%s' is not a gemma4 MTP assistant; "
+                        "treating as a regular draft model\n", __func__, mtp_path.c_str());
+            } else if (llama_model_has_mtp_assistant(model)) {
+                LOG_INF("%s: loaded gemma4 MTP assistant from '%s' into target model\n",
+                        __func__, mtp_path.c_str());
+                // Prevent the server / common from loading the same file again as
+                // a separate draft model.
+                params.speculative.draft.mparams.path.clear();
+            }
+        }
+    }
+
     if (model_only) {
         return;
     }
