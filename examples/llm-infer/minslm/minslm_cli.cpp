@@ -9,6 +9,12 @@
 #include "llama.h"
 #include "ggml-backend.h"
 
+// Optional MTP wiring uses the common/ speculative API. Pulled in only when
+// available; the executable still links the (small) common library so the
+// symbols resolve unconditionally.
+#include "common.h"
+#include "speculative.h"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -189,6 +195,12 @@ struct cli_params {
     bool    force_cpu    = false;
     bool    no_mmap      = false;
     bool    direct_io    = true;
+    // Gemma-4 MTP wiring. When mtp_head_path is non-empty we try to attach the
+    // assistant head to the target via llama_model_load_mtp_from_file and run
+    // the generation loop through common_speculative_* (begin/process/draft/
+    // accept). draft_block_size B drafts B-1 tokens per verify round.
+    std::string mtp_head_path;
+    int32_t     draft_block_size = 3;
     // Flash Attention default. On the GDKX/Xbox build the non-FA path
     // (separate QK matmul + softmax + attn*V) currently outperforms the FA
     // shader for prompt processing on RDNA2, so we default to OFF there.
@@ -258,6 +270,17 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--mtp-head") && i + 1 < argc) {
+            p.mtp_head_path = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--draft-block-size") && i + 1 < argc) {
+            int b = atoi(argv[++i]);
+            if (b < 2 || b > 32) {
+                fprintf(stderr, "Error: --draft-block-size must be in [2, 32], got %d\n", b);
+                return 1;
+            }
+            p.draft_block_size = b;
+        }
         else {
             fprintf(stderr, "Warning: unknown argument '%s' ignored\n", argv[i]);
         }
@@ -322,6 +345,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // --- Optional: attach Gemma-4 MTP assistant head ---
+    bool mtp_attached = false;
+    if (!p.mtp_head_path.empty()) {
+        llama_model_params mp = model_params; // inherit gpu/split/mmap config
+        int rc = llama_model_load_mtp_from_file(model, p.mtp_head_path.c_str(), mp);
+        if (rc != 0 || !llama_model_has_mtp_assistant(model)) {
+            fprintf(stderr, "Warning: failed to load MTP head '%s' (rc=%d); continuing without MTP\n",
+                    p.mtp_head_path.c_str(), rc);
+        } else {
+            mtp_attached = true;
+            printf("[%s]: loaded MTP assistant head '%s' (n_embd_backbone=%u)\n",
+                   __func__, p.mtp_head_path.c_str(),
+                   (unsigned) llama_model_mtp_n_embd_backbone(model));
+        }
+    }
+
     // --- Create context ---
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx    = p.n_ctx;
@@ -336,6 +375,25 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: failed to create context\n");
         llama_model_free(model);
         return 1;
+    }
+
+    // --- Optional: initialize speculative decoding (Gemma-4 MTP) ---
+    common_params_speculative spec_params;
+    common_speculative_ptr    spec;
+    if (mtp_attached) {
+        spec_params.types          = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        spec_params.draft.ctx_tgt  = ctx;
+        spec_params.draft.ctx_dft  = nullptr; // gemma4: assistant lives inside ctx_tgt
+        spec_params.draft.draft_block_size = p.draft_block_size;
+        spec_params.draft.n_max    = p.draft_block_size > 1 ? p.draft_block_size - 1 : 0;
+        spec.reset(common_speculative_init(spec_params, /*n_seq=*/1));
+        if (!spec) {
+            fprintf(stderr, "Warning: common_speculative_init failed; continuing without MTP\n");
+            mtp_attached = false;
+        } else {
+            printf("[%s]: MTP speculative decoding active, draft_block_size=%d (drafts %d tokens/round)\n",
+                   __func__, p.draft_block_size, p.draft_block_size - 1);
+        }
     }
 
     printf("\n[%s]: n_ctx = %d, n_threads = %d, gpu_layers = %d\n",
@@ -364,6 +422,9 @@ int main(int argc, char ** argv) {
     int64_t total_tg_us = 0;
     int64_t total_tg_core_us = 0;
     int64_t total_ttft_us = 0;
+    int total_draft_rounds = 0;
+    int total_draft_proposed = 0;
+    int total_draft_accepted = 0;
 
     for (size_t pi = 0; pi < pf.prompts.size(); pi++) {
         std::string user_msg = trim(pf.prompts[pi]);
@@ -431,19 +492,26 @@ int main(int argc, char ** argv) {
             int64_t t3 = timer_us();
             int64_t t_first_tok = 0;
 
-            while (n_gen < max_gen) {
-                llama_token id = llama_sampler_sample(smpl, ctx, -1);
+            // ---- MTP / non-MTP generation loop ----
+            // Both paths share sampling + emission + stopping logic. The MTP
+            // branch runs draft+verify rounds; the non-MTP branch is the
+            // original single-token loop kept verbatim.
+            //
+            // Stats for MTP runs (populated only when spec is active).
+            int n_draft_rounds = 0;
+            int n_draft_proposed = 0;
+            int n_draft_accepted = 0;
 
+            auto emit_one = [&](llama_token id) -> bool {
+                // Returns true to continue, false to stop generation.
                 if (llama_vocab_is_eog(vocab, id)) {
                     if (p.streaming) printf("\n");
-                    break;
+                    return false;
                 }
-
                 if (t_first_tok == 0) {
                     t_first_tok = timer_us();
                 }
                 n_emit++;
-
                 std::string piece = token_to_piece(ctx, id);
                 all_ids.push_back(id);
                 if (piece.empty()) {
@@ -456,21 +524,172 @@ int main(int argc, char ** argv) {
                 } else {
                     output += piece;
                 }
-
-                // Stop on closing brace (end of JSON/structured output)
                 if (piece.find('}') != std::string::npos) {
                     if (p.streaming) printf("\n");
-                    break;
+                    return false;
                 }
+                return true;
+            };
 
-                if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
-                    fprintf(stderr, "Error: llama_decode failed during generation\n");
-                    llama_sampler_free(smpl);
-                    goto cleanup;
-                }
+            if (mtp_attached && spec) {
+                // ---- MTP path ----
+                // begin() lets the impl reset per-seq state for this generation.
+                common_speculative_begin(spec.get(), /*seq_id=*/0, tokens);
 
+                // Sample first token from prefill's last logit.
+                llama_token id_last = llama_sampler_sample(smpl, ctx, -1);
+                if (!emit_one(id_last)) goto mtp_done;
                 n_gen++;
-                n_past++;
+
+                {
+                    // Allocate verify batch: [id_last, drafts...]. K = block_size-1.
+                    const int K_max = std::max(1, p.draft_block_size - 1);
+                    llama_batch vbatch = llama_batch_init(/*n_tokens=*/ K_max + 1,
+                                                          /*embd=*/ 0,
+                                                          /*n_seq_max=*/ 1);
+                    std::vector<llama_token> drafts;
+                    drafts.reserve(K_max);
+
+                    auto set_row = [&](int i, llama_token tok, llama_pos pos) {
+                        vbatch.token   [i] = tok;
+                        vbatch.pos     [i] = pos;
+                        vbatch.n_seq_id[i] = 1;
+                        vbatch.seq_id  [i][0] = 0;
+                        vbatch.logits  [i] = 1;
+                    };
+
+                    while (n_gen < max_gen) {
+                        // 1) Ask the spec impl to draft K tokens conditioned on
+                        //    (id_last, n_past). Drafts predict positions n_past+1..n_past+K.
+                        drafts.clear();
+                        auto & dp = common_speculative_get_draft_params(spec.get(), 0);
+                        dp.drafting = true;
+                        dp.n_max    = K_max;
+                        dp.n_past   = n_past;
+                        dp.id_last  = id_last;
+                        dp.prompt   = &tokens;
+                        dp.result   = &drafts;
+                        common_speculative_draft(spec.get());
+                        const int K = (int) drafts.size();
+
+                        // 2) Build verify batch.
+                        set_row(0, id_last, n_past);
+                        for (int i = 0; i < K; ++i) {
+                            set_row(i + 1, drafts[i], n_past + 1 + i);
+                        }
+                        vbatch.n_tokens = K + 1;
+
+                        // 3) Decode verify batch.
+                        if (llama_decode(ctx, vbatch) != 0) {
+                            fprintf(stderr, "Error: llama_decode (MTP verify) failed\n");
+                            llama_batch_free(vbatch);
+                            llama_sampler_free(smpl);
+                            goto cleanup;
+                        }
+
+                        // 4) Hand the batch to the spec impl (captures pre-norm
+                        //    hidden state for the upcoming accept()).
+                        if (!common_speculative_process(spec.get(), vbatch)) {
+                            fprintf(stderr, "Error: common_speculative_process failed\n");
+                            llama_batch_free(vbatch);
+                            llama_sampler_free(smpl);
+                            goto cleanup;
+                        }
+
+                        // 5) Verify: sample at each row, count matching drafts.
+                        int n_accepted = 0;
+                        llama_token new_id_last = id_last;
+                        for (int i = 0; i <= K; ++i) {
+                            llama_token s = llama_sampler_sample(smpl, ctx, i);
+                            new_id_last = s;
+                            if (i < K && s == drafts[i]) {
+                                n_accepted++;
+                                continue;
+                            }
+                            break;
+                        }
+
+                        // 6) Rewind KV to drop rejected drafts.
+                        //    After verify batch decode, KV covers up to n_past+K.
+                        //    We accepted n_accepted drafts → keep through n_past+n_accepted.
+                        //    new_id_last is NOT in KV (it goes as row 0 of next round).
+                        if (n_accepted < K) {
+                            llama_memory_seq_rm(llama_get_memory(ctx),
+                                                /*seq=*/0,
+                                                /*p0=*/ n_past + 1 + n_accepted,
+                                                /*p1=*/ -1);
+                        }
+
+                        // 7) Tell the impl how many were accepted (rolls pending_h).
+                        common_speculative_accept(spec.get(), /*seq=*/0, (uint16_t) n_accepted);
+
+                        // 8) Emit accepted drafts (in order), then the rejection
+                        //    / bonus sample. Stop early on EOG.
+                        bool keep_going = true;
+                        for (int i = 0; i < n_accepted && keep_going; ++i) {
+                            if (!emit_one(drafts[i])) { keep_going = false; }
+                            n_gen++;
+                        }
+                        if (keep_going) {
+                            if (!emit_one(new_id_last)) { keep_going = false; }
+                            n_gen++;
+                        }
+
+                        n_draft_rounds   += 1;
+                        n_draft_proposed += K;
+                        n_draft_accepted += n_accepted;
+
+                        if (!keep_going) break;
+
+                        n_past += n_accepted + 1;
+                        id_last = new_id_last;
+                    }
+
+                    llama_batch_free(vbatch);
+                }
+mtp_done:;
+            } else {
+                // ---- Original non-MTP loop (unchanged) ----
+                while (n_gen < max_gen) {
+                    llama_token id = llama_sampler_sample(smpl, ctx, -1);
+
+                    if (llama_vocab_is_eog(vocab, id)) {
+                        if (p.streaming) printf("\n");
+                        break;
+                    }
+
+                    if (t_first_tok == 0) {
+                        t_first_tok = timer_us();
+                    }
+                    n_emit++;
+
+                    std::string piece = token_to_piece(ctx, id);
+                    all_ids.push_back(id);
+                    if (piece.empty()) {
+                        ++empty_pieces;
+                        if (empty_ids.size() < 16) empty_ids.push_back(id);
+                    }
+                    if (p.streaming) {
+                        printf("%s", piece.c_str());
+                        fflush(stdout);
+                    } else {
+                        output += piece;
+                    }
+
+                    if (piece.find('}') != std::string::npos) {
+                        if (p.streaming) printf("\n");
+                        break;
+                    }
+
+                    if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
+                        fprintf(stderr, "Error: llama_decode failed during generation\n");
+                        llama_sampler_free(smpl);
+                        goto cleanup;
+                    }
+
+                    n_gen++;
+                    n_past++;
+                }
             }
 
             // Drain outstanding decode work before stopping the decode timer.
@@ -484,6 +703,9 @@ int main(int argc, char ** argv) {
             total_tg_us += tg_us;
             total_tg_core_us += tg_core_us;
             total_ttft_us += ttft_us;
+            total_draft_rounds   += n_draft_rounds;
+            total_draft_proposed += n_draft_proposed;
+            total_draft_accepted += n_draft_accepted;
 
             llama_sampler_free(smpl);
 
@@ -576,6 +798,11 @@ int main(int argc, char ** argv) {
         if (total_tokens_emitted > 0 && total_tg_core_us > 0) {
             printf("  avg t/s (no-TTFT): %.2f\n", total_tokens_emitted / (total_tg_core_us / 1000000.0));
             printf("  avg TTFT:          %.1fms\n", (double) total_ttft_us / (double) pf.prompts.size() / 1000.0);
+        }
+        if (mtp_attached && total_draft_proposed > 0) {
+            const double acc_rate = (double) total_draft_accepted / (double) total_draft_proposed * 100.0;
+            printf("  MTP drafts: %d accepted / %d proposed (%.1f%%), rounds=%d, block_size=%d\n",
+                   total_draft_accepted, total_draft_proposed, acc_rate, total_draft_rounds, p.draft_block_size);
         }
         printf("  total time: %.2fs\n", t_total / 1000000.0);
     }
