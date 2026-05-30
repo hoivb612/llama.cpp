@@ -747,6 +747,219 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// Gemma-4 MTP: drafts run inside ctx_tgt using the embedded mtp_assistant model,
+// driven by the asynchronous llama_decode_mtp_* C API (slice 4). No separate
+// ctx_dft. Single-context overlap is achieved by submitting the draft request in
+// accept() (right after target verify) and waiting in draft() (right before the
+// next target decode); whatever work the caller does between those calls (e.g.
+// sampling, server bookkeeping) overlaps with the worker thread encoding the
+// MTP graph.
+struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl {
+    common_params_speculative_draft params;
+
+    int32_t  n_embd_bb = 0; // backbone (target) hidden width for MTP h_prev
+    uint32_t n_steps   = 2; // number of greedy MTP steps per draft round
+
+    // Per-row pre-norm hidden state captured from the most recent target verify
+    // batch. Row k corresponds to the k-th token of that seq in the batch (sampled
+    // = row 0, accepted draft i = row i+1 in the conventional layout). accept()
+    // picks the winning row as h_prev for the upcoming draft round.
+    std::vector<std::vector<float>> verify_h;
+    std::vector<int32_t>            verify_h_rows;
+
+    // h_prev for the next draft round (n_embd_bb floats per seq).
+    std::vector<std::vector<float>> pending_h;
+
+    // True iff async draft is in-flight for that seq (only one in-flight per
+    // context — see llama_decode_mtp_async contract). We currently support
+    // n_seq == 1; for n_seq > 1 we fall back to sync per-seq dispatch in draft().
+    std::vector<bool> draft_pending;
+    // Drafts retrieved by the most recent wait; consumed by draft().
+    std::vector<std::vector<llama_token>> draft_ready;
+
+    common_speculative_impl_draft_gemma4_mtp(const common_params_speculative & p, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+        , params(p.draft)
+    {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        GGML_ASSERT(ctx_tgt && "gemma4 MTP requires ctx_tgt to be set");
+        const auto * model_tgt = llama_get_model(ctx_tgt);
+        GGML_ASSERT(llama_model_has_mtp_assistant(model_tgt) &&
+                    "gemma4 MTP requires the target model to carry an mtp_assistant (use --mtp-head)");
+
+        n_embd_bb = (int32_t) llama_model_mtp_n_embd_backbone(model_tgt);
+        GGML_ASSERT(n_embd_bb > 0);
+
+        // n_steps = number of MTP greedy steps. params.n_max is the upper bound on
+        // draft tokens accepted by the verify loop. We do not chain past n_max.
+        if (this->params.n_max > 0) {
+            n_steps = (uint32_t) this->params.n_max;
+        }
+
+        LOG_INF("%s: adding speculative implementation 'draft-mtp' (gemma4 assistant)\n", __func__);
+        LOG_INF("%s: - n_max=%d, n_min=%d, n_steps=%u, n_embd_bb=%d\n",
+                __func__, this->params.n_max, this->params.n_min, n_steps, n_embd_bb);
+
+        // The MTP graph reads the pre-norm hidden state of the *target* via the
+        // ubatch embd field. We still extract pre-norm rows in process() to pick
+        // the correct h_prev based on accept() — same pattern as NEXTN.
+        llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
+
+        pending_h.assign(n_seq, std::vector<float>(n_embd_bb, 0.0f));
+        verify_h.assign(n_seq, {});
+        verify_h_rows.assign(n_seq, 0);
+        draft_pending.assign(n_seq, false);
+        draft_ready.assign(n_seq, {});
+    }
+
+    ~common_speculative_impl_draft_gemma4_mtp() override {
+        // Drain any in-flight async MTP request before tearing down.
+        auto * ctx_tgt = params.ctx_tgt;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (draft_pending[s]) {
+                std::vector<llama_token> discard(n_steps);
+                (void) llama_decode_mtp_wait(ctx_tgt, discard.data(), nullptr);
+                draft_pending[s] = false;
+            }
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        // Drain stale in-flight draft from a prior generation on this seq.
+        if (draft_pending[seq_id]) {
+            std::vector<llama_token> discard(n_steps);
+            (void) llama_decode_mtp_wait(params.ctx_tgt, discard.data(), nullptr);
+            draft_pending[seq_id] = false;
+        }
+        draft_ready[seq_id].clear();
+    }
+
+    // Capture the per-row pre-norm hidden state for each seq's contribution to
+    // batch_in. accept() picks the winning row as h_prev for the next draft.
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        auto * ctx_tgt = params.ctx_tgt;
+        const size_t row_bytes = (size_t) n_embd_bb * sizeof(float);
+
+        std::vector<int32_t> beg(n_seq, -1), end(n_seq, -1);
+        for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
+            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            const llama_seq_id s = batch_in.seq_id[k][0];
+            if (s < 0 || s >= (llama_seq_id) n_seq) {
+                continue;
+            }
+            end[s] = k;
+            if (beg[s] < 0) {
+                beg[s] = k;
+            }
+        }
+
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (beg[s] < 0) {
+                continue;
+            }
+            const int32_t n_rows = end[s] - beg[s] + 1;
+            verify_h_rows[s] = n_rows;
+            verify_h[s].resize((size_t) n_rows * n_embd_bb);
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, beg[s] + i);
+                if (!h) {
+                    LOG_WRN("%s: missing pre-norm embedding at batch idx %d (seq %d)\n",
+                            __func__, beg[s] + i, s);
+                    verify_h_rows[s] = 0;
+                    return true;
+                }
+                std::memcpy(verify_h[s].data() + (size_t) i * n_embd_bb, h, row_bytes);
+            }
+
+            // Default pending_h to the last verify row; accept() may roll it back.
+            std::memcpy(pending_h[s].data(),
+                        verify_h[s].data() + (size_t) (n_rows - 1) * n_embd_bb,
+                        row_bytes);
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto * ctx_tgt = params.ctx_tgt;
+
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            auto & dp = dparams[s];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            // If accept() already submitted async draft for this seq, wait for it.
+            // Otherwise dispatch synchronously now (first draft after begin, or any
+            // call where accept did not run / chose not to submit).
+            std::vector<llama_token> tokens(n_steps, 0);
+            int32_t rc = 0;
+            if (draft_pending[s]) {
+                rc = llama_decode_mtp_wait(ctx_tgt, tokens.data(), /*out_h_prev_last*/ nullptr);
+                draft_pending[s] = false;
+            } else {
+                rc = llama_decode_mtp_async(ctx_tgt, s, dp.n_past, dp.id_last,
+                                            pending_h[s].data(), (int32_t) n_steps);
+                if (rc == 0) {
+                    rc = llama_decode_mtp_wait(ctx_tgt, tokens.data(), nullptr);
+                }
+            }
+            if (rc != 0) {
+                LOG_WRN("%s: MTP draft failed for seq %d (rc=%d)\n", __func__, s, rc);
+                continue;
+            }
+
+            const int32_t n_max = params.n_max > 0
+                ? std::min<int32_t>((int32_t) n_steps, params.n_max)
+                : (int32_t) n_steps;
+            for (int32_t k = 0; k < n_max; ++k) {
+                dp.result->push_back(tokens[k]);
+            }
+            if ((int32_t) dp.result->size() < params.n_min) {
+                dp.result->clear();
+            }
+        }
+    }
+
+    // After verify, pick pending_h from verify_h based on n_accepted, then submit
+    // the next async MTP draft so it overlaps caller-side post-verify work.
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const int32_t n_rows = verify_h_rows[seq_id];
+        if (n_rows <= 0) {
+            return;
+        }
+        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const size_t row_bytes = (size_t) n_embd_bb * sizeof(float);
+        std::memcpy(pending_h[seq_id].data(),
+                    verify_h[seq_id].data() + (size_t) i_h * n_embd_bb,
+                    row_bytes);
+
+        // We do not have id_last/n_past here, so we cannot pre-submit the async
+        // draft from accept(). The submit+wait happens in draft() instead. A
+        // future optimization could plumb the accepted token + position into
+        // accept() to enable true post-verify overlap.
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+
+    bool need_embd_pre_norm() const override {
+        return true;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -1299,7 +1512,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
-        bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        // MTP type covers two backends:
+        //   - NEXTN (Qwen3 / DeepSeek / GLM): requires a separate ctx_dft draft context.
+        //   - Gemma-4 assistant: assistant is embedded in ctx_tgt via mtp_assistant.
+        // Either signal enables the MTP dispatcher; the actual impl is selected below.
+        const bool has_gemma4_mtp = params.draft.ctx_tgt != nullptr
+            && llama_model_has_mtp_assistant(llama_get_model(params.draft.ctx_tgt));
+        bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP))
+            && (params.draft.ctx_dft != nullptr || has_gemma4_mtp);
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -1365,7 +1585,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                // NEXTN (separate ctx_dft) vs Gemma-4 (mtp_assistant on target).
+                const bool gemma4 = config.params.draft.ctx_tgt != nullptr
+                    && llama_model_has_mtp_assistant(llama_get_model(config.params.draft.ctx_tgt));
+                if (gemma4 && config.params.draft.ctx_dft == nullptr) {
+                    impls.push_back(std::make_unique<common_speculative_impl_draft_gemma4_mtp>(config.params, n_seq));
+                } else {
+                    impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                }
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
