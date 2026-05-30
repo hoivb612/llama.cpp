@@ -739,7 +739,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool need_embd() const override {
-        return false;
+        // Gemma-4 MTP needs target output embeddings for bootstrap and per-round h_idx rows.
+        return true;
     }
 
     bool need_embd_pre_norm() const override {
@@ -760,15 +761,14 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
     int32_t  n_embd_bb = 0; // backbone (target) hidden width for MTP h_prev
     uint32_t n_steps   = 2; // number of greedy MTP steps per draft round
 
-    // Per-row pre-norm hidden state captured from the most recent target verify
-    // batch. Row k corresponds to the k-th token of that seq in the batch (sampled
-    // = row 0, accepted draft i = row i+1 in the conventional layout). accept()
-    // picks the winning row as h_prev for the upcoming draft round.
-    std::vector<std::vector<float>> verify_h;
+    // Row span (in the current verify batch output order) for each seq.
+    // accept() maps n_accepted -> row index and fetches the row embedding on demand.
+    std::vector<int32_t>            verify_h_beg;
     std::vector<int32_t>            verify_h_rows;
 
-    // h_prev for the next draft round (n_embd_bb floats per seq).
-    std::vector<std::vector<float>> pending_h;
+    // Output row index in ctx_tgt's most recent decode used to fetch h_prev.
+    // -1 means "last output row" (bootstrap after prefill), matching turbo behavior.
+    std::vector<int32_t> h_idx;
 
     // True iff async draft is in-flight for that seq (only one in-flight per
     // context — see llama_decode_mtp_async contract). We currently support
@@ -803,13 +803,14 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
                 __func__, this->params.draft_block_size, this->params.n_max,
                 this->params.n_min, n_steps, n_embd_bb);
 
-        // The MTP graph reads the pre-norm hidden state of the *target* via the
-        // ubatch embd field. We still extract pre-norm rows in process() to pick
-        // the correct h_prev based on accept() — same pattern as NEXTN.
-        llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
+        // Gemma 4 MTP head was trained on POST-final-norm hidden states
+        // (the same that feeds the LM head). Turbo's reference uses
+        // llama_set_embeddings + llama_get_embeddings_ith for this reason —
+        // pre-norm hiddens give garbage drafts (~5% accept vs ~60%).
+        llama_set_embeddings(ctx_tgt, true);
 
-        pending_h.assign(n_seq, std::vector<float>(n_embd_bb, 0.0f));
-        verify_h.assign(n_seq, {});
+        h_idx.assign(n_seq, -1);
+        verify_h_beg.assign(n_seq, -1);
         verify_h_rows.assign(n_seq, 0);
         draft_pending.assign(n_seq, false);
         draft_ready.assign(n_seq, {});
@@ -837,18 +838,15 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
             (void) llama_decode_mtp_wait(params.ctx_tgt, discard.data(), nullptr);
             draft_pending[seq_id] = false;
         }
+        h_idx[seq_id] = -1;
         draft_ready[seq_id].clear();
     }
 
-    // Capture the per-row pre-norm hidden state for each seq's contribution to
-    // batch_in. accept() picks the winning row as h_prev for the next draft.
+    // Capture per-seq row span for the latest verify batch.
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
-
-        auto * ctx_tgt = params.ctx_tgt;
-        const size_t row_bytes = (size_t) n_embd_bb * sizeof(float);
 
         std::vector<int32_t> beg(n_seq, -1), end(n_seq, -1);
         for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
@@ -865,27 +863,12 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
 
         for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
             if (beg[s] < 0) {
+                verify_h_beg[s] = -1;
+                verify_h_rows[s] = 0;
                 continue;
             }
-            const int32_t n_rows = end[s] - beg[s] + 1;
-            verify_h_rows[s] = n_rows;
-            verify_h[s].resize((size_t) n_rows * n_embd_bb);
-
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, beg[s] + i);
-                if (!h) {
-                    LOG_WRN("%s: missing pre-norm embedding at batch idx %d (seq %d)\n",
-                            __func__, beg[s] + i, s);
-                    verify_h_rows[s] = 0;
-                    return true;
-                }
-                std::memcpy(verify_h[s].data() + (size_t) i * n_embd_bb, h, row_bytes);
-            }
-
-            // Default pending_h to the last verify row; accept() may roll it back.
-            std::memcpy(pending_h[s].data(),
-                        verify_h[s].data() + (size_t) (n_rows - 1) * n_embd_bb,
-                        row_bytes);
+            verify_h_beg[s]  = beg[s];
+            verify_h_rows[s] = end[s] - beg[s] + 1;
         }
 
         return true;
@@ -893,6 +876,8 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto * ctx_tgt = params.ctx_tgt;
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        llama_set_embeddings(ctx_tgt, true);
 
         for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
             auto & dp = dparams[s];
@@ -900,17 +885,32 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
                 continue;
             }
 
-            // If accept() already submitted async draft for this seq, wait for it.
-            // Otherwise dispatch synchronously now (first draft after begin, or any
-            // call where accept did not run / chose not to submit).
+            // attn_pos: turbo queries `llama_memory_seq_pos_max(seq_id)` directly,
+            // which equals the position of the last populated KV cell. With our
+            // invariant (id_last NOT in KV at top of round), this matches
+            // dp.n_past - 1.
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+            llama_pos attn_pos = mem ? llama_memory_seq_pos_max(mem, s) : (llama_pos) 0;
+            if (attn_pos < 0) {
+                attn_pos = 0;
+            }
+            std::vector<float> h_prev((size_t) n_embd_bb, 0.0f);
+            if (const float * h_tgt = llama_get_embeddings_ith(ctx_tgt, h_idx[s])) {
+                const int32_t n_out_tgt = llama_model_n_embd_out(model_tgt);
+                const int32_t n_copy = std::min(n_embd_bb, n_out_tgt);
+                std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
+            } else {
+                LOG_WRN("%s: missing embedding at output row %d (seq %d); using zeros\n",
+                        __func__, h_idx[s], s);
+            }
             std::vector<llama_token> tokens(n_steps, 0);
             int32_t rc = 0;
             if (draft_pending[s]) {
                 rc = llama_decode_mtp_wait(ctx_tgt, tokens.data(), /*out_h_prev_last*/ nullptr);
                 draft_pending[s] = false;
             } else {
-                rc = llama_decode_mtp_async(ctx_tgt, s, dp.n_past, dp.id_last,
-                                            pending_h[s].data(), (int32_t) n_steps);
+                rc = llama_decode_mtp_async(ctx_tgt, s, attn_pos, dp.id_last,
+                                            h_prev.data(), (int32_t) n_steps);
                 if (rc == 0) {
                     rc = llama_decode_mtp_wait(ctx_tgt, tokens.data(), nullptr);
                 }
@@ -938,28 +938,24 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+        auto * ctx_tgt = params.ctx_tgt;
+        const int32_t i_beg = verify_h_beg[seq_id];
         const int32_t n_rows = verify_h_rows[seq_id];
-        if (n_rows <= 0) {
+        if (i_beg < 0 || n_rows <= 0) {
             return;
         }
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        const size_t row_bytes = (size_t) n_embd_bb * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) i_h * n_embd_bb,
-                    row_bytes);
-
-        // We do not have id_last/n_past here, so we cannot pre-submit the async
-        // draft from accept(). The submit+wait happens in draft() instead. A
-        // future optimization could plumb the accepted token + position into
-        // accept() to enable true post-verify overlap.
+        h_idx[seq_id] = i_beg + i_h;
+        GGML_UNUSED(ctx_tgt);
     }
 
     bool need_embd() const override {
-        return false;
+        // Gemma-4 MTP needs target output embeddings for bootstrap and per-round h_idx rows.
+        return true;
     }
 
     bool need_embd_pre_norm() const override {
-        return true;
+        return false;
     }
 };
 

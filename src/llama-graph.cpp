@@ -102,14 +102,28 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-void llm_graph_input_mtp::set_input(const llama_ubatch * /*ubatch*/) {
-    // Inputs are filled by the MTP runtime directly via ggml_backend_tensor_set
-    // (see llama_context::process_ubatch_mtp). Nothing to do here.
+void llm_graph_input_mtp::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->n_tokens == 1);
+    GGML_ASSERT(ubatch->token);
+    GGML_ASSERT(ubatch->embd);
+
+    if (inp_last_token) {
+        ggml_backend_tensor_set(inp_last_token, ubatch->token, 0, sizeof(llama_token));
+    }
+
+    if (inp_h_prev) {
+        const int64_t n_embd = inp_h_prev->ne[0];
+        ggml_backend_tensor_set(inp_h_prev, ubatch->embd, 0, n_embd*ggml_element_size(inp_h_prev));
+    }
 }
 
-bool llm_graph_input_mtp::can_reuse(const llm_graph_params & /*params*/) {
-    // Topology of the MTP graph is fixed once the assistant model is loaded.
-    return inp_last_token != nullptr && inp_h_prev != nullptr;
+bool llm_graph_input_mtp::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= inp_last_token && inp_last_token->ne[0] == 1;
+    res &= inp_h_prev && inp_h_prev->ne[1] == 1;
+
+    return res;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {

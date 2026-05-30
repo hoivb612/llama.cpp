@@ -447,6 +447,9 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> tokens = tokenize(ctx, full_prompt, false, true);
 
         // --- Prompt eval (prefill) ---
+        if (spec) {
+            llama_set_embeddings(ctx, common_speculative_need_embd(spec.get()));
+        }
         int64_t t1 = timer_us();
         for (int i = 0; i < (int)tokens.size(); i += p.n_batch) {
             int n_eval = std::min((int)tokens.size() - i, p.n_batch);
@@ -531,13 +534,31 @@ int main(int argc, char ** argv) {
                 return true;
             };
 
+            // Diagnostic: MTP drafts are produced greedily, so verifying with a
+            // stochastic sampler (top_k/top_p/temp/dist) produces near-zero accept
+            // by construction. For pipeline validation, the MTP branch uses a
+            // greedy sampler instead. Proper rejection sampling is a future fix.
+            llama_sampler * smpl_mtp = nullptr;
             if (mtp_attached && spec) {
-                // ---- MTP path ----
+                auto gparams = llama_sampler_chain_default_params();
+                gparams.no_perf = false;
+                smpl_mtp = llama_sampler_chain_init(gparams);
+                llama_sampler_chain_add(smpl_mtp, llama_sampler_init_greedy());
+            }
+            const int mtp_trace_rounds = [&]() -> int {
+                const char * v = std::getenv("MINSLM_MTP_TRACE_ROUNDS");
+                if (!v || !*v) return 0;
+                int n = std::atoi(v);
+                return n > 0 ? n : 0;
+            }();
+
+            if (mtp_attached && spec) {
+                // ---- MTP path (greedy verify) ----
                 // begin() lets the impl reset per-seq state for this generation.
                 common_speculative_begin(spec.get(), /*seq_id=*/0, tokens);
 
                 // Sample first token from prefill's last logit.
-                llama_token id_last = llama_sampler_sample(smpl, ctx, -1);
+                llama_token id_last = llama_sampler_sample(smpl_mtp, ctx, -1);
                 if (!emit_one(id_last)) goto mtp_done;
                 n_gen++;
 
@@ -571,6 +592,7 @@ int main(int argc, char ** argv) {
                         dp.result   = &drafts;
                         common_speculative_draft(spec.get());
                         const int K = (int) drafts.size();
+                        const bool trace_round = mtp_trace_rounds > 0 && n_draft_rounds < mtp_trace_rounds;
 
                         // 2) Build verify batch.
                         set_row(0, id_last, n_past);
@@ -599,8 +621,15 @@ int main(int argc, char ** argv) {
                         // 5) Verify: sample at each row, count matching drafts.
                         int n_accepted = 0;
                         llama_token new_id_last = id_last;
+                        std::vector<llama_token> sampled;
+                        if (trace_round) {
+                            sampled.reserve((size_t) K + 1);
+                        }
                         for (int i = 0; i <= K; ++i) {
-                            llama_token s = llama_sampler_sample(smpl, ctx, i);
+                            llama_token s = llama_sampler_sample(smpl_mtp, ctx, i);
+                            if (trace_round) {
+                                sampled.push_back(s);
+                            }
                             new_id_last = s;
                             if (i < K && s == drafts[i]) {
                                 n_accepted++;
@@ -608,8 +637,24 @@ int main(int argc, char ** argv) {
                             }
                             break;
                         }
+                        if (trace_round) {
+                            printf("mtp-round %d n_past=%d id_last=%d drafts=[", n_draft_rounds, n_past, (int) id_last);
+                            for (int i = 0; i < K; ++i) {
+                                if (i) printf(" ");
+                                printf("%d", (int) drafts[i]);
+                            }
+                            printf("] sampled=[");
+                            for (size_t i = 0; i < sampled.size(); ++i) {
+                                if (i) printf(" ");
+                                printf("%d", (int) sampled[i]);
+                            }
+                            printf("] accepted=%d new_id_last=%d\n", n_accepted, (int) new_id_last);
+                        }
 
-                        // 6) Rewind KV to drop rejected drafts.
+                        // 6) Tell the impl how many were accepted (rolls pending_h).
+                        common_speculative_accept(spec.get(), /*seq=*/0, (uint16_t) n_accepted);
+
+                        // 7) Rewind KV to drop rejected drafts.
                         //    After verify batch decode, KV covers up to n_past+K.
                         //    We accepted n_accepted drafts → keep through n_past+n_accepted.
                         //    new_id_last is NOT in KV (it goes as row 0 of next round).
@@ -619,9 +664,6 @@ int main(int argc, char ** argv) {
                                                 /*p0=*/ n_past + 1 + n_accepted,
                                                 /*p1=*/ -1);
                         }
-
-                        // 7) Tell the impl how many were accepted (rolls pending_h).
-                        common_speculative_accept(spec.get(), /*seq=*/0, (uint16_t) n_accepted);
 
                         // 8) Emit accepted drafts (in order), then the rejection
                         //    / bonus sample. Stop early on EOG.
@@ -708,6 +750,7 @@ mtp_done:;
             total_draft_accepted += n_draft_accepted;
 
             llama_sampler_free(smpl);
+            if (smpl_mtp) llama_sampler_free(smpl_mtp);
 
             if (!p.streaming) {
                 if (!output.empty()) {
