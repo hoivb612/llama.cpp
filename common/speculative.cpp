@@ -790,15 +790,18 @@ struct common_speculative_impl_draft_gemma4_mtp : public common_speculative_impl
         n_embd_bb = (int32_t) llama_model_mtp_n_embd_backbone(model_tgt);
         GGML_ASSERT(n_embd_bb > 0);
 
-        // n_steps = number of MTP greedy steps. params.n_max is the upper bound on
-        // draft tokens accepted by the verify loop. We do not chain past n_max.
-        if (this->params.n_max > 0) {
+        // n_steps = MTP greedy steps. --draft-block-size B (>=2) sets n_steps = B-1.
+        // Otherwise we fall back to params.n_max as an upper bound.
+        if (this->params.draft_block_size > 1) {
+            n_steps = (uint32_t) (this->params.draft_block_size - 1);
+        } else if (this->params.n_max > 0) {
             n_steps = (uint32_t) this->params.n_max;
         }
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp' (gemma4 assistant)\n", __func__);
-        LOG_INF("%s: - n_max=%d, n_min=%d, n_steps=%u, n_embd_bb=%d\n",
-                __func__, this->params.n_max, this->params.n_min, n_steps, n_embd_bb);
+        LOG_INF("%s: - draft_block_size=%d, n_max=%d, n_min=%d, n_steps=%u, n_embd_bb=%d\n",
+                __func__, this->params.draft_block_size, this->params.n_max,
+                this->params.n_min, n_steps, n_embd_bb);
 
         // The MTP graph reads the pre-norm hidden state of the *target* via the
         // ubatch embd field. We still extract pre-norm rows in process() to pick

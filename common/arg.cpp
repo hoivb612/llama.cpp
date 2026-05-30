@@ -3627,6 +3627,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
+        {"--mtp-head"}, "FNAME",
+        "alias for Gemma-4 MTP: path to gemma4_assistant GGUF (loaded into the target; use with --spec-type draft-mtp)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mparams.path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_HEAD"));
+    add_opt(common_arg(
+        {"--draft-block-size"}, "N",
+        string_format("MTP draft block size B (drafts B-1 tokens per round; default: %d, range: [2, 32])", params.speculative.draft.draft_block_size),
+        [](common_params & params, int value) {
+            if (value < 2 || value > 32) {
+                throw std::invalid_argument("draft block size must be between 2 and 32");
+            }
+            params.speculative.draft.draft_block_size = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_BLOCK_SIZE"));
+    add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),

@@ -305,6 +305,8 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    int32_t draft_block_size = 3; // MTP draft block size B: drafts B-1 tokens per round
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
