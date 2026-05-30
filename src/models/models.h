@@ -806,6 +806,19 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// Single-step MTP graph: takes the last verified target token + previous hidden,
+// runs the assistant transformer with cross-attention reading from the target's
+// KV cache, and emits logits + on-device argmax for one drafted token.
+struct llm_build_gemma4_mtp : public llm_graph_context {
+    const llama_model & target;
+    const llama_model & mtp;
+
+    llm_build_gemma4_mtp(
+            const llama_model & target_model,
+            const llama_model & mtp_model,
+            const llm_graph_params & params);
+};
+
 
 struct llama_model_gemma_embedding : public llama_model_base {
     llama_model_gemma_embedding(const struct llama_model_params & params) : llama_model_base(params) {}

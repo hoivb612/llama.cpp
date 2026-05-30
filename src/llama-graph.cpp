@@ -102,6 +102,16 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp::set_input(const llama_ubatch * /*ubatch*/) {
+    // Inputs are filled by the MTP runtime directly via ggml_backend_tensor_set
+    // (see llama_context::process_ubatch_mtp). Nothing to do here.
+}
+
+bool llm_graph_input_mtp::can_reuse(const llm_graph_params & /*params*/) {
+    // Topology of the MTP graph is fixed once the assistant model is loaded.
+    return inp_last_token != nullptr && inp_h_prev != nullptr;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -500,29 +510,44 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
-    mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    // MTP / split graphs may build this input without scheduling the K/V idx tensors
+    // (cross-attention read-only paths don't write to the cache). Skip set when the
+    // tensor was not actually allocated by ggml-alloc.
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
-    mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
-    mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-    mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
+    }
+    if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
+    }
 
-    mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+    if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
+        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+    }
 
-    if (self_k_rot) {
+    if (self_k_rot && self_k_rot->buffer) {
         mctx->get_base()->set_input_k_rot(self_k_rot);
     }
 
-    if (self_v_rot) {
+    if (self_v_rot && self_v_rot->buffer) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
     }
 
-    if (self_k_rot_swa) {
+    if (self_k_rot_swa && self_k_rot_swa->buffer) {
         mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
     }
 
-    if (self_v_rot_swa) {
+    if (self_v_rot_swa && self_v_rot_swa->buffer) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
 }
@@ -810,6 +835,8 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_pre_norm  = nullptr;
+    t_argmax      = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2419,6 +2446,72 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo_b) {
         //cb(cur, "kqv_wo", il);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_mtp(
+        llm_graph_input_attn_kv_iswa * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * q_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il,
+            int       il_kv_tgt,
+           bool       read_swa,
+        int64_t       kv_embd_head_v,
+        int64_t       kv_n_head_v,
+           bool       use_k_as_v) const {
+    GGML_UNUSED(il);
+
+    // Apply Hadamard rotation on Q to match the K rotation that was written into
+    // the target's KV cache (if any).
+    auto * k_rot = read_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    auto * v_rot = read_swa ? inp->self_v_rot_swa : inp->self_v_rot;
+
+    if (k_rot) {
+        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_cur);
+
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur  = read_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    const auto & kq_mask = read_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il_kv_tgt);
+    ggml_tensor * v = nullptr;
+
+    if (use_k_as_v) {
+        // Read V as a view of K (same backing storage). Used only when the target
+        // wrote K and V to the same cache slot (attention_k_eq_v=True with single
+        // shared cache). The MTP Gemma path always passes use_k_as_v=false.
+        v = ggml_view_4d(ctx0, k, kv_embd_head_v, k->ne[1], k->ne[2], k->ne[3],
+                                  k->nb[1], k->nb[2], k->nb[3], 0);
+    } else {
+        v = mctx_cur->get_v(ctx0, il_kv_tgt);
+    }
+    GGML_UNUSED(kv_n_head_v);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il_kv_tgt);
+    cb(cur, "kqv_out", il_kv_tgt);
+
+    if (v_rot) {
+        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+    }
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur);
     }
 
     if (wo_b) {
