@@ -47,6 +47,9 @@ struct model_params {
     std::string reply                  = "";
     int total_llm_tokens_generated     = 0; // Total accumulated tokens generated from llm_initialize() -> llm_terminate()
     uint64_t total_tokens_gen_time     = 0; // Total accumulated tg time from llm_initialize() -> llm_terminate()
+    int total_mtp_draft_accepted       = 0; // Total accepted MTP draft tokens
+    int total_mtp_draft_proposed       = 0; // Total proposed MTP draft tokens
+    int total_mtp_draft_rounds         = 0; // Total MTP drafting rounds
     int verbose                        = 0;
     int streaming_reply                = 0; // streaming mode instead of full reply at once
     int force_cpu_mode                 = 0; // true to force CPU mode even when GPU is available
@@ -65,6 +68,10 @@ struct model_params {
     int tensor_repack_mode             = 0;     // tensor repack mode: 0 (none) | 1 (ggml) | 2 (xbox)
     bool process_affinity              = false; // true if set process affinity is enabled
     int32_t weight_budget_mb           = 0;     // layer windowing budget in MiB (0=unlimited)
+    std::string flash_attn_mode        = "auto";// flash attention mode: on|off|auto
+    std::string mtp_head_path          = "";    // optional assistant MTP head GGUF path
+    std::string spec_type              = "none";// speculative mode: none|mtp
+    int32_t draft_block_size           = 3;     // MTP verify block size (drafts block_size-1 tokens)
 
     // Multi-turn fields
     std::string turn_template          = "";    // template for subsequent user turns (e.g. "<|user|>\n{message}<|end|>\n<|assistant|>\n")

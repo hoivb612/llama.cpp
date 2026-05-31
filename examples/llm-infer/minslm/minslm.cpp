@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
     int64_t t0 = timer_us(); 
 
     if (argc == 1 || argv[1][0] == '-') {
-        printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [omp] [paffin] [stream] [verbose] [repack-xbox | repack-ggml] [--weight-budget MB]\n", argv[0]);
+        printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [omp] [paffin] [stream] [verbose] [repack-xbox | repack-ggml] [-fa on|off|auto] [--weight-budget MB] [--mtp-head PATH] [--spec-type none|mtp|draft-mtp] [--draft-block-size N]\n", argv[0]);
         return 1;
     }
 
@@ -308,8 +308,26 @@ int main(int argc, char** argv) {
             else if (!strcmp(argv[5], "row"))   params.split_mode = 2;
             argv += 1; argc -= 1;
 
+        } else if (!strcmp(argv[4], "-fa") && argc >= 6) {
+            params.flash_attn_mode = argv[5];
+            argv += 1; argc -= 1;
+
         } else if (!strcmp(argv[4], "--weight-budget") && argc >= 6) {
             params.weight_budget_mb = atoi(argv[5]);
+            argv += 1; argc -= 1;
+        } else if (!strcmp(argv[4], "--mtp-head") && argc >= 6) {
+            params.mtp_head_path = argv[5];
+            argv += 1; argc -= 1;
+        } else if (!strcmp(argv[4], "--spec-type") && argc >= 6) {
+            params.spec_type = argv[5];
+            argv += 1; argc -= 1;
+        } else if (!strcmp(argv[4], "--draft-block-size") && argc >= 6) {
+            int b = atoi(argv[5]);
+            if (b < 2 || b > 32) {
+                printf("Error: --draft-block-size must be in [2, 32], got %d\n", b);
+                return 1;
+            }
+            params.draft_block_size = b;
             argv += 1; argc -= 1;
         }
 
@@ -427,6 +445,15 @@ int main(int argc, char** argv) {
     }
 
     t0 = timer_us() - t0;
+    if (params.total_mtp_draft_proposed > 0) {
+        const double mtp_accept_rate = 100.0 * (double) params.total_mtp_draft_accepted / (double) params.total_mtp_draft_proposed;
+        printf("\nMTP drafts: %d accepted / %d proposed (%.1f%%), rounds=%d, block_size=%d\n",
+            params.total_mtp_draft_accepted,
+            params.total_mtp_draft_proposed,
+            mtp_accept_rate,
+            params.total_mtp_draft_rounds,
+            params.draft_block_size);
+    }
     printf("\n\n total elapsed time %7.2fsec\n", (double)t0 / (1000. * 1000.));
 
     llm_enable_log();

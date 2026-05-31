@@ -7,12 +7,16 @@
 
 #include "llama.h"
 #include "common.h"
+#include "speculative.h"
 #include "log.h"
 #include "ggml-backend.h"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
+
+#include <algorithm>
+#include <cctype>
 
 #include "json.hpp" // For JSON handling
 
@@ -21,6 +25,7 @@ llama_model *llm_model;
 llama_context *llm_ctx;
 std::vector<llama_token> llm_session_tokens;
 std::vector<llama_token> llm_tokens_shared;
+common_speculative_ptr llm_spec;
 
 // For embeddings
 llama_model * embed_model;
@@ -33,14 +38,54 @@ void default_log_callback(
     void * user_data) {
     GGML_UNUSED(text);
 
-    ggml_log_level llindex_log_level = (ggml_log_level)0 /* GGML_LOG_LEVEL_NONE */;
+    ggml_log_level llindex_log_level = GGML_LOG_LEVEL_NONE;
     if (user_data != nullptr) {
         llindex_log_level = *(ggml_log_level *)user_data;
     }
 
-    if (level == llindex_log_level) {
+    // Treat configured level as a threshold:
+    // ERROR -> only errors, WARN -> warnings+errors, INFO -> info+warn+error.
+    bool print = false;
+    switch (llindex_log_level) {
+        case GGML_LOG_LEVEL_ERROR:
+            print = (level == GGML_LOG_LEVEL_ERROR);
+            break;
+        case GGML_LOG_LEVEL_WARN:
+            print = (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR);
+            break;
+        case GGML_LOG_LEVEL_INFO:
+            print = (level == GGML_LOG_LEVEL_INFO || level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR);
+            break;
+        default:
+            print = false;
+            break;
+    }
+
+    if (print) {
         fputs(text, stdout);
     }
+}
+
+static std::string slm_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    return s;
+}
+
+static bool slm_parse_flash_attn_mode(const std::string & mode, llama_flash_attn_type & out) {
+    const std::string v = slm_lower(mode);
+    if (v == "on" || v == "1" || v == "true" || v == "yes" || v == "enabled") {
+        out = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        return true;
+    }
+    if (v == "off" || v == "0" || v == "false" || v == "no" || v == "disabled") {
+        out = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        return true;
+    }
+    if (v == "auto" || v.empty()) {
+        out = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        return true;
+    }
+    return false;
 }
 
 std::string pfx_file_path(
@@ -95,36 +140,36 @@ std::string slm_token_to_piece(const struct llama_context * ctx, llama_token tok
         piece.resize(-n_chars);
         int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
         GGML_ASSERT(check == -n_chars);
-    }
-    else {
+    } else {
         piece.resize(n_chars);
     }
 
     return piece;
 }
 
-void llm_log_callback(ggml_log_level level, const char * text, void * user_data) {
-    ggml_log_level llm_log_level = GGML_LOG_LEVEL_NONE;
-    if (user_data != nullptr) {
-        llm_log_level = *(ggml_log_level *)user_data;
-    }
+static ggml_log_level g_llm_log_level = GGML_LOG_LEVEL_NONE;
 
-    if (level == llm_log_level) {
-        fputs(text, stdout);
-    }
+static ggml_log_level llm_log_level_from_verbose(int verbose) {
+    // Keep llama internal logs quiet by default; avoid INFO spam in perf runs.
+    if (verbose == 2) return GGML_LOG_LEVEL_INFO;
+    (verbose >= 1 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_NONE);
+}
+
+void llm_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    default_log_callback(level, text, user_data);
 }
 
 LLM_INFER_API
 void llm_disable_log() {
-    ggml_log_level log_level = (ggml_log_level) 0;
-    llama_log_set(llm_log_callback, &log_level);
+    g_llm_log_level = GGML_LOG_LEVEL_NONE;
+    llama_log_set(llm_log_callback, &g_llm_log_level);
 
 }
 
 LLM_INFER_API
 void llm_enable_log() {
-    ggml_log_level log_level = GGML_LOG_LEVEL_INFO;
-    llama_log_set(llm_log_callback, &(log_level));
+    g_llm_log_level = GGML_LOG_LEVEL_WARN;
+    llama_log_set(llm_log_callback, &g_llm_log_level);
 }
 
 LLM_INFER_API 
@@ -168,8 +213,9 @@ bool llm_initialize(
         printf("%s: tensor_repack_mode = %d\n", __func__, params.tensor_repack_mode);
     }
 
-    // Control the default verbosity for llama.cpp
-    llama_log_set(default_log_callback, &(params.verbose));
+    // Control llama.cpp log verbosity using stable storage.
+    g_llm_log_level = llm_log_level_from_verbose(params.verbose);
+    llama_log_set(default_log_callback, &g_llm_log_level);
 
     // initialize the model
     llama_model_params model_params = llama_model_default_params();
@@ -197,7 +243,7 @@ bool llm_initialize(
             printf("%s: Running in full CPU mode\n", __func__);
         }
     } else {
-        // GPU offload is default on a Vulkan build 
+        // GPU offload is default on a Vulkan build
         model_params.n_gpu_layers = 999;
         if (params.verbose == 2) {
             printf("%s: Running in full GPU-offload mode\n", __func__);
@@ -223,7 +269,6 @@ bool llm_initialize(
         printf("%s: Running in full CPU mode\n", __func__);
     }
     model_params.n_gpu_layers = 0;
-
 #endif // GGML_USE_CUDA
 
     // GPU adapter and split mode selection
@@ -247,6 +292,10 @@ bool llm_initialize(
     llm_ctx_params.n_threads = params.n_threads;
     llm_ctx_params.n_threads_batch = params.n_threads;
     llm_ctx_params.no_perf = false;
+    if (!slm_parse_flash_attn_mode(params.flash_attn_mode, llm_ctx_params.flash_attn_type)) {
+        printf("%s: warning: invalid flash-attn mode '%s'; using auto\n", __func__, params.flash_attn_mode.c_str());
+        llm_ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
 
     llm_ctx = llama_init_from_model(llm_model, llm_ctx_params);
 
@@ -255,8 +304,59 @@ bool llm_initialize(
         return false;
     }
 
+    llm_spec.reset();
+    params.total_mtp_draft_accepted = 0;
+    params.total_mtp_draft_proposed = 0;
+    params.total_mtp_draft_rounds = 0;
+    const std::string spec_type = slm_lower(params.spec_type);
+    const bool wants_mtp = (spec_type == "mtp" || spec_type == "draft-mtp");
+
+    bool mtp_attached = false;
+    if (wants_mtp && !params.mtp_head_path.empty()) {
+        llama_model_params mp = model_params; // inherit GPU/split/mmap config
+        const int rc = llama_model_load_mtp_from_file(llm_model, params.mtp_head_path.c_str(), mp);
+        if (rc != 0 || !llama_model_has_mtp_assistant(llm_model)) {
+            printf("%s: warning: failed to load MTP head '%s' (rc=%d); continuing without MTP\n",
+                   __func__, params.mtp_head_path.c_str(), rc);
+        } else {
+            mtp_attached = true;
+            printf("%s: loaded MTP assistant head '%s' (n_embd_backbone=%u)\n",
+                   __func__, params.mtp_head_path.c_str(),
+                   (unsigned) llama_model_mtp_n_embd_backbone(llm_model));
+        }
+    } else if (wants_mtp && params.mtp_head_path.empty()) {
+        printf("%s: warning: --spec-type mtp requested but no --mtp-head provided; continuing without MTP\n", __func__);
+    }
+
+    if (wants_mtp) {
+        if (!mtp_attached) {
+            printf("%s: warning: MTP speculative decoding disabled because assistant MTP head is unavailable\n", __func__);
+        } else {
+            const int block_size = std::max(2, std::min(32, params.draft_block_size));
+            common_params_speculative spec_params;
+            spec_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            spec_params.draft.ctx_tgt = llm_ctx;
+            spec_params.draft.ctx_dft = nullptr; // assistant is attached to target model
+            spec_params.draft.n_max = block_size - 1;
+            llm_spec.reset(common_speculative_init(spec_params, /* n_seq */ 1));
+            if (!llm_spec) {
+                printf("%s: warning: failed to initialize MTP speculative path; continuing without MTP\n", __func__);
+            } else {
+                printf("%s: MTP speculative decoding active, draft_block_size=%d (drafts %d tokens/round)\n",
+                       __func__, block_size, block_size - 1);
+            }
+        }
+    } else if (spec_type != "none") {
+        printf("%s: warning: unsupported spec_type '%s'; expected none|mtp|draft-mtp. Continuing without speculative decoding\n",
+               __func__, params.spec_type.c_str());
+    }
+
     printf("\n%s: n_len = %d, n_ctx = %d\n", __func__, params.n_len, llama_n_ctx(llm_ctx));
     printf("%s: n_threads = %d, n_threads_batch = %d\n\n", __func__, llm_ctx_params.n_threads, llm_ctx_params.n_threads_batch);
+    printf("%s: flash-attn = %s%s\n\n",
+           __func__,
+           llama_flash_attn_type_name(llm_ctx_params.flash_attn_type),
+           llm_ctx_params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? " (runtime-selected)" : "");
 
     llm_tokens_shared = {};
     if (params.pfc_mode) {
@@ -418,6 +518,9 @@ bool llm_inference(
     GGML_UNUSED(t1_start );
 
     // decode the remaining prompt not covered by the shared portion
+    if (llm_spec) {
+        llama_set_embeddings(llm_ctx, common_speculative_need_embd(llm_spec.get()));
+    }
     for (int i = 0; i < (int)embd.size(); i += params.n_batch) {
         int n_eval = (int) embd.size() - i;
         if (n_eval > params.n_batch) {
@@ -434,6 +537,8 @@ bool llm_inference(
         n_past += n_eval;
     }
 
+    // Keep prompt/decode timing split accurate on async backends.
+    llama_synchronize(llm_ctx);
     int64_t t2_start = ggml_time_us();
     float t_prompt_eval_ms = (t2_start - t1_start) / 1000.0f;
     if (params.verbose == 2) {
@@ -468,8 +573,11 @@ bool llm_inference(
         }
     }
 
-    // compute max_len output
-    int max_len = std::min(params.n_len, (n_past + 128));
+    // compute max generated tokens for this call (same limit style as minslm-cli)
+    int max_gen = std::min(params.n_len - n_past, 128);
+    if (max_gen < 0) {
+        max_gen = 0;
+    }
 
     std::string slm_output;
     int n_tokens_generated = 0;
@@ -477,50 +585,193 @@ bool llm_inference(
     // sample the last token just received
     const llama_vocab * vocab = llama_model_get_vocab(llm_model);
 
-    while (n_past <= max_len) {
+    int mtp_draft_accepted = 0;
+    int mtp_draft_proposed = 0;
+    int mtp_draft_rounds = 0;
 
-        // sample the last token just received
-        llama_token new_token_id = llama_sampler_sample(smpl, llm_ctx, -1);
+    if (llm_spec) {
 
-        // check wither it is the end of text generation 
-        if (llama_vocab_is_eog(vocab, new_token_id)) {
-            if (params.streaming_reply) {
-                printf("\n");
+        auto gparams = llama_sampler_chain_default_params();
+        gparams.no_perf = false;
+        llama_sampler * smpl_mtp = llama_sampler_chain_init(gparams);
+        llama_sampler_chain_add(smpl_mtp, llama_sampler_init_greedy());
+
+        auto emit_token = [&](llama_token id) -> bool {
+            if (llama_vocab_is_eog(vocab, id)) {
+                if (params.streaming_reply) {
+                    printf("\n");
+                }
+                return false;
             }
-            break;
+
+            const std::string token_str = slm_token_to_piece(llm_ctx, id);
+            if (params.streaming_reply) {
+                printf("%s", token_str.c_str());
+            } else {
+                slm_output += token_str;
+            }
+
+            if (params.stop_char && token_str.find(params.stop_char) != std::string::npos) {
+                if (params.streaming_reply) {
+                    printf("\n");
+                }
+                return false;
+            }
+            return true;
+        };
+
+        common_speculative_begin(llm_spec.get(), /*seq_id=*/0, embd_inp);
+        llama_token id_last = llama_sampler_sample(smpl_mtp, llm_ctx, -1);
+        if (emit_token(id_last)) {
+            n_tokens_generated += 1;
+            params.total_llm_tokens_generated += 1;
+
+            const int K_max = std::max(1, std::max(2, std::min(32, params.draft_block_size)) - 1);
+            llama_batch vbatch = llama_batch_init(/*n_tokens=*/K_max + 1, /*embd=*/0, /*n_seq_max=*/1);
+            std::vector<llama_token> drafts;
+            drafts.reserve(K_max);
+
+            auto set_row = [&](int i, llama_token tok, llama_pos pos) {
+                vbatch.token[i] = tok;
+                vbatch.pos[i] = pos;
+                vbatch.n_seq_id[i] = 1;
+                vbatch.seq_id[i][0] = 0;
+                vbatch.logits[i] = 1;
+            };
+
+            while (n_tokens_generated < max_gen) {
+                drafts.clear();
+                auto & dp = common_speculative_get_draft_params(llm_spec.get(), 0);
+                dp.drafting = true;
+                dp.n_max = K_max;
+                dp.n_past = n_past;
+                dp.id_last = id_last;
+                dp.prompt = &embd_inp;
+                dp.result = &drafts;
+                common_speculative_draft(llm_spec.get());
+
+                const int K = (int) drafts.size();
+                mtp_draft_rounds += 1;
+                mtp_draft_proposed += K;
+                set_row(0, id_last, n_past);
+                for (int i = 0; i < K; ++i) {
+                    set_row(i + 1, drafts[i], n_past + 1 + i);
+                }
+                vbatch.n_tokens = K + 1;
+
+                if (llama_decode(llm_ctx, vbatch) != 0) {
+                    printf("%s : failed MTP verify decode\n", __func__);
+                    llama_batch_free(vbatch);
+                    llama_sampler_free(smpl_mtp);
+                    llama_sampler_free(smpl);
+                    return false;
+                }
+
+                if (!common_speculative_process(llm_spec.get(), vbatch)) {
+                    printf("%s : failed MTP speculative process\n", __func__);
+                    llama_batch_free(vbatch);
+                    llama_sampler_free(smpl_mtp);
+                    llama_sampler_free(smpl);
+                    return false;
+                }
+
+                int n_accepted = 0;
+                llama_token new_id_last = id_last;
+                for (int i = 0; i <= K; ++i) {
+                    llama_token sampled = llama_sampler_sample(smpl_mtp, llm_ctx, i);
+                    new_id_last = sampled;
+                    if (i < K && sampled == drafts[i]) {
+                        n_accepted += 1;
+                        continue;
+                    }
+                    break;
+                }
+
+                common_speculative_accept(llm_spec.get(), /*seq=*/0, (uint16_t) n_accepted);
+                mtp_draft_accepted += n_accepted;
+
+                if (n_accepted < K) {
+                    llama_memory_seq_rm(llama_get_memory(llm_ctx), /*seq=*/0, n_past + 1 + n_accepted, -1);
+                }
+
+                bool keep_going = true;
+                for (int i = 0; i < n_accepted && keep_going; ++i) {
+                    if (n_tokens_generated >= max_gen) {
+                        keep_going = false;
+                        break;
+                    }
+                    keep_going = emit_token(drafts[i]);
+                    n_tokens_generated += 1;
+                    params.total_llm_tokens_generated += 1;
+                }
+                if (keep_going && n_tokens_generated < max_gen) {
+                    keep_going = emit_token(new_id_last);
+                    n_tokens_generated += 1;
+                    params.total_llm_tokens_generated += 1;
+                }
+                if (!keep_going) {
+                    break;
+                }
+
+                n_past += n_accepted + 1;
+                id_last = new_id_last;
+            }
+
+            llama_batch_free(vbatch);
         }
 
-        const std::string token_str = slm_token_to_piece(llm_ctx, new_token_id);
-        if (params.streaming_reply) {
-            printf("%s", token_str.c_str());
-        } else {
-            slm_output += token_str;
-        }
+        params.total_mtp_draft_accepted += mtp_draft_accepted;
+        params.total_mtp_draft_proposed += mtp_draft_proposed;
+        params.total_mtp_draft_rounds += mtp_draft_rounds;
 
-        // Stop on caller-specified character
-        if (params.stop_char && token_str.find(params.stop_char) != std::string::npos) {
-            if (params.streaming_reply) printf("\n");
-            break;
-        }
+        llama_sampler_free(smpl_mtp);
+    } else {
+        while (n_tokens_generated < max_gen) {
+            // sample the last token just received
+            llama_token new_token_id = llama_sampler_sample(smpl, llm_ctx, -1);
 
-        // save this new token for next evaluation
-        embd.clear();
-        embd.push_back(new_token_id);
+            // check wither it is the end of text generation
+            if (llama_vocab_is_eog(vocab, new_token_id)) {
+                if (params.streaming_reply) {
+                    printf("\n");
+                }
+                break;
+            }
 
-        n_tokens_generated += 1;
-        params.total_llm_tokens_generated += 1;
+            const std::string token_str = slm_token_to_piece(llm_ctx, new_token_id);
+            if (params.streaming_reply) {
+                printf("%s", token_str.c_str());
+            } else {
+                slm_output += token_str;
+            }
 
-        // bump current generated token index
-        n_past += 1;
+            // Stop on caller-specified character
+            if (params.stop_char && token_str.find(params.stop_char) != std::string::npos) {
+                if (params.streaming_reply) printf("\n");
+                break;
+            }
 
-        // decode the output for the new generated token
-        if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1))) {
-            printf("%s : failed to eval, return code %d\n", __func__, 1);
-            llama_sampler_free(smpl);
-            return false;
+            // save this new token for next evaluation
+            embd.clear();
+            embd.push_back(new_token_id);
+
+            n_tokens_generated += 1;
+            params.total_llm_tokens_generated += 1;
+
+            // bump current generated token index
+            n_past += 1;
+
+            // decode the output for the new generated token
+            if (llama_decode(llm_ctx, llama_batch_get_one(&embd[0], 1))) {
+                printf("%s : failed to eval, return code %d\n", __func__, 1);
+                llama_sampler_free(smpl);
+                return false;
+            }
         }
     }
 
+    // Keep generation timing accurate on async backends.
+    llama_synchronize(llm_ctx);
     int64_t t_us = (ggml_time_us() - t2_start);
 
     if (params.verbose == 2) {
@@ -528,7 +779,16 @@ bool llm_inference(
             t_us / 1000.0f,
             n_tokens_generated, 
             n_tokens_generated / (t_us / 1000000.0f),
-            (t_us / (n_tokens_generated * 1000.0f)));
+            (n_tokens_generated > 0 ? (t_us / (n_tokens_generated * 1000.0f)) : 0.0f));
+        if (llm_spec && mtp_draft_proposed > 0) {
+            const double mtp_accept_rate = 100.0 * (double) mtp_draft_accepted / (double) mtp_draft_proposed;
+            printf("> MTP drafts: %d accepted / %d proposed (%.1f%%), rounds=%d, block_size=%d\n",
+                mtp_draft_accepted,
+                mtp_draft_proposed,
+                mtp_accept_rate,
+                mtp_draft_rounds,
+                params.draft_block_size);
+        }
     }
 
     // accumulate the token generation time
@@ -829,12 +1089,15 @@ void llm_terminate(const model_params& params) {
 #pragma comment(linker, "/EXPORT:" __FUNCTION__"=" __FUNCDNAME__)
 #endif
 
-    int verbose = GGML_LOG_LEVEL_INFO;
-    llama_log_set(default_log_callback, &verbose);
+    g_llm_log_level = GGML_LOG_LEVEL_INFO;
+    llama_log_set(default_log_callback, &g_llm_log_level);
     llama_perf_context_print(llm_ctx);
 
+    llm_spec.reset();
     llama_free(llm_ctx);
     llama_model_free(llm_model);
+    llm_ctx = nullptr;
+    llm_model = nullptr;
 
     llama_backend_free();
 }
@@ -884,7 +1147,8 @@ bool embed_initialize(
 
     llama_backend_init();
 
-    llama_log_set(default_log_callback, &(params.verbose));
+    g_llm_log_level = llm_log_level_from_verbose(params.verbose);
+    llama_log_set(default_log_callback, &g_llm_log_level);
 
     // initialize the model
     llama_model_params model_params = llama_model_default_params();
@@ -912,7 +1176,7 @@ bool embed_initialize(
             printf("%s: Running in full CPU mode\n", __func__);
         }
     } else {
-        // GPU offload is default on a Vulkan build 
+        // GPU offload is default on a Vulkan build
         model_params.n_gpu_layers = 999;
         if (params.verbose == 2) {
             printf("%s: Running in full GPU-offload mode\n", __func__);
@@ -938,7 +1202,6 @@ bool embed_initialize(
         printf("%s: Running in full CPU mode\n", __func__);
     }
     model_params.n_gpu_layers = 0;
-
 #endif // GGML_USE_CUDA
 
     // GPU adapter and split mode selection
