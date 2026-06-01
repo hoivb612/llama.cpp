@@ -34,6 +34,7 @@ struct Phi3Runtime {
     int n_threads_prefill = 0;
     int n_threads_gen = 0;
     int active_threads = 0;
+    bool enable_fused_greedy_gen = false;
     Phi3GenKernelState gen_kernel_state = {};
 };
 

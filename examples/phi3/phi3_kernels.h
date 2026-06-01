@@ -27,7 +27,12 @@ bool phi3_decode_generate_step(
     const Phi3ExecutionPlan & plan,
     Phi3GenKernelState & state,
     llama_token token,
+    const llama_vocab * vocab,
+    bool enable_fused_greedy,
+    llama_token & sampled_token,
     double & decode_dt_ms,
+    double & sample_dt_ms,
     bool & fusion_eligible,
+    bool & used_fused_sampling,
     const char *& kernel_tag,
     std::string & error);

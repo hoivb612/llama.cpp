@@ -34,6 +34,7 @@ struct Phi3TurnMetrics {
     double other_ms = 0.0;
     int fusion_eligible_gen_steps = 0;
     int generic_gen_steps = 0;
+    int fused_gen_steps = 0;
     int prefill_threads = 0;
     int gen_threads = 0;
     const char * gen_kernel_tag = "llama-generic";
@@ -81,13 +82,29 @@ static bool phi3_decode_generate_step(
     Phi3Runtime & runtime,
     llama_token token,
     Phi3TurnMetrics & metrics,
+    llama_token & sampled_token,
+    double & sample_dt_ms,
+    bool & used_fused_sampling,
     std::string & error) {
     phi3_set_threads_if_needed(runtime, runtime.n_threads_gen);
     metrics.gen_threads = runtime.n_threads_gen;
     double decode_dt_ms = 0.0;
     bool fusion_eligible = false;
     const char * kernel_tag = "llama-generic";
-    if (!phi3_decode_generate_step(runtime.ctx, runtime.plan, runtime.gen_kernel_state, token, decode_dt_ms, fusion_eligible, kernel_tag, error)) {
+    if (!phi3_decode_generate_step(
+            runtime.ctx,
+            runtime.plan,
+            runtime.gen_kernel_state,
+            token,
+            runtime.vocab,
+            runtime.enable_fused_greedy_gen,
+            sampled_token,
+            decode_dt_ms,
+            sample_dt_ms,
+            fusion_eligible,
+            used_fused_sampling,
+            kernel_tag,
+            error)) {
         return false;
     }
     metrics.gen_kernel_tag = kernel_tag;
@@ -96,7 +113,11 @@ static bool phi3_decode_generate_step(
     metrics.decode_calls++;
     metrics.gen_decode_ms += decode_dt_ms;
     metrics.gen_decode_calls++;
-    metrics.generic_gen_steps++;
+    if (used_fused_sampling) {
+        metrics.fused_gen_steps++;
+    } else {
+        metrics.generic_gen_steps++;
+    }
     if (fusion_eligible) {
         metrics.fusion_eligible_gen_steps++;
     }
@@ -162,10 +183,41 @@ static bool phi3_generate(
             prefill_done = true;
         } else {
             const double prev_gen_decode_ms = metrics.gen_decode_ms;
-            if (!phi3_decode_generate_step(runtime, gen_input_token, metrics, error)) {
+            llama_token sampled_token = LLAMA_TOKEN_NULL;
+            double fused_sample_dt_ms = 0.0;
+            bool used_fused_sampling = false;
+            if (!phi3_decode_generate_step(runtime, gen_input_token, metrics, sampled_token, fused_sample_dt_ms, used_fused_sampling, error)) {
                 return false;
             }
             gen_step_decode_ms.push_back(metrics.gen_decode_ms - prev_gen_decode_ms);
+
+            if (used_fused_sampling) {
+                metrics.sample_ms += fused_sample_dt_ms;
+                gen_step_sample_ms.push_back(fused_sample_dt_ms);
+
+                if (llama_vocab_is_eog(runtime.vocab, sampled_token)) {
+                    break;
+                }
+
+                char buf[256];
+                const int n = llama_token_to_piece(runtime.vocab, sampled_token, buf, sizeof(buf), 0, true);
+                if (n < 0) {
+                    error = "failed to convert token to piece";
+                    return false;
+                }
+
+                std::string piece(buf, (size_t) n);
+                printf("%s", piece.c_str());
+                fflush(stdout);
+                response += piece;
+                metrics.generated_tokens++;
+                if (metrics.generated_tokens == 1) {
+                    metrics.ttft_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gen_start).count();
+                }
+
+                gen_input_token = sampled_token;
+                continue;
+            }
         }
 
         const auto sample_start = std::chrono::steady_clock::now();
@@ -263,7 +315,7 @@ static bool phi3_runtime_run_turn(Phi3Runtime & runtime, const std::string & use
             "ttft_ms=%.2f gen_step_avg_ms=%.2f gen_step_p95_ms=%.2f gen_step_max_ms=%.2f "
             "sample_step_avg_ms=%.3f sample_step_p95_ms=%.3f sample_step_max_ms=%.3f "
             "llama_prompt_ms=%.2f llama_gen_ms=%.2f prefill_tps=%.2f prompt_tps=%.2f gen_tps=%.2f prefill_threads=%d gen_threads=%d "
-            "gen_kernel=%s fusion_eligible_gen_steps=%d generic_gen_steps=%d ctx_peak=%d/%d graph_reused=%d total_ms=%.2f\n",
+            "gen_kernel=%s fusion_eligible_gen_steps=%d fused_gen_steps=%d generic_gen_steps=%d ctx_peak=%d/%d graph_reused=%d total_ms=%.2f\n",
             runtime.turn_index,
             metrics.prompt_tokens,
             metrics.generated_tokens,
@@ -294,6 +346,7 @@ static bool phi3_runtime_run_turn(Phi3Runtime & runtime, const std::string & use
             metrics.gen_threads,
             metrics.gen_kernel_tag,
             metrics.fusion_eligible_gen_steps,
+            metrics.fused_gen_steps,
             metrics.generic_gen_steps,
             metrics.max_ctx_used,
             llama_n_ctx(runtime.ctx),
@@ -365,6 +418,7 @@ bool phi3_runtime_init(
         out.n_threads_gen = out.n_threads_prefill;
     }
     out.active_threads = 0;
+    out.enable_fused_greedy_gen = params.temp <= 0.0f && params.min_p <= 0.0f;
     phi3_gen_kernel_state_init(out.gen_kernel_state);
     error.clear();
     return true;
@@ -412,6 +466,7 @@ void phi3_runtime_free(Phi3Runtime & runtime) {
     runtime.n_threads_prefill = 0;
     runtime.n_threads_gen = 0;
     runtime.active_threads = 0;
+    runtime.enable_fused_greedy_gen = false;
     runtime.gen_kernel_state = {};
 
     if (runtime.smpl) {
