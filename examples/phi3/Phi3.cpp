@@ -10,7 +10,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto]\n", argv[0]);
     printf("\n");
 }
 
@@ -27,6 +27,7 @@ int main(int argc, char ** argv) {
     float min_p = 0.05f;
     int n_threads_prefill = 0;
     int n_threads_gen = 0;
+    bool enable_gen_autotune = false;
 
     for (int i = 1; i < argc; i++) {
         try {
@@ -100,6 +101,8 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "--threads-gen-auto") == 0) {
+                enable_gen_autotune = true;
             } else {
                 print_usage(argc, argv);
                 return 1;
@@ -152,14 +155,15 @@ int main(int argc, char ** argv) {
     runtime_params.min_p = min_p;
     runtime_params.n_threads_prefill = n_threads_prefill;
     runtime_params.n_threads_gen = n_threads_gen;
+    runtime_params.enable_gen_autotune = enable_gen_autotune;
     Phi3Runtime runtime;
     if (!phi3_runtime_init(raw_model, plan, runtime_params, runtime, error)) {
         fprintf(stderr, "%s: error: %s\n", __func__, error.c_str());
         phi3_unload_raw_model(raw_model);
         return 1;
     }
-    fprintf(stderr, "phi3 runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d\n",
-        runtime.n_threads_prefill, runtime.n_threads_gen, runtime.n_predict, runtime.seed, runtime_params.temp, runtime_params.min_p, (int) runtime.enable_fused_greedy_gen);
+    fprintf(stderr, "phi3 runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d gen_autotune=%d\n",
+        runtime.n_threads_prefill, runtime.n_threads_gen, runtime.n_predict, runtime.seed, runtime_params.temp, runtime_params.min_p, (int) runtime.enable_fused_greedy_gen, (int) runtime.enable_gen_autotune);
 
     bool ok = true;
     if (!single_prompt.empty()) {

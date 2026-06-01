@@ -16,6 +16,7 @@ struct Phi3RuntimeParams {
     bool enable_instrumentation = true;
     int n_threads_prefill = 0;
     int n_threads_gen = 0;
+    bool enable_gen_autotune = false;
 };
 
 struct Phi3Runtime {
@@ -34,6 +35,13 @@ struct Phi3Runtime {
     int n_threads_prefill = 0;
     int n_threads_gen = 0;
     int active_threads = 0;
+    bool enable_gen_autotune = false;
+    bool gen_autotune_locked = false;
+    int gen_autotune_steps_per_candidate = 12;
+    int gen_autotune_eval_steps = 0;
+    std::vector<int> gen_autotune_candidates;
+    std::vector<double> gen_autotune_decode_ms_sum;
+    std::vector<int> gen_autotune_decode_ms_count;
     bool enable_fused_greedy_gen = false;
     Phi3GenKernelState gen_kernel_state = {};
 };

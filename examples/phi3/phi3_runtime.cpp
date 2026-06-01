@@ -59,6 +59,80 @@ static void phi3_set_threads_if_needed(Phi3Runtime & runtime, int n_threads) {
     runtime.active_threads = n_threads;
 }
 
+static std::vector<int> phi3_build_gen_autotune_candidates(int max_threads, int baseline_threads) {
+    std::vector<int> out;
+    const int fixed[] = {4, 6, 8, 10, 12};
+    for (int t : fixed) {
+        if (t > 0 && t <= max_threads && std::find(out.begin(), out.end(), t) == out.end()) {
+            out.push_back(t);
+        }
+    }
+
+    if (baseline_threads > 0 && baseline_threads <= max_threads && std::find(out.begin(), out.end(), baseline_threads) == out.end()) {
+        out.push_back(baseline_threads);
+    }
+
+    if (out.empty()) {
+        out.push_back(std::max(1, max_threads));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+static int phi3_gen_autotune_candidate_index(const Phi3Runtime & runtime) {
+    const int span = runtime.gen_autotune_steps_per_candidate;
+    if (span <= 0 || runtime.gen_autotune_candidates.empty()) {
+        return 0;
+    }
+    const int idx = runtime.gen_autotune_eval_steps / span;
+    return std::min<int>(idx, (int) runtime.gen_autotune_candidates.size() - 1);
+}
+
+static void phi3_gen_autotune_prepare_step(Phi3Runtime & runtime) {
+    if (!runtime.enable_gen_autotune || runtime.gen_autotune_locked || runtime.gen_autotune_candidates.empty()) {
+        return;
+    }
+    runtime.n_threads_gen = runtime.gen_autotune_candidates[phi3_gen_autotune_candidate_index(runtime)];
+}
+
+static void phi3_gen_autotune_record_step(Phi3Runtime & runtime, double decode_dt_ms) {
+    if (!runtime.enable_gen_autotune || runtime.gen_autotune_locked || runtime.gen_autotune_candidates.empty()) {
+        return;
+    }
+
+    const int idx = phi3_gen_autotune_candidate_index(runtime);
+    if (idx < 0 || idx >= (int) runtime.gen_autotune_decode_ms_sum.size() || idx >= (int) runtime.gen_autotune_decode_ms_count.size()) {
+        return;
+    }
+    runtime.gen_autotune_decode_ms_sum[idx] += decode_dt_ms;
+    runtime.gen_autotune_decode_ms_count[idx] += 1;
+    runtime.gen_autotune_eval_steps += 1;
+
+    const int total_steps = runtime.gen_autotune_steps_per_candidate * (int) runtime.gen_autotune_candidates.size();
+    if (runtime.gen_autotune_eval_steps < total_steps) {
+        return;
+    }
+
+    int best_idx = -1;
+    double best_avg_ms = 0.0;
+    for (int i = 0; i < (int) runtime.gen_autotune_candidates.size(); ++i) {
+        if (runtime.gen_autotune_decode_ms_count[i] <= 0) {
+            continue;
+        }
+        const double avg_ms = runtime.gen_autotune_decode_ms_sum[i] / runtime.gen_autotune_decode_ms_count[i];
+        if (best_idx < 0 || avg_ms < best_avg_ms) {
+            best_idx = i;
+            best_avg_ms = avg_ms;
+        }
+    }
+    if (best_idx >= 0) {
+        runtime.n_threads_gen = runtime.gen_autotune_candidates[best_idx];
+        runtime.gen_autotune_locked = true;
+        fprintf(stderr, "phi3 autotune: selected gen_threads=%d after %d warmup steps (avg_decode_ms=%.2f)\n",
+            runtime.n_threads_gen, runtime.gen_autotune_eval_steps, best_avg_ms);
+    }
+}
+
 static bool phi3_decode_prefill(
     Phi3Runtime & runtime,
     llama_batch & batch,
@@ -84,6 +158,7 @@ static bool phi3_decode_generate_step(
     Phi3TurnMetrics & metrics,
     llama_token & sampled_token,
     double & sample_dt_ms,
+    double & gen_step_decode_ms,
     bool & used_fused_sampling,
     std::string & error) {
     phi3_set_threads_if_needed(runtime, runtime.n_threads_gen);
@@ -113,6 +188,7 @@ static bool phi3_decode_generate_step(
     metrics.decode_calls++;
     metrics.gen_decode_ms += decode_dt_ms;
     metrics.gen_decode_calls++;
+    gen_step_decode_ms = decode_dt_ms;
     if (used_fused_sampling) {
         metrics.fused_gen_steps++;
     } else {
@@ -182,14 +258,16 @@ static bool phi3_generate(
             }
             prefill_done = true;
         } else {
-            const double prev_gen_decode_ms = metrics.gen_decode_ms;
+            phi3_gen_autotune_prepare_step(runtime);
             llama_token sampled_token = LLAMA_TOKEN_NULL;
             double fused_sample_dt_ms = 0.0;
+            double gen_step_decode_dt_ms = 0.0;
             bool used_fused_sampling = false;
-            if (!phi3_decode_generate_step(runtime, gen_input_token, metrics, sampled_token, fused_sample_dt_ms, used_fused_sampling, error)) {
+            if (!phi3_decode_generate_step(runtime, gen_input_token, metrics, sampled_token, fused_sample_dt_ms, gen_step_decode_dt_ms, used_fused_sampling, error)) {
                 return false;
             }
-            gen_step_decode_ms.push_back(metrics.gen_decode_ms - prev_gen_decode_ms);
+            gen_step_decode_ms.push_back(gen_step_decode_dt_ms);
+            phi3_gen_autotune_record_step(runtime, gen_step_decode_dt_ms);
 
             if (used_fused_sampling) {
                 metrics.sample_ms += fused_sample_dt_ms;
@@ -418,6 +496,19 @@ bool phi3_runtime_init(
         out.n_threads_gen = out.n_threads_prefill;
     }
     out.active_threads = 0;
+    out.enable_gen_autotune = params.enable_gen_autotune;
+    out.gen_autotune_locked = !params.enable_gen_autotune;
+    out.gen_autotune_steps_per_candidate = 12;
+    out.gen_autotune_eval_steps = 0;
+    out.gen_autotune_candidates.clear();
+    out.gen_autotune_decode_ms_sum.clear();
+    out.gen_autotune_decode_ms_count.clear();
+    if (params.enable_gen_autotune) {
+        out.gen_autotune_candidates = phi3_build_gen_autotune_candidates(out.n_threads_prefill, out.n_threads_gen);
+        out.gen_autotune_decode_ms_sum.resize(out.gen_autotune_candidates.size(), 0.0);
+        out.gen_autotune_decode_ms_count.resize(out.gen_autotune_candidates.size(), 0);
+        out.n_threads_gen = out.gen_autotune_candidates.front();
+    }
     out.enable_fused_greedy_gen = params.temp <= 0.0f && params.min_p <= 0.0f;
     phi3_gen_kernel_state_init(out.gen_kernel_state);
     error.clear();
@@ -466,6 +557,13 @@ void phi3_runtime_free(Phi3Runtime & runtime) {
     runtime.n_threads_prefill = 0;
     runtime.n_threads_gen = 0;
     runtime.active_threads = 0;
+    runtime.enable_gen_autotune = false;
+    runtime.gen_autotune_locked = false;
+    runtime.gen_autotune_steps_per_candidate = 12;
+    runtime.gen_autotune_eval_steps = 0;
+    runtime.gen_autotune_candidates.clear();
+    runtime.gen_autotune_decode_ms_sum.clear();
+    runtime.gen_autotune_decode_ms_count.clear();
     runtime.enable_fused_greedy_gen = false;
     runtime.gen_kernel_state = {};
 
