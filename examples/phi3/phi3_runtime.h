@@ -3,6 +3,7 @@
 #include "phi3_loader.h"
 #include "phi3_kernels.h"
 #include "phi3_transform.h"
+#include "phi3_fused_ops.h"
 
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@ struct Phi3RuntimeParams {
     int n_threads_prefill = 0;
     int n_threads_gen = 0;
     bool enable_gen_autotune = false;
+    bool enable_fused_lmhead = false;
 };
 
 struct Phi3Runtime {
@@ -43,6 +45,8 @@ struct Phi3Runtime {
     std::vector<double> gen_autotune_decode_ms_sum;
     std::vector<int> gen_autotune_decode_ms_count;
     bool enable_fused_greedy_gen = false;
+    bool enable_fused_lmhead = false;
+    Phi3FusedLmHead fused_lmhead = {};
     Phi3GenKernelState gen_kernel_state = {};
 };
 

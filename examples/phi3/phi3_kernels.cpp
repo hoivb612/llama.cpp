@@ -1,7 +1,21 @@
 #include "phi3_kernels.h"
 
+#include <algorithm>
 #include <chrono>
-#include <limits>
+#include <iterator>
+
+static bool phi3_argmax_logits(const float * logits, int32_t n_vocab, llama_token & sampled_token, double & sample_dt_ms) {
+    if (!logits || n_vocab <= 0) {
+        return false;
+    }
+
+    const auto sample_start = std::chrono::steady_clock::now();
+    const auto best = std::max_element(logits, logits + n_vocab);
+    const int32_t best_id = static_cast<int32_t>(std::distance(logits, best));
+    sample_dt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sample_start).count();
+    sampled_token = static_cast<llama_token>(best_id);
+    return true;
+}
 
 static bool phi3_decode_with_llama(
     llama_context * ctx,
@@ -52,6 +66,9 @@ bool phi3_decode_generate_step(
     llama_token token,
     const llama_vocab * vocab,
     bool enable_fused_greedy,
+    bool enable_fused_lmhead,
+    Phi3FusedLmHead * fused_lmhead,
+    int fused_lmhead_threads,
     llama_token & sampled_token,
     double & decode_dt_ms,
     double & sample_dt_ms,
@@ -70,15 +87,38 @@ bool phi3_decode_generate_step(
     // per-step overhead minimal and isolate this hot path for future fused kernels.
     state.token = token;
 
-    const bool use_fused_greedy = fusion_eligible && enable_fused_greedy;
-    kernel_tag = use_fused_greedy
-        ? (qkv_v2_eligible ? "phi3-gen1tok-fusedv2-qkv-shape" : "phi3-gen1tok-fusedv1-persist")
-        :
-        (fusion_eligible ? "phi3-gen1tok-persist(fused-candidate)" : "phi3-gen1tok-persist");
+    const bool use_fused_lmhead = enable_fused_lmhead && fused_lmhead != nullptr;
+    const bool use_fused_greedy = !use_fused_lmhead && fusion_eligible && enable_fused_greedy;
+    if (use_fused_lmhead) {
+        kernel_tag = qkv_v2_eligible
+            ? "phi3-gen1tok-fusedv3-skip-lmhead-qkv-shape"
+            : "phi3-gen1tok-fusedv3-skip-lmhead";
+    } else {
+        kernel_tag = use_fused_greedy
+            ? (qkv_v2_eligible ? "phi3-gen1tok-fusedv2-qkv-shape" : "phi3-gen1tok-fusedv1-persist")
+            :
+            (fusion_eligible ? "phi3-gen1tok-persist(fused-candidate)" : "phi3-gen1tok-persist");
+    }
     if (!phi3_decode_with_llama(ctx, state.batch, decode_dt_ms, error)) {
         return false;
     }
-    if (!use_fused_greedy) {
+    if (!use_fused_lmhead && !use_fused_greedy) {
+        return true;
+    }
+
+    if (use_fused_lmhead) {
+        const float * hidden = llama_get_embeddings_ith(ctx, -1);
+        if (!hidden) {
+            error = "fused lm_head: missing embeddings output (set cparams.embeddings before init)";
+            return false;
+        }
+        const auto sample_start = std::chrono::steady_clock::now();
+        if (!phi3_fused_lmhead_argmax(*fused_lmhead, hidden, fused_lmhead_threads, sampled_token, error)) {
+            return false;
+        }
+        sample_dt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sample_start).count();
+        used_fused_sampling = true;
+        error.clear();
         return true;
     }
 
@@ -98,18 +138,10 @@ bool phi3_decode_generate_step(
         return false;
     }
 
-    const auto sample_start = std::chrono::steady_clock::now();
-    int32_t best_id = 0;
-    float best_logit = -std::numeric_limits<float>::infinity();
-    for (int32_t i = 0; i < n_vocab; ++i) {
-        if (logits[i] > best_logit) {
-            best_logit = logits[i];
-            best_id = i;
-        }
+    if (!phi3_argmax_logits(logits, n_vocab, sampled_token, sample_dt_ms)) {
+        error = "failed to compute fused greedy token";
+        return false;
     }
-
-    sample_dt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sample_start).count();
-    sampled_token = best_id;
     used_fused_sampling = true;
     error.clear();
     return true;

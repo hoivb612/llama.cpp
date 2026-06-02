@@ -10,7 +10,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -28,6 +28,7 @@ int main(int argc, char ** argv) {
     int n_threads_prefill = 0;
     int n_threads_gen = 0;
     bool enable_gen_autotune = false;
+    bool enable_fused_lmhead = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -104,6 +105,8 @@ int main(int argc, char ** argv) {
                 }
             } else if (strcmp(argv[i], "--threads-gen-auto") == 0) {
                 enable_gen_autotune = true;
+            } else if (strcmp(argv[i], "--phi3-fused-lmhead") == 0) {
+                enable_fused_lmhead = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -151,8 +154,8 @@ int main(int argc, char ** argv) {
         phi3_unload_raw_model(raw_model);
         return 1;
     }
-    fprintf(stderr, "phi3 plan: layers=%d embd=%d qkv_fuse=%d mlp_fuse=%d\n",
-        plan.n_layer, plan.n_embd, (int) plan.fuse_qkv, (int) plan.fuse_mlp);
+    fprintf(stderr, "phi3 plan: layers=%d embd=%d qkv_fuse=%d qkv_v2_fuse=%d mlp_fuse=%d\n",
+        plan.n_layer, plan.n_embd, (int) plan.fuse_qkv, (int) plan.fuse_qkv_v2, (int) plan.fuse_mlp);
     fprintf(stderr, "phi3 transform: %s\n", plan.diagnostics.summary.c_str());
 
     Phi3RuntimeParams runtime_params;
@@ -164,14 +167,20 @@ int main(int argc, char ** argv) {
     runtime_params.n_threads_prefill = n_threads_prefill;
     runtime_params.n_threads_gen = n_threads_gen;
     runtime_params.enable_gen_autotune = enable_gen_autotune;
+    runtime_params.enable_fused_lmhead = enable_fused_lmhead;
+    if (enable_fused_lmhead && (temp > 0.0f || min_p > 0.0f)) {
+        fprintf(stderr, "%s: --phi3-fused-lmhead requires --temp 0 --min-p 0 (greedy decoding)\n", __func__);
+        phi3_unload_raw_model(raw_model);
+        return 1;
+    }
     Phi3Runtime runtime;
     if (!phi3_runtime_init(raw_model, plan, runtime_params, runtime, error)) {
         fprintf(stderr, "%s: error: %s\n", __func__, error.c_str());
         phi3_unload_raw_model(raw_model);
         return 1;
     }
-    fprintf(stderr, "phi3 runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d gen_autotune=%d\n",
-        runtime.n_threads_prefill, runtime.n_threads_gen, runtime.n_predict, runtime.seed, runtime_params.temp, runtime_params.min_p, (int) runtime.enable_fused_greedy_gen, (int) runtime.enable_gen_autotune);
+    fprintf(stderr, "phi3 runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d fused_lmhead=%d gen_autotune=%d\n",
+        runtime.n_threads_prefill, runtime.n_threads_gen, runtime.n_predict, runtime.seed, runtime_params.temp, runtime_params.min_p, (int) runtime.enable_fused_greedy_gen, (int) runtime.enable_fused_lmhead, (int) runtime.enable_gen_autotune);
 
     bool ok = true;
     if (!single_prompt.empty()) {

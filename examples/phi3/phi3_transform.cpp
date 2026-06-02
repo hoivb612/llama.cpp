@@ -43,14 +43,17 @@ bool phi3_build_execution_plan(const Phi3RawModel & raw, Phi3ExecutionPlan & out
         << " qkv_v2_shape_ok=" << (out.diagnostics.qkv_v2_shape_ok ? 1 : 0)
         << " mlp_shape_ok=" << (out.diagnostics.mlp_shape_ok ? 1 : 0)
         << " decode_fusion_candidate=" << (out.diagnostics.decode_fusion_candidate ? 1 : 0)
-        << " decode_qkv_v2_candidate=" << (out.diagnostics.decode_qkv_v2_candidate ? 1 : 0);
+        << " decode_qkv_v2_candidate=" << (out.diagnostics.decode_qkv_v2_candidate ? 1 : 0)
+        << " fuse_qkv=" << (out.fuse_qkv ? 1 : 0)
+        << " fuse_qkv_v2=" << (out.fuse_qkv_v2 ? 1 : 0)
+        << " fuse_mlp=" << (out.fuse_mlp ? 1 : 0);
     out.diagnostics.summary = oss.str();
 
     // Keep booleans as explicit transform gates driven by diagnostics.
     out.fuse_qkv = out.diagnostics.qkv_shape_ok;
     out.fuse_qkv_v2 = out.diagnostics.decode_qkv_v2_candidate;
     out.fuse_mlp = out.diagnostics.mlp_shape_ok;
-    out.notes = "baseline phi3 plan (fusion readiness analyzed, qkv-v2 shape gate prepared)";
+    out.notes = "phi3 fused-greedy path: qkv-v2 shape gate enabled for deterministic generation";
 
     error.clear();
     return true;

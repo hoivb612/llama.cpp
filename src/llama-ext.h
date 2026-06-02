@@ -109,5 +109,20 @@ LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool va
 LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+// LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// Phi3 Phase C: skip the lm_head matmul (and logits buffer write) on each decode.
+// When enabled, the standard graph's output tensor (post-final-norm hidden state)
+// is exposed via the embeddings buffer (llama_get_embeddings_ith) and the caller
+// is responsible for computing the next token directly from it (see phi3_fused_ops.h).
+// Greedy-only: caller must not invoke sampler chains that need full logits.
+// No-op for non-Phi3 architectures.
+LLAMA_API void llama_set_phi3_fused_lmhead(struct llama_context * ctx, bool value);
+
+// Look up a model tensor by GGUF tensor name (e.g. "output.weight").
+// Returns nullptr if the tensor is absent (some models tie lm_head to token_embd).
+// The returned pointer is owned by the model; do not free.
+LLAMA_API const struct ggml_tensor * llama_model_get_tensor_by_name(
+        const struct llama_model * model, const char * name);
 #endif // !defined(LLAMA_B612_API)

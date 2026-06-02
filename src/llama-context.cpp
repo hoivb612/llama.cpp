@@ -76,6 +76,7 @@ llama_context::llama_context(
     cparams.embeddings                  = params.embeddings;
     cparams.embeddings_pre_norm         = false;
     cparams.embeddings_pre_norm_masked  = false;
+    cparams.fused_lmhead                = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -1112,6 +1113,26 @@ void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
 
     cparams.embeddings_pre_norm        = value;
     cparams.embeddings_pre_norm_masked = masked;
+}
+
+void llama_context::set_phi3_fused_lmhead(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (cparams.fused_lmhead == value) {
+        return;
+    }
+
+    cparams.fused_lmhead = value;
+
+    // When fused lm_head is on, the runtime needs the post-final-norm hidden state
+    // copied out through the embeddings buffer. Force-enable embeddings so
+    // output_reserve() allocates embd.size on the next reserve.
+    if (value) {
+        cparams.embeddings = true;
+    }
+
+    // Graph structure depends on cparams.fused_lmhead (see llm_graph_params::operator==);
+    // existing cached graphs will be invalidated on the next can_reuse() check.
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3605,6 +3626,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_pre_norm(value, masked);
+}
+
+void llama_set_phi3_fused_lmhead(llama_context * ctx, bool value) {
+    ctx->set_phi3_fused_lmhead(value);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

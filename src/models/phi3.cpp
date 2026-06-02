@@ -179,6 +179,16 @@ llama_model_phi3::graph<iswa>::graph(const llama_model & model, const llm_graph_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    if (cparams.fused_lmhead) {
+        // Phase C: skip lm_head; pin t_embd into the forward graph so the final
+        // RMSNorm survives pruning, and clear t_logits so the lm_head matmul is
+        // unreachable (pruned by ggml_build_forward_expand). The runtime computes
+        // argmax directly from the post-norm hidden state.
+        ggml_build_forward_expand(gf, cur);
+        res->t_logits = nullptr;
+        return;
+    }
+
     cur = build_lora_mm(model.output, cur, model.output_s);
 
     if (model.output_b != nullptr) {

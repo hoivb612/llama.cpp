@@ -626,8 +626,9 @@ struct llm_graph_params {
         }
 
         return
-            cparams.embeddings  == other.cparams.embeddings  &&
-            cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.embeddings    == other.cparams.embeddings    &&
+            cparams.fused_lmhead  == other.cparams.fused_lmhead  &&
+            cparams.causal_attn   == other.cparams.causal_attn   &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

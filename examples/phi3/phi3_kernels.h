@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "phi3_transform.h"
+#include "phi3_fused_ops.h"
 
 #include <string>
 
@@ -29,6 +30,9 @@ bool phi3_decode_generate_step(
     llama_token token,
     const llama_vocab * vocab,
     bool enable_fused_greedy,
+    bool enable_fused_lmhead,
+    Phi3FusedLmHead * fused_lmhead,
+    int fused_lmhead_threads,
     llama_token & sampled_token,
     double & decode_dt_ms,
     double & sample_dt_ms,

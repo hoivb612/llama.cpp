@@ -1,5 +1,6 @@
 #include "phi3_runtime.h"
 #include "phi3_kernels.h"
+#include "llama_b612.h"
 
 #include <algorithm>
 #include <chrono>
@@ -189,6 +190,9 @@ static bool phi3_decode_generate_step(
             token,
             runtime.vocab,
             runtime.enable_fused_greedy_gen,
+            runtime.enable_fused_lmhead,
+            runtime.enable_fused_lmhead ? &runtime.fused_lmhead : nullptr,
+            runtime.n_threads_gen,
             sampled_token,
             decode_dt_ms,
             sample_dt_ms,
@@ -279,6 +283,49 @@ static bool phi3_generate(
             ctx_used += prefill_batch.n_tokens;
             metrics.max_ctx_used = std::max(metrics.max_ctx_used, ctx_used);
             prefill_done = true;
+
+            // When fused lm_head is on, the logits buffer is not populated by the
+            // graph (lm_head matmul is pruned). The default llama_sampler_sample
+            // path below would read zero-initialized logits and emit token 0.
+            // Compute the first generated token via the fused argmax instead.
+            if (runtime.enable_fused_lmhead) {
+                const float * hidden = llama_get_embeddings_ith(runtime.ctx, -1);
+                if (!hidden) {
+                    error = "fused lm_head: missing embeddings output after prefill";
+                    return false;
+                }
+                llama_token first_tok = LLAMA_TOKEN_NULL;
+                const auto sample_start = std::chrono::steady_clock::now();
+                if (!phi3_fused_lmhead_argmax(runtime.fused_lmhead, hidden, runtime.n_threads_gen, first_tok, error)) {
+                    return false;
+                }
+                const double sample_dt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sample_start).count();
+                metrics.sample_ms += sample_dt_ms;
+                gen_step_sample_ms.push_back(sample_dt_ms);
+
+                if (llama_vocab_is_eog(runtime.vocab, first_tok)) {
+                    break;
+                }
+
+                char buf[256];
+                const int n = llama_token_to_piece(runtime.vocab, first_tok, buf, sizeof(buf), 0, true);
+                if (n < 0) {
+                    error = "failed to convert token to piece";
+                    return false;
+                }
+
+                std::string piece(buf, (size_t) n);
+                printf("%s", piece.c_str());
+                fflush(stdout);
+                response += piece;
+                metrics.generated_tokens++;
+                if (metrics.generated_tokens == 1) {
+                    metrics.ttft_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gen_start).count();
+                }
+
+                gen_input_token = first_tok;
+                continue;
+            }
         } else {
             phi3_gen_autotune_prepare_step(runtime);
             llama_token sampled_token = LLAMA_TOKEN_NULL;
@@ -552,6 +599,14 @@ bool phi3_runtime_init(
         out.n_threads_gen = out.gen_autotune_candidates.front();
     }
     out.enable_fused_greedy_gen = params.temp <= 0.0f && params.min_p <= 0.0f;
+    out.enable_fused_lmhead = params.enable_fused_lmhead && out.enable_fused_greedy_gen;
+    if (out.enable_fused_lmhead) {
+        llama_set_phi3_fused_lmhead(out.ctx, true);
+        if (!phi3_fused_lmhead_init(raw.model, out.fused_lmhead, error)) {
+            phi3_runtime_free(out);
+            return false;
+        }
+    }
     phi3_gen_kernel_state_init(out.gen_kernel_state);
     error.clear();
     return true;
@@ -607,6 +662,8 @@ void phi3_runtime_free(Phi3Runtime & runtime) {
     runtime.gen_autotune_decode_ms_sum.clear();
     runtime.gen_autotune_decode_ms_count.clear();
     runtime.enable_fused_greedy_gen = false;
+    runtime.enable_fused_lmhead = false;
+    runtime.fused_lmhead = {};
     runtime.gen_kernel_state = {};
 
     if (runtime.smpl) {
