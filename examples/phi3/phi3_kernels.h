@@ -33,6 +33,7 @@ bool phi3_decode_generate_step(
     double & decode_dt_ms,
     double & sample_dt_ms,
     bool & fusion_eligible,
+    bool & qkv_v2_eligible,
     bool & used_fused_sampling,
     const char *& kernel_tag,
     std::string & error);

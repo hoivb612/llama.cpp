@@ -2,7 +2,6 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
-#include "../src/llama-ext.h"
 #include "ggml.h"
 #include "gguf-model-data.h"
 #include "gguf.h"

@@ -56,6 +56,7 @@ bool phi3_decode_generate_step(
     double & decode_dt_ms,
     double & sample_dt_ms,
     bool & fusion_eligible,
+    bool & qkv_v2_eligible,
     bool & used_fused_sampling,
     const char *& kernel_tag,
     std::string & error) {
@@ -63,13 +64,16 @@ bool phi3_decode_generate_step(
     sample_dt_ms = 0.0;
     used_fused_sampling = false;
     fusion_eligible = plan.diagnostics.decode_fusion_candidate && plan.fuse_qkv && plan.fuse_mlp;
+    qkv_v2_eligible = fusion_eligible && plan.diagnostics.decode_qkv_v2_candidate && plan.fuse_qkv_v2;
 
     // Reuse pre-wired 1-token batch state across generation steps to keep
     // per-step overhead minimal and isolate this hot path for future fused kernels.
     state.token = token;
 
     const bool use_fused_greedy = fusion_eligible && enable_fused_greedy;
-    kernel_tag = use_fused_greedy ? "phi3-gen1tok-fusedv1-persist" :
+    kernel_tag = use_fused_greedy
+        ? (qkv_v2_eligible ? "phi3-gen1tok-fusedv2-qkv-shape" : "phi3-gen1tok-fusedv1-persist")
+        :
         (fusion_eligible ? "phi3-gen1tok-persist(fused-candidate)" : "phi3-gen1tok-persist");
     if (!phi3_decode_with_llama(ctx, state.batch, decode_dt_ms, error)) {
         return false;

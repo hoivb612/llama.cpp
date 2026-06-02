@@ -3956,16 +3956,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
 #endif
 
-    struct ggml_compute_params params = {
-        /*.ith        =*/ state->ith,
-        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
-        /*.wsize      =*/ cplan->work_size,
-        /*.wdata      =*/ cplan->work_data,
-        /*.threadpool =*/ tp,
-        /*.use_ref    =*/ cplan->use_ref,
-        /*.barrier    =*/ (void *)&(tp->barrier_tb),
-        /*.generation =*/ (void *)&(tp->generation_tb)
-    };
+    struct ggml_compute_params params;
+    memset(&params, 0, sizeof(params));
+
+    params.ith        = state->ith;
+    params.nth        = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+    params.wsize      = cplan->work_size;
+    params.wdata      = cplan->work_data;
+    params.threadpool = tp;
+    params.use_ref    = cplan->use_ref;
+#ifdef GGML_B612_REPACK_CORE
+    params.barrier    = (void *)&(tp->barrier_tb);
+    params.generation = (void *)&(tp->generation_tb);
+#endif
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
@@ -4267,6 +4270,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+#ifdef GGML_B612_REPACK_CORE
+        threadpool->barrier_tb       = 0;
+        threadpool->generation_tb    = 0;
+        threadpool->barrier_db       = 0;
+        threadpool->generation_db    = 0;
+#endif // GGML_B612_REPACK_CORE
     }
 
 #ifdef GGML_USE_OPENMP

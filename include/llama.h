@@ -1578,6 +1578,10 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+#if defined(LLAMA_B612_API)
+#include "llama_b612.h"
+#endif
+
 #ifdef __cplusplus
 }
 #endif

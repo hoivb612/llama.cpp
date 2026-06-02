@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,6 +35,7 @@ struct Phi3TurnMetrics {
     double max_gen_step_sample_ms = 0.0;
     double other_ms = 0.0;
     int fusion_eligible_gen_steps = 0;
+    int qkv_v2_eligible_gen_steps = 0;
     int generic_gen_steps = 0;
     int fused_gen_steps = 0;
     int prefill_threads = 0;
@@ -128,8 +131,20 @@ static void phi3_gen_autotune_record_step(Phi3Runtime & runtime, double decode_d
     if (best_idx >= 0) {
         runtime.n_threads_gen = runtime.gen_autotune_candidates[best_idx];
         runtime.gen_autotune_locked = true;
+        std::ostringstream tiers;
+        tiers << std::fixed << std::setprecision(2);
+        for (int i = 0; i < (int) runtime.gen_autotune_candidates.size(); ++i) {
+            if (i > 0) {
+                tiers << ",";
+            }
+            const int n = runtime.gen_autotune_decode_ms_count[i];
+            const double ms = runtime.gen_autotune_decode_ms_sum[i];
+            const double tps = ms > 0.0 ? (1000.0 * n) / ms : 0.0;
+            tiers << runtime.gen_autotune_candidates[i] << ":" << tps;
+        }
         fprintf(stderr, "phi3 autotune: selected gen_threads=%d after %d warmup steps (avg_decode_ms=%.2f)\n",
             runtime.n_threads_gen, runtime.gen_autotune_eval_steps, best_avg_ms);
+        fprintf(stderr, "phi3 autotune tiers: gen_tps=%s\n", tiers.str().c_str());
     }
 }
 
@@ -165,6 +180,7 @@ static bool phi3_decode_generate_step(
     metrics.gen_threads = runtime.n_threads_gen;
     double decode_dt_ms = 0.0;
     bool fusion_eligible = false;
+    bool qkv_v2_eligible = false;
     const char * kernel_tag = "llama-generic";
     if (!phi3_decode_generate_step(
             runtime.ctx,
@@ -177,6 +193,7 @@ static bool phi3_decode_generate_step(
             decode_dt_ms,
             sample_dt_ms,
             fusion_eligible,
+            qkv_v2_eligible,
             used_fused_sampling,
             kernel_tag,
             error)) {
@@ -196,6 +213,9 @@ static bool phi3_decode_generate_step(
     }
     if (fusion_eligible) {
         metrics.fusion_eligible_gen_steps++;
+    }
+    if (qkv_v2_eligible) {
+        metrics.qkv_v2_eligible_gen_steps++;
     }
     return true;
 }
@@ -231,6 +251,10 @@ static bool phi3_generate(
     llama_batch prefill_batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
     llama_token gen_input_token = 0;
     bool prefill_done = false;
+    int ctx_used = llama_memory_seq_pos_max(llama_get_memory(runtime.ctx), 0) + 1;
+    if (ctx_used < 0) {
+        ctx_used = 0;
+    }
     const auto gen_start = std::chrono::steady_clock::now();
     std::vector<double> gen_step_decode_ms;
     std::vector<double> gen_step_sample_ms;
@@ -242,10 +266,6 @@ static bool phi3_generate(
         }
 
         const int ctx_size = llama_n_ctx(runtime.ctx);
-        const int ctx_used = llama_memory_seq_pos_max(llama_get_memory(runtime.ctx), 0) + 1;
-        if (ctx_used > metrics.max_ctx_used) {
-            metrics.max_ctx_used = ctx_used;
-        }
         const int batch_tokens = prefill_done ? 1 : prefill_batch.n_tokens;
         if (ctx_used + batch_tokens > ctx_size) {
             error = "context size exceeded";
@@ -256,6 +276,8 @@ static bool phi3_generate(
             if (!phi3_decode_prefill(runtime, prefill_batch, metrics, error)) {
                 return false;
             }
+            ctx_used += prefill_batch.n_tokens;
+            metrics.max_ctx_used = std::max(metrics.max_ctx_used, ctx_used);
             prefill_done = true;
         } else {
             phi3_gen_autotune_prepare_step(runtime);
@@ -266,6 +288,8 @@ static bool phi3_generate(
             if (!phi3_decode_generate_step(runtime, gen_input_token, metrics, sampled_token, fused_sample_dt_ms, gen_step_decode_dt_ms, used_fused_sampling, error)) {
                 return false;
             }
+            ctx_used += 1;
+            metrics.max_ctx_used = std::max(metrics.max_ctx_used, ctx_used);
             gen_step_decode_ms.push_back(gen_step_decode_dt_ms);
             phi3_gen_autotune_record_step(runtime, gen_step_decode_dt_ms);
 
@@ -387,13 +411,28 @@ static bool phi3_runtime_run_turn(Phi3Runtime & runtime, const std::string & use
         const double prefill_tps = metrics.prefill_decode_ms > 0.0 ? (1000.0 * metrics.prompt_tokens) / metrics.prefill_decode_ms : 0.0;
         const double prompt_tps = metrics.perf_ctx.t_p_eval_ms > 0.0 ? (1000.0 * metrics.perf_ctx.n_p_eval) / metrics.perf_ctx.t_p_eval_ms : 0.0;
         const double decode_ratio = metrics.turn_total_ms > 0.0 ? (100.0 * metrics.decode_ms) / metrics.turn_total_ms : 0.0;
+        std::string autotune_tiers = "-";
+        if (runtime.enable_gen_autotune && !runtime.gen_autotune_candidates.empty()) {
+            std::ostringstream tiers;
+            tiers << std::fixed << std::setprecision(2);
+            for (int i = 0; i < (int) runtime.gen_autotune_candidates.size(); ++i) {
+                if (i > 0) {
+                    tiers << "|";
+                }
+                const int n = runtime.gen_autotune_decode_ms_count[i];
+                const double ms = runtime.gen_autotune_decode_ms_sum[i];
+                const double tps = ms > 0.0 ? (1000.0 * n) / ms : 0.0;
+                tiers << runtime.gen_autotune_candidates[i] << ":" << tps;
+            }
+            autotune_tiers = tiers.str();
+        }
         fprintf(stderr,
             "\nphi3 profile: turn=%d prompt_tok=%d gen_tok=%d decode_calls=%d prefill_calls=%d gen_calls=%d tokenize_ms=%.2f template_ms=%.2f "
             "decode_ms=%.2f prefill_decode_ms=%.2f gen_decode_ms=%.2f sample_ms=%.2f other_ms=%.2f decode_pct=%.2f "
             "ttft_ms=%.2f gen_step_avg_ms=%.2f gen_step_p95_ms=%.2f gen_step_max_ms=%.2f "
             "sample_step_avg_ms=%.3f sample_step_p95_ms=%.3f sample_step_max_ms=%.3f "
             "llama_prompt_ms=%.2f llama_gen_ms=%.2f prefill_tps=%.2f prompt_tps=%.2f gen_tps=%.2f prefill_threads=%d gen_threads=%d "
-            "gen_kernel=%s fusion_eligible_gen_steps=%d fused_gen_steps=%d generic_gen_steps=%d ctx_peak=%d/%d graph_reused=%d total_ms=%.2f\n",
+            "gen_kernel=%s fusion_eligible_gen_steps=%d qkv_v2_eligible_gen_steps=%d fused_gen_steps=%d generic_gen_steps=%d autotune_prefill_tps=%.2f autotune_tier_gen_tps=%s ctx_peak=%d/%d graph_reused=%d total_ms=%.2f\n",
             runtime.turn_index,
             metrics.prompt_tokens,
             metrics.generated_tokens,
@@ -424,8 +463,11 @@ static bool phi3_runtime_run_turn(Phi3Runtime & runtime, const std::string & use
             metrics.gen_threads,
             metrics.gen_kernel_tag,
             metrics.fusion_eligible_gen_steps,
+            metrics.qkv_v2_eligible_gen_steps,
             metrics.fused_gen_steps,
             metrics.generic_gen_steps,
+            prefill_tps,
+            autotune_tiers.c_str(),
             metrics.max_ctx_used,
             llama_n_ctx(runtime.ctx),
             metrics.perf_ctx.n_reused,

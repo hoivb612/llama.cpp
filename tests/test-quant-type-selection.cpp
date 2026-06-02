@@ -1,4 +1,3 @@
-#include "../src/llama-ext.h"
 #include "ggml-cpp.h"
 #include "gguf-model-data.h"
 #include "llama.h"
