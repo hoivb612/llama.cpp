@@ -4772,7 +4772,7 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-#if defined(GGML_B612_REPACK)
+#if defined(GGML_B612_REPACK_CORE)
         if (!ggml_cpu_tensor_repack_mode_ggml()) {
             return false;
         }
