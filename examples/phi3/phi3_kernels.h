@@ -32,6 +32,7 @@ bool phi3_decode_generate_step(
     bool enable_fused_greedy,
     bool enable_fused_lmhead,
     Phi3FusedLmHead * fused_lmhead,
+    Phi3LmHeadPool *  fused_lmhead_pool,
     int fused_lmhead_threads,
     llama_token & sampled_token,
     double & decode_dt_ms,

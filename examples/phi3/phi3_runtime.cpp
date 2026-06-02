@@ -192,6 +192,7 @@ static bool phi3_decode_generate_step(
             runtime.enable_fused_greedy_gen,
             runtime.enable_fused_lmhead,
             runtime.enable_fused_lmhead ? &runtime.fused_lmhead : nullptr,
+            runtime.enable_fused_lmhead ? &runtime.fused_lmhead_pool : nullptr,
             runtime.n_threads_gen,
             sampled_token,
             decode_dt_ms,
@@ -296,7 +297,7 @@ static bool phi3_generate(
                 }
                 llama_token first_tok = LLAMA_TOKEN_NULL;
                 const auto sample_start = std::chrono::steady_clock::now();
-                if (!phi3_fused_lmhead_argmax(runtime.fused_lmhead, hidden, runtime.n_threads_gen, first_tok, error)) {
+                if (!phi3_fused_lmhead_argmax(runtime.fused_lmhead, &runtime.fused_lmhead_pool, hidden, runtime.n_threads_gen, first_tok, error)) {
                     return false;
                 }
                 const double sample_dt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sample_start).count();
@@ -606,6 +607,13 @@ bool phi3_runtime_init(
             phi3_runtime_free(out);
             return false;
         }
+        // Option 3: persistent worker pool for the per-step argmax. Sized to the
+        // gen-thread count so the partial reductions match the model's compute
+        // tier; falls back to single-thread or legacy spawn if init fails.
+        std::string pool_err;
+        if (!phi3_fused_lmhead_pool_init(out.fused_lmhead_pool, out.n_threads_gen, pool_err)) {
+            fprintf(stderr, "phi3 fused lm_head pool init failed: %s (falling back to per-call thread spawn)\n", pool_err.c_str());
+        }
     }
     phi3_gen_kernel_state_init(out.gen_kernel_state);
     error.clear();
@@ -663,6 +671,7 @@ void phi3_runtime_free(Phi3Runtime & runtime) {
     runtime.gen_autotune_decode_ms_count.clear();
     runtime.enable_fused_greedy_gen = false;
     runtime.enable_fused_lmhead = false;
+    phi3_fused_lmhead_pool_free(runtime.fused_lmhead_pool);
     runtime.fused_lmhead = {};
     runtime.gen_kernel_state = {};
 

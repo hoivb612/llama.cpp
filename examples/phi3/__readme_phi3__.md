@@ -139,3 +139,170 @@ When we set res->t_logits = nullptr in Phi3's graph builder (greedy steps only),
 So suppressing t_logits has zero effect on KV-cache correctness or content for round N+1. The KV-cache for round N's token is fullypopulated by the attention layers themselves; round N+1 will read those cache entries normally when computing its own attention.
 
 The exact mechanism: we'll need to also call ggml_build_forward_expand(gf, res->t_embd) ourselves (or set cparams.embeddings = true)so that final_norm isn't pruned alongside lm_head. That's the one extra wire.
+
+===========================================================================
+
+The Phi3 layer (per step) at memory-bound 40 ms:
+
+┌──────────────────────────────────────┬──────────────┬─────────────┬──────────────┐
+│ stage                                │ inputs       │ bytes read  │ wall time    │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ attn_norm + qkv (combined wqkv)      │ residual f32 │ ~16 MB Q4_K │ ~280 µs      │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ RoPE + scale                         │ small        │ small       │ ~25 µs       │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ attn (QK^T, softmax, V, wo)          │ KV cache     │ varies      │ ~160 µs      │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ residual add                         │ f32          │ tiny        │ ~5 µs        │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ ffn_norm + ffn_up (combined gate+up) │ residual f32 │ ~17 MB Q4_K │ ~430 µs      │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ silu * up                            │ f32          │ ~64 KB      │ ~10 µs       │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ ffn_down                             │ f32          │ ~16 MB Q4_K │ ~330 µs      │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ residual add                         │ f32          │ tiny        │ ~5 µs        │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ total/layer                          │              │ ~49 MB      │ ~1.24 ms     │
+├──────────────────────────────────────┼──────────────┼─────────────┼──────────────┤
+│ × 32 layers                          │              │ ~1.56 GB    │ ~39.7 ms     │
+└──────────────────────────────────────┴──────────────┴─────────────┴──────────────┘
+
+Realistic Phase B targets, ranked:
+
+ 1. Fuse RMSNorm → q8_K-quantize into one op (2 fusion points/layer × 32 = 64 calls): eliminates intermediate f32 write + the nextmatmul's from_float. Estimated +1–2% TPS. ~1 day. Risk: medium (new ggml op).
+ 2. Custom per-layer fused gen kernel (phi3_decode_block): replaces one whole block with a single C++ function that reuses scratchbuffers, skips ggml graph overhead, and pipelines norm→matmul→RoPE→KV-write→… Estimated +5–10% TPS. ~2–3 days. Risk: high(correctness + KV cache layout coupling).
+ 3. Persistent worker pool for fused argmax (Phase C polish): +2–3% TPS. ~1 hour. Risk: low.
+
+Phase B as originally written (option 1) is genuinely modest. Option 2 is what would give real gains but it slides into Phase Aterritory.
+
+My recommendation: do (3) first as a free win, then go straight to Phase A (option 2-ish). That gets us most of the upside with theleast wasted effort.
+
+Option 1 and Option 3 are completely independent code paths and fully additive:
+
+┌───────────────────┬──────────────────────────────────────────────────┬──────────────────────────────────────┐
+│                   │ Option 1 (norm→q8K fuse)                         │ Option 3 (persistent pool)           │
+├───────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
+│ Stage             │ Inside the decode graph (per layer)              │ After decode (sample step)           │
+├───────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
+│ Code location     │ src/models/phi3.cpp + new ggml op                │ examples/phi3/phi3_fused_ops.cpp     │
+├───────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
+│ What it saves     │ Intermediate f32 write + downstream from_float   │ std::thread spawn/join overhead      │
+├───────────────────┼──────────────────────────────────────────────────┼──────────────────────────────────────┤
+│ Threading         │ Runs inside ggml's persistent thread pool (free) │ Replaces our std::thread with a pool │
+└───────────────────┴──────────────────────────────────────────────────┴──────────────────────────────────────┘
+
+The insight worth keeping: Option 3 exists only because our Phase C fused argmax runs outside the ggml graph as our own post-decodeC++ code. Anything we put inside the graph as a ggml op gets parallelized by ggml's pre-allocated thread pool, so the spawn/joinproblem doesn't exist there. Option 1 doesn't need its own thread pool.
+
+How Option 1 would be built
+
+The current graph for the attn_norm + QKV stage is:
+
+ attn_norm_out = RMSNorm(inpL, norm_weight)      // op 1: writes n_embd × f32
+ qkv = mul_mat(wqkv, attn_norm_out)              // op 2: internally calls
+                                                 //         from_float(f32 → q8_K)
+                                                 //         then vec_dot per row
+
+Two ops, an intermediate buffer of n_embd × 4 B, and from_float walks the input again.
+
+Design choice: custom ggml op vs ggml_map_custom
+
+Option A — register a real GGML_OP_NORM_RMS_Q8K: Edit ggml.h (enum), ggml.c (forward decl), ggml-cpu.c (kernel dispatch), per-archquants. Cleanest but invasive — changes ggml core.
+
+Option B — ggml_map_custom3: A black-box custom op already supported by ggml. You hand it 3 input tensors + a function pointer + howmany tasks (threads) to use. ggml's scheduler allocates those tasks from its persistent pool when the op runs. No core changes. This is what "thin core hook" means in the plan. I'd go with B.
+
+But there's a subtlety: ggml's mul_mat always calls from_float on its src1 tensor; it has no way to accept a pre-quantized q8_K input through the standard path. So fusing norm → q8K alone doesn't help — the next mul_mat redoes the work.
+
+Resolution: fuse the whole norm + matmul into one ggml_map_custom3. The op takes (inpL, norm_weight, wqkv) and emits the QKV f32output directly. The downstream graph (RoPE, attention, …) sees the QKV tensor and is unchanged.
+
+The kernel (pseudocode)
+
+ // Runs on each of n_tasks worker threads, dispatched by ggml's pool.
+ static void phi3_fused_norm_qkv(
+         ggml_tensor * dst,                       // [n_embd_qkv, n_tokens] f32
+         const ggml_tensor * inpL,                // [n_embd, n_tokens] f32
+         const ggml_tensor * norm_w,              // [n_embd] f32
+         const ggml_tensor * wqkv,                // [n_embd, n_embd_qkv] q4_K
+         int ith, int nth, void * userdata) {
+
+     const float eps = *(const float *)userdata;
+     const int64_t n_embd     = inpL->ne[0];
+     const int64_t n_embd_qkv = wqkv->ne[1];
+
+     auto w_tr = ggml_get_type_traits_cpu(wqkv->type);
+     auto q_tr = ggml_get_type_traits_cpu(w_tr->vec_dot_type);  // q8_K
+
+     // Per-token; for 1-token gen, ne[1]=1 so this loop runs once.
+     for (int64_t t = 0; t < inpL->ne[1]; ++t) {
+         const float * x = (const float *)inpL->data + t * n_embd;
+         float * y       = (float *)dst->data        + t * n_embd_qkv;
+
+         // 1. RMSNorm — one pass over x to compute sum of squares.
+         //    Each task handles part of the row only on thread 0,
+         //    then broadcasts the scale via simple memory barrier.
+         //    (Simpler for 1-token: do norm on ith==0 into a small scratch,
+         //     ggml's thread sync happens at op boundary anyway.)
+         float ss = 0.0f;
+         for (int64_t i = 0; i < n_embd; ++i) ss += x[i] * x[i];
+         float scale = 1.0f / sqrtf(ss / n_embd + eps);
+
+         // 2. norm * gamma → q8_K scratch buffer (size n_embd / 256 blocks).
+         //    Allocated once per call; reused across blocks.
+         alignas(64) uint8_t qbuf[N_EMBD_MAX_Q8K_BYTES];
+         for (int64_t b = 0; b < n_embd; b += 256) {
+             float tmp[256];
+             for (int j = 0; j < 256; ++j) {
+                 tmp[j] = x[b + j] * scale * ((const float *)norm_w->data)[b + j];
+             }
+             q_tr->from_float(tmp, qbuf + (b/256)*sizeof(block_q8_K), 256);
+         }
+
+         // 3. Per-vocab-row vec_dot, split across nth tasks.
+         const size_t row_bytes = ggml_row_size(wqkv->type, n_embd);
+         const uint8_t * w_base = (const uint8_t *)wqkv->data;
+         const int64_t rows_per = (n_embd_qkv + nth - 1) / nth;
+         const int64_t r0 = ith * rows_per;
+         const int64_t r1 = std::min(r0 + rows_per, n_embd_qkv);
+         for (int64_t r = r0; r < r1; ++r) {
+             float s = 0.0f;
+             w_tr->vec_dot(n_embd, &s, 0,
+                           w_base + r * row_bytes, 0,
+                           qbuf, 0, 1);
+             y[r] = s;
+         }
+     }
+ }
+
+Integration in src/models/phi3.cpp
+
+ if (cparams.fused_decode_phi3) {
+     // Single op replaces build_norm + build_qkv's wqkv matmul.
+     ggml_tensor * qkv = ggml_map_custom3(
+         ctx0, inpL, model.layers[il].attn_norm, model.layers[il].wqkv,
+         phi3_fused_norm_qkv,
+         /*n_tasks=*/GGML_N_TASKS_MAX,
+         /*userdata=*/&hparams.f_norm_rms_eps);
+     qkv = ggml_reshape_2d(ctx0, qkv, n_embd_qkv, n_tokens);
+     // Continue with the views into Q/K/V exactly as before.
+     Qcur = ggml_view_3d(...);
+     Kcur = ggml_view_3d(...);
+     Vcur = ggml_view_3d(...);
+ } else {
+     // Existing path
+     attn_norm_output = build_norm(...);
+     auto [Qcur,Kcur,Vcur] = build_qkv(...);
+ }
+
+You'd do the same for ffn_norm + ffn_up (combined gate+up, output 2*n_ff). That's 2 fusion sites × 32 layers = 64 fused-opinvocations per step.
+
+What you actually win
+
+ - Skip from_float on the matmul input — one fewer pass over n_embd f32 = 12 KB/site → ~10 µs × 64 = ~640 µs/step.
+ - Skip the intermediate attn_norm_out f32 write+read — another 12 KB/site = ~5 µs × 64 = ~320 µs/step.
+ - Total realistic gain: ~1 ms/step → ~+2.5% gen TPS (matches my earlier estimate).
+
+The cost
+
+ - One new C++ kernel function (~50 lines).
+ - Two ggml_map_custom3 substitutions in phi3.cpp under a new cparams.fused_decode_phi3 flag.
+ - Reuses everything else (existing vec_dot, ggml's thread pool, scheduler, graph reuse).

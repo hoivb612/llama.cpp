@@ -68,6 +68,7 @@ bool phi3_decode_generate_step(
     bool enable_fused_greedy,
     bool enable_fused_lmhead,
     Phi3FusedLmHead * fused_lmhead,
+    Phi3LmHeadPool *  fused_lmhead_pool,
     int fused_lmhead_threads,
     llama_token & sampled_token,
     double & decode_dt_ms,
@@ -113,7 +114,7 @@ bool phi3_decode_generate_step(
             return false;
         }
         const auto sample_start = std::chrono::steady_clock::now();
-        if (!phi3_fused_lmhead_argmax(*fused_lmhead, hidden, fused_lmhead_threads, sampled_token, error)) {
+        if (!phi3_fused_lmhead_argmax(*fused_lmhead, fused_lmhead_pool, hidden, fused_lmhead_threads, sampled_token, error)) {
             return false;
         }
         sample_dt_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sample_start).count();

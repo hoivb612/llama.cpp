@@ -47,6 +47,7 @@ struct Phi3Runtime {
     bool enable_fused_greedy_gen = false;
     bool enable_fused_lmhead = false;
     Phi3FusedLmHead fused_lmhead = {};
+    Phi3LmHeadPool  fused_lmhead_pool = {};
     Phi3GenKernelState gen_kernel_state = {};
 };
 

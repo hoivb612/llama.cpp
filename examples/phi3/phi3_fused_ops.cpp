@@ -6,10 +6,17 @@
 #include "llama_b612.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <thread>
 #include <vector>
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#  include <intrin.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#  include <immintrin.h>
+#endif
 
 namespace {
 
@@ -38,6 +45,23 @@ bool resolve_weight_data(Phi3FusedLmHead & lm, std::string & error) {
 }
 
 } // namespace
+
+// Tight spin used in both worker poll-loops and driver wait. We have plenty of
+// cores idle during decode (the lm_head argmax burst is < 2 ms total), so
+// burning a few hundred microseconds of cycles here is preferable to
+// std::this_thread::yield(), which can introduce millisecond-scale wake-up
+// latency on Windows when the OS deschedules the spinner.
+static inline void phi3_cpu_relax() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
 
 bool phi3_fused_lmhead_init(const llama_model * model, Phi3FusedLmHead & out, std::string & error) {
     out = {};
@@ -90,6 +114,7 @@ bool phi3_fused_lmhead_init(const llama_model * model, Phi3FusedLmHead & out, st
 
 bool phi3_fused_lmhead_argmax(
         Phi3FusedLmHead & lm,
+        Phi3LmHeadPool *  pool,
         const float *     hidden,
         int               n_threads,
         llama_token &     out_token,
@@ -119,6 +144,62 @@ bool phi3_fused_lmhead_argmax(
     const int       n_embd_int   = (int) lm.n_embd;
     const void *    q_hidden_ptr = lm.quant_hidden.data();
 
+    // Persistent-pool fast path (Option 3): publish job state and spin-wait
+    // on done_count. Avoids the ~50-100 us/thread spawn cost x N threads x 256
+    // steps that dominated the prior std::thread fallback.
+    if (pool && pool->initialized && pool->n_threads >= 2) {
+        const int N = pool->n_threads;
+
+        // Slice [0, n_vocab) into N contiguous chunks.
+        const int64_t chunk = (n_vocab + N - 1) / N;
+        for (int wid = 0; wid < N; ++wid) {
+            const int64_t lo = (int64_t) wid * chunk;
+            const int64_t hi = std::min<int64_t>(lo + chunk, n_vocab);
+            pool->slots[wid].lo       = lo;
+            pool->slots[wid].hi       = hi;
+            pool->slots[wid].best_val = -std::numeric_limits<float>::infinity();
+            pool->slots[wid].best_id  = lo;
+        }
+        pool->w_traits     = w_traits;
+        pool->w_base       = w_base;
+        pool->row_bytes    = row_bytes;
+        pool->n_embd       = n_embd_int;
+        pool->q_hidden_ptr = q_hidden_ptr;
+
+        // Reset done_count BEFORE publishing job_seq so workers don't observe a
+        // stale count from a previous dispatch.
+        pool->done_count.store(0, std::memory_order_release);
+        // Publish under the cv mutex so a parked worker can't miss the
+        // wake-up (classic cv pattern: change predicate, then notify).
+        {
+            std::lock_guard<std::mutex> lk(pool->mtx);
+            pool->job_seq.fetch_add(1, std::memory_order_acq_rel);
+        }
+        pool->cv_work.notify_all();
+
+        // Driver tight-spins on done_count. The ~1 ms argmax burst happens
+        // immediately after llama_decode returns, so spinning here keeps the
+        // driver core hot and avoids any further wake-up latency.
+        while (pool->done_count.load(std::memory_order_acquire) < N) {
+            phi3_cpu_relax();
+        }
+
+        // Reduce N partials.
+        float   best_val = -std::numeric_limits<float>::infinity();
+        int64_t best_id  = 0;
+        for (int wid = 0; wid < N; ++wid) {
+            const auto & s = pool->slots[wid];
+            if (s.hi <= s.lo) continue;
+            if (s.best_val > best_val) {
+                best_val = s.best_val;
+                best_id  = s.best_id;
+            }
+        }
+        out_token = (llama_token) best_id;
+        error.clear();
+        return true;
+    }
+
     int n_workers = n_threads > 0 ? n_threads : 1;
     if (n_workers > n_vocab) {
         n_workers = (int) n_vocab;
@@ -140,6 +221,8 @@ bool phi3_fused_lmhead_argmax(
         return true;
     }
 
+    // Legacy fallback: per-call std::thread spawn. Retained for the case where
+    // the pool is not provided (e.g. one-shot init failure, single-thread mode).
     struct Slot { float val; int64_t id; };
     std::vector<Slot> partials(n_workers, Slot{-std::numeric_limits<float>::infinity(), 0});
     std::vector<std::thread> workers;
@@ -182,4 +265,104 @@ bool phi3_fused_lmhead_argmax(
     out_token = (llama_token) best_id;
     error.clear();
     return true;
+}
+
+namespace {
+
+void phi3_lmhead_worker_loop(Phi3LmHeadPool * pool, int wid) {
+    uint64_t last_seq = 0;
+    while (true) {
+        // Park on cv until the driver publishes a new job (or signals stop).
+        // Parking matters because the driver thread runs ggml decode on its
+        // own threadpool for ~40 ms between argmax calls; spinning during
+        // decode would steal cycles from those workers.
+        {
+            std::unique_lock<std::mutex> lk(pool->mtx);
+            pool->cv_work.wait(lk, [&]{
+                return pool->stop.load(std::memory_order_acquire) ||
+                       pool->job_seq.load(std::memory_order_acquire) != last_seq;
+            });
+            if (pool->stop.load(std::memory_order_acquire)) {
+                return;
+            }
+            last_seq = pool->job_seq.load(std::memory_order_acquire);
+        }
+
+        // Acquire-load on job_seq above synchronizes with driver's release store,
+        // so the per-job state below is safe to read.
+        const auto *   w_traits  = pool->w_traits;
+        const uint8_t * w_base    = pool->w_base;
+        const size_t   row_bytes = pool->row_bytes;
+        const int      n_embd    = pool->n_embd;
+        const void *   q_hidden  = pool->q_hidden_ptr;
+        auto &         s         = pool->slots[wid];
+
+        const int64_t lo = s.lo;
+        const int64_t hi = s.hi;
+        if (lo < hi && w_traits && w_traits->vec_dot) {
+            float   best_val = -std::numeric_limits<float>::infinity();
+            int64_t best_id  = lo;
+            for (int64_t v = lo; v < hi; ++v) {
+                float ss = 0.0f;
+                w_traits->vec_dot(n_embd, &ss, 0, w_base + (size_t) v * row_bytes, 0, q_hidden, 0, 1);
+                if (ss > best_val) {
+                    best_val = ss;
+                    best_id  = v;
+                }
+            }
+            s.best_val = best_val;
+            s.best_id  = best_id;
+        }
+
+        pool->done_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+} // namespace
+
+bool phi3_fused_lmhead_pool_init(Phi3LmHeadPool & pool, int n_threads, std::string & error) {
+    phi3_fused_lmhead_pool_free(pool);
+    if (n_threads <= 1) {
+        // Pool disabled; argmax will fall back to single-thread or legacy spawn.
+        pool.n_threads   = 0;
+        pool.initialized = false;
+        error.clear();
+        return true;
+    }
+    pool.n_threads = n_threads;
+    pool.slots.assign(n_threads, Phi3LmHeadPool::Slot{});
+    pool.stop.store(false, std::memory_order_release);
+    pool.job_seq.store(0, std::memory_order_release);
+    pool.done_count.store(0, std::memory_order_release);
+    pool.workers.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        pool.workers.emplace_back(phi3_lmhead_worker_loop, &pool, i);
+    }
+    pool.initialized = true;
+    error.clear();
+    return true;
+}
+
+void phi3_fused_lmhead_pool_free(Phi3LmHeadPool & pool) {
+    if (!pool.initialized && pool.workers.empty()) {
+        pool.slots.clear();
+        pool.n_threads = 0;
+        return;
+    }
+    pool.stop.store(true, std::memory_order_release);
+    // Bump job_seq AND notify under the cv mutex so parked workers observe both.
+    {
+        std::lock_guard<std::mutex> lk(pool.mtx);
+        pool.job_seq.fetch_add(1, std::memory_order_acq_rel);
+    }
+    pool.cv_work.notify_all();
+    for (auto & t : pool.workers) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    pool.workers.clear();
+    pool.slots.clear();
+    pool.initialized = false;
+    pool.n_threads = 0;
 }
