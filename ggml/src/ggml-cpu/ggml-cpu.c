@@ -2752,6 +2752,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
+#if defined(GGML_B612_REPACK_CORE)
                 if (ggml_cpu_tensor_repack_mode_xbox() ||
                     ggml_cpu_tensor_repack_mode_xbox_callgraph() ||
                     ggml_cpu_tensor_repack_mode_xbox_single_thread() ||
@@ -2760,6 +2761,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 } else {
                     ggml_compute_forward_mul_mat(params, tensor);
                 }
+#else
+                ggml_compute_forward_mul_mat(params, tensor);
+#endif
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
