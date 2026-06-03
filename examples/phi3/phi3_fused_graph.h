@@ -287,3 +287,53 @@ void phi3_fused_ctx_free(Phi3FusedCtx & cx);
 // triaging "did we resolve this correctly?" questions). Safe to call on an
 // uninitialized cx; just prints zeros.
 void phi3_fused_ctx_dump(const Phi3FusedCtx & cx);
+
+
+// ===========================================================================
+// A2.3 — Single-layer F32 self-test.
+// ===========================================================================
+// Populate the per-layer F32 weight mirrors in cx.scratch from the model's
+// quantized weights. Requires cx.scratch.f32_debug == true (i.e., ctx_init
+// was called with f32_debug=true). Returns false with a specific error if
+// the dequantize fails for any tensor.
+bool phi3_layer_warmup_f32_mirrors(Phi3FusedCtx & cx, int il, std::string & error);
+
+// Optional capture of per-step intermediates for diagnostics. All buffers
+// the caller provides MUST be sized to the values shown; null pointers are
+// skipped. Capture is the same for our impl and the oracle so a diverging
+// step is immediately visible.
+struct Phi3LayerCapture {
+    float * norm1            = nullptr; // [n_embd]
+    float * qkv              = nullptr; // [n_qkv]
+    float * Q_post_rope      = nullptr; // [n_embd]
+    float * K_post_rope      = nullptr; // [n_embd_kv]   (just the current token's K)
+    float * V_cur            = nullptr; // [n_embd_kv]   (current token's V, pre-cache)
+    float * attn_ctx         = nullptr; // [n_embd]      (post softmax · V)
+    float * attn_out         = nullptr; // [n_embd]      (after wo)
+    float * x_after_res1     = nullptr; // [n_embd]
+    float * norm2            = nullptr; // [n_embd]
+    float * upgate           = nullptr; // [2 * n_ff]
+    float * ff               = nullptr; // [n_ff]
+    float * ffn_out          = nullptr; // [n_embd]
+};
+
+// Our F32-everywhere single-layer forward for one token at absolute `pos`.
+// Caller is responsible for the cache state at positions [0..pos); this call
+// writes our newly-computed K, V at position `pos` (F16) and updates
+// cx.kv.current_len if necessary.
+//
+// On entry x_inout = input residual stream (token embedding for layer 0).
+// On exit  x_inout = output residual stream after this layer.
+bool phi3_layer_forward_f32(
+        Phi3FusedCtx       & cx,
+        int                  il,
+        int                  pos,
+        float              * x_inout,
+        Phi3LayerCapture   * capture,   // optional, may be nullptr
+        std::string        & error);
+
+// Run the single-layer F32 self-test against a ggml-cpu oracle graph.
+// Loads layer 0 of the live model, pre-fills 4 prior positions of random
+// K/V, then runs one token at pos=4 through both pipelines and compares
+// every intermediate. Returns false with the first diverging step + index.
+bool phi3_layer_self_test(const llama_model * model, std::string & error);

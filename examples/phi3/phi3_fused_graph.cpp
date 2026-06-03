@@ -1275,3 +1275,585 @@ void phi3_fused_ctx_dump(const Phi3FusedCtx & cx) {
         fprintf(stderr, "  scratch.f32_dbg_MiB= %.1f (per-layer mirrors + vocab chunk)\n", dbg / (1024.0 * 1024.0));
     }
 }
+
+// ===========================================================================
+// A2.3 — Per-layer F32 warmup, F32 forward, and single-layer self-test.
+// ===========================================================================
+
+namespace {
+
+// Dequantize a 2-D weight tensor into a flat F32 buffer. `dst_capacity` is
+// the size of `dst` in floats; we need at least ne[0] * ne[1] floats.
+bool dequant_2d_to_f32(const ggml_tensor * src, float * dst, size_t dst_capacity, std::string & error) {
+    if (src == nullptr) {
+        error = "dequant_2d_to_f32: src is null";
+        return false;
+    }
+    const int64_t n0 = src->ne[0];
+    const int64_t n1 = src->ne[1];
+    if ((size_t) n0 * (size_t) n1 > dst_capacity) {
+        std::ostringstream oss;
+        oss << "dequant_2d_to_f32: capacity too small (need " << (size_t)n0*(size_t)n1
+            << " got " << dst_capacity << ")";
+        error = oss.str();
+        return false;
+    }
+    const auto * traits = ggml_get_type_traits(src->type);
+    if (src->type == GGML_TYPE_F32) {
+        for (int64_t r = 0; r < n1; ++r) {
+            const float * row = (const float *) ((const uint8_t *) src->data + r * src->nb[1]);
+            std::memcpy(dst + r * n0, row, (size_t) n0 * sizeof(float));
+        }
+    } else if (src->type == GGML_TYPE_F16) {
+        for (int64_t r = 0; r < n1; ++r) {
+            const ggml_fp16_t * row = (const ggml_fp16_t *) ((const uint8_t *) src->data + r * src->nb[1]);
+            ggml_fp16_to_fp32_row(row, dst + r * n0, n0);
+        }
+    } else {
+        if (traits == nullptr || traits->to_float == nullptr) {
+            error = std::string("dequant_2d_to_f32: no to_float for type ") + ggml_type_name(src->type);
+            return false;
+        }
+        for (int64_t r = 0; r < n1; ++r) {
+            const uint8_t * row = (const uint8_t *) src->data + r * src->nb[1];
+            traits->to_float(row, dst + r * n0, n0);
+        }
+    }
+    return true;
+}
+
+// Naive F32 matmul: y[j] = sum_k w[j*K + k] * x[k] for j in [0..M).
+// w stored row-major: rows are length K, M rows total.
+void f32_matmul_row(const float * w, const float * x, float * y, int M, int K) {
+    for (int j = 0; j < M; ++j) {
+        double acc = 0.0;
+        const float * row = w + (size_t) j * K;
+        for (int k = 0; k < K; ++k) {
+            acc += (double) row[k] * (double) x[k];
+        }
+        y[j] = (float) acc;
+    }
+}
+
+} // namespace
+
+
+bool phi3_layer_warmup_f32_mirrors(Phi3FusedCtx & cx, int il, std::string & error) {
+    error.clear();
+    if (cx.w == nullptr) {
+        error = "phi3_layer_warmup_f32_mirrors: cx.w is null";
+        return false;
+    }
+    if (!cx.scratch.f32_debug) {
+        error = "phi3_layer_warmup_f32_mirrors: cx.scratch.f32_debug is false (alloc the mirrors first)";
+        return false;
+    }
+    if (il < 0 || il >= cx.w->n_layer) {
+        std::ostringstream oss; oss << "phi3_layer_warmup_f32_mirrors: il=" << il << " out of range";
+        error = oss.str();
+        return false;
+    }
+    if (cx.scratch.f32_cached_layer == il) {
+        return true;  // already warm
+    }
+    const Phi3LayerWeights & L = cx.w->layers[il];
+    if (!dequant_2d_to_f32(L.attn_norm, cx.scratch.w_f32_attn_norm.data(), cx.scratch.w_f32_attn_norm.size(), error)) return false;
+    if (!dequant_2d_to_f32(L.wqkv,      cx.scratch.w_f32_wqkv.data(),      cx.scratch.w_f32_wqkv.size(),      error)) return false;
+    if (!dequant_2d_to_f32(L.wo,        cx.scratch.w_f32_wo.data(),        cx.scratch.w_f32_wo.size(),        error)) return false;
+    if (!dequant_2d_to_f32(L.ffn_norm,  cx.scratch.w_f32_ffn_norm.data(),  cx.scratch.w_f32_ffn_norm.size(),  error)) return false;
+    if (!dequant_2d_to_f32(L.ffn_up,    cx.scratch.w_f32_ffn_up.data(),    cx.scratch.w_f32_ffn_up.size(),    error)) return false;
+    if (!dequant_2d_to_f32(L.ffn_down,  cx.scratch.w_f32_ffn_down.data(),  cx.scratch.w_f32_ffn_down.size(),  error)) return false;
+    cx.scratch.f32_cached_layer = il;
+    return true;
+}
+
+
+bool phi3_layer_forward_f32(
+        Phi3FusedCtx       & cx,
+        int                  il,
+        int                  pos,
+        float              * x_inout,
+        Phi3LayerCapture   * capture,
+        std::string        & error) {
+    error.clear();
+    if (cx.w == nullptr) { error = "phi3_layer_forward_f32: cx.w is null"; return false; }
+    if (!cx.scratch.f32_debug) { error = "phi3_layer_forward_f32: requires f32_debug"; return false; }
+    if (cx.scratch.f32_cached_layer != il) {
+        if (!phi3_layer_warmup_f32_mirrors(cx, il, error)) return false;
+    }
+
+    const Phi3Weights & W = *cx.w;
+    const int n_embd     = W.n_embd;
+    const int n_head     = W.n_head;
+    const int n_head_kv  = W.n_head_kv;
+    const int head_dim   = W.n_embd_head;
+    const int n_embd_kv  = head_dim * n_head_kv;
+    const int n_embd_q   = head_dim * n_head;
+    const int n_qkv      = W.n_qkv;
+    const int n_ff       = W.n_ff;
+
+    if (pos < 0 || pos >= cx.kv.ctx_max) {
+        std::ostringstream oss; oss << "phi3_layer_forward_f32: pos=" << pos << " out of range";
+        error = oss.str();
+        return false;
+    }
+
+    // Local scratch (we cannot reuse cx.scratch.x_buf etc. since the capture
+    // pointers may alias them; safer to use local std::vector here).
+    std::vector<float> norm1(n_embd);
+    std::vector<float> qkv(n_qkv);
+    std::vector<float> attn_ctx(n_embd, 0.0f);
+    std::vector<float> attn_out_buf(n_embd);
+    std::vector<float> x_after_res1(n_embd);
+    std::vector<float> norm2(n_embd);
+    std::vector<float> upgate(2 * n_ff);
+    std::vector<float> ff(n_ff);
+    std::vector<float> ffn_out_buf(n_embd);
+
+    // --- 1. Pre-attn RMSNorm ---
+    phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout,
+                                cx.scratch.w_f32_attn_norm.data(),
+                                n_embd, cx.eps);
+    if (capture && capture->norm1) std::memcpy(capture->norm1, norm1.data(), n_embd * sizeof(float));
+
+    // --- 2. wqkv ---
+    f32_matmul_row(cx.scratch.w_f32_wqkv.data(), norm1.data(), qkv.data(), n_qkv, n_embd);
+    if (capture && capture->qkv) std::memcpy(capture->qkv, qkv.data(), n_qkv * sizeof(float));
+
+    float * q = qkv.data();
+    float * k = qkv.data() + n_embd_q;
+    float * v = qkv.data() + n_embd_q + n_embd_kv;
+
+    // --- 3. RoPE on Q, K (per head, NeoX) ---
+    for (int h = 0; h < n_head; ++h) {
+        phi3_kernel_rope_neox_f32(q + h * head_dim, q + h * head_dim, /*factors=*/nullptr,
+                                  cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+    }
+    for (int h = 0; h < n_head_kv; ++h) {
+        phi3_kernel_rope_neox_f32(k + h * head_dim, k + h * head_dim, /*factors=*/nullptr,
+                                  cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+    }
+    if (capture && capture->Q_post_rope) std::memcpy(capture->Q_post_rope, q, n_embd_q * sizeof(float));
+    if (capture && capture->K_post_rope) std::memcpy(capture->K_post_rope, k, n_embd_kv * sizeof(float));
+    if (capture && capture->V_cur)       std::memcpy(capture->V_cur, v, n_embd_kv * sizeof(float));
+
+    // --- 4. Write K, V to cache at position `pos` (F16) ---
+    //     Layout: cache[(pos * n_head_kv + h) * head_dim + d]
+    {
+        ggml_fp16_t * K_pos = cx.kv.K[il] + (size_t) pos * (size_t) n_embd_kv;
+        ggml_fp16_t * V_pos = cx.kv.V[il] + (size_t) pos * (size_t) n_embd_kv;
+        ggml_fp32_to_fp16_row(k, K_pos, n_embd_kv);
+        ggml_fp32_to_fp16_row(v, V_pos, n_embd_kv);
+    }
+    const int new_len = pos + 1;
+    if (cx.kv.current_len < new_len) cx.kv.current_len = new_len;
+
+    // --- 5. Attention (per head) ---
+    const float scale_q = 1.0f / std::sqrt((float) head_dim);
+    std::vector<float> scores((size_t) new_len);
+    for (int h = 0; h < n_head; ++h) {
+        const float * q_h = q + h * head_dim;
+        // K dots
+        float max_s = -INFINITY;
+        for (int p = 0; p < new_len; ++p) {
+            const ggml_fp16_t * k_p = cx.kv.K[il] + ((size_t) p * n_head_kv + h) * head_dim;
+            double acc = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                acc += (double) q_h[d] * (double) ggml_fp16_to_fp32(k_p[d]);
+            }
+            const float s = (float) (acc * (double) scale_q);
+            scores[p] = s;
+            if (s > max_s) max_s = s;
+        }
+        // softmax
+        double sum_exp = 0.0;
+        for (int p = 0; p < new_len; ++p) {
+            scores[p] = std::exp(scores[p] - max_s);
+            sum_exp += (double) scores[p];
+        }
+        const float inv_sum = (float) (1.0 / sum_exp);
+        // dot V
+        float * ctx_h = attn_ctx.data() + h * head_dim;
+        for (int d = 0; d < head_dim; ++d) ctx_h[d] = 0.0f;
+        for (int p = 0; p < new_len; ++p) {
+            const float w_p = scores[p] * inv_sum;
+            const ggml_fp16_t * v_p = cx.kv.V[il] + ((size_t) p * n_head_kv + h) * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                ctx_h[d] += w_p * ggml_fp16_to_fp32(v_p[d]);
+            }
+        }
+    }
+    if (capture && capture->attn_ctx) std::memcpy(capture->attn_ctx, attn_ctx.data(), n_embd * sizeof(float));
+
+    // --- 6. wo ---
+    f32_matmul_row(cx.scratch.w_f32_wo.data(), attn_ctx.data(), attn_out_buf.data(), n_embd, n_embd);
+    if (capture && capture->attn_out) std::memcpy(capture->attn_out, attn_out_buf.data(), n_embd * sizeof(float));
+
+    // --- 7. Residual 1 ---
+    for (int i = 0; i < n_embd; ++i) x_after_res1[i] = x_inout[i] + attn_out_buf[i];
+    if (capture && capture->x_after_res1) std::memcpy(capture->x_after_res1, x_after_res1.data(), n_embd * sizeof(float));
+
+    // --- 8. FFN RMSNorm ---
+    phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(),
+                                cx.scratch.w_f32_ffn_norm.data(),
+                                n_embd, cx.eps);
+    if (capture && capture->norm2) std::memcpy(capture->norm2, norm2.data(), n_embd * sizeof(float));
+
+    // --- 9. ffn_up (gate||up fused) ---
+    f32_matmul_row(cx.scratch.w_f32_ffn_up.data(), norm2.data(), upgate.data(), 2 * n_ff, n_embd);
+    if (capture && capture->upgate) std::memcpy(capture->upgate, upgate.data(), 2 * n_ff * sizeof(float));
+
+    // --- 10. SwiGLU: ff[i] = silu(gate[i]) * up[i]
+    //         gate = upgate[0..n_ff), up = upgate[n_ff..2*n_ff)
+    for (int i = 0; i < n_ff; ++i) {
+        const float g = upgate[i];
+        const float u = upgate[n_ff + i];
+        const float silu = g / (1.0f + std::exp(-g));
+        ff[i] = silu * u;
+    }
+    if (capture && capture->ff) std::memcpy(capture->ff, ff.data(), n_ff * sizeof(float));
+
+    // --- 11. ffn_down ---
+    f32_matmul_row(cx.scratch.w_f32_ffn_down.data(), ff.data(), ffn_out_buf.data(), n_embd, n_ff);
+    if (capture && capture->ffn_out) std::memcpy(capture->ffn_out, ffn_out_buf.data(), n_embd * sizeof(float));
+
+    // --- 12. Residual 2 ---
+    for (int i = 0; i < n_embd; ++i) x_inout[i] = x_after_res1[i] + ffn_out_buf[i];
+
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Oracle: build a ggml single-layer F32 graph that mirrors our naive impl.
+//
+// All weights are F32 (dequantized) — we are testing layout, not Q-quant
+// precision. The prior K/V are passed in already-F16-rounded-to-F32 to
+// match our F16 KV cache rounding. The new K/V (computed by oracle's
+// wqkv+rope) is also rounded through F16 via ggml_cast to match the hand
+// path's "write F16 then read F16" semantics.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Round an F32 array through F16 in-place (host-side).
+void round_through_f16(float * x, int n) {
+    std::vector<ggml_fp16_t> tmp((size_t) n);
+    ggml_fp32_to_fp16_row(x, tmp.data(), n);
+    ggml_fp16_to_fp32_row(tmp.data(), x, n);
+}
+
+bool buffers_close(const char * stage, const float * a, const float * b, int n,
+                   float atol, float rtol, std::string & error) {
+    int worst_i = -1;
+    float worst_diff = 0.0f;
+    float worst_a = 0.0f, worst_b = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float diff = std::fabs(a[i] - b[i]);
+        const float ref  = std::fabs(b[i]);
+        if (diff > atol && diff > rtol * ref) {
+            if (diff > worst_diff) {
+                worst_diff = diff; worst_i = i; worst_a = a[i]; worst_b = b[i];
+            }
+        }
+    }
+    if (worst_i >= 0) {
+        std::ostringstream oss;
+        oss << "phi3 layer self-test: stage '" << stage << "' diverges at i=" << worst_i
+            << " ours=" << worst_a << " oracle=" << worst_b << " diff=" << worst_diff
+            << " (atol=" << atol << " rtol=" << rtol << " n=" << n << ")";
+        error = oss.str();
+        return false;
+    }
+    fprintf(stderr, "phi3 layer self-test: stage %-16s OK (n=%d, atol=%g, rtol=%g)\n",
+            stage, n, atol, rtol);
+    return true;
+}
+
+} // namespace
+
+
+bool phi3_layer_self_test(const llama_model * model, std::string & error) {
+    error.clear();
+    if (model == nullptr) { error = "phi3_layer_self_test: model is null"; return false; }
+
+    // ----- Resolve weights -----
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+    const int n_embd     = W.n_embd;
+    const int n_head     = W.n_head;
+    const int n_head_kv  = W.n_head_kv;
+    const int head_dim   = W.n_embd_head;
+    const int n_embd_kv  = head_dim * n_head_kv;
+    const int n_embd_q   = head_dim * n_head;
+    const int n_qkv      = W.n_qkv;
+    const int n_ff       = W.n_ff;
+
+    // ----- Build a fused-ctx (no lctx — we set sensible defaults) -----
+    Phi3FusedCtx cx;
+    {
+        const int test_ctx_max = 8;
+        if (!phi3_fused_ctx_init(cx, W, /*pool=*/nullptr, model, /*lctx=*/nullptr,
+                                 test_ctx_max, /*f32_debug=*/true, error)) {
+            return false;
+        }
+    }
+    if (!phi3_layer_warmup_f32_mirrors(cx, 0, error)) { phi3_fused_ctx_free(cx); return false; }
+
+    // ----- Inputs -----
+    const int n_prior = 4;
+    const int cur_pos = n_prior;  // 4
+    const int total   = n_prior + 1;
+    std::mt19937 rng(2026u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    std::vector<float> x_in(n_embd);
+    for (int i = 0; i < n_embd; ++i) x_in[i] = nd(rng);
+
+    // Prior K/V — random, then rounded through F16 so both paths see the
+    // same F16-quantized prior cache.
+    std::vector<float> prior_K_f32((size_t) n_prior * n_embd_kv);
+    std::vector<float> prior_V_f32((size_t) n_prior * n_embd_kv);
+    for (auto & x : prior_K_f32) x = nd(rng);
+    for (auto & x : prior_V_f32) x = nd(rng);
+    round_through_f16(prior_K_f32.data(), (int) prior_K_f32.size());
+    round_through_f16(prior_V_f32.data(), (int) prior_V_f32.size());
+
+    // ----- Pre-load Phi3KV with the F16-rounded prior data -----
+    for (int p = 0; p < n_prior; ++p) {
+        ggml_fp16_t * K_p = cx.kv.K[0] + (size_t) p * n_embd_kv;
+        ggml_fp16_t * V_p = cx.kv.V[0] + (size_t) p * n_embd_kv;
+        ggml_fp32_to_fp16_row(prior_K_f32.data() + p * n_embd_kv, K_p, n_embd_kv);
+        ggml_fp32_to_fp16_row(prior_V_f32.data() + p * n_embd_kv, V_p, n_embd_kv);
+    }
+    cx.kv.current_len = n_prior;
+
+    // ----- Our path with capture -----
+    std::vector<float> cap_norm1(n_embd), cap_qkv(n_qkv), cap_Q(n_embd_q), cap_K(n_embd_kv), cap_V(n_embd_kv);
+    std::vector<float> cap_attn_ctx(n_embd), cap_attn_out(n_embd), cap_res1(n_embd);
+    std::vector<float> cap_norm2(n_embd), cap_upgate(2 * n_ff), cap_ff(n_ff), cap_ffn_out(n_embd);
+    Phi3LayerCapture cap_ours{
+        cap_norm1.data(), cap_qkv.data(), cap_Q.data(), cap_K.data(), cap_V.data(),
+        cap_attn_ctx.data(), cap_attn_out.data(), cap_res1.data(),
+        cap_norm2.data(), cap_upgate.data(), cap_ff.data(), cap_ffn_out.data()
+    };
+    std::vector<float> x_out_ours(n_embd);
+    std::memcpy(x_out_ours.data(), x_in.data(), n_embd * sizeof(float));
+    if (!phi3_layer_forward_f32(cx, /*il=*/0, cur_pos, x_out_ours.data(), &cap_ours, error)) {
+        phi3_fused_ctx_free(cx);
+        return false;
+    }
+
+    // =====================================================================
+    // ----- Oracle: ggml-cpu graph for one token at pos=cur_pos -----
+    // =====================================================================
+    // Strategy: build an F32 graph that does
+    //   norm1 → wqkv(F32) → split Q|K|V → rope(Q), rope(K)
+    //   → round(K_new, V) through F16 (via ggml_cast F32→F16→F32)
+    //   → concat(prior_K, K_new) on dim 2 → same for V
+    //   → permute(Q,K,V), kq = mul_mat(K,Q), softmax(kq*scale_q),
+    //     V_T = cont(transpose(V)), kqv = mul_mat(V_T, kq)
+    //   → wo(F32), residual1
+    //   → norm2, ffn_up, swiglu, ffn_down, residual2.
+    //
+    // We capture the SAME intermediates as cap_ours via separate output
+    // tensors (each added to the graph as build_forward_expand sources).
+    //
+    // 1 GiB ggml arena (F32 weight mirrors alone are ~450 MiB: wqkv 110 +
+    // wo 38 + ffn_up 200 + ffn_down 100; plus intermediates and work data).
+    const size_t graph_mem = (size_t) 1024 * 1024 * 1024;
+    std::vector<uint8_t> arena(graph_mem);
+    ggml_init_params ip{ graph_mem, arena.data(), false };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) { error = "phi3_layer_self_test: ggml_init failed"; phi3_fused_ctx_free(cx); return false; }
+
+    // Helper to create + populate an F32 tensor.
+    auto new_f32 = [&](int64_t a, int64_t b, int64_t c, const float * src, int64_t nelt) -> ggml_tensor * {
+        ggml_tensor * t;
+        if (c > 1)       t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, a, b, c);
+        else if (b > 1)  t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, a, b);
+        else             t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, a);
+        if (src) std::memcpy(t->data, src, (size_t) nelt * sizeof(float));
+        return t;
+    };
+
+    // Inputs.
+    ggml_tensor * t_x       = new_f32(n_embd, 1, 1, x_in.data(), n_embd);
+    ggml_tensor * t_priorK  = new_f32(head_dim, n_head_kv, n_prior, prior_K_f32.data(), (int64_t) n_prior * n_embd_kv);
+    ggml_tensor * t_priorV  = new_f32(head_dim, n_head_kv, n_prior, prior_V_f32.data(), (int64_t) n_prior * n_embd_kv);
+
+    // F32 weight mirrors (just borrow the buffers — no_alloc=false means ggml
+    // allocates the tensor data; we memcpy).
+    ggml_tensor * t_attn_norm = new_f32(n_embd,        1, 1, cx.scratch.w_f32_attn_norm.data(), n_embd);
+    ggml_tensor * t_wqkv      = new_f32(n_embd,    n_qkv, 1, cx.scratch.w_f32_wqkv.data(),      (int64_t) n_embd * n_qkv);
+    ggml_tensor * t_wo        = new_f32(n_embd,   n_embd, 1, cx.scratch.w_f32_wo.data(),        (int64_t) n_embd * n_embd);
+    ggml_tensor * t_ffn_norm  = new_f32(n_embd,        1, 1, cx.scratch.w_f32_ffn_norm.data(),  n_embd);
+    ggml_tensor * t_ffn_up    = new_f32(n_embd, 2 * n_ff, 1, cx.scratch.w_f32_ffn_up.data(),    (int64_t) n_embd * 2 * n_ff);
+    ggml_tensor * t_ffn_down  = new_f32(n_ff,    n_embd,  1, cx.scratch.w_f32_ffn_down.data(),  (int64_t) n_ff * n_embd);
+
+    // Position tensor for ggml_rope_ext: [n_tokens=1] int32 with value [cur_pos].
+    ggml_tensor * t_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ((int32_t *) t_pos->data)[0] = cur_pos;
+
+    // ---- Graph: norm1 = rms_norm(x) * attn_norm ----
+    ggml_tensor * norm1 = ggml_rms_norm(gctx, t_x, cx.eps);
+    norm1 = ggml_mul(gctx, norm1, t_attn_norm);
+
+    // ---- wqkv: qkv = mul_mat(W, norm1) ----
+    ggml_tensor * qkv = ggml_mul_mat(gctx, t_wqkv, norm1);   // [n_qkv, 1]
+
+    // ---- Split Q/K/V (3-D views) ----
+    // Q view: offset 0, shape [head_dim, n_head,    1]
+    // K view: offset n_embd_q*sizeof(f32), shape [head_dim, n_head_kv, 1]
+    // V view: offset (n_embd_q + n_embd_kv)*sizeof(f32), shape [head_dim, n_head_kv, 1]
+    ggml_tensor * Q = ggml_view_3d(gctx, qkv, head_dim, n_head,    1,
+                                   head_dim * sizeof(float), qkv->nb[1], 0);
+    ggml_tensor * K = ggml_view_3d(gctx, qkv, head_dim, n_head_kv, 1,
+                                   head_dim * sizeof(float), qkv->nb[1],
+                                   (size_t) n_embd_q * sizeof(float));
+    ggml_tensor * V = ggml_view_3d(gctx, qkv, head_dim, n_head_kv, 1,
+                                   head_dim * sizeof(float), qkv->nb[1],
+                                   (size_t) (n_embd_q + n_embd_kv) * sizeof(float));
+
+    // ---- RoPE on Q and K (NEOX) ----
+    Q = ggml_rope_ext(gctx, Q, t_pos, /*factors=*/nullptr,
+                      cx.rope.n_rot, GGML_ROPE_TYPE_NEOX, cx.rope.n_ctx_orig,
+                      cx.rope.freq_base, cx.rope.freq_scale,
+                      cx.rope.ext_factor, cx.rope.attn_factor,
+                      cx.rope.beta_fast, cx.rope.beta_slow);
+    K = ggml_rope_ext(gctx, K, t_pos, /*factors=*/nullptr,
+                      cx.rope.n_rot, GGML_ROPE_TYPE_NEOX, cx.rope.n_ctx_orig,
+                      cx.rope.freq_base, cx.rope.freq_scale,
+                      cx.rope.ext_factor, cx.rope.attn_factor,
+                      cx.rope.beta_fast, cx.rope.beta_slow);
+
+    // ---- Round new K/V through F16 to match the hand path ----
+    K = ggml_cast(gctx, K, GGML_TYPE_F16);
+    K = ggml_cast(gctx, K, GGML_TYPE_F32);
+    V = ggml_cast(gctx, V, GGML_TYPE_F16);
+    V = ggml_cast(gctx, V, GGML_TYPE_F32);
+
+    // ---- Concat prior + new on dim 2 (positions) ----
+    ggml_tensor * K_all = ggml_concat(gctx, t_priorK, K, 2);   // [head_dim, n_head_kv, total]
+    ggml_tensor * V_all = ggml_concat(gctx, t_priorV, V, 2);
+
+    // ---- Attention: kq = mul_mat(K_all_perm, Q_perm) then softmax ----
+    // build_attn_mha pattern: permute (0,2,1,3) so head becomes outer.
+    ggml_tensor * Qp = ggml_permute(gctx, Q,     0, 2, 1, 3);  // [head_dim, n_tokens_q=1, n_head, 1]
+    ggml_tensor * Kp = ggml_permute(gctx, K_all, 0, 2, 1, 3);  // [head_dim, n_tokens_kv=total, n_head_kv, 1]
+    ggml_tensor * Vp = ggml_permute(gctx, V_all, 0, 2, 1, 3);  // [head_dim, n_tokens_kv=total, n_head_kv, 1]
+    Qp = ggml_cont(gctx, Qp);
+    Kp = ggml_cont(gctx, Kp);
+    Vp = ggml_cont(gctx, Vp);
+
+    ggml_tensor * kq = ggml_mul_mat(gctx, Kp, Qp);  // [n_tokens_kv, n_tokens_q=1, n_head, 1]
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    // soft_max_ext applies scale; we pass scale=1/sqrt(head_dim) so Q is effectively scaled.
+    const float kq_scale = 1.0f / std::sqrt((float) head_dim);
+    kq = ggml_soft_max_ext(gctx, kq, /*mask=*/nullptr, kq_scale, /*max_bias=*/0.0f);
+
+    // V_T: transpose then contiguous so positions are dim 0 (contraction axis).
+    ggml_tensor * Vt = ggml_cont(gctx, ggml_transpose(gctx, Vp));  // [n_tokens_kv, head_dim, n_head_kv, 1] permuted
+
+    ggml_tensor * kqv = ggml_mul_mat(gctx, Vt, kq);  // [head_dim, n_tokens_q=1, n_head, 1]
+    // Permute back so heads are middle dim, then flatten to [n_embd, 1].
+    kqv = ggml_permute(gctx, kqv, 0, 2, 1, 3);       // [head_dim, n_head, n_tokens_q=1, 1]
+    kqv = ggml_cont(gctx, kqv);
+    ggml_tensor * attn_ctx_t = ggml_reshape_2d(gctx, kqv, n_embd, 1);
+
+    // ---- wo ----
+    ggml_tensor * attn_out_t = ggml_mul_mat(gctx, t_wo, attn_ctx_t);
+
+    // ---- Residual 1 ----
+    ggml_tensor * x_after_res1_t = ggml_add(gctx, t_x, attn_out_t);
+
+    // ---- ffn norm ----
+    ggml_tensor * norm2 = ggml_rms_norm(gctx, x_after_res1_t, cx.eps);
+    norm2 = ggml_mul(gctx, norm2, t_ffn_norm);
+
+    // ---- ffn_up + swiglu ----
+    ggml_tensor * upgate_t = ggml_mul_mat(gctx, t_ffn_up, norm2);  // [2*n_ff, 1]
+    ggml_tensor * ff_t     = ggml_swiglu(gctx, upgate_t);          // [n_ff, 1]
+
+    // ---- ffn_down + residual 2 ----
+    ggml_tensor * ffn_out_t = ggml_mul_mat(gctx, t_ffn_down, ff_t);
+    ggml_tensor * x_final_t = ggml_add(gctx, x_after_res1_t, ffn_out_t);
+
+    // Build graph. Mark every comparison stage as a forward leaf so it
+    // gets computed and we can inspect its data after compute.
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, 256, false);
+    ggml_build_forward_expand(gf, norm1);
+    ggml_build_forward_expand(gf, qkv);
+    ggml_build_forward_expand(gf, Q);
+    ggml_build_forward_expand(gf, K);
+    ggml_build_forward_expand(gf, V);
+    ggml_build_forward_expand(gf, attn_ctx_t);
+    ggml_build_forward_expand(gf, attn_out_t);
+    ggml_build_forward_expand(gf, x_after_res1_t);
+    ggml_build_forward_expand(gf, norm2);
+    ggml_build_forward_expand(gf, upgate_t);
+    ggml_build_forward_expand(gf, ff_t);
+    ggml_build_forward_expand(gf, ffn_out_t);
+    ggml_build_forward_expand(gf, x_final_t);
+
+    const ggml_status status = ggml_graph_compute_with_ctx(gctx, gf, /*n_threads=*/1);
+    if (status != GGML_STATUS_SUCCESS) {
+        error = "phi3_layer_self_test: ggml_graph_compute_with_ctx failed";
+        ggml_free(gctx);
+        phi3_fused_ctx_free(cx);
+        return false;
+    }
+
+    // Read oracle data into host buffers.
+    auto read_f32 = [](ggml_tensor * t, std::vector<float> & dst) {
+        const size_t n = (size_t) ggml_nelements(t);
+        dst.assign(n, 0.0f);
+        std::memcpy(dst.data(), t->data, n * sizeof(float));
+    };
+    std::vector<float> o_norm1, o_qkv, o_Q, o_K, o_V, o_attn_ctx, o_attn_out, o_res1;
+    std::vector<float> o_norm2, o_upgate, o_ff, o_ffn_out, o_final;
+    read_f32(norm1,             o_norm1);
+    read_f32(qkv,               o_qkv);
+    read_f32(Q,                 o_Q);
+    read_f32(K,                 o_K);
+    read_f32(V,                 o_V);
+    read_f32(attn_ctx_t,        o_attn_ctx);
+    read_f32(attn_out_t,        o_attn_out);
+    read_f32(x_after_res1_t,    o_res1);
+    read_f32(norm2,             o_norm2);
+    read_f32(upgate_t,          o_upgate);
+    read_f32(ff_t,              o_ff);
+    read_f32(ffn_out_t,         o_ffn_out);
+    read_f32(x_final_t,         o_final);
+
+    // ----- Compare staged outputs -----
+    // Tolerances: most stages should be tight (rel 5e-3). Final stage cumulates
+    // ~12 ops worth of F32 reduction reorder noise; allow looser.
+    bool ok = true;
+    auto chk = [&](const char * name, const float * a, const float * b, int n,
+                   float atol, float rtol) {
+        if (!ok) return;
+        if (!buffers_close(name, a, b, n, atol, rtol, error)) ok = false;
+    };
+    chk("norm1",          cap_norm1.data(),    o_norm1.data(),    n_embd,         1e-3f, 5e-3f);
+    chk("qkv",            cap_qkv.data(),      o_qkv.data(),      n_qkv,          5e-3f, 5e-3f);
+    chk("Q_post_rope",    cap_Q.data(),        o_Q.data(),        n_embd_q,       5e-3f, 5e-3f);
+    chk("K_post_rope",    cap_K.data(),        o_K.data(),        n_embd_kv,      5e-3f, 5e-3f);
+    chk("V_cur",          cap_V.data(),        o_V.data(),        n_embd_kv,      5e-3f, 5e-3f);
+    chk("attn_ctx",       cap_attn_ctx.data(), o_attn_ctx.data(), n_embd,         1e-2f, 1e-2f);
+    chk("attn_out",       cap_attn_out.data(), o_attn_out.data(), n_embd,         1e-2f, 1e-2f);
+    chk("x_after_res1",   cap_res1.data(),     o_res1.data(),     n_embd,         1e-2f, 1e-2f);
+    chk("norm2",          cap_norm2.data(),    o_norm2.data(),    n_embd,         1e-2f, 1e-2f);
+    chk("upgate",         cap_upgate.data(),   o_upgate.data(),   2 * n_ff,       1e-2f, 1e-2f);
+    chk("ff_swiglu",      cap_ff.data(),       o_ff.data(),       n_ff,           1e-2f, 1e-2f);
+    chk("ffn_out",        cap_ffn_out.data(),  o_ffn_out.data(),  n_embd,         2e-2f, 2e-2f);
+    chk("x_final",        x_out_ours.data(),   o_final.data(),    n_embd,         2e-2f, 2e-2f);
+
+    ggml_free(gctx);
+    phi3_fused_ctx_free(cx);
+
+    if (ok) {
+        fprintf(stderr, "phi3 layer self-test: PASS (13 stages, 1 token at pos=%d, %d prior K/V positions)\n",
+                cur_pos, n_prior);
+    }
+    return ok;
+}
