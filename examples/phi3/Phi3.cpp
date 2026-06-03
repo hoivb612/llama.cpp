@@ -11,7 +11,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -32,6 +32,7 @@ int main(int argc, char ** argv) {
     bool enable_fused_lmhead = false;
     bool enable_fused_decode = false;
     bool dump_weights = false;
+    bool test_kv = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -114,6 +115,8 @@ int main(int argc, char ** argv) {
                 enable_fused_decode = true;
             } else if (strcmp(argv[i], "--phi3-dump-weights") == 0) {
                 dump_weights = true;
+            } else if (strcmp(argv[i], "--phi3-test-kv") == 0) {
+                test_kv = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -174,6 +177,22 @@ int main(int argc, char ** argv) {
             return 1;
         }
         phi3_weights_dump(w);
+    }
+
+    if (test_kv) {
+        Phi3Weights w;
+        std::string werr;
+        if (!phi3_weights_resolve(raw_model.model, w, werr)) {
+            fprintf(stderr, "phi3 weights: resolve failed: %s\n", werr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        std::string kerr;
+        if (!phi3_kv_self_test(w, kerr)) {
+            fprintf(stderr, "phi3 kv self-test: FAIL: %s\n", kerr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
     }
 
     Phi3RuntimeParams runtime_params;

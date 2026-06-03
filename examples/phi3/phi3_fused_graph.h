@@ -79,3 +79,79 @@ bool phi3_weights_resolve(const llama_model * model, Phi3Weights & out, std::str
 // Print the resolved tensor table to stderr (shape, type, address). Useful for
 // confirming A0 worked correctly before any forward code lands.
 void phi3_weights_dump(const Phi3Weights & w);
+
+
+// =============================================================================
+// Phi3KV — custom contiguous KV cache for Phase A custom forward.
+// =============================================================================
+// Owns its own F16 K/V storage, independent of llama's internal kv cache.
+//
+// Layout (matches what manual scaled-dot-product attention prefers):
+//   K[il]  : [head_dim, n_head_kv, ctx_max]    F16
+//            (innermost dim = head_dim, contiguous; matches standard layout)
+//   V_T[il]: [ctx_max,  n_head_kv, head_dim]   F16
+//            (TRANSPOSED so attn[1..n_kv] . V_T[:, h, d] is a contiguous
+//             reduction over the n_kv dimension)
+//
+// Single-sequence, contiguous positions. Multi-turn rewind is supported via
+// kv_truncate (O(1)), kv_drop_range (memmove), and kv_keep_prefix.
+//
+// Indexing helpers (do NOT bounds-check; caller is responsible):
+//   K[il] at position pos, head h, dim d:
+//       k_ptr[il][pos*n_head_kv*head_dim + h*head_dim + d]
+//   V_T[il] at position pos, head h, dim d:
+//       v_ptr[il][d*n_head_kv*ctx_max + h*ctx_max + pos]
+//
+// Memory budget at ctx_max=4096 for Phi-3-mini-4k (n_layer=32, head_dim=96,
+// n_head_kv=32) is ~1.5 GiB total (K and V combined). Logged at init.
+
+#include "ggml.h"   // for ggml_fp16_t
+
+struct Phi3KV {
+    int n_layer       = 0;
+    int n_head_kv     = 0;
+    int head_dim      = 0;
+    int ctx_max       = 0;
+    int current_len   = 0;   // logical number of populated positions [0, current_len)
+
+    // Per-layer base pointers into the K_buf / V_buf flat arenas.
+    ggml_fp16_t * K[Phi3Weights::MAX_LAYERS] = {};
+    ggml_fp16_t * V[Phi3Weights::MAX_LAYERS] = {};
+
+private:
+    // Single backing allocations to keep alloc/free simple.
+    // Sized: n_layer * head_dim * n_head_kv * ctx_max F16s each.
+    ggml_fp16_t * K_buf = nullptr;
+    ggml_fp16_t * V_buf = nullptr;
+    friend bool   phi3_kv_init  (Phi3KV & kv, int n_layer, int n_head_kv, int head_dim, int ctx_max, std::string & error);
+    friend void   phi3_kv_free  (Phi3KV & kv);
+    friend void   phi3_kv_drop_range(Phi3KV & kv, int p0, int p1);
+};
+
+// Allocate K_buf / V_buf and populate per-layer base pointers.
+// On failure (e.g. OOM), returns false and writes a reason to `error`.
+bool   phi3_kv_init      (Phi3KV & kv, int n_layer, int n_head_kv, int head_dim, int ctx_max, std::string & error);
+
+// Release all KV memory. Safe to call on an uninitialized struct.
+void   phi3_kv_free      (Phi3KV & kv);
+
+// Total bytes allocated for K + V across all layers.
+size_t phi3_kv_bytes     (const Phi3KV & kv);
+
+// O(1) — drop tokens at positions [new_len, current_len). Used between turns.
+// new_len must be in [0, current_len].
+void   phi3_kv_truncate  (Phi3KV & kv, int new_len);
+
+// Drop the range [p0, p1) and shift positions [p1, current_len) left by (p1-p0).
+// Cost: O((current_len - p1) * n_layer * 2 * row_bytes). Used for middle drops
+// (rare). Caller must ensure no RoPE-position-shifting concerns (tokens after
+// p1 keep their original RoPE phase, which is correct for our usage).
+void   phi3_kv_drop_range(Phi3KV & kv, int p0, int p1);
+
+// Convenience: keep_prefix(N) == truncate(N).
+inline void phi3_kv_keep_prefix(Phi3KV & kv, int n_keep) { phi3_kv_truncate(kv, n_keep); }
+
+// One-shot self-test: allocate a tiny KV using the model's dimensions, write
+// known sentinels, exercise truncate / drop_range / keep_prefix, verify, free.
+// Prints PASS/FAIL to stderr. Returns true on PASS.
+bool   phi3_kv_self_test (const Phi3Weights & w, std::string & error);

@@ -241,3 +241,245 @@ void phi3_weights_dump(const Phi3Weights & w) {
         std::snprintf(tag, sizeof(tag), "blk.%d.ffn_down.weight",    il); dump(tag, L.ffn_down);
     }
 }
+
+
+// =============================================================================
+// Phi3KV — implementation
+// =============================================================================
+
+namespace {
+
+// Layer stride in F16 elements: head_dim * n_head_kv * ctx_max
+// (identical for K layout [head_dim, n_head_kv, ctx_max] and
+//  V_T layout [ctx_max, n_head_kv, head_dim] — same total cells, different order).
+size_t phi3_kv_layer_stride(const Phi3KV & kv) {
+    return (size_t) kv.head_dim * (size_t) kv.n_head_kv * (size_t) kv.ctx_max;
+}
+
+} // namespace
+
+bool phi3_kv_init(Phi3KV & kv, int n_layer, int n_head_kv, int head_dim, int ctx_max, std::string & error) {
+    error.clear();
+    phi3_kv_free(kv); // safe on uninitialized struct
+
+    if (n_layer <= 0 || n_layer > Phi3Weights::MAX_LAYERS ||
+        n_head_kv <= 0 || head_dim <= 0 || ctx_max <= 0) {
+        std::ostringstream oss;
+        oss << "phi3_kv_init: invalid dims n_layer=" << n_layer
+            << " n_head_kv=" << n_head_kv << " head_dim=" << head_dim
+            << " ctx_max=" << ctx_max;
+        error = oss.str();
+        return false;
+    }
+
+    kv.n_layer     = n_layer;
+    kv.n_head_kv   = n_head_kv;
+    kv.head_dim    = head_dim;
+    kv.ctx_max     = ctx_max;
+    kv.current_len = 0;
+
+    const size_t stride_elts = phi3_kv_layer_stride(kv);
+    const size_t total_elts  = (size_t) n_layer * stride_elts;
+    const size_t total_bytes = total_elts * sizeof(ggml_fp16_t);
+
+    // Allocate K_buf and V_buf separately so each is cache-line aligned and we
+    // can free them independently. Using new[]() zero-initializes (helpful for
+    // any uninitialized-read corner cases during early development).
+    try {
+        kv.K_buf = new ggml_fp16_t[total_elts]();
+        kv.V_buf = new ggml_fp16_t[total_elts]();
+    } catch (const std::bad_alloc &) {
+        phi3_kv_free(kv);
+        std::ostringstream oss;
+        oss << "phi3_kv_init: OOM allocating " << (2 * total_bytes / (1024 * 1024)) << " MiB";
+        error = oss.str();
+        return false;
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        kv.K[il] = kv.K_buf + (size_t) il * stride_elts;
+        kv.V[il] = kv.V_buf + (size_t) il * stride_elts;
+    }
+
+    fprintf(stderr, "phi3 kv: allocated K=%.1f MiB + V=%.1f MiB (total %.2f GiB), n_layer=%d head_dim=%d n_head_kv=%d ctx_max=%d\n",
+        total_bytes / (1024.0 * 1024.0),
+        total_bytes / (1024.0 * 1024.0),
+        (2.0 * total_bytes) / (1024.0 * 1024.0 * 1024.0),
+        n_layer, head_dim, n_head_kv, ctx_max);
+
+    return true;
+}
+
+void phi3_kv_free(Phi3KV & kv) {
+    delete[] kv.K_buf; kv.K_buf = nullptr;
+    delete[] kv.V_buf; kv.V_buf = nullptr;
+    for (int il = 0; il < Phi3Weights::MAX_LAYERS; ++il) {
+        kv.K[il] = nullptr;
+        kv.V[il] = nullptr;
+    }
+    kv.n_layer = kv.n_head_kv = kv.head_dim = kv.ctx_max = kv.current_len = 0;
+}
+
+size_t phi3_kv_bytes(const Phi3KV & kv) {
+    if (kv.n_layer <= 0) return 0;
+    return 2 * (size_t) kv.n_layer * phi3_kv_layer_stride(kv) * sizeof(ggml_fp16_t);
+}
+
+void phi3_kv_truncate(Phi3KV & kv, int new_len) {
+    if (new_len < 0)               new_len = 0;
+    if (new_len > kv.current_len)  new_len = kv.current_len;
+    kv.current_len = new_len;
+    // Stale cells beyond current_len are intentionally NOT zeroed — they will
+    // be overwritten on the next write at those positions.
+}
+
+void phi3_kv_drop_range(Phi3KV & kv, int p0, int p1) {
+    if (p0 < 0) p0 = 0;
+    if (p1 > kv.current_len) p1 = kv.current_len;
+    if (p1 <= p0) return;
+
+    const int n_drop = p1 - p0;
+    const int n_tail = kv.current_len - p1;
+    if (n_tail <= 0) {
+        kv.current_len = p0;
+        return;
+    }
+
+    const int head_dim   = kv.head_dim;
+    const int n_head_kv  = kv.n_head_kv;
+    const int ctx_max    = kv.ctx_max;
+
+    for (int il = 0; il < kv.n_layer; ++il) {
+        // K layout: [head_dim, n_head_kv, ctx_max]. A "row" at position pos
+        // is (n_head_kv * head_dim) F16s starting at K[pos * n_head_kv * head_dim].
+        // We can shift the entire tail in one memmove because positions are the
+        // outer dimension in this layout.
+        const size_t k_row_elts = (size_t) n_head_kv * (size_t) head_dim;
+        ggml_fp16_t * k_dst = kv.K[il] + (size_t) p0 * k_row_elts;
+        ggml_fp16_t * k_src = kv.K[il] + (size_t) p1 * k_row_elts;
+        std::memmove(k_dst, k_src, (size_t) n_tail * k_row_elts * sizeof(ggml_fp16_t));
+
+        // V_T layout: [ctx_max, n_head_kv, head_dim]. Position pos is the
+        // INNERMOST dim, so dropping positions requires shifting each
+        // (h, d) column independently with a strided memmove.
+        for (int d = 0; d < head_dim; ++d) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                ggml_fp16_t * v_col = kv.V[il] +
+                    (size_t) d * (size_t) n_head_kv * (size_t) ctx_max +
+                    (size_t) h * (size_t) ctx_max;
+                std::memmove(v_col + p0, v_col + p1, (size_t) n_tail * sizeof(ggml_fp16_t));
+            }
+        }
+    }
+
+    kv.current_len -= n_drop;
+}
+
+
+// Self-test: write sentinel = (uint16_t)(0x1000 + il*0x100 + h*0x10 + (pos & 0xF))
+// to K and V at each (il, h, d=0..head_dim-1, pos), then exercise the rewind
+// primitives and check invariants.
+namespace {
+
+uint16_t kv_sentinel(int il, int h, int d, int pos) {
+    return (uint16_t) (((il & 0xF) << 12) | ((h & 0xF) << 8) | ((d & 0xF) << 4) | (pos & 0xF));
+}
+
+void kv_write_sentinels(Phi3KV & kv, int p0, int p1) {
+    const int head_dim   = kv.head_dim;
+    const int n_head_kv  = kv.n_head_kv;
+    const int ctx_max    = kv.ctx_max;
+    const size_t k_row_elts = (size_t) n_head_kv * (size_t) head_dim;
+
+    for (int il = 0; il < kv.n_layer; ++il) {
+        for (int pos = p0; pos < p1; ++pos) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                for (int d = 0; d < head_dim; ++d) {
+                    kv.K[il][(size_t) pos * k_row_elts + (size_t) h * head_dim + d] =
+                        (ggml_fp16_t) kv_sentinel(il, h, d, pos);
+                    kv.V[il][(size_t) d * n_head_kv * ctx_max + (size_t) h * ctx_max + pos] =
+                        (ggml_fp16_t) kv_sentinel(il, h, d, pos);
+                }
+            }
+        }
+    }
+}
+
+bool kv_check_sentinel(const Phi3KV & kv, int pos, int expect_il, int expect_h, int expect_d, int expect_pos, const char * tag, std::string & error) {
+    const size_t k_row_elts = (size_t) kv.n_head_kv * (size_t) kv.head_dim;
+    const uint16_t want = kv_sentinel(expect_il, expect_h, expect_d, expect_pos);
+    const ggml_fp16_t got_k = kv.K[expect_il][(size_t) pos * k_row_elts + (size_t) expect_h * kv.head_dim + expect_d];
+    const ggml_fp16_t got_v = kv.V[expect_il][(size_t) expect_d * kv.n_head_kv * kv.ctx_max + (size_t) expect_h * kv.ctx_max + pos];
+    if ((uint16_t) got_k != want || (uint16_t) got_v != want) {
+        std::ostringstream oss;
+        oss << "kv self-test (" << tag << "): pos=" << pos << " expected_orig_pos=" << expect_pos
+            << " want=0x" << std::hex << want
+            << " got_K=0x" << (uint16_t) got_k
+            << " got_V=0x" << (uint16_t) got_v;
+        error = oss.str();
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool phi3_kv_self_test(const Phi3Weights & w, std::string & error) {
+    error.clear();
+
+    Phi3KV kv;
+    // Tiny ctx for the test — keep alloc fast (and total under a few MB).
+    constexpr int kTestCtx = 16;
+    if (!phi3_kv_init(kv, w.n_layer, w.n_head_kv, w.n_embd_head, kTestCtx, error)) {
+        return false;
+    }
+
+    // 1. Write 10 positions of sentinels.
+    kv.current_len = 10;
+    kv_write_sentinels(kv, 0, 10);
+
+    // 2. Spot check: pos 7, layer 3, head 5, dim 2 — must match sentinel(3,5,2,7).
+    if (!kv_check_sentinel(kv, 7, 3, 5, 2, 7, "initial write", error)) { phi3_kv_free(kv); return false; }
+
+    // 3. truncate(5).
+    phi3_kv_truncate(kv, 5);
+    if (kv.current_len != 5) {
+        error = "phi3_kv_truncate did not update current_len";
+        phi3_kv_free(kv);
+        return false;
+    }
+
+    // 4. Re-populate positions 5..7 with NEW sentinels (different il pattern), check.
+    kv.current_len = 8;
+    kv_write_sentinels(kv, 5, 8);
+    if (!kv_check_sentinel(kv, 6, 1, 0, 4, 6, "post-truncate rewrite", error)) { phi3_kv_free(kv); return false; }
+
+    // 5. drop_range(1, 3) — drops positions 1,2 and shifts {3,4,5,6,7} -> {1,2,3,4,5}.
+    phi3_kv_drop_range(kv, 1, 3);
+    if (kv.current_len != 6) {
+        std::ostringstream oss;
+        oss << "phi3_kv_drop_range: expected current_len=6, got " << kv.current_len;
+        error = oss.str();
+        phi3_kv_free(kv);
+        return false;
+    }
+    // After drop: NEW pos 1 holds what was at OLD pos 3, NEW pos 5 holds OLD pos 7.
+    if (!kv_check_sentinel(kv, 1, 2, 1, 3, 3, "post-drop pos1<-3", error)) { phi3_kv_free(kv); return false; }
+    if (!kv_check_sentinel(kv, 5, 0, 2, 1, 7, "post-drop pos5<-7", error)) { phi3_kv_free(kv); return false; }
+    // Surviving prefix [0] should be untouched.
+    if (!kv_check_sentinel(kv, 0, 7, 7, 7, 0, "post-drop pos0 prefix", error)) { phi3_kv_free(kv); return false; }
+
+    // 6. keep_prefix(2).
+    phi3_kv_keep_prefix(kv, 2);
+    if (kv.current_len != 2) {
+        error = "phi3_kv_keep_prefix did not update current_len";
+        phi3_kv_free(kv);
+        return false;
+    }
+
+    fprintf(stderr, "phi3 kv self-test: PASS (alloc=%.2f MiB, all rewind ops correct)\n",
+        phi3_kv_bytes(kv) / (1024.0 * 1024.0));
+
+    phi3_kv_free(kv);
+    return true;
+}
