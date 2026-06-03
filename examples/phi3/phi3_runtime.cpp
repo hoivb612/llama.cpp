@@ -546,6 +546,9 @@ bool phi3_runtime_init(
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = params.n_ctx;
     ctx_params.n_batch = params.n_ctx;
+    if (params.disable_flash_attn) {
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
 
     out.ctx = llama_init_from_model(raw.model, ctx_params);
     if (!out.ctx) {

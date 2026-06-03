@@ -5,6 +5,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama_b612.h"
 #include "llama-impl.h"
 
 #include "ggml-cpp.h"
@@ -119,6 +120,7 @@ struct llama_context {
     // B612 Phi3 Phase A custom-forward fast-path guards.
     bool has_active_lora() const;
     bool has_active_cvec() const;
+    void get_phi3_features(llama_b612_phi3_features & out) const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 

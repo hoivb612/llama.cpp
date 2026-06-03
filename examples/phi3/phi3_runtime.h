@@ -20,6 +20,7 @@ struct Phi3RuntimeParams {
     bool enable_gen_autotune = false;
     bool enable_fused_lmhead = false;
     bool enable_fused_decode = false;
+    bool disable_flash_attn  = false;
 };
 
 struct Phi3Runtime {

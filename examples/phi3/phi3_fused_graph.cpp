@@ -888,3 +888,390 @@ bool phi3_kernel_self_test(std::string & error) {
     error.clear();
     return true;
 }
+
+// ===========================================================================
+// A2.2 — Validator + ctx alloc/free.
+//
+// Implementation of the Phase A custom-forward init path:
+//   - phi3_fused_validate_supported : exhaustive feature-rejection check.
+//   - phi3_fused_ctx_init / _free   : KV + scratch + resolved RoPE config.
+//
+// The validator returns a specific error naming the offending feature; the
+// runtime treats a `false` return as fatal when --phi3-fused-forward was
+// explicitly requested (no silent fallback to the standard graph). See
+// __phase_A2_spec.md §1.5 for the full list.
+// ===========================================================================
+
+#include <cstdio>
+
+namespace {
+
+// Helper: look up a tensor by formatted name. Returns nullptr if not present.
+const ggml_tensor * tensor_or_null(const llama_model * model, const char * fmt, int il) {
+    char name[64];
+    std::snprintf(name, sizeof(name), fmt, il);
+    return llama_model_get_tensor_by_name(model, name);
+}
+
+const ggml_tensor * tensor_or_null(const llama_model * model, const char * name) {
+    return llama_model_get_tensor_by_name(model, name);
+}
+
+// Helper: reject if `t` is present. Builds a descriptive error message.
+bool reject_if_present(const ggml_tensor * t, const char * label, std::string & error) {
+    if (t != nullptr) {
+        error = std::string("phi3_fused_validate: feature not supported by Phase A path: ") + label;
+        return false;
+    }
+    return true;
+}
+
+// Helper: assert tensor is canonical-layout host data (no view, contiguous row).
+bool check_host_canonical(const ggml_tensor * w, const char * label, std::string & error) {
+    if (w == nullptr) {
+        return true;  // optional weights pass through
+    }
+    if (w->data == nullptr) {
+        error = std::string("phi3_fused_validate: ") + label + " has w->data == NULL (likely a view)";
+        return false;
+    }
+    const size_t expected_row = ggml_row_size(w->type, w->ne[0]);
+    if ((size_t) w->nb[1] != expected_row) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "phi3_fused_validate: %s non-canonical layout: nb[1]=%zu expected %zu (type=%s, ne[0]=%lld)",
+            label, (size_t) w->nb[1], expected_row, ggml_type_name(w->type), (long long) w->ne[0]);
+        error = buf;
+        return false;
+    }
+    return true;
+}
+
+// Helper: ensure a vec_dot exists for the weight type (CPU path will use it).
+bool check_vec_dot_available(const ggml_tensor * w, const char * label, std::string & error) {
+    if (w == nullptr) return true;
+    const auto * tr = ggml_get_type_traits_cpu(w->type);
+    if (tr == nullptr || tr->vec_dot == nullptr || tr->vec_dot_type == GGML_TYPE_COUNT) {
+        error = std::string("phi3_fused_validate: ") + label + " type " + ggml_type_name(w->type)
+              + " has no CPU vec_dot kernel";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool phi3_fused_validate_supported(
+        const llama_model    * model,
+        const Phi3Weights    & w,
+        const llama_context  * lctx,
+        std::string          & error) {
+    error.clear();
+
+    if (model == nullptr) {
+        error = "phi3_fused_validate: model is null";
+        return false;
+    }
+
+    // ----- context-side (cparams) checks -----
+    // Skipped only if lctx is null (caller validating model-only).
+    if (lctx != nullptr) {
+        llama_b612_phi3_features f{};
+        llama_b612_get_phi3_features(model, lctx, &f);
+
+        if (f.cp_flash_attn) {
+            error = "phi3_fused_validate: cparams.flash_attn == true (Phase A path requires manual SD attention)";
+            return false;
+        }
+        if (f.cp_embeddings) {
+            error = "phi3_fused_validate: cparams.embeddings == true (generation context only)";
+            return false;
+        }
+        if (!f.cp_causal_attn) {
+            error = "phi3_fused_validate: cparams.causal_attn == false (Phase A path is causal-only)";
+            return false;
+        }
+        if (f.cp_n_seq_max != 1) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                "phi3_fused_validate: cparams.n_seq_max=%u (Phase A path supports single-sequence only)",
+                (unsigned) f.cp_n_seq_max);
+            error = buf;
+            return false;
+        }
+
+        // YARN long-context guard: if RoPE factor tables exist (Phi-3-medium-128k style)
+        // AND we'd actually need them (ctx > orig), reject — Phase A doesn't implement
+        // YARN-style ext_factor blending yet. Allow either rope_factors-absent OR
+        // ctx <= orig (the factor tables are present but unused at short ctx).
+        const bool has_rope_factors = (w.rope_long != nullptr) || (w.rope_short != nullptr);
+        if (has_rope_factors && f.hp_n_ctx_orig_yarn > 0 && f.cp_n_ctx_seq > (uint32_t) f.hp_n_ctx_orig_yarn) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                "phi3_fused_validate: YARN long-context engaged (n_ctx_seq=%u > n_ctx_orig_yarn=%d) "
+                "with rope_factors present — Phase A path does not implement YARN blending yet",
+                (unsigned) f.cp_n_ctx_seq, (int) f.hp_n_ctx_orig_yarn);
+            error = buf;
+            return false;
+        }
+
+        // Hparams flags that Phase A cannot honor.
+        if (f.hp_f_clamp_kqv != 0.0f) {
+            error = "phi3_fused_validate: hparams.f_clamp_kqv != 0 (KQV clamp not in Phase A path)";
+            return false;
+        }
+        if (f.hp_attn_soft_cap) {
+            error = "phi3_fused_validate: hparams.attn_soft_cap is enabled (tanh cap not in Phase A path)";
+            return false;
+        }
+        if (f.hp_use_alibi || f.hp_f_max_alibi_bias != 0.0f) {
+            error = "phi3_fused_validate: ALiBi attention not supported by Phase A path";
+            return false;
+        }
+        if (f.hp_swa_type != 0) {  // LLAMA_SWA_TYPE_NONE == 0
+            char buf[120];
+            std::snprintf(buf, sizeof(buf),
+                "phi3_fused_validate: hparams.swa_type=%d (Phase A path requires LLAMA_SWA_TYPE_NONE)",
+                (int) f.hp_swa_type);
+            error = buf;
+            return false;
+        }
+
+        // LoRA / control-vectors must be inactive.
+        if (llama_b612_has_active_lora(lctx)) {
+            error = "phi3_fused_validate: active LoRA adapter (Phase A path bypasses build_lora_mm)";
+            return false;
+        }
+        if (llama_b612_has_active_cvec(lctx)) {
+            error = "phi3_fused_validate: active control vector (Phase A path bypasses build_cvec)";
+            return false;
+        }
+    }
+
+    // ----- GQA guard -----
+    if (w.n_head != w.n_head_kv) {
+        char buf[120];
+        std::snprintf(buf, sizeof(buf),
+            "phi3_fused_validate: GQA detected (n_head=%d, n_head_kv=%d) — Phase A path is dense-attention only",
+            w.n_head, w.n_head_kv);
+        error = buf;
+        return false;
+    }
+
+    // ----- Per-layer absent-tensor checks -----
+    for (int il = 0; il < w.n_layer; ++il) {
+        // MoE: must be absent (Phi-3-MoE/Phi-4-MoE not yet supported).
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_gate_inp.weight",  il), "MoE ffn_gate_inp",  error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_up_exps.weight",   il), "MoE ffn_up_exps",   error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_gate_exps.weight", il), "MoE ffn_gate_exps", error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_down_exps.weight", il), "MoE ffn_down_exps", error)) return false;
+
+        // Biases: must be absent.
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.attn_qkv.bias",    il), "attn_qkv.bias",    error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.attn_output.bias", il), "attn_output.bias", error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.attn_norm.bias",   il), "attn_norm.bias",   error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_norm.bias",    il), "ffn_norm.bias",    error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_up.bias",      il), "ffn_up.bias",      error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_down.bias",    il), "ffn_down.bias",    error)) return false;
+
+        // Per-tensor scales: must be absent (NVFP4-style activation scales not honored).
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.attn_qkv.scale",    il), "attn_qkv.scale",    error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.attn_output.scale", il), "attn_output.scale", error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_up.scale",      il), "ffn_up.scale",      error)) return false;
+        if (!reject_if_present(tensor_or_null(model, "blk.%d.ffn_down.scale",    il), "ffn_down.scale",    error)) return false;
+
+        // Canonical layout + vec_dot for all per-layer weights we'll touch.
+        const Phi3LayerWeights & L = w.layers[il];
+        if (!check_host_canonical(L.attn_norm, "attn_norm", error)) return false;
+        if (!check_host_canonical(L.wqkv,      "wqkv",      error)) return false;
+        if (!check_host_canonical(L.wo,        "wo",        error)) return false;
+        if (!check_host_canonical(L.ffn_norm,  "ffn_norm",  error)) return false;
+        if (!check_host_canonical(L.ffn_up,    "ffn_up",    error)) return false;
+        if (!check_host_canonical(L.ffn_down,  "ffn_down",  error)) return false;
+        if (!check_vec_dot_available(L.wqkv,      "wqkv",      error)) return false;
+        if (!check_vec_dot_available(L.wo,        "wo",        error)) return false;
+        if (!check_vec_dot_available(L.ffn_up,    "ffn_up",    error)) return false;
+        if (!check_vec_dot_available(L.ffn_down,  "ffn_down",  error)) return false;
+    }
+
+    // ----- Global absent-tensor checks -----
+    if (!reject_if_present(tensor_or_null(model, "output.bias"),        "output.bias",        error)) return false;
+    if (!reject_if_present(tensor_or_null(model, "output.scale"),       "output.scale",       error)) return false;
+    if (!reject_if_present(tensor_or_null(model, "output.input_scale"), "output.input_scale", error)) return false;
+    if (!reject_if_present(tensor_or_null(model, "output_norm.bias"),   "output_norm.bias",   error)) return false;
+
+    // tok_embd dequant availability.
+    if (w.tok_embd == nullptr) {
+        error = "phi3_fused_validate: tok_embd is null";
+        return false;
+    }
+    {
+        const auto * tr = ggml_get_type_traits(w.tok_embd->type);
+        if (tr == nullptr || tr->to_float == nullptr) {
+            error = std::string("phi3_fused_validate: tok_embd type ") + ggml_type_name(w.tok_embd->type)
+                  + " has no to_float dequantize kernel";
+            return false;
+        }
+    }
+    if (!check_host_canonical(w.tok_embd,    "tok_embd",    error)) return false;
+    if (!check_host_canonical(w.output_norm, "output_norm", error)) return false;
+    if (!check_host_canonical(w.output,      "output",      error)) return false;
+    if (!check_vec_dot_available(w.output,   "output (lm_head)", error)) return false;
+
+    return true;
+}
+
+
+bool phi3_fused_ctx_init(
+        Phi3FusedCtx         & out,
+        const Phi3Weights    & w,
+        Phi3MatmulPool       * matmul_pool,
+        const llama_model    * model,
+        const llama_context  * lctx,
+        int                    ctx_max,
+        bool                   f32_debug,
+        std::string          & error) {
+    error.clear();
+    out = Phi3FusedCtx{};
+
+    if (!phi3_fused_validate_supported(model, w, lctx, error)) {
+        return false;
+    }
+    if (ctx_max <= 0) {
+        error = "phi3_fused_ctx_init: ctx_max must be > 0";
+        return false;
+    }
+
+    out.w           = &w;
+    out.matmul_pool = matmul_pool;
+
+    // Resolve RoPE config from cparams + hparams (via accessor).
+    llama_b612_phi3_features f{};
+    if (lctx != nullptr) {
+        llama_b612_get_phi3_features(model, lctx, &f);
+        out.eps               = f.hp_f_norm_rms_eps;
+        out.rope.n_rot        = f.hp_n_rot;
+        out.rope.n_ctx_orig   = f.hp_n_ctx_orig_yarn;
+        out.rope.freq_base    = f.cp_rope_freq_base;
+        out.rope.freq_scale   = f.cp_rope_freq_scale;
+        out.rope.ext_factor   = f.cp_yarn_ext_factor;
+        out.rope.attn_factor  = f.cp_yarn_attn_factor;
+        out.rope.beta_fast    = f.cp_yarn_beta_fast;
+        out.rope.beta_slow    = f.cp_yarn_beta_slow;
+    } else {
+        // No lctx: fill from model only (cparams stay at training defaults).
+        llama_b612_get_phi3_features(model, nullptr, &f);
+        out.eps               = f.hp_f_norm_rms_eps;
+        out.rope.n_rot        = f.hp_n_rot;
+        out.rope.n_ctx_orig   = f.hp_n_ctx_orig_yarn;
+        out.rope.freq_base    = f.hp_rope_freq_base_train;
+        out.rope.freq_scale   = 1.0f;
+        out.rope.attn_factor  = 1.0f;
+    }
+    // For short ctx we treat rope_factors as null even if they're loaded —
+    // matches the standard graph (model.get_rope_factors returns short or
+    // long based on pos at runtime; at short pos both reduce to identity).
+    // Phase A only handles factors==null until A2.4+ adds long-ctx support.
+    out.rope.rope_factors = nullptr;
+
+    // Allocate KV cache.
+    {
+        const int head_dim = w.n_embd_head;
+        if (!phi3_kv_init(out.kv, w.n_layer, w.n_head_kv, head_dim, ctx_max, error)) {
+            return false;
+        }
+    }
+
+    // Resolve quant types from weight traits.
+    out.scratch.q_type_attn = ggml_get_type_traits_cpu(w.layers[0].wqkv->type)->vec_dot_type;
+    out.scratch.q_type_ffn  = ggml_get_type_traits_cpu(w.layers[0].ffn_down->type)->vec_dot_type;
+
+    // Scratch buffers (per-step).
+    out.scratch.x_buf     .assign(w.n_embd,              0.0f);
+    out.scratch.h_buf     .assign(w.n_embd,              0.0f);
+    out.scratch.hq_buf    .assign(ggml_row_size(out.scratch.q_type_attn, w.n_embd), 0);
+    out.scratch.ffq_buf   .assign(ggml_row_size(out.scratch.q_type_ffn,  w.n_ff),   0);
+    out.scratch.qkv_buf   .assign(w.n_qkv,               0.0f);
+    out.scratch.ctx_buf   .assign(w.n_embd,              0.0f);
+    out.scratch.scores_buf.assign((size_t) ctx_max,      0.0f);
+    out.scratch.upgate_buf.assign((size_t) 2 * w.n_ff,   0.0f);
+    out.scratch.ff_buf    .assign(w.n_ff,                0.0f);
+
+    if (f32_debug) {
+        out.scratch.f32_debug = true;
+        // Per-layer transient F32 mirrors. Allocated once; overwritten per layer.
+        out.scratch.w_f32_attn_norm  .assign((size_t) w.n_embd,                   0.0f);
+        out.scratch.w_f32_wqkv       .assign((size_t) w.n_embd * (size_t) w.n_qkv, 0.0f);
+        out.scratch.w_f32_wo         .assign((size_t) w.n_embd * (size_t) w.n_embd, 0.0f);
+        out.scratch.w_f32_ffn_norm   .assign((size_t) w.n_embd,                   0.0f);
+        out.scratch.w_f32_ffn_up     .assign((size_t) w.n_embd * (size_t) 2 * (size_t) w.n_ff, 0.0f);
+        out.scratch.w_f32_ffn_down   .assign((size_t) w.n_ff   * (size_t) w.n_embd, 0.0f);
+        out.scratch.w_f32_vocab_chunk.assign((size_t) out.scratch.f32_vocab_chunk * (size_t) w.n_embd, 0.0f);
+        out.scratch.f32_cached_layer = -1;
+    }
+
+    out.cur_pos = 0;
+    return true;
+}
+
+void phi3_fused_ctx_free(Phi3FusedCtx & cx) {
+    phi3_kv_free(cx.kv);
+    cx.scratch.x_buf.clear();           cx.scratch.x_buf.shrink_to_fit();
+    cx.scratch.h_buf.clear();           cx.scratch.h_buf.shrink_to_fit();
+    cx.scratch.hq_buf.clear();          cx.scratch.hq_buf.shrink_to_fit();
+    cx.scratch.ffq_buf.clear();         cx.scratch.ffq_buf.shrink_to_fit();
+    cx.scratch.qkv_buf.clear();         cx.scratch.qkv_buf.shrink_to_fit();
+    cx.scratch.ctx_buf.clear();         cx.scratch.ctx_buf.shrink_to_fit();
+    cx.scratch.scores_buf.clear();      cx.scratch.scores_buf.shrink_to_fit();
+    cx.scratch.upgate_buf.clear();      cx.scratch.upgate_buf.shrink_to_fit();
+    cx.scratch.ff_buf.clear();          cx.scratch.ff_buf.shrink_to_fit();
+    cx.scratch.w_f32_attn_norm.clear(); cx.scratch.w_f32_attn_norm.shrink_to_fit();
+    cx.scratch.w_f32_wqkv.clear();      cx.scratch.w_f32_wqkv.shrink_to_fit();
+    cx.scratch.w_f32_wo.clear();        cx.scratch.w_f32_wo.shrink_to_fit();
+    cx.scratch.w_f32_ffn_norm.clear();  cx.scratch.w_f32_ffn_norm.shrink_to_fit();
+    cx.scratch.w_f32_ffn_up.clear();    cx.scratch.w_f32_ffn_up.shrink_to_fit();
+    cx.scratch.w_f32_ffn_down.clear();  cx.scratch.w_f32_ffn_down.shrink_to_fit();
+    cx.scratch.w_f32_vocab_chunk.clear();
+    cx.scratch.w_f32_vocab_chunk.shrink_to_fit();
+    cx.w           = nullptr;
+    cx.matmul_pool = nullptr;
+    cx.cur_pos     = 0;
+}
+
+void phi3_fused_ctx_dump(const Phi3FusedCtx & cx) {
+    fprintf(stderr, "phi3_fused_ctx_dump:\n");
+    fprintf(stderr, "  eps                = %g\n", cx.eps);
+    fprintf(stderr, "  rope.n_rot         = %d\n", cx.rope.n_rot);
+    fprintf(stderr, "  rope.n_ctx_orig    = %d\n", cx.rope.n_ctx_orig);
+    fprintf(stderr, "  rope.freq_base     = %g\n", cx.rope.freq_base);
+    fprintf(stderr, "  rope.freq_scale    = %g\n", cx.rope.freq_scale);
+    fprintf(stderr, "  rope.ext_factor    = %g\n", cx.rope.ext_factor);
+    fprintf(stderr, "  rope.attn_factor   = %g\n", cx.rope.attn_factor);
+    fprintf(stderr, "  rope.rope_factors  = %p (null=identity)\n", (const void *) cx.rope.rope_factors);
+    fprintf(stderr, "  kv.ctx_max         = %d\n", cx.kv.ctx_max);
+    fprintf(stderr, "  scratch.q_type_attn= %s\n", cx.scratch.q_type_attn != GGML_TYPE_COUNT ? ggml_type_name(cx.scratch.q_type_attn) : "(unset)");
+    fprintf(stderr, "  scratch.q_type_ffn = %s\n", cx.scratch.q_type_ffn  != GGML_TYPE_COUNT ? ggml_type_name(cx.scratch.q_type_ffn)  : "(unset)");
+    fprintf(stderr, "  scratch.f32_debug  = %s\n", cx.scratch.f32_debug ? "yes" : "no");
+    size_t total = 0;
+    total += cx.scratch.x_buf.size()      * sizeof(float);
+    total += cx.scratch.h_buf.size()      * sizeof(float);
+    total += cx.scratch.hq_buf.size();
+    total += cx.scratch.ffq_buf.size();
+    total += cx.scratch.qkv_buf.size()    * sizeof(float);
+    total += cx.scratch.ctx_buf.size()    * sizeof(float);
+    total += cx.scratch.scores_buf.size() * sizeof(float);
+    total += cx.scratch.upgate_buf.size() * sizeof(float);
+    total += cx.scratch.ff_buf.size()     * sizeof(float);
+    fprintf(stderr, "  scratch.hot_bytes  = %zu (~%.1f KiB)\n", total, total / 1024.0);
+    if (cx.scratch.f32_debug) {
+        size_t dbg = 0;
+        dbg += cx.scratch.w_f32_attn_norm.size()    * sizeof(float);
+        dbg += cx.scratch.w_f32_wqkv.size()         * sizeof(float);
+        dbg += cx.scratch.w_f32_wo.size()           * sizeof(float);
+        dbg += cx.scratch.w_f32_ffn_norm.size()     * sizeof(float);
+        dbg += cx.scratch.w_f32_ffn_up.size()       * sizeof(float);
+        dbg += cx.scratch.w_f32_ffn_down.size()     * sizeof(float);
+        dbg += cx.scratch.w_f32_vocab_chunk.size()  * sizeof(float);
+        fprintf(stderr, "  scratch.f32_dbg_MiB= %.1f (per-layer mirrors + vocab chunk)\n", dbg / (1024.0 * 1024.0));
+    }
+}

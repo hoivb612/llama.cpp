@@ -12,6 +12,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama_b612.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -1169,6 +1170,33 @@ bool llama_context::has_active_cvec() const {
         }
     }
     return false;
+}
+
+void llama_context::get_phi3_features(llama_b612_phi3_features & out) const {
+    out = {};
+
+    out.cp_flash_attn        = cparams.flash_attn;
+    out.cp_embeddings        = cparams.embeddings;
+    out.cp_causal_attn       = cparams.causal_attn;
+    out.cp_n_seq_max         = cparams.n_seq_max;
+    out.cp_n_ctx_seq         = cparams.n_ctx_seq;
+    out.cp_rope_freq_base    = cparams.rope_freq_base;
+    out.cp_rope_freq_scale   = cparams.rope_freq_scale;
+    out.cp_yarn_ext_factor   = cparams.yarn_ext_factor;
+    out.cp_yarn_attn_factor  = cparams.yarn_attn_factor;
+    out.cp_yarn_beta_fast    = cparams.yarn_beta_fast;
+    out.cp_yarn_beta_slow    = cparams.yarn_beta_slow;
+
+    const auto & hp = model.hparams;
+    out.hp_n_rot                 = hp.n_rot(0);
+    out.hp_f_norm_rms_eps        = hp.f_norm_rms_eps;
+    out.hp_f_clamp_kqv           = hp.f_clamp_kqv;
+    out.hp_f_max_alibi_bias      = hp.f_max_alibi_bias;
+    out.hp_use_alibi             = hp.use_alibi;
+    out.hp_attn_soft_cap         = hp.attn_soft_cap;
+    out.hp_swa_type              = (int) hp.swa_type;
+    out.hp_n_ctx_orig_yarn       = hp.n_ctx_orig_yarn;
+    out.hp_rope_freq_base_train  = hp.rope_freq_base_train;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3684,6 +3712,33 @@ bool llama_b612_has_active_cvec(const llama_context * ctx) {
         return false;
     }
     return ctx->has_active_cvec();
+}
+
+void llama_b612_get_phi3_features(
+        const llama_model   * model,
+        const llama_context * ctx,
+        llama_b612_phi3_features * out) {
+    if (out == nullptr) {
+        return;
+    }
+    if (ctx != nullptr) {
+        ctx->get_phi3_features(*out);
+        return;
+    }
+    // No ctx — fill what we can from the model (or zero everything).
+    *out = {};
+    if (model != nullptr) {
+        const auto & hp = model->hparams;
+        out->hp_n_rot                 = hp.n_rot(0);
+        out->hp_f_norm_rms_eps        = hp.f_norm_rms_eps;
+        out->hp_f_clamp_kqv           = hp.f_clamp_kqv;
+        out->hp_f_max_alibi_bias      = hp.f_max_alibi_bias;
+        out->hp_use_alibi             = hp.use_alibi;
+        out->hp_attn_soft_cap         = hp.attn_soft_cap;
+        out->hp_swa_type              = (int) hp.swa_type;
+        out->hp_n_ctx_orig_yarn       = hp.n_ctx_orig_yarn;
+        out->hp_rope_freq_base_train  = hp.rope_freq_base_train;
+    }
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

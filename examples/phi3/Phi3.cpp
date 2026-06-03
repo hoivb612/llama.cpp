@@ -12,7 +12,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -36,6 +36,7 @@ int main(int argc, char ** argv) {
     bool test_kv = false;
     bool test_matmul = false;
     bool test_kernels = false;
+    bool validate_fused = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -124,6 +125,8 @@ int main(int argc, char ** argv) {
                 test_matmul = true;
             } else if (strcmp(argv[i], "--phi3-kernel-test") == 0) {
                 test_kernels = true;
+            } else if (strcmp(argv[i], "--phi3-validate-fused") == 0) {
+                validate_fused = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -232,6 +235,10 @@ int main(int argc, char ** argv) {
     runtime_params.enable_gen_autotune = enable_gen_autotune;
     runtime_params.enable_fused_lmhead = enable_fused_lmhead;
     runtime_params.enable_fused_decode = enable_fused_decode;
+    // The Phase A custom forward path requires flash_attn=false (the validator
+    // enforces this). When --phi3-validate-fused is set, force-disable flash
+    // so the validator can actually demonstrate the ACCEPT path.
+    runtime_params.disable_flash_attn  = validate_fused;
     if (enable_fused_lmhead && (temp > 0.0f || min_p > 0.0f)) {
         fprintf(stderr, "%s: --phi3-fused-lmhead requires --temp 0 --min-p 0 (greedy decoding)\n", __func__);
         phi3_unload_raw_model(raw_model);
@@ -254,6 +261,46 @@ int main(int argc, char ** argv) {
         const bool has_cvec = llama_b612_has_active_cvec(runtime.ctx);
         fprintf(stderr, "phi3 adapters: active_lora=%d active_cvec=%d\n",
             (int) has_lora, (int) has_cvec);
+    }
+
+    if (validate_fused) {
+        Phi3Weights w;
+        std::string werr;
+        if (!phi3_weights_resolve(raw_model.model, w, werr)) {
+            fprintf(stderr, "phi3 validate-fused: weights resolve failed: %s\n", werr.c_str());
+            phi3_runtime_free(runtime);
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        std::string verr;
+        const bool vok = phi3_fused_validate_supported(raw_model.model, w, runtime.ctx, verr);
+        if (!vok) {
+            fprintf(stderr, "phi3 validate-fused: REJECT: %s\n", verr.c_str());
+            phi3_runtime_free(runtime);
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        fprintf(stderr, "phi3 validate-fused: ACCEPT (all 24 feature checks passed)\n");
+
+        // Also exercise ctx_init/free with f32_debug=false to confirm the
+        // alloc/free path works on the live model.
+        Phi3FusedCtx cx;
+        std::string cerr;
+        const bool cok = phi3_fused_ctx_init(cx, w, /*matmul_pool=*/nullptr,
+            raw_model.model, runtime.ctx, n_ctx, /*f32_debug=*/false, cerr);
+        if (!cok) {
+            fprintf(stderr, "phi3 validate-fused: ctx_init FAIL: %s\n", cerr.c_str());
+            phi3_runtime_free(runtime);
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        phi3_fused_ctx_dump(cx);
+        phi3_fused_ctx_free(cx);
+        fprintf(stderr, "phi3 validate-fused: ctx_init/free OK\n");
+
+        phi3_runtime_free(runtime);
+        phi3_unload_raw_model(raw_model);
+        return 0;
     }
 
     bool ok = true;

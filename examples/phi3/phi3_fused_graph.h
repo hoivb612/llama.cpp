@@ -16,7 +16,9 @@
 #include "llama.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 struct ggml_tensor;
 
@@ -183,3 +185,105 @@ bool   phi3_matmul_pool_self_test(int n_threads, std::string & error);
 // Does NOT need a model. Prints PASS/FAIL to stderr. Returns true on PASS.
 // ---------------------------------------------------------------------------
 bool   phi3_kernel_self_test(std::string & error);
+
+
+// ===========================================================================
+// Phi3FusedCtx — Phase A custom-forward execution context (A2.2 scaffolding).
+// ===========================================================================
+// This struct ties together the borrowed weights/pool with the owned KV cache,
+// per-step scratch buffers, and resolved RoPE config. The actual decode and
+// prefill functions land in A2.4; for A2.2 we only define the structs, the
+// 24-feature validator, and the allocator/deallocator.
+
+struct Phi3MatmulPool;       // fwd-decl from phi3_fused_ops.h
+
+// RoPE configuration, resolved once at init from cparams/hparams.
+struct Phi3RoPEConfig {
+    int32_t       n_rot           = 0;     // dimensions to rotate (Phi-3: == head_dim)
+    int32_t       n_ctx_orig      = 0;     // hparams.n_ctx_orig_yarn
+    float         freq_base       = 0.0f;
+    float         freq_scale      = 0.0f;
+    float         ext_factor      = 0.0f;
+    float         attn_factor     = 0.0f;
+    float         beta_fast       = 0.0f;
+    float         beta_slow       = 0.0f;
+    const float * rope_factors    = nullptr;  // null → unit factors (no YARN)
+};
+
+// Per-step scratch buffers. Allocated once at init, reused every step.
+struct Phi3ForwardScratch {
+    // Quantization types resolved from weight traits at ctx_init.
+    ggml_type            q_type_attn = GGML_TYPE_COUNT;
+    ggml_type            q_type_ffn  = GGML_TYPE_COUNT;
+
+    std::vector<float>   x_buf;       // [n_embd]
+    std::vector<float>   h_buf;       // [n_embd]
+    std::vector<uint8_t> hq_buf;      // [row_size(q_type_attn, n_embd)]
+    std::vector<uint8_t> ffq_buf;     // [row_size(q_type_ffn, n_ff)]
+    std::vector<float>   qkv_buf;     // [n_qkv]
+    std::vector<float>   ctx_buf;     // [n_embd]
+    std::vector<float>   scores_buf;  // [ctx_max]
+    std::vector<float>   upgate_buf;  // [2*n_ff]
+    std::vector<float>   ff_buf;      // [n_ff]
+
+    // F32-debug mode: per-layer TRANSIENT F32 mirrors. Allocated only when
+    // f32_debug is set at ctx_init time. Each holds ONE layer's dequantized
+    // weights and is overwritten before processing the next layer.
+    // Peak ~150 MiB at mini-4k Q4_K_M (one layer worth). lm_head is streamed
+    // in vocab-row chunks (f32_vocab_chunk * n_embd) instead of a full mirror.
+    bool                 f32_debug          = false;
+    std::vector<float>   w_f32_attn_norm;     // [n_embd]
+    std::vector<float>   w_f32_wqkv;          // [n_embd * n_qkv]
+    std::vector<float>   w_f32_wo;            // [n_embd * n_embd]
+    std::vector<float>   w_f32_ffn_norm;      // [n_embd]
+    std::vector<float>   w_f32_ffn_up;        // [n_embd * 2 * n_ff]
+    std::vector<float>   w_f32_ffn_down;      // [n_ff * n_embd]
+    std::vector<float>   w_f32_vocab_chunk;   // [f32_vocab_chunk * n_embd]
+    int32_t              f32_vocab_chunk    = 256;
+    int32_t              f32_cached_layer   = -1;
+};
+
+// Per-context state. Borrows weights & pool; owns KV, scratch, RoPE config.
+struct Phi3FusedCtx {
+    const Phi3Weights *  w           = nullptr;  // borrowed
+    Phi3MatmulPool *     matmul_pool = nullptr;  // borrowed (may be null → serial)
+    float                eps         = 1e-5f;
+
+    Phi3RoPEConfig       rope;
+    Phi3KV               kv;
+    Phi3ForwardScratch   scratch;
+    int32_t              cur_pos     = 0;
+};
+
+// 24-feature validator (see __phase_A2_spec.md §1.5). Returns true if the
+// model + context can be safely served by the Phase A custom forward. On
+// false, `error` names the first failing check. Cheap; no allocation.
+//
+// `lctx` is required (cparams checks: flash_attn, embeddings, causal_attn,
+// n_seq_max, plus LoRA/cvec). Pass nullptr only if the caller intends to
+// validate model-side checks only — in that case only the per-layer +
+// model-global rejection rules are checked.
+bool phi3_fused_validate_supported(
+        const llama_model    * model,
+        const Phi3Weights    & w,
+        const llama_context  * lctx,
+        std::string          & error);
+
+// Allocate KV + scratch, resolve RoPE config, validate features. Returns
+// false with a specific error message on any failure.
+bool phi3_fused_ctx_init(
+        Phi3FusedCtx         & out,
+        const Phi3Weights    & w,
+        Phi3MatmulPool       * matmul_pool,
+        const llama_model    * model,
+        const llama_context  * lctx,
+        int                    ctx_max,
+        bool                   f32_debug,
+        std::string          & error);
+
+void phi3_fused_ctx_free(Phi3FusedCtx & cx);
+
+// Optional: log the resolved RoPE + scratch sizes to stderr (helpful when
+// triaging "did we resolve this correctly?" questions). Safe to call on an
+// uninitialized cx; just prints zeros.
+void phi3_fused_ctx_dump(const Phi3FusedCtx & cx);

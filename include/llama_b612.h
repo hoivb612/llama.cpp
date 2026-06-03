@@ -107,6 +107,40 @@ LLAMA_API const struct ggml_tensor * llama_model_get_tensor_by_name(
 LLAMA_API bool llama_b612_has_active_lora(const struct llama_context * ctx);
 LLAMA_API bool llama_b612_has_active_cvec(const struct llama_context * ctx);
 
+// Snapshot of the hparams / cparams fields needed by the Phi-3 custom-forward
+// validator and RoPE config builder. One round trip into the llama internals
+// instead of a dozen tiny accessors. All fields are non-mutating reads.
+struct llama_b612_phi3_features {
+    // --- cparams (per-context) ---
+    bool     cp_flash_attn;
+    bool     cp_embeddings;
+    bool     cp_causal_attn;
+    uint32_t cp_n_seq_max;
+    uint32_t cp_n_ctx_seq;
+    float    cp_rope_freq_base;
+    float    cp_rope_freq_scale;
+    float    cp_yarn_ext_factor;
+    float    cp_yarn_attn_factor;
+    float    cp_yarn_beta_fast;
+    float    cp_yarn_beta_slow;
+
+    // --- hparams (per-model) ---
+    uint32_t hp_n_rot;             // for layer 0 (Phi-3 uses one rotation count)
+    float    hp_f_norm_rms_eps;
+    float    hp_f_clamp_kqv;
+    float    hp_f_max_alibi_bias;
+    bool     hp_use_alibi;
+    bool     hp_attn_soft_cap;
+    int      hp_swa_type;          // 0 == LLAMA_SWA_TYPE_NONE
+    uint32_t hp_n_ctx_orig_yarn;
+    float    hp_rope_freq_base_train;
+};
+
+LLAMA_API void llama_b612_get_phi3_features(
+        const struct llama_model   * model,
+        const struct llama_context * ctx,
+        struct llama_b612_phi3_features * out);
+
 #ifdef __cplusplus
 }
 #endif
