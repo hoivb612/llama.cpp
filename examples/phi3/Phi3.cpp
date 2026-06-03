@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -48,6 +48,8 @@ int main(int argc, char ** argv) {
     bool fused_qquant_debug = false;
     int  fused_qquant_n_gen = 4;
     int  fused_qquant_threads = 0;   // 0 => use n_threads_gen
+    bool fused_qquant_regress = false;
+    int  fused_qquant_regress_n_gen = 256;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -168,6 +170,17 @@ int main(int argc, char ** argv) {
                 } else {
                     print_usage(argc, argv);
                     return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-regress") == 0) {
+                fused_qquant_regress = true;
+                // optional N argument
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    try {
+                        fused_qquant_regress_n_gen = std::stoi(argv[++i]);
+                    } catch (...) {
+                        // not a number — leave i pointing to the next flag
+                        --i;
+                    }
                 }
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
@@ -297,6 +310,28 @@ int main(int argc, char ** argv) {
         }
         phi3_unload_raw_model(raw_model);
         return 0;
+    }
+
+    if (fused_qquant_regress) {
+        // A2.5c — 3-prompt regression vs baseline. Runs INSTEAD of the normal
+        // runtime path (no runtime init); exits with status 0 on PASS, 1 on FAIL.
+        int reg_t_prefill = n_threads_prefill > 0 ? n_threads_prefill : 1;
+        int reg_t_gen     = n_threads_gen     > 0 ? n_threads_gen     : 1;
+        int reg_t_qquant  = fused_qquant_threads > 0 ? fused_qquant_threads : reg_t_gen;
+        bool pass = false;
+        std::string rerr;
+        const bool ok_call = phi3_run_qquant_regress(raw_model.model,
+                                                     fused_qquant_regress_n_gen,
+                                                     reg_t_prefill, reg_t_gen, reg_t_qquant,
+                                                     pass, rerr);
+        if (!ok_call) {
+            fprintf(stderr, "phi3 qquant-regress: HARNESS ERROR: %s\n", rerr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        fprintf(stderr, "phi3 qquant-regress: %s\n", pass ? "PASS (all prompts match)" : "FAIL");
+        phi3_unload_raw_model(raw_model);
+        return pass ? 0 : 1;
     }
 
     Phi3RuntimeParams runtime_params;

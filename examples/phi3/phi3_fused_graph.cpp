@@ -492,6 +492,7 @@ bool phi3_kv_self_test(const Phi3Weights & w, std::string & error) {
 #include "phi3_fused_ops.h"
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <thread>
 
@@ -3000,45 +3001,92 @@ bool phi3_layer_forward_qquant(
     }
 
     // --- 4. Write K, V to cache at position pos (F16) ---
+    //
+    // K cache layout: [pos, head, dim]  -> contiguous over dim, so
+    //                 vec_dot_f16(K_p_for_(pos,head), Q_h) reads a contiguous
+    //                 head_dim-vector. Matches baseline KQ matmul where Q is
+    //                 quantized to F16 (vec_dot_type) and dotted against F16 K
+    //                 rows.
+    //
+    // V cache layout: TRANSPOSED [d, h, pos]  (matches header docstring) so
+    //                 V*scores can call vec_dot_f16(scores_f16, V_strip) where
+    //                 V_strip is contiguous along the pos axis per (h, d).
+    //                 Cost: scattered single-F16 writes per token (n_embd_kv
+    //                 writes total, same as before, just non-contiguous).
+    //                 Required to bit-match baseline V mul_mat ordering.
     {
         ggml_fp16_t * K_pos = cx.kv.K[il] + (size_t) pos * (size_t) n_embd_kv;
-        ggml_fp16_t * V_pos = cx.kv.V[il] + (size_t) pos * (size_t) n_embd_kv;
         ggml_fp32_to_fp16_row(k, K_pos, n_embd_kv);
-        ggml_fp32_to_fp16_row(v, V_pos, n_embd_kv);
+
+        const int ctx_max_v = cx.kv.ctx_max;
+        ggml_fp16_t * V_base = cx.kv.V[il];
+        for (int h = 0; h < n_head_kv; ++h) {
+            const float * v_h = v + h * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                V_base[((size_t) d * n_head_kv + h) * ctx_max_v + pos] =
+                    ggml_fp32_to_fp16(v_h[d]);
+            }
+        }
     }
     const int new_len = pos + 1;
     if (cx.kv.current_len < new_len) cx.kv.current_len = new_len;
 
-    // --- 5. Attention (F32 dot against F16 KV, matches A2.4b) ---
+    // --- 5. Attention (bit-match baseline via ggml_vec_dot_f16) ---
+    //
+    // K*Q : Quantize Q row to F16 once per head (matches baseline's KQ matmul
+    //       which casts F32 Q to vec_dot_type=F16 via type_traits->from_float),
+    //       then call vec_dot_f16(K_p, Q_h_f16) per position, scale F32 result.
+    //       This bit-matches baseline's KQ scaled by ggml_soft_max_ext(scale=).
+    //
+    // softmax : F32 throughout (matches baseline F32 soft_max).
+    //
+    // V*scores : Quantize attention weights to F16 once per head, then call
+    //            vec_dot_f16(V_strip, scores_f16) per output dim where V_strip
+    //            is contiguous along pos under the transposed cache layout.
+    //            This bit-matches baseline's V mul_mat (V is F16, scores
+    //            quantized to vec_dot_type=F16, contiguous reduction over pos).
+    const auto * f16_traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_F16);
+    if (!f16_traits_cpu || !f16_traits_cpu->vec_dot || !f16_traits_cpu->from_float) {
+        error = "phi3_layer_forward_qquant: F16 type traits missing";
+        return false;
+    }
+    const int ctx_max_v = cx.kv.ctx_max;
     const float scale_q = 1.0f / std::sqrt((float) head_dim);
-    std::vector<float> scores((size_t) new_len);
+    std::vector<float>       scores((size_t) new_len);
+    std::vector<ggml_fp16_t> scores_f16((size_t) new_len);
+    std::vector<ggml_fp16_t> q_h_f16((size_t) head_dim);
     for (int h = 0; h < n_head; ++h) {
         const float * q_h = q + h * head_dim;
+        f16_traits_cpu->from_float(q_h, q_h_f16.data(), head_dim);
+
         float max_s = -INFINITY;
         for (int p = 0; p < new_len; ++p) {
             const ggml_fp16_t * k_p = cx.kv.K[il] + ((size_t) p * n_head_kv + h) * head_dim;
-            double acc = 0.0;
-            for (int d = 0; d < head_dim; ++d) {
-                acc += (double) q_h[d] * (double) ggml_fp16_to_fp32(k_p[d]);
-            }
-            const float s = (float) (acc * (double) scale_q);
+            float s = 0.0f;
+            f16_traits_cpu->vec_dot(head_dim, &s, 0, k_p, 0, q_h_f16.data(), 0, 1);
+            s *= scale_q;
             scores[p] = s;
             if (s > max_s) max_s = s;
         }
-        double sum_exp = 0.0;
+        float sum_exp = 0.0f;
         for (int p = 0; p < new_len; ++p) {
             scores[p] = std::exp(scores[p] - max_s);
-            sum_exp += (double) scores[p];
+            sum_exp += scores[p];
         }
-        const float inv_sum = (float) (1.0 / sum_exp);
-        float * ctx_h = attn_ctx.data() + h * head_dim;
-        for (int d = 0; d < head_dim; ++d) ctx_h[d] = 0.0f;
+        const float inv_sum = 1.0f / sum_exp;
         for (int p = 0; p < new_len; ++p) {
-            const float w_p = scores[p] * inv_sum;
-            const ggml_fp16_t * v_p = cx.kv.V[il] + ((size_t) p * n_head_kv + h) * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                ctx_h[d] += w_p * ggml_fp16_to_fp32(v_p[d]);
-            }
+            scores[p] *= inv_sum;
+        }
+        f16_traits_cpu->from_float(scores.data(), scores_f16.data(), new_len);
+
+        float * ctx_h = attn_ctx.data() + h * head_dim;
+        ggml_fp16_t * V_base = cx.kv.V[il];
+        for (int d = 0; d < head_dim; ++d) {
+            const ggml_fp16_t * v_strip =
+                V_base + ((size_t) d * n_head_kv + h) * ctx_max_v;
+            float s = 0.0f;
+            f16_traits_cpu->vec_dot(new_len, &s, 0, v_strip, 0, scores_f16.data(), 0, 1);
+            ctx_h[d] = s;
         }
     }
 
@@ -3269,3 +3317,403 @@ bool phi3_run_qquant_decode(
     return true;
 }
 
+// ===========================================================================
+// A2.5c — Baseline oracle + 3-prompt regression driver.
+// ===========================================================================
+
+namespace {
+
+// Diagnostic-only top-2 lm_head scan. Serial (~32K * 3K ops). Used solely on
+// regression divergence to print the top-2 margin per spec line 476.
+bool phi3_diag_lmhead_top2(
+        Phi3FusedLmHead & lm,
+        const float     * hidden,
+        int             & out_best_id,
+        float           & out_best_val,
+        int             & out_second_id,
+        float           & out_second_val,
+        std::string     & error) {
+    if (!hidden) { error = "phi3 diag top2: hidden null"; return false; }
+    if (lm.n_vocab <= 0 || lm.n_embd <= 0 || !lm.weight_data) {
+        error = "phi3 diag top2: lm_head not initialized";
+        return false;
+    }
+    const auto * w_traits = ggml_get_type_traits_cpu((ggml_type) lm.weight_type);
+    const auto * q_traits = ggml_get_type_traits_cpu((ggml_type) lm.quant_type);
+    if (!w_traits || !w_traits->vec_dot || !q_traits || !q_traits->from_float) {
+        error = "phi3 diag top2: missing traits";
+        return false;
+    }
+    q_traits->from_float(hidden, lm.quant_hidden.data(), lm.n_embd);
+    const uint8_t * w_base    = lm.weight_data;
+    const size_t    row_bytes = lm.weight_row_bytes;
+    const int64_t   n_vocab   = lm.n_vocab;
+    const int       n_embd_i  = (int) lm.n_embd;
+    const void *    q_ptr     = lm.quant_hidden.data();
+
+    float   best   = -std::numeric_limits<float>::infinity();
+    float   second = -std::numeric_limits<float>::infinity();
+    int64_t best_id = 0, second_id = 0;
+    for (int64_t v = 0; v < n_vocab; ++v) {
+        float s = 0.0f;
+        w_traits->vec_dot(n_embd_i, &s, 0, w_base + (size_t) v * row_bytes,
+                          0, q_ptr, 0, 1);
+        if (s > best) {
+            second = best; second_id = best_id;
+            best = s;       best_id = v;
+        } else if (s > second) {
+            second = s; second_id = v;
+        }
+    }
+    out_best_id    = (int) best_id;
+    out_best_val   = best;
+    out_second_id  = (int) second_id;
+    out_second_val = second;
+    return true;
+}
+
+} // namespace
+
+bool phi3_run_baseline_decode(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error) {
+    error.clear();
+    if (model == nullptr)       { error = "phi3_run_baseline_decode: model is null";        return false; }
+    if (prompt_tokens.empty())  { error = "phi3_run_baseline_decode: prompt_tokens empty";  return false; }
+    if (n_gen <= 0)             { error = "phi3_run_baseline_decode: n_gen must be > 0";    return false; }
+    if (n_threads_prefill <= 0) { n_threads_prefill = 1; }
+    if (n_threads_gen <= 0)     { n_threads_gen     = 1; }
+
+    const int n_prompt = (int) prompt_tokens.size();
+    const int n_ctx    = n_prompt + n_gen + 64;
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "phi3_run_baseline_decode: llama_init_from_model failed"; return false; }
+
+    // Prune lm_head from graph; hidden state becomes available via embeddings.
+    llama_set_phi3_fused_lmhead(ctx, true);
+
+    Phi3FusedLmHead lm;
+    if (!phi3_fused_lmhead_init(model, lm, error)) {
+        llama_free(ctx);
+        return false;
+    }
+    Phi3LmHeadPool lm_pool;
+    const int lm_pool_threads = std::max(n_threads_prefill, n_threads_gen);
+    if (lm_pool_threads > 1) {
+        std::string perr;
+        if (!phi3_fused_lmhead_pool_init(lm_pool, lm_pool_threads, perr)) {
+            fprintf(stderr, "phi3 baseline-decode: lmhead pool init failed (%s); serial fallback\n",
+                    perr.c_str());
+        }
+    }
+
+    fprintf(stderr,
+            "phi3 baseline-decode: starting (n_prompt=%d, n_gen=%d, n_ctx=%d, prefill_threads=%d, gen_threads=%d)\n",
+            n_prompt, n_gen, n_ctx, n_threads_prefill, n_threads_gen);
+
+    // ---- Prefill (sequential, one token at a time to match qquant prefill) ----
+    //
+    // Spec mandate (§4 "Prefill threading"): our qquant path owns the KV and
+    // processes prompt tokens one at a time through phi3_layer_forward_qquant.
+    // For a fair byte-exact comparison the baseline must do the same; batched
+    // prefill in llama_decode uses ggml mul_mat tiling that produces ulp-level
+    // F32 drift vs per-token vec_dot. Empirically the drift can flip argmax on
+    // close-call tokens within the first ~20 generated tokens.
+    llama_set_n_threads(ctx, n_threads_prefill, n_threads_prefill);
+    const auto t_pre = std::chrono::steady_clock::now();
+    for (int i = 0; i < n_prompt; ++i) {
+        llama_token tok = prompt_tokens[i];
+        llama_batch one = llama_batch_get_one(&tok, 1);
+        if (llama_decode(ctx, one) != 0) {
+            error = "phi3_run_baseline_decode: llama_decode (prefill seq) failed at i=" + std::to_string(i);
+            phi3_fused_lmhead_pool_free(lm_pool);
+            llama_free(ctx);
+            return false;
+        }
+    }
+    const double t_pre_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_pre).count();
+    fprintf(stderr, "phi3 baseline-decode: prefill %d tokens (seq) in %.2f s (%.3f s/tok)\n",
+            n_prompt, t_pre_ms / 1000.0, t_pre_ms / 1000.0 / std::max(1, n_prompt));
+
+    // Sample first gen token from last prompt hidden state.
+    const float * hidden = llama_get_embeddings_ith(ctx, -1);
+    if (!hidden) {
+        error = "phi3_run_baseline_decode: missing embeddings after prefill";
+        phi3_fused_lmhead_pool_free(lm_pool);
+        llama_free(ctx);
+        return false;
+    }
+    llama_token next = 0;
+    if (!phi3_fused_lmhead_argmax(lm, &lm_pool, hidden, n_threads_gen, next, error)) {
+        phi3_fused_lmhead_pool_free(lm_pool);
+        llama_free(ctx);
+        return false;
+    }
+    out_generated.reserve(out_generated.size() + n_gen);
+    out_generated.push_back(next);
+
+    // ---- Generation ----
+    llama_set_n_threads(ctx, n_threads_gen, n_threads_gen);
+    const auto t_gen = std::chrono::steady_clock::now();
+    for (int i = 1; i < n_gen; ++i) {
+        llama_batch step = llama_batch_get_one(&next, 1);
+        if (llama_decode(ctx, step) != 0) {
+            error = "phi3_run_baseline_decode: llama_decode (gen) failed at step " + std::to_string(i);
+            phi3_fused_lmhead_pool_free(lm_pool);
+            llama_free(ctx);
+            return false;
+        }
+        const float * h = llama_get_embeddings_ith(ctx, -1);
+        if (!h) {
+            error = "phi3_run_baseline_decode: missing embeddings at step " + std::to_string(i);
+            phi3_fused_lmhead_pool_free(lm_pool);
+            llama_free(ctx);
+            return false;
+        }
+        if (!phi3_fused_lmhead_argmax(lm, &lm_pool, h, n_threads_gen, next, error)) {
+            phi3_fused_lmhead_pool_free(lm_pool);
+            llama_free(ctx);
+            return false;
+        }
+        out_generated.push_back(next);
+    }
+    const double t_gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen).count();
+    fprintf(stderr, "phi3 baseline-decode: generated %d tokens in %.2f s (%.3f s/tok)\n",
+            n_gen, t_gen_ms / 1000.0, t_gen_ms / 1000.0 / std::max(1, n_gen));
+
+    phi3_fused_lmhead_pool_free(lm_pool);
+    llama_free(ctx);
+    return true;
+}
+
+bool phi3_run_qquant_regress(
+        const llama_model * model,
+        int                 n_gen,
+        int                 n_threads_prefill,
+        int                 n_threads_gen,
+        int                 n_threads_qquant,
+        bool              & out_pass,
+        std::string       & error) {
+    error.clear();
+    out_pass = false;
+    if (model == nullptr) { error = "phi3_run_qquant_regress: model is null"; return false; }
+    if (n_gen <= 0)       { error = "phi3_run_qquant_regress: n_gen must be > 0"; return false; }
+    if (n_threads_prefill <= 0) n_threads_prefill = 1;
+    if (n_threads_gen     <= 0) n_threads_gen     = 1;
+    if (n_threads_qquant  <= 0) n_threads_qquant  = 1;
+
+    static const char * const prompts[] = {
+        "Why is the sky blue?",
+        "Write a short story about a dragon.",
+        "Explain photosynthesis in simple terms."
+    };
+    const int n_prompts = (int) (sizeof(prompts) / sizeof(prompts[0]));
+
+    const char * chat_template = llama_model_chat_template(model, nullptr);
+    if (!chat_template) {
+        error = "phi3_run_qquant_regress: model has no chat template";
+        return false;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    fprintf(stderr,
+            "\nphi3 qquant-regress: starting (n_prompts=%d, n_gen=%d, "
+            "threads_prefill=%d, threads_gen=%d, threads_qquant=%d)\n",
+            n_prompts, n_gen, n_threads_prefill, n_threads_gen, n_threads_qquant);
+
+    Phi3FusedLmHead lm_diag;
+    bool lm_diag_inited = false;
+
+    int pass_count = 0;
+    for (int pi = 0; pi < n_prompts; ++pi) {
+        fprintf(stderr, "\n=== phi3 qquant-regress: prompt %d/%d: \"%s\" ===\n",
+                pi + 1, n_prompts, prompts[pi]);
+
+        // Apply chat template (same as the qquant-debug code path).
+        std::vector<llama_chat_message> msgs;
+        char * user_cstr = strdup(prompts[pi]);
+        msgs.push_back({"user", user_cstr});
+        std::vector<char> formatted(8192);
+        int n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                              true, formatted.data(), (int32_t) formatted.size());
+        if (n_fmt > (int) formatted.size()) {
+            formatted.resize((size_t) n_fmt);
+            n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                              true, formatted.data(), (int32_t) formatted.size());
+        }
+        free(user_cstr);
+        if (n_fmt < 0) {
+            error = "phi3_run_qquant_regress: chat_apply_template failed";
+            return false;
+        }
+        const std::string fmt_prompt(formatted.begin(), formatted.begin() + n_fmt);
+
+        const int n_neg = -llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                          nullptr, 0, true, true);
+        if (n_neg <= 0) {
+            error = "phi3_run_qquant_regress: tokenize sizing failed";
+            return false;
+        }
+        std::vector<llama_token> prompt_tokens((size_t) n_neg);
+        const int n_tok = llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                         prompt_tokens.data(), (int) prompt_tokens.size(),
+                                         true, true);
+        if (n_tok < 0) {
+            error = "phi3_run_qquant_regress: llama_tokenize failed";
+            return false;
+        }
+        prompt_tokens.resize((size_t) n_tok);
+
+        // Baseline (oracle).
+        std::vector<llama_token> baseline_tokens;
+        std::string berr;
+        if (!phi3_run_baseline_decode(model, prompt_tokens, n_gen,
+                                      n_threads_prefill, n_threads_gen,
+                                      baseline_tokens, berr)) {
+            error = std::string("phi3_run_qquant_regress: baseline_decode failed: ") + berr;
+            return false;
+        }
+
+        // Q-quant hand path.
+        std::vector<llama_token> qquant_tokens;
+        std::string qerr;
+        if (!phi3_run_qquant_decode(model, prompt_tokens, n_gen, n_threads_qquant,
+                                    qquant_tokens, qerr)) {
+            error = std::string("phi3_run_qquant_regress: qquant_decode failed: ") + qerr;
+            return false;
+        }
+
+        // Compare element-wise.
+        if (baseline_tokens.size() != (size_t) n_gen ||
+            qquant_tokens.size()   != (size_t) n_gen) {
+            error = "phi3_run_qquant_regress: token count mismatch (internal bug)";
+            return false;
+        }
+        int divergence = -1;
+        for (int i = 0; i < n_gen; ++i) {
+            if (baseline_tokens[i] != qquant_tokens[i]) { divergence = i; break; }
+        }
+
+        if (divergence < 0) {
+            ++pass_count;
+            fprintf(stderr, "phi3 qquant-regress: prompt %d PASS  matched %d/%d tokens\n",
+                    pi + 1, n_gen, n_gen);
+            std::string text;
+            const int show = std::min(n_gen, 48);
+            for (int i = 0; i < show; ++i) {
+                char buf[64];
+                int n = llama_token_to_piece(vocab, baseline_tokens[i], buf, sizeof(buf), 0, true);
+                if (n > 0) text.append(buf, (size_t) n);
+            }
+            fprintf(stderr, "phi3 qquant-regress: prompt %d text (first %d toks): \"%s\"\n",
+                    pi + 1, show, text.c_str());
+        } else {
+            fprintf(stderr,
+                    "phi3 qquant-regress: prompt %d FAIL  first divergence at step %d  baseline=%d  qquant=%d\n",
+                    pi + 1, divergence, baseline_tokens[divergence], qquant_tokens[divergence]);
+            char b_buf[64], q_buf[64];
+            int bn = llama_token_to_piece(vocab, baseline_tokens[divergence], b_buf, sizeof(b_buf), 0, true);
+            int qn = llama_token_to_piece(vocab, qquant_tokens[divergence],   q_buf, sizeof(q_buf), 0, true);
+            fprintf(stderr, "phi3 qquant-regress:   baseline token piece=\"%.*s\"  qquant token piece=\"%.*s\"\n",
+                    bn > 0 ? bn : 0, b_buf, qn > 0 ? qn : 0, q_buf);
+            std::string match_text;
+            for (int i = 0; i < divergence; ++i) {
+                char buf[64];
+                int n = llama_token_to_piece(vocab, baseline_tokens[i], buf, sizeof(buf), 0, true);
+                if (n > 0) match_text.append(buf, (size_t) n);
+            }
+            fprintf(stderr, "phi3 qquant-regress:   matched prefix (decoded): \"%s\"\n",
+                    match_text.c_str());
+
+            // Top-2 margin diagnostic (spec line 476). Replay baseline up to
+            // divergence to capture the hidden state at that step, then do a
+            // serial scan for top-2.
+            if (!lm_diag_inited) {
+                std::string ierr;
+                if (!phi3_fused_lmhead_init(model, lm_diag, ierr)) {
+                    fprintf(stderr, "phi3 qquant-regress:   top-2 diag skipped (lmhead_init: %s)\n",
+                            ierr.c_str());
+                } else {
+                    lm_diag_inited = true;
+                }
+            }
+            if (lm_diag_inited) {
+                const int dctx_n = n_tok + divergence + 8;
+                llama_context_params dcp = llama_context_default_params();
+                dcp.n_ctx           = dctx_n;
+                dcp.n_batch         = dctx_n;
+                dcp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                dcp.no_perf         = true;
+                llama_context * dctx = llama_init_from_model(const_cast<llama_model *>(model), dcp);
+                if (!dctx) {
+                    fprintf(stderr, "phi3 qquant-regress:   top-2 diag: llama_init_from_model failed\n");
+                } else {
+                    llama_set_phi3_fused_lmhead(dctx, true);
+                    llama_set_n_threads(dctx, n_threads_prefill, n_threads_prefill);
+                    std::vector<llama_token> replay = prompt_tokens;
+                    replay.insert(replay.end(), baseline_tokens.begin(),
+                                  baseline_tokens.begin() + divergence);
+                    // Sequential single-token feed to match baseline-decode prefill.
+                    bool replay_ok = true;
+                    for (size_t i = 0; i + 1 < replay.size(); ++i) {
+                        llama_token tok = replay[i];
+                        llama_batch step = llama_batch_get_one(&tok, 1);
+                        if (llama_decode(dctx, step) != 0) { replay_ok = false; break; }
+                    }
+                    if (replay_ok) {
+                        llama_token last_tok = replay.back();
+                        llama_batch last = llama_batch_get_one(&last_tok, 1);
+                        if (llama_decode(dctx, last) != 0) { replay_ok = false; }
+                    }
+                    if (!replay_ok) {
+                        fprintf(stderr, "phi3 qquant-regress:   top-2 diag: replay decode failed\n");
+                    } else {
+                        const float * dh = llama_get_embeddings_ith(dctx, -1);
+                        if (!dh) {
+                            fprintf(stderr, "phi3 qquant-regress:   top-2 diag: hidden missing\n");
+                        } else {
+                            int  b_id = 0, s_id = 0;
+                            float b_val = 0.f, s_val = 0.f;
+                            std::string derr;
+                            if (phi3_diag_lmhead_top2(lm_diag, dh, b_id, b_val, s_id, s_val, derr)) {
+                                char t1[64], t2[64];
+                                int  t1n = llama_token_to_piece(vocab, b_id, t1, sizeof(t1), 0, true);
+                                int  t2n = llama_token_to_piece(vocab, s_id, t2, sizeof(t2), 0, true);
+                                fprintf(stderr,
+                                    "phi3 qquant-regress:   baseline-hidden top-1=%d (\"%.*s\") score=%.6f  "
+                                    "top-2=%d (\"%.*s\") score=%.6f  margin=%.6f\n",
+                                    b_id, t1n > 0 ? t1n : 0, t1, b_val,
+                                    s_id, t2n > 0 ? t2n : 0, t2, s_val,
+                                    b_val - s_val);
+                            } else {
+                                fprintf(stderr, "phi3 qquant-regress:   top-2 diag failed: %s\n", derr.c_str());
+                            }
+                        }
+                    }
+                    llama_free(dctx);
+                }
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "\nphi3 qquant-regress: SUMMARY  pass=%d/%d  fail=%d/%d  (n_gen=%d per prompt)\n",
+            pass_count, n_prompts, n_prompts - pass_count, n_prompts, n_gen);
+
+    out_pass = (pass_count == n_prompts);
+    return true;
+}

@@ -457,3 +457,42 @@ bool phi3_run_qquant_decode(
         int                            n_threads,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);
+
+// ---------------------------------------------------------------------------
+// A2.5c — 3-prompt × n-token regression infrastructure.
+//
+// phi3_run_baseline_decode drives the production-equivalent path:
+// llama_decode for layers/KV evolution + phi3_fused_lmhead_argmax for token
+// selection (exact same selector the runtime uses in greedy mode). Creates a
+// fresh llama_context with flash_attn DISABLED to match spec §0; uses
+// llama_set_phi3_fused_lmhead(ctx, true) so the lm_head matmul is pruned
+// from the graph and the hidden state is exposed via
+// llama_get_embeddings_ith(ctx, -1). Never stops early on EOS — generates
+// exactly n_gen tokens.
+//
+// This is the oracle for the A2.5c yes/no acceptance bar (spec §4 lines
+// 472-479: "All 256 tokens MUST match").
+bool phi3_run_baseline_decode(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error);
+
+// phi3_run_qquant_regress: 3-prompt × n_gen-token regression. Compares
+// phi3_run_baseline_decode against phi3_run_qquant_decode element-wise per
+// prompt. PASS only if all tokens match for all prompts (yes/no bar). On
+// divergence, logs the first diverging step + top-2 logit margin (computed
+// from the baseline hidden state at that step) for diagnostics only — the
+// bar is still "all match" per spec line 477. Prompts are hardcoded for
+// reproducibility (see implementation).
+bool phi3_run_qquant_regress(
+        const llama_model * model,
+        int                 n_gen,
+        int                 n_threads_prefill,
+        int                 n_threads_gen,
+        int                 n_threads_qquant,
+        bool              & out_pass,
+        std::string       & error);
