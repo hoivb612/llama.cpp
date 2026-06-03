@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -42,8 +42,11 @@ int main(int argc, char ** argv) {
     bool validate_fused = false;
     bool test_layer = false;
     bool test_full = false;
+    bool test_qmatmul = false;
     bool fused_f32_debug = false;
     int  fused_f32_n_gen = 4;
+    bool fused_qquant_debug = false;
+    int  fused_qquant_n_gen = 4;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -138,11 +141,22 @@ int main(int argc, char ** argv) {
                 test_layer = true;
             } else if (strcmp(argv[i], "--phi3-full-test") == 0) {
                 test_full = true;
+            } else if (strcmp(argv[i], "--phi3-qmatmul-test") == 0) {
+                test_qmatmul = true;
             } else if (strcmp(argv[i], "--phi3-fused-f32-debug") == 0) {
                 fused_f32_debug = true;
             } else if (strcmp(argv[i], "--phi3-fused-f32-n-gen") == 0) {
                 if (i + 1 < argc) {
                     fused_f32_n_gen = std::stoi(argv[++i]);
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-debug") == 0) {
+                fused_qquant_debug = true;
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-n-gen") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_n_gen = std::stoi(argv[++i]);
                 } else {
                     print_usage(argc, argv);
                     return 1;
@@ -259,6 +273,17 @@ int main(int argc, char ** argv) {
         std::string ferr;
         if (!phi3_full_self_test(raw_model.model, ferr)) {
             fprintf(stderr, "phi3 full self-test: FAIL: %s\n", ferr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        phi3_unload_raw_model(raw_model);
+        return 0;
+    }
+
+    if (test_qmatmul) {
+        std::string ferr;
+        if (!phi3_qmatmul_self_test(raw_model.model, ferr)) {
+            fprintf(stderr, "phi3 qmatmul self-test: FAIL: %s\n", ferr.c_str());
             phi3_unload_raw_model(raw_model);
             return 1;
         }
@@ -435,6 +460,87 @@ int main(int argc, char ** argv) {
                             }
                             fprintf(stderr, "\n");
                             fprintf(stderr, "phi3 f32-decode: generated text: \"%s\"\n", gen_text.c_str());
+                        }
+                    }
+                }
+            }
+            free(user_cstr);
+        }
+    }
+
+    // ----- A2.5a.1: Q-quant decode spot-check (optional) -----
+    // Same structure as the F32 debug block: re-apply chat template fresh,
+    // tokenize, call phi3_run_qquant_decode, print side-by-side. Uses the
+    // ORIGINAL quantized weights via q_matmul_row + the existing fused
+    // q-quant lm_head argmax. Much faster than the F32 debug path.
+    if (ok && fused_qquant_debug && !single_prompt.empty()) {
+        if (temp != 0.0f) {
+            fprintf(stderr,
+                "\nphi3 qquant-debug: WARNING --temp=%g is non-zero. Baseline is sampling,\n"
+                "qquant hand path is GREEDY. Side-by-side comparison is informational only.\n", temp);
+        }
+
+        const char * chat_template = llama_model_chat_template(raw_model.model, nullptr);
+        if (chat_template == nullptr) {
+            fprintf(stderr, "phi3 qquant-debug: model has no chat template; aborting\n");
+        } else {
+            std::vector<llama_chat_message> msgs;
+            char * user_cstr = strdup(single_prompt.c_str());
+            msgs.push_back({"user", user_cstr});
+            std::vector<char> formatted(8192);
+            int n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                                  /*add_ass=*/true, formatted.data(), formatted.size());
+            if (n_fmt > (int) formatted.size()) {
+                formatted.resize((size_t) n_fmt);
+                n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                                  true, formatted.data(), formatted.size());
+            }
+            if (n_fmt < 0) {
+                fprintf(stderr, "phi3 qquant-debug: chat_apply_template failed; aborting\n");
+            } else {
+                const std::string fmt_prompt(formatted.begin(), formatted.begin() + n_fmt);
+                const llama_vocab * vocab = llama_model_get_vocab(raw_model.model);
+                const int n_neg = -llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                                  nullptr, 0, true, true);
+                if (n_neg <= 0) {
+                    fprintf(stderr, "phi3 qquant-debug: tokenize sizing failed (n_neg=%d)\n", n_neg);
+                } else {
+                    std::vector<llama_token> prompt_tokens((size_t) n_neg);
+                    const int n_tok = llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                                     prompt_tokens.data(), (int) prompt_tokens.size(),
+                                                     true, true);
+                    if (n_tok < 0) {
+                        fprintf(stderr, "phi3 qquant-debug: llama_tokenize failed\n");
+                    } else {
+                        prompt_tokens.resize((size_t) n_tok);
+                        std::vector<llama_token> gen_tokens;
+                        std::string qerr;
+                        const bool qok = phi3_run_qquant_decode(raw_model.model, prompt_tokens,
+                                                                fused_qquant_n_gen, gen_tokens, qerr);
+                        if (!qok) {
+                            fprintf(stderr, "phi3 qquant-debug: FAIL: %s\n", qerr.c_str());
+                        } else {
+                            fprintf(stderr, "\nphi3 qquant-decode: n_prompt_tokens=%d  n_gen=%d\n",
+                                    (int) prompt_tokens.size(), (int) gen_tokens.size());
+                            fprintf(stderr, "phi3 qquant-decode: prompt tokens (last 8): ");
+                            const int show_n = std::min((int) prompt_tokens.size(), 8);
+                            for (int i = (int) prompt_tokens.size() - show_n; i < (int) prompt_tokens.size(); ++i) {
+                                char buf[64];
+                                const int n = llama_token_to_piece(vocab, prompt_tokens[i], buf, sizeof(buf), 0, true);
+                                fprintf(stderr, "[%d:%.*s] ", prompt_tokens[i], n > 0 ? n : 0, buf);
+                            }
+                            fprintf(stderr, "\n");
+
+                            std::string gen_text;
+                            fprintf(stderr, "phi3 qquant-decode: generated tokens: ");
+                            for (auto t : gen_tokens) {
+                                char buf[64];
+                                const int n = llama_token_to_piece(vocab, t, buf, sizeof(buf), 0, true);
+                                fprintf(stderr, "[%d:%.*s] ", t, n > 0 ? n : 0, buf);
+                                if (n > 0) gen_text.append(buf, (size_t) n);
+                            }
+                            fprintf(stderr, "\n");
+                            fprintf(stderr, "phi3 qquant-decode: generated text: \"%s\"\n", gen_text.c_str());
                         }
                     }
                 }

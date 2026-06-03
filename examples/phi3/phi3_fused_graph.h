@@ -413,3 +413,46 @@ bool phi3_run_f32_decode(
         int                            n_gen,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);
+
+
+// ===========================================================================
+// A2.5a.0 - Q-quant matmul primitive self-test.
+// ===========================================================================
+// For layer 0's wqkv/wo/ffn_up/ffn_down, compares the hand q_matmul_row
+// (private impl) against ggml-cpu's ggml_mul_mat over the SAME quantized
+// weight + same F32 input vector. Expected: very close to byte-identical
+// (same vec_dot kernel + same from_float quantization). Tolerances:
+// max_abs <= 1e-3, rmse <= 1e-4 (generous; printed for diagnostics).
+//
+// Use --phi3-qmatmul-test in Phi3.cpp.
+bool phi3_qmatmul_self_test(const llama_model * model, std::string & error);
+
+
+// ===========================================================================
+// A2.5a.1 - Q-quant end-to-end decode (sibling of phi3_run_f32_decode).
+// ===========================================================================
+// Same shape as phi3_run_f32_decode, but:
+//   - Uses the ORIGINAL quantized weights via q_matmul_row (no F32 mirrors,
+//     no ~150MB transient, no per-token ~450ms dequant cost).
+//   - Allocates Phi3FusedCtx with f32_debug=false.
+//   - lm_head argmax uses the existing phi3_fused_lmhead_argmax (q-quant,
+//     same path as production runtime).
+//
+// Attention path remains F32-dot-vs-F16-KV (matches A2.4b). This is a known
+// minor divergence from ggml's ggml_vec_dot_f16 attention; A2.4 showed
+// argmax still matches baseline.
+//
+// Pre-conditions enforced inside:
+//   - prompt_tokens non-empty
+//   - n_gen > 0
+//   - n_head == n_head_kv (no GQA support yet)
+//   - all prompt tokens in [0, n_vocab)
+//
+// Output: out_generated is appended with exactly n_gen token ids.
+// Frees ctx + lm_head on every failure path.
+bool phi3_run_qquant_decode(
+        const llama_model            * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                            n_gen,
+        std::vector<llama_token>     & out_generated,
+        std::string                  & error);

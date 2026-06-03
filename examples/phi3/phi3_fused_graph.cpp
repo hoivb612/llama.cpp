@@ -2580,3 +2580,594 @@ bool phi3_run_f32_decode(
     phi3_fused_ctx_free(cx);
     return true;
 }
+
+// ===========================================================================
+// A2.5a.0 - Q-quant matmul primitive + micro-oracle self-test.
+// ===========================================================================
+
+// Hand q-quant matmul: y[r] = vec_dot(W[r,:], x) for r in [0..M),
+//                     where W is a quantized 2D tensor of shape {K, M}
+//                     (K elements per row, M rows) and x is a F32 vector
+//                     of length K. The src is q-quantized ONCE into
+//                     q_scratch using w_traits->vec_dot_type's from_float.
+//
+// Aggressive validation: w not null, w->data not null, w->ne[0]==K, ne[1]==M,
+// nb[0]==type_size, nb[1]==row_size; w_traits/q_traits non-null with
+// vec_dot/from_float; K compatible with vec_dot_type's block size.
+//
+// q_scratch is resized inside; caller may reuse across calls.
+//
+// Returns false with a populated error on any failure.
+namespace {
+
+bool q_matmul_row(
+        const ggml_tensor   * w,
+        const float         * x_f32,
+        float               * y_out,
+        int                   M,
+        int                   K,
+        std::vector<uint8_t> & q_scratch,
+        std::string         & error) {
+    if (w == nullptr)           { error = "q_matmul_row: w is null"; return false; }
+    if (w->data == nullptr)     { error = "q_matmul_row: w->data is null (weight not resident)"; return false; }
+    if (x_f32 == nullptr)       { error = "q_matmul_row: x_f32 is null"; return false; }
+    if (y_out == nullptr)       { error = "q_matmul_row: y_out is null"; return false; }
+    if (M <= 0 || K <= 0)       { error = "q_matmul_row: M or K <= 0"; return false; }
+
+    if ((int) w->ne[0] != K || (int) w->ne[1] != M) {
+        std::ostringstream oss;
+        oss << "q_matmul_row: shape mismatch: w->ne=(" << w->ne[0] << "," << w->ne[1]
+            << ") expected (K=" << K << ", M=" << M << ")";
+        error = oss.str();
+        return false;
+    }
+    if ((size_t) w->nb[0] != ggml_type_size(w->type)) {
+        std::ostringstream oss;
+        oss << "q_matmul_row: w->nb[0]=" << w->nb[0]
+            << " != ggml_type_size(" << ggml_type_name(w->type) << ")=" << ggml_type_size(w->type);
+        error = oss.str();
+        return false;
+    }
+    const size_t expected_row_bytes = ggml_row_size(w->type, K);
+    if ((size_t) w->nb[1] != expected_row_bytes) {
+        std::ostringstream oss;
+        oss << "q_matmul_row: w->nb[1]=" << w->nb[1]
+            << " != ggml_row_size(" << ggml_type_name(w->type) << ", K=" << K << ")="
+            << expected_row_bytes;
+        error = oss.str();
+        return false;
+    }
+
+    const auto * w_traits = ggml_get_type_traits_cpu(w->type);
+    if (!w_traits || !w_traits->vec_dot) {
+        std::ostringstream oss;
+        oss << "q_matmul_row: no CPU vec_dot for type " << ggml_type_name(w->type);
+        error = oss.str();
+        return false;
+    }
+    const ggml_type q_type   = w_traits->vec_dot_type;
+    const auto *    q_traits = ggml_get_type_traits_cpu(q_type);
+    if (!q_traits || !q_traits->from_float) {
+        std::ostringstream oss;
+        oss << "q_matmul_row: vec_dot_type=" << ggml_type_name(q_type)
+            << " has no from_float kernel";
+        error = oss.str();
+        return false;
+    }
+    // K must be a multiple of vec_dot_type's block size (typical: 256 for Q8_K).
+    const int64_t q_block = (int64_t) ggml_blck_size(q_type);
+    if (q_block > 1 && (K % q_block) != 0) {
+        std::ostringstream oss;
+        oss << "q_matmul_row: K=" << K << " not a multiple of block size "
+            << q_block << " for vec_dot_type=" << ggml_type_name(q_type);
+        error = oss.str();
+        return false;
+    }
+
+    const size_t q_bytes = ggml_row_size(q_type, K);
+    if (q_scratch.size() < q_bytes) q_scratch.assign(q_bytes, 0);
+
+    q_traits->from_float(x_f32, q_scratch.data(), K);
+
+    const uint8_t * w_base   = (const uint8_t *) w->data;
+    const size_t    row_b    = expected_row_bytes;
+    const void *    q_src    = q_scratch.data();
+    for (int r = 0; r < M; ++r) {
+        float s = 0.0f;
+        w_traits->vec_dot(K, &s, 0, w_base + (size_t) r * row_b, 0, q_src, 0, 1);
+        y_out[r] = s;
+    }
+    return true;
+}
+
+// Build a single mul_mat oracle: y_oracle = ggml_mul_mat(w, x_f32) computed
+// via ggml-cpu in the same process. Comparison vs q_matmul_row should be
+// byte-identical because both call the same vec_dot kernel after the same
+// from_float quantization.
+bool qmatmul_oracle_one(
+        const ggml_tensor * w,
+        const float       * x_f32,
+        int                 M,
+        int                 K,
+        std::vector<float> & y_oracle,
+        std::string       & error) {
+    y_oracle.assign((size_t) M, 0.0f);
+
+    const size_t weight_bytes = ggml_nbytes(w);
+    const size_t arena_bytes  = weight_bytes
+                              + (size_t) K * sizeof(float)
+                              + (size_t) M * sizeof(float)
+                              + 8ull * 1024 * 1024;  // graph + overhead
+    std::vector<uint8_t> arena(arena_bytes);
+    ggml_init_params ip{ arena_bytes, arena.data(), false };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) { error = "qmatmul_oracle_one: ggml_init failed"; return false; }
+
+    ggml_tensor * tw = ggml_new_tensor_2d(gctx, w->type, K, M);
+    std::memcpy(tw->data, w->data, weight_bytes);
+    ggml_tensor * tx = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, K);
+    std::memcpy(tx->data, x_f32, (size_t) K * sizeof(float));
+    ggml_tensor * ty = ggml_mul_mat(gctx, tw, tx);
+    ggml_mul_mat_set_prec(ty, GGML_PREC_F32);
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+    ggml_build_forward_expand(gf, ty);
+    ggml_graph_compute_with_ctx(gctx, gf, 1);
+    std::memcpy(y_oracle.data(), ty->data, (size_t) M * sizeof(float));
+    ggml_free(gctx);
+    return true;
+}
+
+} // namespace
+
+
+bool phi3_qmatmul_self_test(const llama_model * model, std::string & error) {
+    error.clear();
+    if (model == nullptr) { error = "phi3_qmatmul_self_test: model is null"; return false; }
+
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+    if (W.n_layer < 1) { error = "phi3_qmatmul_self_test: no layers"; return false; }
+    const Phi3LayerWeights & L = W.layers[0];
+
+    struct WtCase {
+        const char        * name;
+        const ggml_tensor * w;
+        int                 M;
+        int                 K;
+    };
+    const WtCase cases[] = {
+        { "wqkv",     L.wqkv,     W.n_qkv,     W.n_embd },
+        { "wo",       L.wo,       W.n_embd,    W.n_embd },
+        { "ffn_up",   L.ffn_up,   2 * W.n_ff,  W.n_embd },
+        { "ffn_down", L.ffn_down, W.n_embd,    W.n_ff   },
+    };
+
+    // Deterministic seeded input vectors (one per case width).
+    auto make_x = [&](int K, uint32_t seed) {
+        std::vector<float> x((size_t) K);
+        uint32_t s = seed;
+        for (int k = 0; k < K; ++k) {
+            s = s * 1664525u + 1013904223u;
+            const float v = ((float)(s >> 8) / (float)(1u << 24)) - 0.5f; // ~U[-0.5, 0.5)
+            x[k] = v * 0.5f;
+        }
+        return x;
+    };
+
+    std::vector<uint8_t> q_scratch;
+    std::vector<float>   hand;
+    std::vector<float>   oracle;
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); ++c) {
+        const WtCase & cs = cases[c];
+        if (cs.w == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_qmatmul_self_test: weight '" << cs.name << "' is null";
+            error = oss.str();
+            return false;
+        }
+
+        const std::vector<float> x = make_x(cs.K, /*seed=*/0x9E3779B9u + (uint32_t) c);
+
+        hand.assign((size_t) cs.M, 0.0f);
+        if (!q_matmul_row(cs.w, x.data(), hand.data(), cs.M, cs.K, q_scratch, error)) {
+            std::string sub = error;
+            std::ostringstream oss;
+            oss << "phi3_qmatmul_self_test: q_matmul_row '" << cs.name << "' failed: " << sub;
+            error = oss.str();
+            return false;
+        }
+
+        std::string sub_err;
+        if (!qmatmul_oracle_one(cs.w, x.data(), cs.M, cs.K, oracle, sub_err)) {
+            std::ostringstream oss;
+            oss << "phi3_qmatmul_self_test: oracle '" << cs.name << "' failed: " << sub_err;
+            error = oss.str();
+            return false;
+        }
+
+        // Compare. Identical kernels => exact match expected. Allow ULP wiggle
+        // (1 ulp ~= 1e-7 * |val|) in case ggml's mul_mat takes a different
+        // internal accumulator path (e.g. AVX-512 vs scalar) but compute the
+        // numerically same dot.
+        int worst_i = -1;
+        float worst_diff = 0.0f, worst_a = 0.0f, worst_b = 0.0f;
+        double sumsq = 0.0;
+        int n_exact = 0;
+        for (int j = 0; j < cs.M; ++j) {
+            const float a = hand[j], b = oracle[j];
+            const float d = std::fabs(a - b);
+            if (d == 0.0f) ++n_exact;
+            sumsq += (double) d * (double) d;
+            if (d > worst_diff) { worst_diff = d; worst_i = j; worst_a = a; worst_b = b; }
+        }
+        const float rmse = (float) std::sqrt(sumsq / (double) cs.M);
+        const float tol_abs = 1e-3f;  // generous for K-quant arithmetic
+        const float tol_rmse = 1e-4f;
+        const bool pass = worst_diff <= tol_abs && rmse <= tol_rmse;
+        fprintf(stderr,
+                "phi3 qmatmul: %-9s  M=%-6d K=%-5d  type=%s  vec_dot_type=%s"
+                "  max_abs=%.4g rmse=%.4g  exact=%d/%d  %s\n",
+                cs.name, cs.M, cs.K, ggml_type_name(cs.w->type),
+                ggml_type_name(ggml_get_type_traits_cpu(cs.w->type)->vec_dot_type),
+                worst_diff, rmse, n_exact, cs.M,
+                pass ? "PASS" : "FAIL");
+        if (!pass) {
+            std::ostringstream oss;
+            oss << "phi3_qmatmul_self_test: '" << cs.name
+                << "' diverged at j=" << worst_i
+                << " hand=" << worst_a << " oracle=" << worst_b
+                << " |diff|=" << worst_diff
+                << "  tol_abs=" << tol_abs << " tol_rmse=" << tol_rmse;
+            error = oss.str();
+            return false;
+        }
+    }
+    fprintf(stderr, "phi3 qmatmul self-test: PASS (4 weight classes on layer 0)\n");
+    return true;
+}
+
+
+// ===========================================================================
+// A2.5a.1 - Q-quant decode (sibling of phi3_run_f32_decode).
+// ===========================================================================
+
+// Sibling of phi3_layer_forward_f32 using the ORIGINAL quantized weights via
+// q_matmul_row. Does NOT require cx.scratch.f32_debug; reuses cx.scratch.hq_buf
+// and ffq_buf (already provisioned for q-scratch).
+//
+// Attention path remains F32 (Q*K^T in F32 against F16-rounded K) to match
+// A2.4b. This is a known minor numerical divergence from baseline's
+// ggml_vec_dot_f16, but A2.4 showed argmax still matches.
+bool phi3_layer_forward_qquant(
+        Phi3FusedCtx       & cx,
+        int                  il,
+        int                  pos,
+        float              * x_inout,
+        std::string        & error) {
+    error.clear();
+    if (cx.w == nullptr) { error = "phi3_layer_forward_qquant: cx.w is null"; return false; }
+    if (x_inout == nullptr) { error = "phi3_layer_forward_qquant: x_inout is null"; return false; }
+
+    const Phi3Weights & W = *cx.w;
+    const Phi3LayerWeights & L = W.layers[il];
+    const int n_embd     = W.n_embd;
+    const int n_head     = W.n_head;
+    const int n_head_kv  = W.n_head_kv;
+    const int head_dim   = W.n_embd_head;
+    const int n_embd_kv  = head_dim * n_head_kv;
+    const int n_embd_q   = head_dim * n_head;
+    const int n_qkv      = W.n_qkv;
+    const int n_ff       = W.n_ff;
+
+    if (pos < 0 || pos >= cx.kv.ctx_max) {
+        std::ostringstream oss; oss << "phi3_layer_forward_qquant: pos=" << pos << " out of range";
+        error = oss.str();
+        return false;
+    }
+
+    // Dequant attn_norm and ffn_norm into small per-call vectors (n_embd each).
+    // These are 1-D F16 or F32 tensors and cheap to handle.
+    std::vector<float> attn_norm_w(n_embd);
+    std::vector<float> ffn_norm_w(n_embd);
+    {
+        const ggml_tensor * an = L.attn_norm;
+        if (an->type == GGML_TYPE_F32) {
+            std::memcpy(attn_norm_w.data(), an->data, n_embd * sizeof(float));
+        } else if (an->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) an->data, attn_norm_w.data(), n_embd);
+        } else {
+            if (!dequant_row_to_f32(an, 0, attn_norm_w.data(), error)) return false;
+        }
+        const ggml_tensor * fn = L.ffn_norm;
+        if (fn->type == GGML_TYPE_F32) {
+            std::memcpy(ffn_norm_w.data(), fn->data, n_embd * sizeof(float));
+        } else if (fn->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) fn->data, ffn_norm_w.data(), n_embd);
+        } else {
+            if (!dequant_row_to_f32(fn, 0, ffn_norm_w.data(), error)) return false;
+        }
+    }
+
+    // Local scratch (avoid aliasing with cx.scratch buffers used by q_matmul_row).
+    std::vector<float> norm1(n_embd);
+    std::vector<float> qkv(n_qkv);
+    std::vector<float> attn_ctx(n_embd, 0.0f);
+    std::vector<float> attn_out_buf(n_embd);
+    std::vector<float> x_after_res1(n_embd);
+    std::vector<float> norm2(n_embd);
+    std::vector<float> upgate(2 * n_ff);
+    std::vector<float> ff(n_ff);
+    std::vector<float> ffn_out_buf(n_embd);
+
+    // --- 1. Pre-attn RMSNorm ---
+    phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout, attn_norm_w.data(), n_embd, cx.eps);
+
+    // --- 2. wqkv (q-quant) ---
+    if (!q_matmul_row(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
+                      cx.scratch.hq_buf, error)) {
+        std::string s = error; error = "phi3_layer_forward_qquant: wqkv: " + s; return false;
+    }
+
+    float * q = qkv.data();
+    float * k = qkv.data() + n_embd_q;
+    float * v = qkv.data() + n_embd_q + n_embd_kv;
+
+    // --- 3. RoPE on Q, K ---
+    for (int h = 0; h < n_head; ++h) {
+        phi3_kernel_rope_neox_f32(q + h * head_dim, q + h * head_dim, /*factors=*/nullptr,
+                                  cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+    }
+    for (int h = 0; h < n_head_kv; ++h) {
+        phi3_kernel_rope_neox_f32(k + h * head_dim, k + h * head_dim, /*factors=*/nullptr,
+                                  cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+    }
+
+    // --- 4. Write K, V to cache at position pos (F16) ---
+    {
+        ggml_fp16_t * K_pos = cx.kv.K[il] + (size_t) pos * (size_t) n_embd_kv;
+        ggml_fp16_t * V_pos = cx.kv.V[il] + (size_t) pos * (size_t) n_embd_kv;
+        ggml_fp32_to_fp16_row(k, K_pos, n_embd_kv);
+        ggml_fp32_to_fp16_row(v, V_pos, n_embd_kv);
+    }
+    const int new_len = pos + 1;
+    if (cx.kv.current_len < new_len) cx.kv.current_len = new_len;
+
+    // --- 5. Attention (F32 dot against F16 KV, matches A2.4b) ---
+    const float scale_q = 1.0f / std::sqrt((float) head_dim);
+    std::vector<float> scores((size_t) new_len);
+    for (int h = 0; h < n_head; ++h) {
+        const float * q_h = q + h * head_dim;
+        float max_s = -INFINITY;
+        for (int p = 0; p < new_len; ++p) {
+            const ggml_fp16_t * k_p = cx.kv.K[il] + ((size_t) p * n_head_kv + h) * head_dim;
+            double acc = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                acc += (double) q_h[d] * (double) ggml_fp16_to_fp32(k_p[d]);
+            }
+            const float s = (float) (acc * (double) scale_q);
+            scores[p] = s;
+            if (s > max_s) max_s = s;
+        }
+        double sum_exp = 0.0;
+        for (int p = 0; p < new_len; ++p) {
+            scores[p] = std::exp(scores[p] - max_s);
+            sum_exp += (double) scores[p];
+        }
+        const float inv_sum = (float) (1.0 / sum_exp);
+        float * ctx_h = attn_ctx.data() + h * head_dim;
+        for (int d = 0; d < head_dim; ++d) ctx_h[d] = 0.0f;
+        for (int p = 0; p < new_len; ++p) {
+            const float w_p = scores[p] * inv_sum;
+            const ggml_fp16_t * v_p = cx.kv.V[il] + ((size_t) p * n_head_kv + h) * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                ctx_h[d] += w_p * ggml_fp16_to_fp32(v_p[d]);
+            }
+        }
+    }
+
+    // --- 6. wo (q-quant) ---
+    if (!q_matmul_row(L.wo, attn_ctx.data(), attn_out_buf.data(), n_embd, n_embd,
+                      cx.scratch.hq_buf, error)) {
+        std::string s = error; error = "phi3_layer_forward_qquant: wo: " + s; return false;
+    }
+
+    // --- 7. Residual 1 ---
+    for (int i = 0; i < n_embd; ++i) x_after_res1[i] = x_inout[i] + attn_out_buf[i];
+
+    // --- 8. FFN RMSNorm ---
+    phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(), ffn_norm_w.data(), n_embd, cx.eps);
+
+    // --- 9. ffn_up (q-quant, gate||up fused) ---
+    if (!q_matmul_row(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
+                      cx.scratch.hq_buf, error)) {
+        std::string s = error; error = "phi3_layer_forward_qquant: ffn_up: " + s; return false;
+    }
+
+    // --- 10. SwiGLU ---
+    for (int i = 0; i < n_ff; ++i) {
+        const float g = upgate[i];
+        const float u = upgate[n_ff + i];
+        const float silu = g / (1.0f + std::exp(-g));
+        ff[i] = silu * u;
+    }
+
+    // --- 11. ffn_down (q-quant) ---
+    if (!q_matmul_row(L.ffn_down, ff.data(), ffn_out_buf.data(), n_embd, n_ff,
+                      cx.scratch.ffq_buf, error)) {
+        std::string s = error; error = "phi3_layer_forward_qquant: ffn_down: " + s; return false;
+    }
+
+    // --- 12. Residual 2 ---
+    for (int i = 0; i < n_embd; ++i) x_inout[i] = x_after_res1[i] + ffn_out_buf[i];
+
+    return true;
+}
+
+
+// Full per-token forward in q-quant mode. Produces the post-final-norm hidden
+// state into out_hidden (n_embd). lm_head argmax is performed by the caller
+// using phi3_fused_lmhead_argmax against this hidden state.
+bool phi3_full_forward_qquant(
+        Phi3FusedCtx       & cx,
+        int                  token_id,
+        int                  pos,
+        float              * out_hidden,
+        std::string        & error) {
+    error.clear();
+    if (cx.w == nullptr)    { error = "phi3_full_forward_qquant: cx.w is null"; return false; }
+    if (out_hidden == nullptr) { error = "phi3_full_forward_qquant: out_hidden is null"; return false; }
+
+    const Phi3Weights & W = *cx.w;
+    const int n_embd  = W.n_embd;
+    const int n_layer = W.n_layer;
+    const int n_vocab = W.n_vocab;
+
+    if (token_id < 0 || token_id >= n_vocab) {
+        std::ostringstream oss;
+        oss << "phi3_full_forward_qquant: token_id=" << token_id << " out of [0," << n_vocab << ")";
+        error = oss.str();
+        return false;
+    }
+
+    // 1. tok_embd lookup -> F32
+    std::vector<float> x(n_embd);
+    if (!dequant_row_to_f32(W.tok_embd, token_id, x.data(), error)) return false;
+
+    // 2. 32 layers in q-quant
+    for (int il = 0; il < n_layer; ++il) {
+        if (!phi3_layer_forward_qquant(cx, il, pos, x.data(), error)) return false;
+    }
+
+    // 3. Final RMSNorm
+    {
+        std::vector<float> w_final(n_embd);
+        const ggml_tensor * onm = W.output_norm;
+        if (onm->type == GGML_TYPE_F32) {
+            std::memcpy(w_final.data(), onm->data, n_embd * sizeof(float));
+        } else if (onm->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) onm->data, w_final.data(), n_embd);
+        } else {
+            if (!dequant_row_to_f32(onm, 0, w_final.data(), error)) return false;
+        }
+        std::vector<float> tmp(n_embd);
+        phi3_kernel_rmsnorm_mul_f32(tmp.data(), x.data(), w_final.data(), n_embd, cx.eps);
+        std::memcpy(out_hidden, tmp.data(), n_embd * sizeof(float));
+    }
+    return true;
+}
+
+
+bool phi3_run_qquant_decode(
+        const llama_model            * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                            n_gen,
+        std::vector<llama_token>     & out_generated,
+        std::string                  & error) {
+    error.clear();
+    if (model == nullptr)        { error = "phi3_run_qquant_decode: model is null"; return false; }
+    if (prompt_tokens.empty())   { error = "phi3_run_qquant_decode: prompt_tokens is empty"; return false; }
+    if (n_gen <= 0)              { error = "phi3_run_qquant_decode: n_gen must be > 0"; return false; }
+
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+
+    if (W.n_head != W.n_head_kv) {
+        std::ostringstream oss;
+        oss << "phi3_run_qquant_decode: GQA not supported (n_head=" << W.n_head
+            << " n_head_kv=" << W.n_head_kv << ")";
+        error = oss.str();
+        return false;
+    }
+
+    const int n_embd   = W.n_embd;
+    const int n_vocab  = W.n_vocab;
+    const int n_prompt = (int) prompt_tokens.size();
+    const int ctx_max  = n_prompt + n_gen + 2;
+
+    for (int p = 0; p < n_prompt; ++p) {
+        if (prompt_tokens[p] < 0 || prompt_tokens[p] >= n_vocab) {
+            std::ostringstream oss;
+            oss << "phi3_run_qquant_decode: prompt token " << p << "=" << prompt_tokens[p]
+                << " out of [0," << n_vocab << ")";
+            error = oss.str();
+            return false;
+        }
+    }
+
+    // f32_debug=false  =>  no ~150MB F32 weight mirrors allocated
+    Phi3FusedCtx cx;
+    if (!phi3_fused_ctx_init(cx, W, /*pool=*/nullptr, model, /*lctx=*/nullptr,
+                             ctx_max, /*f32_debug=*/false, error)) {
+        return false;
+    }
+
+    // lm_head: use the existing fused q-quant argmax helper.
+    Phi3FusedLmHead lm;
+    if (!phi3_fused_lmhead_init(model, lm, error)) {
+        phi3_fused_ctx_free(cx);
+        return false;
+    }
+
+    fprintf(stderr,
+            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d)\n",
+            n_prompt, n_gen, ctx_max);
+
+    std::vector<float> hidden((size_t) n_embd);
+
+    auto step = [&](int tok, int pos, llama_token * out_tok_or_null) -> bool {
+        if (!phi3_full_forward_qquant(cx, tok, pos, hidden.data(), error)) return false;
+        // Finite check on hidden state.
+        for (int i = 0; i < n_embd; ++i) {
+            if (!std::isfinite(hidden[i])) {
+                std::ostringstream oss;
+                oss << "phi3 qquant-decode: non-finite hidden at pos=" << pos << " dim=" << i << " val=" << hidden[i];
+                error = oss.str();
+                return false;
+            }
+        }
+        if (out_tok_or_null) {
+            llama_token best = 0;
+            if (!phi3_fused_lmhead_argmax(lm, /*pool=*/nullptr, hidden.data(),
+                                          /*n_threads=*/1, best, error)) return false;
+            *out_tok_or_null = best;
+        }
+        return true;
+    };
+
+    // ---- Prefill ----
+    const auto t_prefill_start = std::chrono::steady_clock::now();
+    llama_token next_tok = 0;
+    for (int p = 0; p < n_prompt; ++p) {
+        const bool is_last = (p == n_prompt - 1);
+        if (!step(prompt_tokens[p], p, is_last ? &next_tok : nullptr)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    fprintf(stderr, "phi3 qquant-decode: prefill %d tokens in %.2f s (%.3f s/tok)\n",
+            n_prompt, prefill_ms / 1000.0, prefill_ms / 1000.0 / std::max(1, n_prompt));
+
+    // ---- Generation ----
+    out_generated.reserve(out_generated.size() + n_gen);
+    const auto t_gen_start = std::chrono::steady_clock::now();
+
+    out_generated.push_back(next_tok);
+    for (int i = 1; i < n_gen; ++i) {
+        const int pos = n_prompt + i - 1;
+        if (!step(next_tok, pos, &next_tok)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+        out_generated.push_back(next_tok);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen_start).count();
+    fprintf(stderr, "phi3 qquant-decode: generated %d tokens in %.2f s (%.3f s/tok)\n",
+            n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+
+    phi3_fused_ctx_free(cx);
+    return true;
+}
+
