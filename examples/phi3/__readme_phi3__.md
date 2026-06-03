@@ -369,4 +369,367 @@ So the corrected story is:
 
  - nth=10: BOTH = +12.9% (real win, lmhead does the heavy lifting, decode contributes a little)
  - nth=1: BOTH = +1.9% (lmhead win partly offset by decode overhead) — still better than baseline, but worse than lmhead alone
- 
+
+ =====================================================================
+
+ Today's flow (one gen step)
+
+ Driver: pick next token
+    ↓
+ llama_decode(ctx, batch[1 token])
+    ↓ (inside llama)
+    1. Build a ggml graph — a DAG of ~320 nodes describing the Phi3 forward pass:
+         tok_embd → [RMSNorm → wqkv mul → split → RoPE → attn → wo → add
+                     → RMSNorm → ffn_up mul → swiglu → ffn_down → add] × 32
+                   → final_norm → lm_head
+       Each box is a ggml op (ggml_rms_norm, ggml_mul_mat, ggml_rope_ext, …)
+    2. Scheduler walks the DAG topologically, dispatching each op to the CPU
+       threadpool. Threads sync at barriers between stages.
+    3. Each op:
+         - allocates/zeros a result tensor (intermediate f32 buffer)
+         - dispatches its kernel
+         - thread fan-out + fan-in
+         - writes result, next op reads it
+    4. Logits land in a designated output tensor.
+    ↑
+ llama_get_logits(ctx) → float* logits
+    ↓
+ Driver: argmax → token
+
+The cost of this for n_tokens=1 isn't dominated by the math — it's dominated by 320 ops × per-op dispatch + 30+ barriers per token.Our Option 1 experiment hit this wall: a single ggml_custom_4d "fused op" cost ~5 µs of actual savings but ~30 µs of dispatch.
+
+Phase A flow (one gen step)
+
+ Driver: pick next token
+    ↓
+ phi3_custom_decode(custom_ctx, tok_id, pos) — ONE C++ function
+    ↓ (inside our code, NO ggml graph, NO scheduler)
+    embed = tok_embd_row[tok_id]                 // memcpy, ~3 µs
+    for il = 0..31:
+        // all of this stays in registers/L1, no intermediate ggml tensors
+        norm1   = rmsnorm_inplace_with_gain(embed, attn_norm[il])
+        norm1_q = quantize_to_Q8K(norm1)         // hot in L1
+        qkv     = q4k_matmul(wqkv[il], norm1_q)  // calls the existing vec_dot kernel directly
+        Q, K, V = split_qkv(qkv)
+        rope_inplace(Q, K, pos, rope_factors)
+        our_kv.K[il][pos] = K                    // append to OUR cache
+        our_kv.V[il][pos] = V
+        attn    = scaled_dot_attn(Q, our_kv.K[il, 0..pos], our_kv.V[il, 0..pos])
+        attn    = q4k_matmul(wo[il], attn)
+        embed  += attn                           // residual
+        norm2   = rmsnorm_inplace_with_gain(embed, ffn_norm[il])
+        gate_up = q4k_matmul(ffn_up[il], quantize_to_Q8K(norm2))
+        ff      = swiglu_then_q4k_matmul(ffn_down[il], gate_up)
+        embed  += ff
+    final  = rmsnorm_with_gain(embed, output_norm)
+    token  = lmhead_argmax(final, lm_head OR tok_embd)   // reuses Phase C pool
+    ↓
+ Driver: token
+
+That's it. No graph. No scheduler. No llama_decode. No llama_get_logits. The whole thing is one C++ function that knows it's doingPhi3 and runs straight through, with the inner matmul/norm primitives being the same kernels ggml-cpu already implements — we justcall them inline instead of going through the op-dispatch machinery.
+
+What we're actually trading
+
+┌──────────────────────────┬────────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+│                          │ Today (graph)              │ Phase A (direct)                                                        │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Per gen step: graph      │ ~320                       │ 0 (we just call functions)                                              │
+│ nodes executed           │                            │                                                                         │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Per gen step: thread     │ ~30+                       │ 1 fork-join per matmul we parallelize (~7/layer × 32 = ~220) but with   │
+│ barriers                 │                            │ no per-node dispatch overhead between them                              │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Intermediate f32 tensors │ every edge in the DAG      │ only what we explicitly choose to materialize                           │
+│ materialized             │                            │                                                                         │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Cache locality control   │ scheduler's whim           │ ours                                                                    │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ KV cache                 │ llama-owned (paged,        │ ours (one contiguous block per layer)                                   │
+│                          │ iswa-capable, multi-seq)   │                                                                         │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Math kernels             │ ggml's vec_dot Q4_K×Q8_K   │ same vec_dot routine, called inline                                     │
+├──────────────────────────┼────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Correctness risk         │ zero (it's the oracle)     │ high — must reproduce byte-identical output                             │
+└──────────────────────────┴────────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+
+So the perf win comes from eliminating dispatch and barrier overhead, materializing fewer intermediate buffers, and keeping data hot in cache — not from inventing new math kernels. The matmuls themselves cost the same.
+
+Where prefill fits in
+
+Prefill = the very first call after llama_init_from_model, processing the entire prompt as one big batch (n_tokens = prompt_len, say15-256 tokens). Then every subsequent gen step is n_tokens=1.
+
+The current win story is entirely about gen steps — prefill happens once and its overhead is already amortized over many matmul rows. So we only NEED Phase A to be fast at gen.
+
+But: gen step 1 needs the KV cache populated with the prompt's K/V. Three ways to get there:
+
+ 1. Own prefill too — re-implement prefill in our custom code. Our cache is populated by our code from the start. Singlearchitecture, but means re-doing all the multi-token causal-mask correctness.
+ 2. Let llama prefill, then copy KV — call standard llama_decode on the prompt (one call). The KV ends up in llama's internal cache.Just before gen step 1, copy llama's K/V into ours. Then never touch llama again. This needs an internal (not public-API) function in llama-context.cpp to expose layer K/V tensors so we can memcpy them out.
+ 3. Share llama's KV — most aggressive, most fragile. Skip.
+
+That's what the architectural question is. Option 2 = small surgical hook, prefill stays the oracle, we only own the perf-criticalcode. Option 1 = no llama leakage but we re-prove prefill correctness ourselves.
+
+========================================================================
+
+ we don't lose parallelism; we just choose where it lives. Let me walk through the three viable patterns.
+
+What ggml does today (for context)
+
+ ggml scheduler                                  CPU threadpool (N threads)
+ ─────────────                                   ──────────────
+ for each op in topological order:               while !done:
+     pick threads, set ith for each              wait for op...
+     fan out: launch all threads → ┐             enter op(ith, nth)
+                                   ├─────────►   compute MY slice
+                                   ▼             arrive at barrier
+                                                 wait for siblings
+     fan in: barrier                             return
+     move to next op                             wait for op...
+
+Inside each op (say ggml_compute_forward_mul_mat): every thread enters the same function with its own ith (0..N-1) and nth (N). Thefunction divides the rows of the output among threads, each does its slice, joins via an atomic-counter barrier. Then the schedulermoves to the next op.
+
+Three things to notice:
+
+ 1. Threads stay "live" the whole time — they don't get destroyed and re-created per op. The pool is persistent.
+ 2. Per-op overhead = setup (1-3 µs) + barrier (1-2 µs) ≈ 3-5 µs/op of pure overhead.
+ 3. The math kernel inside doesn't know about the graph — it just sees (ith, nth, src0, src1, dst).
+
+That last point is the key insight for Phase A: the inner math kernels are reusable. We can call ggml_compute_forward_mul_matdirectly from our own code.
+
+Phase A — three parallelism patterns
+
+Pattern A: "Per-block fork-join" (simplest, closest to today)
+
+ main thread (driver)                            persistent worker pool (N threads)
+ ────────────────────                            ──────────────────────────────────
+ phi3_custom_decode(tok, pos):                   while !done:
+     embed = tok_embd[tok]                         park on cv
+     for il = 0..31:
+        norm1 = rmsnorm(embed, gain)
+        pool.run(N, |ith, nth| {                  ←────  wake all N
+           q4k_matmul_slice(wqkv,                        each thread:
+                             norm1, qkv,                   compute MY rows of qkv
+                             ith, nth)                     atomic.fetch_add → barrier
+        })                                                 signal done
+        ... rope, attn, etc, each as pool.run ──── ►  park again
+
+This is essentially our existing Phi3LmHeadPool pattern (the one we landed in Option 3), just extended to many call sites per token.Each pool.run(...) is the fork-join.
+
+Cost: 3 µs cv wake + ~2 µs barrier = ~5 µs per pool.run.
+Calls per token: ~5 matmuls × 32 layers = ~160 → **0.8 ms/token of pool overhead** (vs today's ~10 ms of total overhead). Big win.
+
+Pattern B: "SPMD" (all threads run the whole forward together)
+
+ driver thread is just one of N worker threads. All N enter the same function:
+
+ phi3_custom_decode_spmd(tok, pos, ith, nth):
+     embed = (ith == 0) ? tok_embd[tok] : nullptr
+     barrier()
+     for il = 0..31:
+        if (ith == 0) norm1 = rmsnorm(embed, gain)    // tiny op, single thread
+        barrier()
+        q4k_matmul_slice(wqkv, norm1, qkv, ith, nth)  // all threads, divide rows
+        barrier()
+        ...
+
+Every thread takes the same code path; serial ops are guarded by if (ith == 0); parallel ops divide work by (ith, nth). Only one fork at the start, one join at the end of the whole decode — barriers in between are just atomic-counter spins (no cv wake).
+
+Cost: 0.5 µs per barrier × ~200 barriers = **0.1 ms/token of sync overhead**. Lowest possible.
+
+But: every line of the forward function has to be written with ith/nth awareness. More restructuring. This is exactly how ggml-cpuwrites its op kernels — we'd be doing it for the whole graph rather than just one op.
+
+Pattern C: "Hybrid" — large ops parallelized, small ops single-threaded
+
+ phi3_custom_decode(tok, pos):
+     embed = tok_embd[tok]                     // single thread, ~3 µs (tiny copy)
+     for il = 0..31:
+         norm1 = rmsnorm(embed, gain)          // single thread, ~30 µs (small reduce)
+         pool.run_matmul(wqkv, norm1, qkv)     // FORK only for the big matmul
+         rope_inplace(Q, K, ...)               // single thread, ~10 µs
+         pool.run_matmul(wo, attn, ...)        // FORK only for big matmul
+         ...
+
+Only the matmuls (the only things that are actually big enough to benefit from N threads) get the fork-join treatment. RMSNorm, RoPE, residual add, and softmax all run single-threaded on the driver — they're each only ~5-30 µs, not worth the ~5 µs fork-join cost toparallelize.
+
+This is what I'd actually implement first because it matches the existing Phi3LmHeadPool shape and is easiest to reason about. We can later promote to Pattern A or B if profiling says it helps.
+
+Quick math: do thread counts matter?
+
+For Phi-3-mini, the dominant cost per token is matmuls — call it ~7 ms at nth=10 today. If we have 10 threads on a matmul, eachthread does 1/10 of the rows. That parallelism MUST be preserved or we lose 10x. Patterns A, B, C all preserve it (each calls aparallel matmul slice).
+
+What changes is only the overhead between ops (dispatch, intermediate buffer allocation, scheduler bookkeeping):
+
+ - Today: ~10 ms/token total time, of which ~3 ms is overhead.
+ - Phase A Pattern C: ~7 ms/token total time, of which ~0.5-1 ms is overhead. Expected gain: ~30-40%.
+ - Patterns A, B: marginal further gains (saving the last ~0.5 ms of overhead).
+
+Connecting to the kernels we already have
+
+The inner functions like ggml_compute_forward_mul_mat, ggml_compute_forward_rms_norm_f32, ggml_compute_forward_rope are already parameterized by (ith, nth). They are pure C functions that take a ggml_compute_params* and a tensor pair. We can call them from ourpool tasks without reimplementing anything. The win comes from calling them sequentially without a graph in between, not fromrewriting the math.
+
+For A3 (the aggressive fusion step) we may eventually inline the inner loops to fuse RMSNorm+quantize+matmul into one cache-hot pass. But that's a follow-up.
+
+--------------------------------------------------------------------------------------------------------------------------------------
+
+Recommended starting point: Pattern C with our existing Phi3LmHeadPool extended to take "matmul-style" tasks. Once we measure that,we can promote the per-step orchestration to Pattern B if the residual overhead is still too high.
+
+================================================================
+
+Files (planned)
+
+ examples/phi3/
+   phi3_fused_graph.h        Phi3Weights, Phi3KV, Phi3FusedCtx structs
+   phi3_fused_graph.cpp      weight resolution, KV alloc, forward fn, rewind ops
+   phi3_kernels.{h,cpp}      already exists — add matmul-task entrypoints
+   phi3_runtime.{h,cpp}      route gen+prefill through custom path when flag set
+   Phi3.cpp                  add --phi3-fused-forward CLI flag
+ include/llama_b612.h        no public API change (Phi3 custom lives in examples/)
+
+Sub-phase rollout
+
+A0 — Weight resolution & oracle harness (1 commit)
+
+ - Resolve all Phi3 tensors via llama_model_get_tensor_by_name.
+ - Dtype check uses phi3_weight_accepts_q8K() (not type==Q4_K) — accepts Q4_K_M's mixed K-quants per duck #2.
+ - Handle tied output → tok_embd fallback per duck #9.
+ - Resolve rope_long/rope_short once based on n_ctx_seq > n_ctx_orig_yarn per duck #3 (not per-position, not per-layer —TENSOR_DUPLICATED per duck #8).
+ - Assert non-SWA, non-MoE, single-seq.
+ - No code path changes yet; just the harness + a --phi3-dump-weights debug flag.
+
+A1 — Phi3KV alloc + rewind primitives (1 commit)
+
+ - Allocate ~1.5 GiB KV (per duck #1 corrected math) — log exact size loudly at init.
+ - Implement phi3_kv_truncate / drop_range / keep_prefix.
+ - Unit test: allocate, write dummy values, truncate, verify.
+ - No forward yet.
+
+  A0 + A1 summary
+
+  ┌──────┬───────────────────────┬──────┬─────────────────────────────────────────────────────────────────────────────┬─────────────┐
+  │ step │ files                 │ LOC  │ verification                                                                │ commit      │
+  ├──────┼───────────────────────┼──────┼─────────────────────────────────────────────────────────────────────────────┼─────────────┤
+  │ A0   │ weights resolver +    │ ~340 │ --phi3-dump-weights confirms 12 K-quant + F32 tensors per layer × 32 +      │ 05456a51f   │
+  │      │ dump                  │      │ globals                                                                     │             │
+  ├──────┼───────────────────────┼──────┼─────────────────────────────────────────────────────────────────────────────┼─────────────┤
+  │ A1   │ KV alloc + rewind ops │ ~340 │ --phi3-test-kv self-test PASS (init/write/truncate/drop_range/keep_prefix)  │ 2a52d4217   │
+  └──────┴───────────────────────┴──────┴─────────────────────────────────────────────────────────────────────────────┴─────────────┘
+
+  Both commits are pure-additive: no existing behavior changed, both new CLI flags are opt-in, normal generation still runs tocompletion alongside the diagnostics.
+
+  The bigger sub-phases are next:
+
+   - A2 (the actual functional path): phi3_custom_decode + phi3_custom_prefill calling ggml inner kernels with Pattern C threading.Single biggest piece of code. Byte-identical to baseline is the acceptance bar.
+   - A3 (perf step, optional): aggressive fusion. +10% gen_tps is the acceptance bar.
+
+  A2 is going to take real care — it's where bugs live (RoPE config, KV cell stride, attention scaling, residual order). Want me to:
+
+A2 — Direct decode forward (1 commit, the big one)
+
+ - phi3_custom_decode(ctx, tok_id, pos) -> token_id for n_tokens=1.
+ - phi3_custom_prefill(ctx, tokens[], n) for the prompt.
+ - Pattern C threading: matmuls go through pool, rest is serial.
+ - Wire into Phi3Runtime: when --phi3-fused-forward set, replace llama_decode for both prefill and gen.
+ - Threadpool ownership: dedicated pool sized to n_threads_gen for decode, n_threads_prefill for prefill (per duck #10 — don't assume llama_context's pool reusable).
+ - Verification gate: 3 prompts × 256 tokens × seed 1234, byte-identical to baseline. No commit if not byte-identical.
+
+A3 — Aggressive fusion (perf step) (1 commit, optional)
+
+ - Fuse RMSNorm + quantize + matmul as a single cache-hot inlined function (the win Option 1 couldn't get because of ggml dispatchoverhead).
+ - Fuse SwiGLU split + silu + mul into the path between gate_up matmul and ffn_down matmul.
+ - Acceptance: gen_tps ≥ +10% over both-flags 28.27 (target ~31.0+). If not achieved, document and stop — A2 alone may already be the win.
+
+Invariants (unchanged)
+
+ - Non-repack only. Non-SWA only. Single-seq only. Greedy (temp=0, min_p=0) only.
+ - Standard llama path remains the oracle.
+ - Every commit byte-identical to baseline.
+
+Things explicitly out of scope
+
+ - Multi-sequence / batch > 1
+ - GPU backend
+ - Multi-turn seq_cp (we have keep_prefix instead)
+ - Public LLAMA_API additions (everything lives in examples/phi3/)
+
+=============================================================================
+
+The standard Phi-3 graph supports a bunch of optional features beyond what mini-4k Q4_K_M uses. The spec says these are "out ofscope" but doesn't enforce that. If a user runs our fused path on a model file that has any of these, we silently produce wrongtokens (no crash, no error — just garbage). The duck wants me to add a concrete check at init that lists every unsupported feature.
+
+The exhaustive rejection list (every check phi3_fused_ctx_init must perform, with the file:line in the standard graph that handleseach case):
+
+┌──────────────┬──────────────────────────────────────────────────────────────────────────────┬───────────────────────────────────┐
+│ Feature      │ Check at init                                                                │ Standard graph handles at         │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ MoE          │ for il: layers[il].ffn_gate_inp == nullptr && ffn_up_exps == nullptr &&      │ phi3.cpp:319, 327-340             │
+│              │ ffn_gate_exps == nullptr && ffn_down_exps == nullptr                         │                                   │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ GQA          │ hparams.n_head == hparams.n_head_kv                                          │ implicit via n_embd_gqa           │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ SWA          │ hparams.swa_type == LLAMA_SWA_TYPE_NONE                                      │ phi3.cpp:165-176 (already         │
+│              │                                                                              │ auto-disabled but defensive)      │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ QKV bias     │ for il: wqkv_b == nullptr (resolve via attn_qkv.bias)                        │ build_qkv adds bias if present    │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Attn output  │ for il: wo_b == nullptr                                                      │ build_attn(.., wo_b, ..) arg      │
+│ bias         │                                                                              │ phi3.cpp:292                      │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Attn output  │ for il: wo_s == nullptr                                                      │ build_attn(.., wo_s, ..)          │
+│ scale        │                                                                              │                                   │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Attn-norm    │ for il: attn_norm_b == nullptr                                               │ build_norm(.., attn_norm_b, ..)   │
+│ bias         │                                                                              │ phi3.cpp:264-265                  │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ FFN-norm     │ for il: ffn_norm_b == nullptr                                                │ build_norm(.., ffn_norm_b, ..)    │
+│ bias         │                                                                              │ phi3.cpp:313                      │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Final output │ output_b == nullptr                                                          │ phi3.cpp:370-372                  │
+│ bias         │                                                                              │                                   │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Output scale │ output_s == nullptr                                                          │ build_lora_mm(.., output_s)       │
+│              │                                                                              │ phi3.cpp:368                      │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ LoRA         │ loras->empty() (need accessor or pass from runtime)                          │ build_lora_mm checks per-layer    │
+│ adapters     │                                                                              │                                   │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Control      │ no active cvec (need accessor)                                               │ build_cvec(cur, il) phi3.cpp:344  │
+│ vectors      │                                                                              │                                   │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Flash        │ cparams.flash_attn == false                                                  │ build_attn branches               │
+│ attention    │                                                                              │ llama-graph.cpp:1963-1981         │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ YARN long    │ cparams.n_ctx_seq <= hparams.n_ctx_orig_yarn (or rope_long/short are absent) │ model.get_rope_factors()          │
+│ context      │                                                                              │ llama-model.cpp:2026-2038         │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Embed type   │ traits(tok_embd->type) supports dequantize_row                               │ direct                            │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Weight types │ for every K-quant weight: traits->vec_dot_type != GGML_TYPE_COUNT            │ direct                            │
+├──────────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+│ Tensor       │ for every weight: w->data != nullptr && w->buffer is host && nb[1] ==        │ this is duck issue #1             │
+│ canonicality │ row_size                                                                     │                                   │
+└──────────────┴──────────────────────────────────────────────────────────────────────────────┴───────────────────────────────────┘
+
+The behavior contract:
+
+ bool phi3_fused_ctx_init(...) {
+     // Run all checks. On first failure, set error to a specific message
+     // ("MoE not supported in fused path: layer 3 has ffn_gate_inp") and
+     // return false. Caller decides whether to abort or fall back.
+ }
+
+Runtime contract:
+
+ if (runtime.use_fused_forward) {
+     if (!phi3_fused_ctx_init(...)) {
+         // User explicitly asked --phi3-fused-forward.
+         // Abort with clear error rather than silently falling back.
+         fprintf(stderr, "phi3 fused-forward unavailable: %s\n", err.c_str());
+         return 1;
+     }
+ }
+
+Why "rejection" beats "documented as out of scope":
+
+Right now if I write the spec saying "MoE: out of scope, falls back", and a user grabs Phi-3.5-MoE.gguf (same LLM_ARCH_PHI3 archenum, different tensors), they pass --phi3-fused-forward, our path runs, we read wqkv (which doesn't exist for MoE),phi3_weights_resolve either crashes on a NULL deref or hands back a Phi3Weights with garbage in it, and we emit nonsense tokens withno warning. The explicit rejection turns that into a one-line error message before any decode happens.
+
+Same logic for every row above: each is something a real Phi-3 family model could have that breaks our assumed math.
+
+===================================================================================
