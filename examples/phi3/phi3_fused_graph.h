@@ -454,5 +454,6 @@ bool phi3_run_qquant_decode(
         const llama_model            * model,
         const std::vector<llama_token> & prompt_tokens,
         int                            n_gen,
+        int                            n_threads,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);

@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -47,6 +47,7 @@ int main(int argc, char ** argv) {
     int  fused_f32_n_gen = 4;
     bool fused_qquant_debug = false;
     int  fused_qquant_n_gen = 4;
+    int  fused_qquant_threads = 0;   // 0 => use n_threads_gen
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -157,6 +158,13 @@ int main(int argc, char ** argv) {
             } else if (strcmp(argv[i], "--phi3-fused-qquant-n-gen") == 0) {
                 if (i + 1 < argc) {
                     fused_qquant_n_gen = std::stoi(argv[++i]);
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-threads") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_threads = std::stoi(argv[++i]);
                 } else {
                     print_usage(argc, argv);
                     return 1;
@@ -515,8 +523,11 @@ int main(int argc, char ** argv) {
                         prompt_tokens.resize((size_t) n_tok);
                         std::vector<llama_token> gen_tokens;
                         std::string qerr;
+                        int qq_threads = fused_qquant_threads > 0 ? fused_qquant_threads : n_threads_gen;
+                        if (qq_threads <= 0) qq_threads = 1;
                         const bool qok = phi3_run_qquant_decode(raw_model.model, prompt_tokens,
-                                                                fused_qquant_n_gen, gen_tokens, qerr);
+                                                                fused_qquant_n_gen, qq_threads,
+                                                                gen_tokens, qerr);
                         if (!qok) {
                             fprintf(stderr, "phi3 qquant-debug: FAIL: %s\n", qerr.c_str());
                         } else {

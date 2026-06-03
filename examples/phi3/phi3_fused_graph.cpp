@@ -2717,6 +2717,83 @@ bool qmatmul_oracle_one(
     return true;
 }
 
+// Pool-dispatched q-quant matmul. Same shape as q_matmul_row but routes the
+// per-row vec_dot inner loop through the (optional) Phi3MatmulPool. If pool
+// is null/uninitialized/single-threaded, falls back to the same serial path
+// as q_matmul_row (so behavior is byte-identical regardless of threading).
+//
+// The src is quantized ONCE on the calling thread before the dispatch.
+bool q_matmul_pool(
+        const ggml_tensor    * w,
+        const float          * x_f32,
+        float                * y_out,
+        int                    M,
+        int                    K,
+        std::vector<uint8_t> & q_scratch,
+        Phi3MatmulPool       * pool,
+        std::string          & error) {
+    if (w == nullptr)        { error = "q_matmul_pool: w is null"; return false; }
+    if (w->data == nullptr)  { error = "q_matmul_pool: w->data is null"; return false; }
+    if (x_f32 == nullptr)    { error = "q_matmul_pool: x_f32 is null"; return false; }
+    if (y_out == nullptr)    { error = "q_matmul_pool: y_out is null"; return false; }
+    if (M <= 0 || K <= 0)    { error = "q_matmul_pool: M or K <= 0"; return false; }
+
+    if ((int) w->ne[0] != K || (int) w->ne[1] != M) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool: shape mismatch: w->ne=(" << w->ne[0] << "," << w->ne[1]
+            << ") expected (K=" << K << ", M=" << M << ")";
+        error = oss.str();
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(w->type, K);
+    if ((size_t) w->nb[1] != row_bytes) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool: w->nb[1]=" << w->nb[1] << " != ggml_row_size=" << row_bytes;
+        error = oss.str();
+        return false;
+    }
+
+    const auto * w_traits = ggml_get_type_traits_cpu(w->type);
+    if (!w_traits || !w_traits->vec_dot) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool: no CPU vec_dot for type " << ggml_type_name(w->type);
+        error = oss.str();
+        return false;
+    }
+    const ggml_type q_type   = w_traits->vec_dot_type;
+    const auto *    q_traits = ggml_get_type_traits_cpu(q_type);
+    if (!q_traits || !q_traits->from_float) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool: vec_dot_type=" << ggml_type_name(q_type) << " has no from_float";
+        error = oss.str();
+        return false;
+    }
+    const int64_t q_block = (int64_t) ggml_blck_size(q_type);
+    if (q_block > 1 && (K % q_block) != 0) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool: K=" << K << " not multiple of block size " << q_block;
+        error = oss.str();
+        return false;
+    }
+
+    const size_t q_bytes = ggml_row_size(q_type, K);
+    if (q_scratch.size() < q_bytes) q_scratch.assign(q_bytes, 0);
+
+    q_traits->from_float(x_f32, q_scratch.data(), K);
+
+    Phi3MatmulJob job;
+    job.w_traits    = w_traits;
+    job.w_base      = (const uint8_t *) w->data;
+    job.w_row_bytes = row_bytes;
+    job.src_q       = q_scratch.data();
+    job.dst         = y_out;
+    job.K           = K;
+    job.N_total     = M;
+
+    phi3_matmul_pool_run(pool, job);
+    return true;
+}
+
 } // namespace
 
 
@@ -2902,9 +2979,9 @@ bool phi3_layer_forward_qquant(
     // --- 1. Pre-attn RMSNorm ---
     phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout, attn_norm_w.data(), n_embd, cx.eps);
 
-    // --- 2. wqkv (q-quant) ---
-    if (!q_matmul_row(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
-                      cx.scratch.hq_buf, error)) {
+    // --- 2. wqkv (q-quant, pool-dispatched) ---
+    if (!q_matmul_pool(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
+                       cx.scratch.hq_buf, cx.matmul_pool, error)) {
         std::string s = error; error = "phi3_layer_forward_qquant: wqkv: " + s; return false;
     }
 
@@ -2965,9 +3042,9 @@ bool phi3_layer_forward_qquant(
         }
     }
 
-    // --- 6. wo (q-quant) ---
-    if (!q_matmul_row(L.wo, attn_ctx.data(), attn_out_buf.data(), n_embd, n_embd,
-                      cx.scratch.hq_buf, error)) {
+    // --- 6. wo (q-quant, pool-dispatched) ---
+    if (!q_matmul_pool(L.wo, attn_ctx.data(), attn_out_buf.data(), n_embd, n_embd,
+                       cx.scratch.hq_buf, cx.matmul_pool, error)) {
         std::string s = error; error = "phi3_layer_forward_qquant: wo: " + s; return false;
     }
 
@@ -2977,9 +3054,9 @@ bool phi3_layer_forward_qquant(
     // --- 8. FFN RMSNorm ---
     phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(), ffn_norm_w.data(), n_embd, cx.eps);
 
-    // --- 9. ffn_up (q-quant, gate||up fused) ---
-    if (!q_matmul_row(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
-                      cx.scratch.hq_buf, error)) {
+    // --- 9. ffn_up (q-quant, gate||up fused, pool-dispatched) ---
+    if (!q_matmul_pool(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
+                       cx.scratch.hq_buf, cx.matmul_pool, error)) {
         std::string s = error; error = "phi3_layer_forward_qquant: ffn_up: " + s; return false;
     }
 
@@ -2991,9 +3068,9 @@ bool phi3_layer_forward_qquant(
         ff[i] = silu * u;
     }
 
-    // --- 11. ffn_down (q-quant) ---
-    if (!q_matmul_row(L.ffn_down, ff.data(), ffn_out_buf.data(), n_embd, n_ff,
-                      cx.scratch.ffq_buf, error)) {
+    // --- 11. ffn_down (q-quant, pool-dispatched) ---
+    if (!q_matmul_pool(L.ffn_down, ff.data(), ffn_out_buf.data(), n_embd, n_ff,
+                       cx.scratch.ffq_buf, cx.matmul_pool, error)) {
         std::string s = error; error = "phi3_layer_forward_qquant: ffn_down: " + s; return false;
     }
 
@@ -3061,12 +3138,14 @@ bool phi3_run_qquant_decode(
         const llama_model            * model,
         const std::vector<llama_token> & prompt_tokens,
         int                            n_gen,
+        int                            n_threads,
         std::vector<llama_token>     & out_generated,
         std::string                  & error) {
     error.clear();
     if (model == nullptr)        { error = "phi3_run_qquant_decode: model is null"; return false; }
     if (prompt_tokens.empty())   { error = "phi3_run_qquant_decode: prompt_tokens is empty"; return false; }
     if (n_gen <= 0)              { error = "phi3_run_qquant_decode: n_gen must be > 0"; return false; }
+    if (n_threads <= 0)          { n_threads = 1; }
 
     Phi3Weights W;
     if (!phi3_weights_resolve(model, W, error)) return false;
@@ -3094,10 +3173,25 @@ bool phi3_run_qquant_decode(
         }
     }
 
+    // Allocate matmul pool (n_threads > 1) and wire it through the ctx.
+    // n_threads <= 1 leaves the pool uninitialized; phi3_matmul_pool_run
+    // falls back to serial on the calling thread (byte-identical).
+    Phi3MatmulPool pool;
+    if (n_threads > 1) {
+        std::string perr;
+        if (!phi3_matmul_pool_init(pool, n_threads, perr)) {
+            // Non-fatal: fall back to serial.
+            fprintf(stderr, "phi3 qquant-decode: matmul_pool_init failed (%s); falling back to serial\n",
+                    perr.c_str());
+        }
+    }
+
     // f32_debug=false  =>  no ~150MB F32 weight mirrors allocated
     Phi3FusedCtx cx;
-    if (!phi3_fused_ctx_init(cx, W, /*pool=*/nullptr, model, /*lctx=*/nullptr,
+    if (!phi3_fused_ctx_init(cx, W, pool.initialized ? &pool : nullptr,
+                             model, /*lctx=*/nullptr,
                              ctx_max, /*f32_debug=*/false, error)) {
+        phi3_matmul_pool_free(pool);
         return false;
     }
 
@@ -3105,12 +3199,13 @@ bool phi3_run_qquant_decode(
     Phi3FusedLmHead lm;
     if (!phi3_fused_lmhead_init(model, lm, error)) {
         phi3_fused_ctx_free(cx);
+        phi3_matmul_pool_free(pool);
         return false;
     }
 
     fprintf(stderr,
-            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d)\n",
-            n_prompt, n_gen, ctx_max);
+            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s)\n",
+            n_prompt, n_gen, ctx_max, n_threads, pool.initialized ? "on" : "off");
 
     std::vector<float> hidden((size_t) n_embd);
 
@@ -3141,6 +3236,7 @@ bool phi3_run_qquant_decode(
         const bool is_last = (p == n_prompt - 1);
         if (!step(prompt_tokens[p], p, is_last ? &next_tok : nullptr)) {
             phi3_fused_ctx_free(cx);
+            phi3_matmul_pool_free(pool);
             return false;
         }
     }
@@ -3158,6 +3254,7 @@ bool phi3_run_qquant_decode(
         const int pos = n_prompt + i - 1;
         if (!step(next_tok, pos, &next_tok)) {
             phi3_fused_ctx_free(cx);
+            phi3_matmul_pool_free(pool);
             return false;
         }
         out_generated.push_back(next_tok);
@@ -3168,6 +3265,7 @@ bool phi3_run_qquant_decode(
             n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
 
     phi3_fused_ctx_free(cx);
+    phi3_matmul_pool_free(pool);
     return true;
 }
 
