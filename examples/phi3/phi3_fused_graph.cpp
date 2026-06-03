@@ -483,3 +483,142 @@ bool phi3_kv_self_test(const Phi3Weights & w, std::string & error) {
     phi3_kv_free(kv);
     return true;
 }
+
+
+// ---------------------------------------------------------------------------
+// Phi3MatmulPool self-test — Phase A.
+// ---------------------------------------------------------------------------
+
+#include "phi3_fused_ops.h"
+#include <chrono>
+#include <cmath>
+#include <random>
+#include <thread>
+
+namespace {
+
+void matmul_serial_ref(const float * w, const float * x, float * dst, int K, int N) {
+    for (int v = 0; v < N; ++v) {
+        const float * row = w + (size_t) v * K;
+        float s = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            s += row[k] * x[k];
+        }
+        dst[v] = s;
+    }
+}
+
+bool matmul_compare(const float * a, const float * b, int N, std::string & error, const char * tag) {
+    for (int v = 0; v < N; ++v) {
+        // F32×F32 vec_dot may use SIMD with different summation order than the
+        // strict left-to-right reference. Allow a tiny absolute+relative slop.
+        const float diff = std::fabs(a[v] - b[v]);
+        const float ref  = std::fabs(b[v]);
+        if (diff > 1e-3f && diff > 1e-4f * ref) {
+            std::ostringstream oss;
+            oss << "phi3 matmul self-test (" << tag << "): mismatch at row " << v
+                << " pool=" << a[v] << " ref=" << b[v]
+                << " diff=" << diff;
+            error = oss.str();
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool phi3_matmul_pool_self_test(int n_threads, std::string & error) {
+    if (n_threads < 2) {
+        n_threads = 4;
+    }
+
+    Phi3MatmulPool pool;
+    if (!phi3_matmul_pool_init(pool, n_threads, error)) {
+        return false;
+    }
+
+    const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_F32);
+    if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_F32) {
+        error = "phi3 matmul self-test: F32 type traits unavailable";
+        phi3_matmul_pool_free(pool);
+        return false;
+    }
+
+    std::mt19937 rng(0xC0FFEEu);
+    std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+
+    struct Case { int K; int N; const char * tag; };
+    const Case cases[] = {
+        {  64,  512, "tiny"  },
+        { 256, 1024, "small" },
+        {3072, 9216, "phi3-wqkv" }, // exercises the actual phi3-mini wqkv shape
+    };
+
+    for (const auto & c : cases) {
+        std::vector<float> w((size_t) c.K * c.N);
+        std::vector<float> x((size_t) c.K);
+        std::vector<float> dst_pool(c.N, 0.0f);
+        std::vector<float> dst_ref (c.N, 0.0f);
+        for (auto & v : w) { v = uniform(rng); }
+        for (auto & v : x) { v = uniform(rng); }
+
+        Phi3MatmulJob job{};
+        job.w_traits    = traits;
+        job.w_base      = (const uint8_t *) w.data();
+        job.w_row_bytes = (size_t) c.K * sizeof(float);
+        job.src_q       = x.data();
+        job.dst         = dst_pool.data();
+        job.K           = c.K;
+        job.N_total     = c.N;
+
+        // Run several iterations to exercise the phase-1 spin path
+        // (back-to-back jobs).
+        for (int i = 0; i < 8; ++i) {
+            std::fill(dst_pool.begin(), dst_pool.end(), 0.0f);
+            phi3_matmul_pool_run(&pool, job);
+            matmul_serial_ref(w.data(), x.data(), dst_ref.data(), c.K, c.N);
+            if (!matmul_compare(dst_pool.data(), dst_ref.data(), c.N, error, c.tag)) {
+                phi3_matmul_pool_free(pool);
+                return false;
+            }
+        }
+
+        // Insert a sleep > phase2_us to drive workers into phase-3 (cv-park),
+        // then dispatch again — exercises the wake path.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::fill(dst_pool.begin(), dst_pool.end(), 0.0f);
+        phi3_matmul_pool_run(&pool, job);
+        if (!matmul_compare(dst_pool.data(), dst_ref.data(), c.N, error, c.tag)) {
+            phi3_matmul_pool_free(pool);
+            return false;
+        }
+    }
+
+    // Stress: kick 200 back-to-back jobs and time them. Just verifies no
+    // crashes / hangs; output already validated above.
+    {
+        const Case c = cases[1]; // small
+        std::vector<float> w((size_t) c.K * c.N);
+        std::vector<float> x((size_t) c.K);
+        std::vector<float> dst(c.N);
+        for (auto & v : w) { v = uniform(rng); }
+        for (auto & v : x) { v = uniform(rng); }
+        Phi3MatmulJob job{traits, (const uint8_t *) w.data(),
+                          (size_t) c.K * sizeof(float),
+                          x.data(), dst.data(), c.K, c.N};
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 200; ++i) {
+            phi3_matmul_pool_run(&pool, job);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        fprintf(stderr, "phi3 matmul self-test: stress 200x %s @ %d workers in %.1f us (%.2f us/dispatch)\n",
+            c.tag, n_threads, us, us / 200.0);
+    }
+
+    phi3_matmul_pool_free(pool);
+    fprintf(stderr, "phi3 matmul self-test: PASS (%d workers, 3 shapes, phase-1/3 transitions exercised)\n", n_threads);
+    error.clear();
+    return true;
+}

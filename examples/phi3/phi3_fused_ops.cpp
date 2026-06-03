@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -365,4 +366,182 @@ void phi3_fused_lmhead_pool_free(Phi3LmHeadPool & pool) {
     pool.slots.clear();
     pool.initialized = false;
     pool.n_threads = 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// Phi3MatmulPool — spin-policy pool for the Phase A custom forward.
+// See header for design rationale.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline void phi3_cpu_pause() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#else
+    // No-op on architectures without a pause hint; the wall-clock guards prevent
+    // busy-spinning from getting out of hand.
+#endif
+}
+
+void phi3_matmul_compute_range(const Phi3MatmulJob & j, int lo, int hi) {
+    if (!j.w_traits || !j.w_traits->vec_dot || lo >= hi) {
+        return;
+    }
+    for (int v = lo; v < hi; ++v) {
+        float s = 0.0f;
+        j.w_traits->vec_dot(j.K, &s, 0,
+                            j.w_base + (size_t) v * j.w_row_bytes, 0,
+                            j.src_q, 0, 1);
+        j.dst[v] = s;
+    }
+}
+
+void phi3_matmul_worker_loop(Phi3MatmulPool * pool, int wid) {
+    uint64_t last_seq = 0;
+    while (true) {
+        // ---- Three-phase backoff ----
+        // Phase 1: tight pause for spin_phase1_us.
+        // Phase 2: pause loop with wall-clock check until spin_phase2_us.
+        // Phase 3: cv-park until job_seq advances or stop is set.
+
+        const auto t_phase_start = std::chrono::steady_clock::now();
+        const auto phase1_deadline = t_phase_start + std::chrono::microseconds(pool->spin_phase1_us);
+        const auto phase2_deadline = t_phase_start + std::chrono::microseconds(pool->spin_phase2_us);
+
+        uint64_t seq = pool->job_seq.load(std::memory_order_acquire);
+        bool got_work = false;
+
+        // Phase 1: tight pause loop (~10 us). No wall-clock check inside.
+        for (int i = 0; i < 256 && seq == last_seq; ++i) {
+            phi3_cpu_pause();
+            seq = pool->job_seq.load(std::memory_order_acquire);
+        }
+        if (seq != last_seq) {
+            got_work = !pool->stop.load(std::memory_order_acquire);
+        } else if (std::chrono::steady_clock::now() < phase1_deadline) {
+            while (seq == last_seq && std::chrono::steady_clock::now() < phase1_deadline) {
+                phi3_cpu_pause();
+                seq = pool->job_seq.load(std::memory_order_acquire);
+            }
+            if (seq != last_seq) {
+                got_work = !pool->stop.load(std::memory_order_acquire);
+            }
+        }
+
+        // Phase 2: continued pause with wall-clock check, until phase2_deadline.
+        if (seq == last_seq) {
+            while (seq == last_seq && std::chrono::steady_clock::now() < phase2_deadline) {
+                for (int i = 0; i < 64; ++i) {
+                    phi3_cpu_pause();
+                }
+                seq = pool->job_seq.load(std::memory_order_acquire);
+            }
+            if (seq != last_seq) {
+                got_work = !pool->stop.load(std::memory_order_acquire);
+            }
+        }
+
+        // Phase 3: park on cv with predicate.
+        if (seq == last_seq) {
+            std::unique_lock<std::mutex> lk(pool->mtx);
+            pool->cv_work.wait(lk, [&]{
+                return pool->stop.load(std::memory_order_acquire) ||
+                       pool->job_seq.load(std::memory_order_acquire) != last_seq;
+            });
+            seq = pool->job_seq.load(std::memory_order_acquire);
+            got_work = !pool->stop.load(std::memory_order_acquire);
+        }
+
+        if (pool->stop.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (!got_work || seq == last_seq) {
+            continue;
+        }
+        last_seq = seq;
+
+        // Acquire on job_seq above synchronizes with the driver's release store,
+        // so the job struct fields are safe to read.
+        const Phi3MatmulJob j = pool->job;
+        const int N = j.N_total;
+        const int W = pool->n_threads;
+        const int lo = (int) (((int64_t) wid * N) / W);
+        const int hi = (int) (((int64_t) (wid + 1) * N) / W);
+        phi3_matmul_compute_range(j, lo, hi);
+
+        pool->done_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+} // namespace
+
+bool phi3_matmul_pool_init(Phi3MatmulPool & pool, int n_threads, std::string & error) {
+    phi3_matmul_pool_free(pool);
+    if (n_threads <= 1) {
+        pool.n_threads   = 0;
+        pool.initialized = false;
+        error.clear();
+        return true;
+    }
+    pool.n_threads = n_threads;
+    pool.stop.store(false, std::memory_order_release);
+    pool.job_seq.store(0, std::memory_order_release);
+    pool.done_count.store(0, std::memory_order_release);
+    pool.workers.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        pool.workers.emplace_back(phi3_matmul_worker_loop, &pool, i);
+    }
+    pool.initialized = true;
+    error.clear();
+    return true;
+}
+
+void phi3_matmul_pool_free(Phi3MatmulPool & pool) {
+    if (!pool.initialized && pool.workers.empty()) {
+        pool.n_threads = 0;
+        return;
+    }
+    pool.stop.store(true, std::memory_order_release);
+    // Bump job_seq AND notify under cv mutex so parked workers observe both.
+    {
+        std::lock_guard<std::mutex> lk(pool.mtx);
+        pool.job_seq.fetch_add(1, std::memory_order_acq_rel);
+    }
+    pool.cv_work.notify_all();
+    for (auto & t : pool.workers) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    pool.workers.clear();
+    pool.initialized = false;
+    pool.n_threads = 0;
+}
+
+void phi3_matmul_pool_run(Phi3MatmulPool * pool, const Phi3MatmulJob & job) {
+    if (!pool || !pool->initialized || pool->n_threads <= 1) {
+        // Fallback: run on the calling thread.
+        phi3_matmul_compute_range(job, 0, job.N_total);
+        return;
+    }
+
+    pool->job = job;
+    pool->done_count.store(0, std::memory_order_release);
+    // Publish job under cv mutex so phase-3-parked workers see the seq bump
+    // AND get woken. Workers in phases 1/2 observe via the acquire load.
+    {
+        std::lock_guard<std::mutex> lk(pool->mtx);
+        pool->job_seq.fetch_add(1, std::memory_order_acq_rel);
+    }
+    pool->cv_work.notify_all();
+
+    // Driver tight-spins on done_count for the short matmul burst.
+    const int target = pool->n_threads;
+    while (pool->done_count.load(std::memory_order_acquire) < target) {
+        phi3_cpu_pause();
+    }
 }

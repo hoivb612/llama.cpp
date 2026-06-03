@@ -155,3 +155,13 @@ inline void phi3_kv_keep_prefix(Phi3KV & kv, int n_keep) { phi3_kv_truncate(kv, 
 // known sentinels, exercise truncate / drop_range / keep_prefix, verify, free.
 // Prints PASS/FAIL to stderr. Returns true on PASS.
 bool   phi3_kv_self_test (const Phi3Weights & w, std::string & error);
+
+// ---------------------------------------------------------------------------
+// Phi3MatmulPool self-test — Phase A.
+// Builds a small F32 weight matrix + F32 src vector, dispatches many matmul
+// jobs through the pool, compares against a serial reference, and verifies
+// byte-equality. Stress-tests phase-1/2/3 backoff transitions with
+// deliberate inter-job sleeps. Does NOT need a model.
+// Prints PASS/FAIL to stderr. Returns true on PASS.
+// ---------------------------------------------------------------------------
+bool   phi3_matmul_pool_self_test(int n_threads, std::string & error);

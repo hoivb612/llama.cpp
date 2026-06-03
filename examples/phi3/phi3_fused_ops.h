@@ -97,3 +97,66 @@ bool phi3_fused_lmhead_argmax(
     int               n_threads,
     llama_token &     out_token,
     std::string &     error);
+
+// ---------------------------------------------------------------------------
+// Phi3MatmulPool — Phase A: persistent matmul-row pool for the custom Phi-3
+// forward pass.
+//
+// Distinct from Phi3LmHeadPool above. The lm-head pool fires ONCE per token
+// and cv-parks between calls so it doesn't steal cycles from the ggml decode
+// threadpool during the ~40 ms graph evaluation. The matmul pool fires
+// ~128 times per token (4 matmuls × 32 layers) and the cv-park overhead at
+// that frequency would dominate; workers use a wall-clock-measured 3-phase
+// backoff (tight pause → light pause with deadline → cv-park) so the
+// typical sub-millisecond gap stays in the spin phases.
+//
+// Job shape: a single ggml-style K-quant × Q8_K-family matmul. Workers split
+// the output-row range [0, N_total) evenly. Single driver thread (the
+// runtime loop) publishes the job via job_seq and tight-spins on done_count.
+// ---------------------------------------------------------------------------
+
+struct Phi3MatmulJob {
+    const struct ggml_type_traits_cpu * w_traits = nullptr;
+    const uint8_t *                     w_base   = nullptr;  // base of weight matrix (row-contiguous K-quant)
+    size_t                              w_row_bytes = 0;     // ggml_row_size(w->type, K)
+    const void *                        src_q    = nullptr;  // pre-quantized src (q_type = w_traits->vec_dot_type)
+    float *                             dst      = nullptr;  // F32 output, length N_total
+    int                                 K        = 0;        // inner dim
+    int                                 N_total  = 0;        // total output rows
+};
+
+struct Phi3MatmulPool {
+    int  n_threads   = 0;
+    bool initialized = false;
+
+    Phi3MatmulJob job;
+
+    std::vector<std::thread>          workers;
+    std::mutex                        mtx;
+    std::condition_variable           cv_work;
+
+    alignas(64) std::atomic<uint64_t> job_seq{0};
+    alignas(64) std::atomic<int>      done_count{0};
+    alignas(64) std::atomic<bool>     stop{false};
+
+    // Idle backoff thresholds (microseconds) — see spec §4. Phase 1 is tight
+    // _mm_pause; phase 2 is _mm_pause with wall-clock check; phase 3 is
+    // cv-park. Tunable; A2.5 will measure.
+    int  spin_phase1_us = 10;
+    int  spin_phase2_us = 1000;
+};
+
+// Spawn n_threads persistent worker threads. n_threads <= 1 leaves the pool
+// uninitialized (caller falls back to single-thread serial matmul).
+// Safe to call on an already-initialized pool: existing workers are joined
+// and replaced.
+bool phi3_matmul_pool_init(Phi3MatmulPool & pool, int n_threads, std::string & error);
+
+// Signal stop, wake spinners, join workers, reset state. Idempotent.
+void phi3_matmul_pool_free(Phi3MatmulPool & pool);
+
+// Dispatch one matmul job and wait for completion. When pool is null or
+// uninitialized, runs the matmul on the calling thread. The job struct is
+// copied into the pool; caller may reuse its storage immediately after this
+// returns.
+void phi3_matmul_pool_run(Phi3MatmulPool * pool, const Phi3MatmulJob & job);
