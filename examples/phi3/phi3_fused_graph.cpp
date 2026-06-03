@@ -2451,3 +2451,132 @@ bool phi3_full_self_test(const llama_model * model, std::string & error) {
     fprintf(stderr, "\nphi3 full self-test: PASS (2 sub-tests; %d layers + final_norm + logits each)\n", n_layer);
     return true;
 }
+
+// ===========================================================================
+// A2.4b ? F32-everywhere decode (debug / spot-check).
+// ===========================================================================
+
+bool phi3_run_f32_decode(
+        const llama_model            * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                            n_gen,
+        std::vector<llama_token>     & out_generated,
+        std::string                  & error) {
+    error.clear();
+    if (model == nullptr)         { error = "phi3_run_f32_decode: model is null"; return false; }
+    if (prompt_tokens.empty())    { error = "phi3_run_f32_decode: prompt_tokens is empty"; return false; }
+    if (n_gen <= 0)               { error = "phi3_run_f32_decode: n_gen must be > 0"; return false; }
+
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+
+    if (W.n_head != W.n_head_kv) {
+        std::ostringstream oss;
+        oss << "phi3_run_f32_decode: GQA models not yet supported (n_head="
+            << W.n_head << " n_head_kv=" << W.n_head_kv << "). "
+            << "F32 hand path was built and tested for n_head==n_head_kv only.";
+        error = oss.str();
+        return false;
+    }
+
+    const int n_vocab  = W.n_vocab;
+    const int n_prompt = (int) prompt_tokens.size();
+    const int ctx_max  = n_prompt + n_gen + 2;
+
+    // Validate prompt tokens in range.
+    for (int p = 0; p < n_prompt; ++p) {
+        if (prompt_tokens[p] < 0 || prompt_tokens[p] >= n_vocab) {
+            std::ostringstream oss;
+            oss << "phi3_run_f32_decode: prompt token " << p << "=" << prompt_tokens[p]
+                << " out of [0," << n_vocab << ")";
+            error = oss.str();
+            return false;
+        }
+    }
+
+    Phi3FusedCtx cx;
+    if (!phi3_fused_ctx_init(cx, W, /*pool=*/nullptr, model, /*lctx=*/nullptr,
+                             ctx_max, /*f32_debug=*/true, error)) {
+        return false;
+    }
+
+    fprintf(stderr,
+            "phi3 f32-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, est ~%.0fs total)\n",
+            n_prompt, n_gen, ctx_max, (double)(n_prompt + n_gen) * 6.5);
+
+    std::vector<float> logits((size_t) n_vocab);
+
+    auto check_finite_and_argmax = [&](int * out_idx) -> bool {
+        int best_idx = 0;
+        float best   = logits[0];
+        for (int v = 0; v < n_vocab; ++v) {
+            const float x = logits[v];
+            if (!std::isfinite(x)) {
+                std::ostringstream oss;
+                oss << "phi3_run_f32_decode: non-finite logit at v=" << v << " value=" << x;
+                error = oss.str();
+                return false;
+            }
+            if (x > best) { best = x; best_idx = v; }
+        }
+        *out_idx = best_idx;
+        return true;
+    };
+
+    // ---- Prefill positions [0..n_prompt-1] ----
+    const auto t_prefill_start = std::chrono::steady_clock::now();
+    for (int p = 0; p < n_prompt; ++p) {
+        if (!phi3_full_forward_f32(cx, prompt_tokens[p], p, logits.data(),
+                                   nullptr, nullptr, error)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+        // Sanity check on every prefill forward (cheap insurance against NaN).
+        for (int v = 0; v < 8; ++v) {
+            if (!std::isfinite(logits[v])) {
+                std::ostringstream oss;
+                oss << "phi3_run_f32_decode: non-finite logit during prefill pos=" << p
+                    << " v=" << v << " value=" << logits[v];
+                error = oss.str();
+                phi3_fused_ctx_free(cx);
+                return false;
+            }
+        }
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    fprintf(stderr, "phi3 f32-decode: prefill %d tokens in %.2f s (%.2f s/tok)\n",
+            n_prompt, prefill_ms / 1000.0, prefill_ms / 1000.0 / std::max(1, n_prompt));
+
+    // ---- Generation ----
+    out_generated.reserve(out_generated.size() + n_gen);
+    const auto t_gen_start = std::chrono::steady_clock::now();
+
+    int next_tok = 0;
+    if (!check_finite_and_argmax(&next_tok)) {
+        phi3_fused_ctx_free(cx);
+        return false;
+    }
+    out_generated.push_back(next_tok);
+
+    for (int i = 1; i < n_gen; ++i) {
+        const int pos = n_prompt + i - 1;  // position of the token we just generated
+        if (!phi3_full_forward_f32(cx, next_tok, pos, logits.data(),
+                                   nullptr, nullptr, error)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+        if (!check_finite_and_argmax(&next_tok)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+        out_generated.push_back(next_tok);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen_start).count();
+    fprintf(stderr, "phi3 f32-decode: generated %d tokens in %.2f s (%.2f s/tok)\n",
+            n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+
+    phi3_fused_ctx_free(cx);
+    return true;
+}

@@ -7,12 +7,15 @@
 
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
+#include <vector>
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -39,6 +42,8 @@ int main(int argc, char ** argv) {
     bool validate_fused = false;
     bool test_layer = false;
     bool test_full = false;
+    bool fused_f32_debug = false;
+    int  fused_f32_n_gen = 4;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -133,6 +138,15 @@ int main(int argc, char ** argv) {
                 test_layer = true;
             } else if (strcmp(argv[i], "--phi3-full-test") == 0) {
                 test_full = true;
+            } else if (strcmp(argv[i], "--phi3-fused-f32-debug") == 0) {
+                fused_f32_debug = true;
+            } else if (strcmp(argv[i], "--phi3-fused-f32-n-gen") == 0) {
+                if (i + 1 < argc) {
+                    fused_f32_n_gen = std::stoi(argv[++i]);
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -339,6 +353,94 @@ int main(int argc, char ** argv) {
     }
     if (!ok && !error.empty()) {
         fprintf(stderr, "%s: error: %s\n", __func__, error.c_str());
+    }
+
+    // ----- A2.4b: F32-everywhere decode spot-check (optional) -----
+    // Runs AFTER the baseline so the user sees baseline output first, then a
+    // separate "phi3 f32-decode" section with the hand-path tokens for
+    // visual comparison. Greedy-only path; baseline must also be greedy
+    // (temp=0) for the side-by-side to be apples-to-apples.
+    if (ok && fused_f32_debug && !single_prompt.empty()) {
+        if (temp != 0.0f) {
+            fprintf(stderr,
+                "\nphi3 f32-debug: WARNING --temp=%g is non-zero. Baseline is sampling,\n"
+                "F32 hand path is GREEDY. Side-by-side comparison is informational only.\n", temp);
+        }
+        fprintf(stderr, "\nphi3 f32-debug: extremely slow path (~6-7 s/tok). NOT for CI.\n");
+
+        // Apply the SAME Phi-3 chat template that the baseline runtime used.
+        // We re-derive it stateless (fresh messages vector) to avoid touching
+        // runtime state which has already been advanced by the turn above.
+        const char * chat_template = llama_model_chat_template(raw_model.model, nullptr);
+        if (chat_template == nullptr) {
+            fprintf(stderr, "phi3 f32-debug: model has no chat template; aborting f32 debug path\n");
+        } else {
+            std::vector<llama_chat_message> msgs;
+            char * user_cstr = strdup(single_prompt.c_str());
+            msgs.push_back({"user", user_cstr});
+            std::vector<char> formatted(8192);
+            int n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                                  /*add_ass=*/true, formatted.data(), formatted.size());
+            if (n_fmt > (int) formatted.size()) {
+                formatted.resize((size_t) n_fmt);
+                n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                                  true, formatted.data(), formatted.size());
+            }
+            if (n_fmt < 0) {
+                fprintf(stderr, "phi3 f32-debug: chat_apply_template failed; aborting\n");
+            } else {
+                const std::string fmt_prompt(formatted.begin(), formatted.begin() + n_fmt);
+
+                const llama_vocab * vocab = llama_model_get_vocab(raw_model.model);
+                const int n_neg = -llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                                  nullptr, 0, /*add_special=*/true, /*parse_special=*/true);
+                if (n_neg <= 0) {
+                    fprintf(stderr, "phi3 f32-debug: tokenize sizing failed (n_neg=%d)\n", n_neg);
+                } else {
+                    std::vector<llama_token> prompt_tokens((size_t) n_neg);
+                    const int n_tok = llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                                     prompt_tokens.data(), (int) prompt_tokens.size(),
+                                                     /*add_special=*/true, /*parse_special=*/true);
+                    if (n_tok < 0) {
+                        fprintf(stderr, "phi3 f32-debug: llama_tokenize failed\n");
+                    } else {
+                        prompt_tokens.resize((size_t) n_tok);
+
+                        std::vector<llama_token> gen_tokens;
+                        std::string ferr;
+                        const bool fok = phi3_run_f32_decode(raw_model.model, prompt_tokens,
+                                                             fused_f32_n_gen, gen_tokens, ferr);
+                        if (!fok) {
+                            fprintf(stderr, "phi3 f32-debug: FAIL: %s\n", ferr.c_str());
+                        } else {
+                            // Detokenize and print side-by-side info.
+                            fprintf(stderr, "\nphi3 f32-decode: n_prompt_tokens=%d  n_gen=%d\n",
+                                    (int) prompt_tokens.size(), (int) gen_tokens.size());
+                            fprintf(stderr, "phi3 f32-decode: prompt tokens (last 8): ");
+                            const int show_n = std::min((int) prompt_tokens.size(), 8);
+                            for (int i = (int) prompt_tokens.size() - show_n; i < (int) prompt_tokens.size(); ++i) {
+                                char buf[64];
+                                const int n = llama_token_to_piece(vocab, prompt_tokens[i], buf, sizeof(buf), 0, true);
+                                fprintf(stderr, "[%d:%.*s] ", prompt_tokens[i], n > 0 ? n : 0, buf);
+                            }
+                            fprintf(stderr, "\n");
+
+                            std::string gen_text;
+                            fprintf(stderr, "phi3 f32-decode: generated tokens: ");
+                            for (auto t : gen_tokens) {
+                                char buf[64];
+                                const int n = llama_token_to_piece(vocab, t, buf, sizeof(buf), 0, true);
+                                fprintf(stderr, "[%d:%.*s] ", t, n > 0 ? n : 0, buf);
+                                if (n > 0) gen_text.append(buf, (size_t) n);
+                            }
+                            fprintf(stderr, "\n");
+                            fprintf(stderr, "phi3 f32-decode: generated text: \"%s\"\n", gen_text.c_str());
+                        }
+                    }
+                }
+            }
+            free(user_cstr);
+        }
     }
 
     phi3_runtime_free(runtime);

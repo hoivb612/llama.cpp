@@ -382,3 +382,34 @@ bool phi3_full_forward_f32(
 //
 // Returns false with the first diverging stage on failure.
 bool phi3_full_self_test(const llama_model * model, std::string & error);
+
+
+// ===========================================================================
+// A2.4b — F32-everywhere decode (debug / spot-check).
+// ===========================================================================
+// Run the F32 hand path end-to-end:
+//   - For each prompt token, call phi3_full_forward_f32 at increasing pos.
+//     This populates cx.kv at positions [0..n_prompt-1] for all 32 layers
+//     and produces logits for the last prompt token.
+//   - Greedy-argmax the last prefill logits => first generated token.
+//   - For each remaining gen step: forward the previously-generated token
+//     at the next position, argmax to produce the next token.
+//
+// Slow (~6-7s/token on Phi-3-mini-4k Q4_K_M because every layer re-
+// dequantizes ~450 MiB of F32 weight mirrors per token). Intended for
+// one-shot side-by-side comparison with the baseline (Q4_K_M via
+// llama_decode), NOT for production decode or CI.
+//
+// Pre-conditions enforced inside:
+//   - prompt_tokens non-empty
+//   - n_gen > 0
+//   - model resolves through phi3_weights_resolve
+//   - n_head == n_head_kv (no GQA support yet; fails loudly otherwise)
+//
+// Output: out_generated is appended with exactly n_gen token ids.
+bool phi3_run_f32_decode(
+        const llama_model            * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                            n_gen,
+        std::vector<llama_token>     & out_generated,
+        std::string                  & error);
