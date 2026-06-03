@@ -306,3 +306,49 @@ The cost
  - One new C++ kernel function (~50 lines).
  - Two ggml_map_custom3 substitutions in phi3.cpp under a new cparams.fused_decode_phi3 flag.
  - Reuses everything else (existing vec_dot, ggml's thread pool, scheduler, graph reuse).
+
+ =========================================================
+
+ Option 3: phi3: persistent worker pool for fused lm_head argmax
+
+ A/B (Phi-3-mini-4k Q4_K_M, seed=1234, n=256, prefill=32/gen=10 threads, greedy):
+
+┌────────────────────────────────────────┬─────────────────┬────────────────────┬─────────────────┐
+│ variant                                │ gen_tps         │ sample_step_avg_ms │ gen_step_avg_ms │
+├────────────────────────────────────────┼─────────────────┼────────────────────┼─────────────────┤
+│ baseline (no fused-lmhead)             │ 26.09           │ 0.004              │ 38.49           │
+├────────────────────────────────────────┼─────────────────┼────────────────────┼─────────────────┤
+│ fused-lmhead + legacy spawn (previous) │ 26.88           │ 2.42               │ 37.34           │
+├────────────────────────────────────────┼─────────────────┼────────────────────┼─────────────────┤
+│ fused-lmhead + cv-park pool            │ 27.32–27.69     │ 1.6–1.9            │ 36.3–36.8       │
+└────────────────────────────────────────┴─────────────────┴────────────────────┴─────────────────┘
+
+Net: +1.2–1.6 t/s (~+5–6% TPS) over baseline; pool also slightly reduces decode_avg because workers are parked between argmax callsand don't steal cycles from the ggml decode pool. Output is byte-identical to baseline.
+
+=========================================================
+
+Option 1 (in-graph fused RMSNorm + quantize-to-Q8_K): IMPLEMENTED, gated by --phi3-fused-decode, kept for educational reference.
+
+Empirical result: roughly neutral (within noise) for greedy decode on Phi-3-mini-4k Q4_K_M, threads-prefill=32, threads-gen=10:
+
+  4-iteration mean (n=256, seed=1234):
+    BASE      : 25.03 gen_tps  40.12 ms/step
+    --fused-decode (Option 1)        : 25.16 gen_tps  40.12 ms/step  (+0.5%, within ±5% noise)
+    --fused-lmhead (Phase C+Option 3): 27.45 gen_tps  36.62 ms/step  (+9.7%)
+    both flags                       : 28.27 gen_tps  35.63 ms/step  (+12.9%)
+
+Single-thread isolation (--threads-gen 1, n=64, 3 iters):
+    BASE_1t  : 9.34 gen_tps  108.82 ms/step
+    DEC_1t   : 9.18 gen_tps  110.89 ms/step  (-1.7%)
+
+Output is byte-identical to baseline (requires double-precision sum_sq accumulation to match ggml_compute_forward_rms_norm_f32 which uses ggml_float == double at vec.h:15).
+
+Why it doesn't win as designed:
+ - Per-site fusion savings: ~5 us (eliminate f32 intermediate buffer + skip mul_mat internal from_float).
+ - Per-site GGML_OP_CUSTOM dispatch overhead: ~30 us.
+ - At nth>1, redundant per-thread sum_sq adds ~3 us/site (small relative to dispatch overhead).
+ - Net: ~-25 us/site x 64 sites = ~-1.6 ms/step.
+
+Lesson: ggml_custom_4d is the wrong tool when the per-call work (here ~10-15 us of real work) is comparable to its dispatch overhead. Real wins require either (a) a native ggml-cpu op with full compute_params/threadpool/barrier access, or (b) Phase A custom decode block bypassing the graph entirely.
+
+The rubber-duck pre-implementation critique predicted a regression (it identified loss-of-parallelism for the original token-only-split design); the actual cause turned out to be dispatch overhead, but the directional prediction was correct.

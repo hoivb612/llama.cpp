@@ -77,6 +77,7 @@ llama_context::llama_context(
     cparams.embeddings_pre_norm         = false;
     cparams.embeddings_pre_norm_masked  = false;
     cparams.fused_lmhead                = false;
+    cparams.fused_decode_phi3           = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -1132,6 +1133,19 @@ void llama_context::set_phi3_fused_lmhead(bool value) {
     }
 
     // Graph structure depends on cparams.fused_lmhead (see llm_graph_params::operator==);
+    // existing cached graphs will be invalidated on the next can_reuse() check.
+}
+
+void llama_context::set_phi3_fused_decode(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (cparams.fused_decode_phi3 == value) {
+        return;
+    }
+
+    cparams.fused_decode_phi3 = value;
+
+    // Graph structure depends on cparams.fused_decode_phi3 (see llm_graph_params::operator==);
     // existing cached graphs will be invalidated on the next can_reuse() check.
 }
 
@@ -3630,6 +3644,10 @@ void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked)
 
 void llama_set_phi3_fused_lmhead(llama_context * ctx, bool value) {
     ctx->set_phi3_fused_lmhead(value);
+}
+
+void llama_set_phi3_fused_decode(llama_context * ctx, bool value) {
+    ctx->set_phi3_fused_decode(value);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

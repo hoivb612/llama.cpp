@@ -19,6 +19,7 @@ struct Phi3RuntimeParams {
     int n_threads_gen = 0;
     bool enable_gen_autotune = false;
     bool enable_fused_lmhead = false;
+    bool enable_fused_decode = false;
 };
 
 struct Phi3Runtime {
@@ -46,6 +47,7 @@ struct Phi3Runtime {
     std::vector<int> gen_autotune_decode_ms_count;
     bool enable_fused_greedy_gen = false;
     bool enable_fused_lmhead = false;
+    bool enable_fused_decode = false;
     Phi3FusedLmHead fused_lmhead = {};
     Phi3LmHeadPool  fused_lmhead_pool = {};
     Phi3GenKernelState gen_kernel_state = {};

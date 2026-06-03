@@ -601,6 +601,10 @@ bool phi3_runtime_init(
     }
     out.enable_fused_greedy_gen = params.temp <= 0.0f && params.min_p <= 0.0f;
     out.enable_fused_lmhead = params.enable_fused_lmhead && out.enable_fused_greedy_gen;
+    out.enable_fused_decode = params.enable_fused_decode;
+    if (out.enable_fused_decode) {
+        llama_set_phi3_fused_decode(out.ctx, true);
+    }
     if (out.enable_fused_lmhead) {
         llama_set_phi3_fused_lmhead(out.ctx, true);
         if (!phi3_fused_lmhead_init(raw.model, out.fused_lmhead, error)) {
@@ -671,6 +675,7 @@ void phi3_runtime_free(Phi3Runtime & runtime) {
     runtime.gen_autotune_decode_ms_count.clear();
     runtime.enable_fused_greedy_gen = false;
     runtime.enable_fused_lmhead = false;
+    runtime.enable_fused_decode = false;
     phi3_fused_lmhead_pool_free(runtime.fused_lmhead_pool);
     runtime.fused_lmhead = {};
     runtime.gen_kernel_state = {};

@@ -120,6 +120,13 @@ LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, 
 // No-op for non-Phi3 architectures.
 LLAMA_API void llama_set_phi3_fused_lmhead(struct llama_context * ctx, bool value);
 
+// Phi3 Option 1: in-graph fusion of RMSNorm + quantize-to-Q8_K at the two
+// per-layer matmul sites (attn_norm+wqkv and ffn_norm+ffn_up). Enables the
+// downstream `mul_mat` to skip its internal `from_float` step. Combinable
+// with --phi3-fused-lmhead. Greedy-only (no impact on logits values, only
+// on intermediate quantization paths). No-op for non-Phi3 architectures.
+LLAMA_API void llama_set_phi3_fused_decode(struct llama_context * ctx, bool value);
+
 // Look up a model tensor by GGUF tensor name (e.g. "output.weight").
 // Returns nullptr if the tensor is absent (some models tie lm_head to token_embd).
 // The returned pointer is owned by the model; do not free.
