@@ -622,3 +622,269 @@ bool phi3_matmul_pool_self_test(int n_threads, std::string & error) {
     error.clear();
     return true;
 }
+
+
+// ---------------------------------------------------------------------------
+// Per-kernel self-test — Phase A.
+//
+// Three small F32 kernel helpers compared against the standard ggml ops on
+// the ggml-cpu backend. The helpers below mirror the math of:
+//   - ggml_compute_forward_rms_norm_f32 fused with ggml_mul (LLM_NORM_RMS)
+//   - ggml_compute_forward_get_rows for quantized tok_embd
+//   - ggml_compute_forward_rope_f32 for GGML_ROPE_TYPE_NEOX
+// They are intentionally simple, single-thread reference implementations.
+// In A2.4 the inner loops will be promoted into the Phi3MatmulPool / hot
+// path; the math contract proven here will not change.
+// ---------------------------------------------------------------------------
+
+#include <cmath>
+#include <random>
+
+namespace {
+
+// ---- Helper 1: fused RMSNorm * weight (F32) -------------------------------
+void phi3_kernel_rmsnorm_mul_f32(float * dst, const float * src, const float * w, int n, float eps) {
+    // sum_sq must accumulate in double to match ggml_float in
+    // ggml-cpu/ops.cpp:3757.
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += (double) src[i] * (double) src[i];
+    }
+    const float mean  = (float) (sum / (double) n);
+    const float scale = 1.0f / std::sqrt(mean + eps);
+    for (int i = 0; i < n; ++i) {
+        dst[i] = src[i] * scale * w[i];
+    }
+}
+
+// ---- Helper 2: token embedding row dequant -------------------------------
+// Reads one row of length n_embd from a quantized weight matrix of shape
+// {n_embd, n_vocab} and writes n_embd F32 floats. tok_embd is stored
+// row-contiguous: row stride = ggml_row_size(type, n_embd).
+void phi3_kernel_tok_embd_row(float * dst, const ggml_type_traits * traits,
+                              const uint8_t * w_base, size_t row_bytes,
+                              int token, int n_embd) {
+    const uint8_t * row = w_base + (size_t) token * row_bytes;
+    traits->to_float(row, dst, n_embd);
+}
+
+// ---- Helper 3: NeoX RoPE for one head, one position ----------------------
+// In-place style: dst and src may alias. n_dims is the number of dims to
+// rotate (== head_dim for full rotation). pos is a single position. The
+// remaining (head_dim - n_dims) dims are copied through unchanged
+// (matches ggml's "fill the remain channels" branch).
+void phi3_kernel_rope_neox_f32(float * dst, const float * src,
+                               const float * freq_factors,
+                               int n_dims, int head_dim,
+                               int pos, float freq_base) {
+    const float theta_scale = std::pow(freq_base, -2.0f / (float) n_dims);
+    float theta = (float) pos;
+    const int half = n_dims / 2;
+
+    for (int i0 = 0; i0 < n_dims; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+        const float cos_t = std::cos(theta / ff);
+        const float sin_t = std::sin(theta / ff);
+        const int ic = i0 / 2;
+        const float x0 = src[ic];
+        const float x1 = src[ic + half];
+        dst[ic]        = x0 * cos_t - x1 * sin_t;
+        dst[ic + half] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
+    }
+    // copy through any trailing dims (n_dims < head_dim)
+    for (int i = n_dims; i < head_dim; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+bool kernel_close(const float * a, const float * b, int n, float atol, float rtol,
+                  std::string & error, const char * tag) {
+    for (int i = 0; i < n; ++i) {
+        const float diff = std::fabs(a[i] - b[i]);
+        const float ref  = std::fabs(b[i]);
+        if (diff > atol && diff > rtol * ref) {
+            std::ostringstream oss;
+            oss << "phi3 kernel self-test (" << tag << "): mismatch at i=" << i
+                << " ours=" << a[i] << " ggml=" << b[i] << " diff=" << diff;
+            error = oss.str();
+            return false;
+        }
+    }
+    return true;
+}
+
+// Run a single-op ggml graph and copy the result into `out`.
+bool run_ggml_graph(ggml_context * ctx, ggml_tensor * result, float * out, int n_elts) {
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, result);
+    if (ggml_graph_compute_with_ctx(ctx, gf, 1) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    std::memcpy(out, result->data, (size_t) n_elts * sizeof(float));
+    return true;
+}
+
+bool test_rmsnorm(std::string & error) {
+    const int n_embd = 3072;
+    const float eps = 1e-5f;
+
+    std::mt19937 rng(0xA11CEu);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    std::vector<float> src(n_embd), w(n_embd);
+    for (auto & v : src) v = uni(rng);
+    for (auto & v : w)   v = uni(rng) * 0.5f + 1.0f;
+
+    // ours
+    std::vector<float> ours(n_embd);
+    phi3_kernel_rmsnorm_mul_f32(ours.data(), src.data(), w.data(), n_embd, eps);
+
+    // ggml oracle: rms_norm(eps) * w
+    ggml_init_params ip{ 16ull * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { error = "rmsnorm: ggml_init failed"; return false; }
+
+    ggml_tensor * tsrc = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    ggml_tensor * tw   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    std::memcpy(tsrc->data, src.data(), n_embd * sizeof(float));
+    std::memcpy(tw->data,   w.data(),   n_embd * sizeof(float));
+    ggml_tensor * tout = ggml_mul(ctx, ggml_rms_norm(ctx, tsrc, eps), tw);
+
+    std::vector<float> oracle(n_embd);
+    bool ok = run_ggml_graph(ctx, tout, oracle.data(), n_embd);
+    ggml_free(ctx);
+    if (!ok) { error = "rmsnorm: graph_compute failed"; return false; }
+
+    // Reduction order differs vs ggml SIMD path -> small relative tolerance.
+    return kernel_close(ours.data(), oracle.data(), n_embd, 1e-4f, 1e-4f, error, "rmsnorm");
+}
+
+bool test_tok_embd_dequant(std::string & error) {
+    const int n_embd  = 64;
+    const int n_vocab = 32;
+    const int probe_tokens[] = { 0, 7, 17, 31 };
+
+    std::mt19937 rng(0xB033Du);
+    std::uniform_real_distribution<float> uni(-0.1f, 0.1f);
+    std::vector<float> ref_full((size_t) n_embd * n_vocab);
+    for (auto & v : ref_full) v = uni(rng);
+
+    // Test for F16 (the practical token embedding type for the custom forward
+    // and for "phi3-mini-4k tied weights" case). Quantized types are stored
+    // row-aligned to QK boundary which n_embd=64 satisfies for all K-quants,
+    // but only F16 is required for the immediate A2 plan.
+    const ggml_type type = GGML_TYPE_F16;
+
+    ggml_init_params ip{ 4ull * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { error = "tok_embd: ggml_init failed"; return false; }
+
+    ggml_tensor * tok_embd = ggml_new_tensor_2d(ctx, type, n_embd, n_vocab);
+    // quantize the reference into tok_embd row-by-row using the type's from_float
+    const auto * trc = ggml_get_type_traits_cpu(type);
+    if (!trc || !trc->from_float) {
+        ggml_free(ctx);
+        error = "tok_embd: type has no from_float";
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(type, n_embd);
+    for (int v = 0; v < n_vocab; ++v) {
+        trc->from_float(ref_full.data() + (size_t) v * n_embd,
+                        (uint8_t *) tok_embd->data + (size_t) v * row_bytes,
+                        n_embd);
+    }
+
+    // build get_rows graph for all probe tokens at once
+    const int n_probe = (int) (sizeof(probe_tokens) / sizeof(probe_tokens[0]));
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_probe);
+    int32_t * idx_data = (int32_t *) idx->data;
+    for (int i = 0; i < n_probe; ++i) idx_data[i] = probe_tokens[i];
+    ggml_tensor * tout = ggml_get_rows(ctx, tok_embd, idx);
+
+    std::vector<float> oracle((size_t) n_embd * n_probe);
+    bool ok = run_ggml_graph(ctx, tout, oracle.data(), n_embd * n_probe);
+    if (!ok) { ggml_free(ctx); error = "tok_embd: graph_compute failed"; return false; }
+
+    // ours: helper per-row, into a flat buffer
+    std::vector<float> ours((size_t) n_embd * n_probe);
+    const auto * tr = ggml_get_type_traits(type);
+    for (int i = 0; i < n_probe; ++i) {
+        phi3_kernel_tok_embd_row(ours.data() + (size_t) i * n_embd, tr,
+                                 (const uint8_t *) tok_embd->data, row_bytes,
+                                 probe_tokens[i], n_embd);
+    }
+    ggml_free(ctx);
+    // F16 dequant is bit-exact in both paths but allow tiny slop just in case
+    return kernel_close(ours.data(), oracle.data(), n_embd * n_probe, 1e-6f, 1e-6f, error, "tok_embd");
+}
+
+bool test_rope_neox(const char * tag, bool with_factors, std::string & error) {
+    const int head_dim = 96;
+    const int n_dims   = 96;  // full rotation
+    const int n_head   = 2;
+    const int pos      = 5;
+    const float freq_base = 10000.0f;
+
+    std::mt19937 rng(0xC0DEu + (with_factors ? 1u : 0u));
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    std::vector<float> src((size_t) head_dim * n_head);
+    for (auto & v : src) v = uni(rng);
+    std::vector<float> factors(n_dims / 2);
+    for (auto & v : factors) v = 0.5f + 0.5f * uni(rng);  // > 0 to avoid div-by-zero
+    const float * ff = with_factors ? factors.data() : nullptr;
+
+    // ours
+    std::vector<float> ours((size_t) head_dim * n_head);
+    for (int h = 0; h < n_head; ++h) {
+        phi3_kernel_rope_neox_f32(ours.data() + (size_t) h * head_dim,
+                                  src .data() + (size_t) h * head_dim,
+                                  ff, n_dims, head_dim, pos, freq_base);
+    }
+
+    // ggml oracle: ggml_rope_ext(src, pos_tensor, factors_or_null,
+    //   n_dims, GGML_ROPE_TYPE_NEOX, n_ctx_orig=0, freq_base, 1.0, 0.0, 1.0, 32, 1)
+    ggml_init_params ip{ 4ull * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { error = std::string("rope ") + tag + ": ggml_init failed"; return false; }
+
+    // ggml rope expects shape [head_dim, n_head, n_pos, n_batch]. We have
+    // one position so n_pos=1, n_batch=1.
+    ggml_tensor * tsrc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, 1);
+    std::memcpy(tsrc->data, src.data(), src.size() * sizeof(float));
+
+    ggml_tensor * tpos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    *(int32_t *) tpos->data = pos;
+
+    ggml_tensor * tff = nullptr;
+    if (with_factors) {
+        tff = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims / 2);
+        std::memcpy(tff->data, factors.data(), factors.size() * sizeof(float));
+    }
+
+    ggml_tensor * tout = ggml_rope_ext(ctx, tsrc, tpos, tff,
+        n_dims, GGML_ROPE_TYPE_NEOX, 0,
+        freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+    std::vector<float> oracle((size_t) head_dim * n_head);
+    bool ok = run_ggml_graph(ctx, tout, oracle.data(), head_dim * n_head);
+    ggml_free(ctx);
+    if (!ok) { error = std::string("rope ") + tag + ": graph_compute failed"; return false; }
+
+    return kernel_close(ours.data(), oracle.data(), head_dim * n_head, 1e-5f, 1e-5f, error, tag);
+}
+
+} // namespace
+
+bool phi3_kernel_self_test(std::string & error) {
+    if (!test_rmsnorm(error))                                 return false;
+    fprintf(stderr, "phi3 kernel self-test: rmsnorm                       OK\n");
+    if (!test_tok_embd_dequant(error))                        return false;
+    fprintf(stderr, "phi3 kernel self-test: tok_embd_dequant (F16)        OK\n");
+    if (!test_rope_neox("rope_neox_no_factors", false, error)) return false;
+    fprintf(stderr, "phi3 kernel self-test: rope_neox (factors=NULL)      OK\n");
+    if (!test_rope_neox("rope_neox_with_factors", true, error)) return false;
+    fprintf(stderr, "phi3 kernel self-test: rope_neox (factors=synth)     OK\n");
+    fprintf(stderr, "phi3 kernel self-test: PASS (rmsnorm + tok_embd + 2x rope_neox)\n");
+    error.clear();
+    return true;
+}

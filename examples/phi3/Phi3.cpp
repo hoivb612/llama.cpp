@@ -12,7 +12,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -35,6 +35,7 @@ int main(int argc, char ** argv) {
     bool dump_weights = false;
     bool test_kv = false;
     bool test_matmul = false;
+    bool test_kernels = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -121,6 +122,8 @@ int main(int argc, char ** argv) {
                 test_kv = true;
             } else if (strcmp(argv[i], "--phi3-matmul-test") == 0) {
                 test_matmul = true;
+            } else if (strcmp(argv[i], "--phi3-kernel-test") == 0) {
+                test_kernels = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -204,6 +207,15 @@ int main(int argc, char ** argv) {
         const int test_threads = n_threads_gen > 0 ? n_threads_gen : 4;
         if (!phi3_matmul_pool_self_test(test_threads, merr)) {
             fprintf(stderr, "phi3 matmul self-test: FAIL: %s\n", merr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+    }
+
+    if (test_kernels) {
+        std::string kerr;
+        if (!phi3_kernel_self_test(kerr)) {
+            fprintf(stderr, "phi3 kernel self-test: FAIL: %s\n", kerr.c_str());
             phi3_unload_raw_model(raw_model);
             return 1;
         }

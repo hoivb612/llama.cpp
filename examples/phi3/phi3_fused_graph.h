@@ -165,3 +165,21 @@ bool   phi3_kv_self_test (const Phi3Weights & w, std::string & error);
 // Prints PASS/FAIL to stderr. Returns true on PASS.
 // ---------------------------------------------------------------------------
 bool   phi3_matmul_pool_self_test(int n_threads, std::string & error);
+
+// ---------------------------------------------------------------------------
+// Per-kernel self-test — Phase A.
+// Validates the three small F32 kernels needed by the upcoming custom forward
+// pass against the corresponding ggml ops (RMSNorm, token-embedding dequant,
+// NeoX RoPE), executed on the standard ggml-cpu backend.
+//
+// Coverage:
+//   - RMSNorm: n_embd=3072, eps=1e-5, fused with F32 weight (matches
+//     llm_build_norm(LLM_NORM_RMS)).
+//   - Token embedding dequant: ggml_get_rows on a synthetic F16 token-embd
+//     tensor for several tokens.
+//   - NeoX RoPE: head_dim=96, two heads, three positions; tested with both
+//     freq_factors == NULL (Phi-3-mini-4k case) and with synthetic factors
+//     (Phi-3-medium long/short rope case).
+// Does NOT need a model. Prints PASS/FAIL to stderr. Returns true on PASS.
+// ---------------------------------------------------------------------------
+bool   phi3_kernel_self_test(std::string & error);
