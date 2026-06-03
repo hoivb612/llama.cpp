@@ -335,7 +335,9 @@ Empirical result: roughly neutral (within noise) for greedy decode on Phi-3-mini
     BASE      : 25.03 gen_tps  40.12 ms/step
     --fused-decode (Option 1)        : 25.16 gen_tps  40.12 ms/step  (+0.5%, within ±5% noise)
     --fused-lmhead (Phase C+Option 3): 27.45 gen_tps  36.62 ms/step  (+9.7%)
-    both flags                       : 28.27 gen_tps  35.63 ms/step  (+12.9%)
+    both flags (decode + lmhead)     : 28.27 gen_tps  35.63 ms/step  (+12.9%)
+    (note: --phi3-fused-lmhead already includes Phase C skip-logits +
+     Option 3 persistent worker pool — those are not separate flags)
 
 Single-thread isolation (--threads-gen 1, n=64, 3 iters):
     BASE_1t  : 9.34 gen_tps  108.82 ms/step
