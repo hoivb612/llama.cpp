@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "phi3_fused_graph.h"
 #include "phi3_loader.h"
 #include "phi3_runtime.h"
 #include "phi3_transform.h"
@@ -10,7 +11,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -30,6 +31,7 @@ int main(int argc, char ** argv) {
     bool enable_gen_autotune = false;
     bool enable_fused_lmhead = false;
     bool enable_fused_decode = false;
+    bool dump_weights = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -110,6 +112,8 @@ int main(int argc, char ** argv) {
                 enable_fused_lmhead = true;
             } else if (strcmp(argv[i], "--phi3-fused-decode") == 0) {
                 enable_fused_decode = true;
+            } else if (strcmp(argv[i], "--phi3-dump-weights") == 0) {
+                dump_weights = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -160,6 +164,17 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "phi3 plan: layers=%d embd=%d qkv_fuse=%d qkv_v2_fuse=%d mlp_fuse=%d\n",
         plan.n_layer, plan.n_embd, (int) plan.fuse_qkv, (int) plan.fuse_qkv_v2, (int) plan.fuse_mlp);
     fprintf(stderr, "phi3 transform: %s\n", plan.diagnostics.summary.c_str());
+
+    if (dump_weights) {
+        Phi3Weights w;
+        std::string werr;
+        if (!phi3_weights_resolve(raw_model.model, w, werr)) {
+            fprintf(stderr, "phi3 weights: resolve failed: %s\n", werr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        phi3_weights_dump(w);
+    }
 
     Phi3RuntimeParams runtime_params;
     runtime_params.n_ctx = n_ctx;

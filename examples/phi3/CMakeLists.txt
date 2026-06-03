@@ -5,6 +5,7 @@ add_executable(${TARGET}
     phi3_transform.cpp
     phi3_kernels.cpp
     phi3_fused_ops.cpp
+    phi3_fused_graph.cpp
     phi3_runtime.cpp
 )
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME Phi3)
