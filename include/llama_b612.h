@@ -100,6 +100,13 @@ LLAMA_API void llama_set_phi3_fused_decode(struct llama_context * ctx, bool valu
 LLAMA_API const struct ggml_tensor * llama_model_get_tensor_by_name(
         const struct llama_model * model, const char * name);
 
+// Phi3 Phase A custom-forward fast-path guards: report whether the context
+// currently has any active LoRA adapters or active control-vector slices.
+// Returns true if active (the custom forward must fall back to the standard
+// ggml graph for correctness). Cheap to call: no synchronization required.
+LLAMA_API bool llama_b612_has_active_lora(const struct llama_context * ctx);
+LLAMA_API bool llama_b612_has_active_cvec(const struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif

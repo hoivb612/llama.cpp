@@ -1149,6 +1149,28 @@ void llama_context::set_phi3_fused_decode(bool value) {
     // existing cached graphs will be invalidated on the next can_reuse() check.
 }
 
+bool llama_context::has_active_lora() const {
+    // set_adapters_lora only inserts entries with nonzero scale (see
+    // llama_context::set_adapter_lora), so non-empty is the correct check.
+    return loras && !loras->empty();
+}
+
+bool llama_context::has_active_cvec() const {
+    if (!cvec) {
+        return false;
+    }
+    // cvec defaults to layer_start=layer_end=-1 (inactive); tensor_for(il)
+    // returns nullptr when il falls outside the active range. Walk every
+    // layer because apply() can be invoked with a non-zero il_start.
+    const int n_layer = (int) model.hparams.n_layer;
+    for (int il = 0; il < n_layer; ++il) {
+        if (cvec->tensor_for(il) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3648,6 +3670,20 @@ void llama_set_phi3_fused_lmhead(llama_context * ctx, bool value) {
 
 void llama_set_phi3_fused_decode(llama_context * ctx, bool value) {
     ctx->set_phi3_fused_decode(value);
+}
+
+bool llama_b612_has_active_lora(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    return ctx->has_active_lora();
+}
+
+bool llama_b612_has_active_cvec(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    return ctx->has_active_cvec();
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

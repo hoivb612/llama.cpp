@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama_b612.h"
 #include "phi3_fused_graph.h"
 #include "phi3_loader.h"
 #include "phi3_runtime.h"
@@ -232,6 +233,16 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "phi3 runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d fused_lmhead=%d fused_decode=%d gen_autotune=%d\n",
         runtime.n_threads_prefill, runtime.n_threads_gen, runtime.n_predict, runtime.seed, runtime_params.temp, runtime_params.min_p, (int) runtime.enable_fused_greedy_gen, (int) runtime.enable_fused_lmhead, (int) runtime.enable_fused_decode, (int) runtime.enable_gen_autotune);
+
+    {
+        // A2.1b smoke check: the Phase A custom forward fast-paths require no
+        // active LoRA and no active control vectors. Probe early so a misuse
+        // is reported once, here, instead of buried inside the decode loop.
+        const bool has_lora = llama_b612_has_active_lora(runtime.ctx);
+        const bool has_cvec = llama_b612_has_active_cvec(runtime.ctx);
+        fprintf(stderr, "phi3 adapters: active_lora=%d active_cvec=%d\n",
+            (int) has_lora, (int) has_cvec);
+    }
 
     bool ok = true;
     if (!single_prompt.empty()) {
