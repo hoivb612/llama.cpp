@@ -1857,3 +1857,597 @@ bool phi3_layer_self_test(const llama_model * model, std::string & error) {
     }
     return ok;
 }
+
+// ===========================================================================
+// A2.4a ? Full-network F32 forward + cross-layer self-test.
+// ===========================================================================
+
+namespace {
+
+// Per-row dequant of a 2-D weight tensor (one outer-dim row).
+bool dequant_row_to_f32(const ggml_tensor * src, int row, float * dst, std::string & error) {
+    if (src == nullptr) { error = "dequant_row_to_f32: src is null"; return false; }
+    const int64_t n0 = src->ne[0];
+    const int64_t n1 = src->ne[1];
+    if (row < 0 || row >= n1) {
+        std::ostringstream oss; oss << "dequant_row_to_f32: row=" << row << " out of [0," << n1 << ")";
+        error = oss.str(); return false;
+    }
+    const uint8_t * row_p = (const uint8_t *) src->data + (size_t) row * src->nb[1];
+    if (src->type == GGML_TYPE_F32) {
+        std::memcpy(dst, row_p, (size_t) n0 * sizeof(float));
+        return true;
+    }
+    if (src->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) row_p, dst, n0);
+        return true;
+    }
+    const auto * traits = ggml_get_type_traits(src->type);
+    if (traits == nullptr || traits->to_float == nullptr) {
+        error = std::string("dequant_row_to_f32: no to_float for type ") + ggml_type_name(src->type);
+        return false;
+    }
+    traits->to_float(row_p, dst, n0);
+    return true;
+}
+
+struct CompareStats {
+    int    n        = 0;
+    float  max_abs  = 0.0f;
+    float  mean_abs = 0.0f;
+    float  rmse     = 0.0f;
+    float  max_rel  = 0.0f;
+    int    worst_i  = -1;
+    float  worst_a  = 0.0f;
+    float  worst_b  = 0.0f;
+};
+
+CompareStats compute_stats(const float * a, const float * b, int n) {
+    CompareStats s; s.n = n;
+    double sum_abs = 0.0;
+    double sum_sq  = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float diff = std::fabs(a[i] - b[i]);
+        const float ref  = std::fabs(b[i]);
+        const float rel  = (ref > 1e-30f) ? (diff / ref) : 0.0f;
+        sum_abs += diff;
+        sum_sq  += (double) diff * (double) diff;
+        if (diff > s.max_abs) {
+            s.max_abs = diff;
+            s.worst_i = i;
+            s.worst_a = a[i];
+            s.worst_b = b[i];
+        }
+        if (rel > s.max_rel) s.max_rel = rel;
+    }
+    s.mean_abs = (float) (sum_abs / (double) n);
+    s.rmse     = (float) std::sqrt(sum_sq / (double) n);
+    return s;
+}
+
+void print_stats(const char * stage, const CompareStats & s, float tol_max, float tol_rmse, bool ok) {
+    fprintf(stderr,
+            "phi3 full self-test: %-22s %s  n=%-6d  max_abs=%-10.4g rmse=%-10.4g mean=%-10.4g max_rel=%-10.4g"
+            "  (tol_max=%.2g tol_rmse=%.2g) worst_i=%d ours=%.6g oracle=%.6g\n",
+            stage, ok ? "OK  " : "FAIL", s.n, s.max_abs, s.rmse, s.mean_abs, s.max_rel,
+            tol_max, tol_rmse, s.worst_i, s.worst_a, s.worst_b);
+}
+
+bool check_close_stats(const char * stage, const float * a, const float * b, int n,
+                       float tol_max, float tol_rmse, std::string & error) {
+    CompareStats s = compute_stats(a, b, n);
+    const bool ok = (s.max_abs <= tol_max) && (s.rmse <= tol_rmse);
+    print_stats(stage, s, tol_max, tol_rmse, ok);
+    if (!ok) {
+        std::ostringstream oss;
+        oss << "phi3 full self-test: stage '" << stage << "' FAIL"
+            << " max_abs=" << s.max_abs << " (tol=" << tol_max << ")"
+            << " rmse=" << s.rmse << " (tol=" << tol_rmse << ")"
+            << " worst_i=" << s.worst_i << " ours=" << s.worst_a << " oracle=" << s.worst_b;
+        error = oss.str();
+    }
+    return ok;
+}
+
+int argmax_f32(const float * x, int n) {
+    int idx = 0;
+    float best = x[0];
+    for (int i = 1; i < n; ++i) {
+        if (x[i] > best) { best = x[i]; idx = i; }
+    }
+    return idx;
+}
+
+// Returns the top-K indices of x in descending order. K must be <= n.
+std::vector<int> top_k_indices(const float * x, int n, int k) {
+    std::vector<int> idx(n);
+    for (int i = 0; i < n; ++i) idx[i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                      [x](int a, int b){ return x[a] > x[b]; });
+    idx.resize(k);
+    return idx;
+}
+
+// Runs a single decoder layer through a ggml-cpu oracle graph using F32
+// weights from cx.scratch.w_f32_* (caller must warm them first via
+// phi3_layer_warmup_f32_mirrors). prior_K_f32/prior_V_f32 are pre-F16-
+// rounded host F32 buffers of shape [n_prior * n_embd_kv] (NULL allowed
+// when n_prior == 0).
+// Outputs:
+//   x_out_f32[n_embd]              ? residual after this layer (F32)
+//   K_new_f16_round_f32[n_embd_kv] ? new K_pos after F16 round-trip (F32)
+//   V_new_f16_round_f32[n_embd_kv] ? new V_pos after F16 round-trip (F32)
+// The arena buffer is owned by the caller and reused across layers.
+bool oracle_run_one_layer_f32(
+        Phi3FusedCtx       & cx,
+        int                  pos,
+        int                  n_prior,
+        const float        * x_in_f32,
+        const float        * prior_K_f32,
+        const float        * prior_V_f32,
+        std::vector<uint8_t> & arena,
+        float              * x_out_f32,
+        float              * K_new_f16_round_f32,
+        float              * V_new_f16_round_f32,
+        std::string        & error) {
+    const Phi3Weights & W = *cx.w;
+    const int n_embd     = W.n_embd;
+    const int n_head     = W.n_head;
+    const int n_head_kv  = W.n_head_kv;
+    const int head_dim   = W.n_embd_head;
+    const int n_embd_kv  = head_dim * n_head_kv;
+    const int n_embd_q   = head_dim * n_head;
+    const int n_qkv      = W.n_qkv;
+    const int n_ff       = W.n_ff;
+    const int total      = n_prior + 1;
+
+    ggml_init_params ip{ arena.size(), arena.data(), false };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) { error = "oracle_run_one_layer_f32: ggml_init failed"; return false; }
+
+    auto new_f32 = [&](int64_t a, int64_t b, int64_t c, const float * src, int64_t nelt) -> ggml_tensor * {
+        ggml_tensor * t;
+        if (c > 1)       t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, a, b, c);
+        else if (b > 1)  t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, a, b);
+        else             t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, a);
+        if (src) std::memcpy(t->data, src, (size_t) nelt * sizeof(float));
+        return t;
+    };
+
+    ggml_tensor * t_x         = new_f32(n_embd, 1, 1, x_in_f32, n_embd);
+    ggml_tensor * t_attn_norm = new_f32(n_embd,        1, 1, cx.scratch.w_f32_attn_norm.data(), n_embd);
+    ggml_tensor * t_wqkv      = new_f32(n_embd,    n_qkv, 1, cx.scratch.w_f32_wqkv.data(),      (int64_t) n_embd * n_qkv);
+    ggml_tensor * t_wo        = new_f32(n_embd,   n_embd, 1, cx.scratch.w_f32_wo.data(),        (int64_t) n_embd * n_embd);
+    ggml_tensor * t_ffn_norm  = new_f32(n_embd,        1, 1, cx.scratch.w_f32_ffn_norm.data(),  n_embd);
+    ggml_tensor * t_ffn_up    = new_f32(n_embd, 2 * n_ff, 1, cx.scratch.w_f32_ffn_up.data(),    (int64_t) n_embd * 2 * n_ff);
+    ggml_tensor * t_ffn_down  = new_f32(n_ff,    n_embd,  1, cx.scratch.w_f32_ffn_down.data(),  (int64_t) n_ff * n_embd);
+
+    ggml_tensor * t_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+    ((int32_t *) t_pos->data)[0] = pos;
+
+    // ---- norm1 = rms_norm(x) * attn_norm ----
+    ggml_tensor * norm1 = ggml_rms_norm(gctx, t_x, cx.eps);
+    norm1 = ggml_mul(gctx, norm1, t_attn_norm);
+
+    // ---- wqkv ----
+    ggml_tensor * qkv = ggml_mul_mat(gctx, t_wqkv, norm1);
+
+    // ---- Split Q/K/V ----
+    ggml_tensor * Q = ggml_view_3d(gctx, qkv, head_dim, n_head,    1,
+                                   head_dim * sizeof(float), qkv->nb[1], 0);
+    ggml_tensor * K = ggml_view_3d(gctx, qkv, head_dim, n_head_kv, 1,
+                                   head_dim * sizeof(float), qkv->nb[1],
+                                   (size_t) n_embd_q * sizeof(float));
+    ggml_tensor * V = ggml_view_3d(gctx, qkv, head_dim, n_head_kv, 1,
+                                   head_dim * sizeof(float), qkv->nb[1],
+                                   (size_t) (n_embd_q + n_embd_kv) * sizeof(float));
+
+    // ---- RoPE on Q and K (NEOX) ----
+    Q = ggml_rope_ext(gctx, Q, t_pos, /*factors=*/nullptr,
+                      cx.rope.n_rot, GGML_ROPE_TYPE_NEOX, cx.rope.n_ctx_orig,
+                      cx.rope.freq_base, cx.rope.freq_scale,
+                      cx.rope.ext_factor, cx.rope.attn_factor,
+                      cx.rope.beta_fast, cx.rope.beta_slow);
+    K = ggml_rope_ext(gctx, K, t_pos, /*factors=*/nullptr,
+                      cx.rope.n_rot, GGML_ROPE_TYPE_NEOX, cx.rope.n_ctx_orig,
+                      cx.rope.freq_base, cx.rope.freq_scale,
+                      cx.rope.ext_factor, cx.rope.attn_factor,
+                      cx.rope.beta_fast, cx.rope.beta_slow);
+
+    // ---- Round new K/V through F16 to match the hand path ----
+    K = ggml_cast(gctx, K, GGML_TYPE_F16);
+    K = ggml_cast(gctx, K, GGML_TYPE_F32);
+    V = ggml_cast(gctx, V, GGML_TYPE_F16);
+    V = ggml_cast(gctx, V, GGML_TYPE_F32);
+
+    // ---- Concat prior + new on dim 2 (positions) ----
+    ggml_tensor * K_all;
+    ggml_tensor * V_all;
+    if (n_prior > 0) {
+        ggml_tensor * t_priorK = new_f32(head_dim, n_head_kv, n_prior, prior_K_f32, (int64_t) n_prior * n_embd_kv);
+        ggml_tensor * t_priorV = new_f32(head_dim, n_head_kv, n_prior, prior_V_f32, (int64_t) n_prior * n_embd_kv);
+        K_all = ggml_concat(gctx, t_priorK, K, 2);
+        V_all = ggml_concat(gctx, t_priorV, V, 2);
+    } else {
+        K_all = K;
+        V_all = V;
+    }
+
+    // ---- Attention ----
+    ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q,     0, 2, 1, 3));
+    ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, K_all, 0, 2, 1, 3));
+    ggml_tensor * Vp = ggml_cont(gctx, ggml_permute(gctx, V_all, 0, 2, 1, 3));
+
+    ggml_tensor * kq = ggml_mul_mat(gctx, Kp, Qp);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    const float kq_scale = 1.0f / std::sqrt((float) head_dim);
+    kq = ggml_soft_max_ext(gctx, kq, /*mask=*/nullptr, kq_scale, /*max_bias=*/0.0f);
+
+    ggml_tensor * Vt  = ggml_cont(gctx, ggml_transpose(gctx, Vp));
+    ggml_tensor * kqv = ggml_mul_mat(gctx, Vt, kq);
+    kqv = ggml_cont(gctx, ggml_permute(gctx, kqv, 0, 2, 1, 3));
+    ggml_tensor * attn_ctx_t = ggml_reshape_2d(gctx, kqv, n_embd, 1);
+
+    // ---- wo + residual 1 ----
+    ggml_tensor * attn_out_t    = ggml_mul_mat(gctx, t_wo, attn_ctx_t);
+    ggml_tensor * x_after_res1  = ggml_add(gctx, t_x, attn_out_t);
+
+    // ---- ffn norm + ffn_up + swiglu + ffn_down + residual 2 ----
+    ggml_tensor * norm2 = ggml_rms_norm(gctx, x_after_res1, cx.eps);
+    norm2 = ggml_mul(gctx, norm2, t_ffn_norm);
+    ggml_tensor * upgate_t = ggml_mul_mat(gctx, t_ffn_up, norm2);
+    ggml_tensor * ff_t     = ggml_swiglu(gctx, upgate_t);
+    ggml_tensor * ffn_out  = ggml_mul_mat(gctx, t_ffn_down, ff_t);
+    ggml_tensor * x_final  = ggml_add(gctx, x_after_res1, ffn_out);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, 256, false);
+    ggml_build_forward_expand(gf, x_final);
+    ggml_build_forward_expand(gf, K);  // F16-rounded new K
+    ggml_build_forward_expand(gf, V);  // F16-rounded new V
+
+    const ggml_status status = ggml_graph_compute_with_ctx(gctx, gf, /*n_threads=*/1);
+    if (status != GGML_STATUS_SUCCESS) {
+        error = "oracle_run_one_layer_f32: ggml_graph_compute_with_ctx failed";
+        ggml_free(gctx);
+        return false;
+    }
+
+    std::memcpy(x_out_f32, x_final->data, (size_t) n_embd * sizeof(float));
+    std::memcpy(K_new_f16_round_f32, K->data, (size_t) n_embd_kv * sizeof(float));
+    std::memcpy(V_new_f16_round_f32, V->data, (size_t) n_embd_kv * sizeof(float));
+
+    ggml_free(gctx);
+    return true;
+}
+
+} // namespace
+
+
+bool phi3_full_forward_f32(
+        Phi3FusedCtx       & cx,
+        int                  token_id,
+        int                  pos,
+        float              * out_logits,
+        float              * tok_embd_capture,
+        float * const      * capture_x_per_layer,
+        std::string        & error) {
+    error.clear();
+    if (cx.w == nullptr)          { error = "phi3_full_forward_f32: cx.w is null"; return false; }
+    if (!cx.scratch.f32_debug)    { error = "phi3_full_forward_f32: requires f32_debug"; return false; }
+    if (out_logits == nullptr)    { error = "phi3_full_forward_f32: out_logits is null"; return false; }
+
+    const Phi3Weights & W = *cx.w;
+    const int n_embd  = W.n_embd;
+    const int n_layer = W.n_layer;
+    const int n_vocab = W.n_vocab;
+
+    if (token_id < 0 || token_id >= n_vocab) {
+        std::ostringstream oss; oss << "phi3_full_forward_f32: token_id=" << token_id << " out of [0," << n_vocab << ")";
+        error = oss.str(); return false;
+    }
+
+    // ---- 1. tok_embd lookup -> F32 ----
+    std::vector<float> x(n_embd);
+    if (!dequant_row_to_f32(W.tok_embd, token_id, x.data(), error)) return false;
+    if (tok_embd_capture) std::memcpy(tok_embd_capture, x.data(), n_embd * sizeof(float));
+
+    // ---- 2. Iterate 32 layers ----
+    for (int il = 0; il < n_layer; ++il) {
+        if (!phi3_layer_forward_f32(cx, il, pos, x.data(), /*capture=*/nullptr, error)) {
+            return false;
+        }
+        if (capture_x_per_layer && capture_x_per_layer[il]) {
+            std::memcpy(capture_x_per_layer[il], x.data(), n_embd * sizeof(float));
+        }
+    }
+
+    // ---- 3. Final RMSNorm with cx.eps and output_norm weights ----
+    {
+        std::vector<float> w_final(n_embd);
+        if (!dequant_row_to_f32(W.output_norm, 0, w_final.data(), error)) {
+            // output_norm is 1-D; try as a flat copy.
+            const int64_t n = ggml_nelements(W.output_norm);
+            if (n != n_embd) { return false; }
+            if (W.output_norm->type == GGML_TYPE_F32) {
+                std::memcpy(w_final.data(), W.output_norm->data, (size_t) n_embd * sizeof(float));
+                error.clear();
+            } else {
+                return false;
+            }
+        }
+        std::vector<float> tmp(n_embd);
+        phi3_kernel_rmsnorm_mul_f32(tmp.data(), x.data(), w_final.data(), n_embd, cx.eps);
+        x.swap(tmp);
+    }
+    if (capture_x_per_layer && capture_x_per_layer[n_layer]) {
+        std::memcpy(capture_x_per_layer[n_layer], x.data(), n_embd * sizeof(float));
+    }
+
+    // ---- 4. lm_head: per-row dequant + dot ----
+    const ggml_tensor * lm_head = W.output;
+    std::vector<float> row(n_embd);
+    for (int v = 0; v < n_vocab; ++v) {
+        if (!dequant_row_to_f32(lm_head, v, row.data(), error)) return false;
+        double acc = 0.0;
+        for (int d = 0; d < n_embd; ++d) acc += (double) x[d] * (double) row[d];
+        out_logits[v] = (float) acc;
+    }
+    return true;
+}
+
+
+bool phi3_full_self_test(const llama_model * model, std::string & error) {
+    error.clear();
+    if (model == nullptr) { error = "phi3_full_self_test: model is null"; return false; }
+
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+    const int n_embd     = W.n_embd;
+    const int n_layer    = W.n_layer;
+    const int n_head_kv  = W.n_head_kv;
+    const int head_dim   = W.n_embd_head;
+    const int n_embd_kv  = head_dim * n_head_kv;
+    const int n_vocab    = W.n_vocab;
+
+    fprintf(stderr, "phi3 full self-test: model n_layer=%d n_embd=%d n_vocab=%d output_tied_to_embd=%d\n",
+            n_layer, n_embd, n_vocab, (int) W.output_tied_to_embd);
+
+    // Token used for both sub-tests: BOS or token id 1.
+    const int token_id = 1;
+
+    // Reusable 1 GiB arena for per-layer oracle sub-graphs.
+    std::vector<uint8_t> arena_layer((size_t) 1024 * 1024 * 1024);
+
+    auto run_sub_test = [&](const char * label, int pos, int n_prior, std::string & sub_err) -> bool {
+        fprintf(stderr, "\n=== phi3 full self-test: %s  (pos=%d  n_prior=%d) ===\n",
+                label, pos, n_prior);
+
+        const int test_ctx_max = std::max(pos + 1, n_prior + 1) + 1;
+
+        Phi3FusedCtx cx;
+        if (!phi3_fused_ctx_init(cx, W, /*pool=*/nullptr, model, /*lctx=*/nullptr,
+                                 test_ctx_max, /*f32_debug=*/true, sub_err)) {
+            return false;
+        }
+
+        // Hand path state == oracle path state at this point (both have empty KV).
+
+        // Seed prior K/V per layer if needed. Use deterministic RNG keyed by
+        // sub-test label so the two sub-tests don't accidentally share state.
+        const uint32_t seed = (pos == 0) ? 2027u : 2028u;
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+
+        // prior_K_f32_per_layer[il] / prior_V_f32_per_layer[il] are the
+        // F16-rounded prior K/V for layer il (shape [n_prior * n_embd_kv]).
+        // We allocate them whether n_prior>0 or not; empty vectors when 0.
+        std::vector<std::vector<float>> prior_K_per_layer(n_layer);
+        std::vector<std::vector<float>> prior_V_per_layer(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            if (n_prior > 0) {
+                prior_K_per_layer[il].resize((size_t) n_prior * n_embd_kv);
+                prior_V_per_layer[il].resize((size_t) n_prior * n_embd_kv);
+                for (auto & v : prior_K_per_layer[il]) v = nd(rng);
+                for (auto & v : prior_V_per_layer[il]) v = nd(rng);
+                round_through_f16(prior_K_per_layer[il].data(), (int) prior_K_per_layer[il].size());
+                round_through_f16(prior_V_per_layer[il].data(), (int) prior_V_per_layer[il].size());
+                // Load prior into hand path's cx.kv at positions [0..n_prior).
+                for (int p = 0; p < n_prior; ++p) {
+                    ggml_fp16_t * Kp = cx.kv.K[il] + (size_t) p * n_embd_kv;
+                    ggml_fp16_t * Vp = cx.kv.V[il] + (size_t) p * n_embd_kv;
+                    ggml_fp32_to_fp16_row(prior_K_per_layer[il].data() + (size_t) p * n_embd_kv, Kp, n_embd_kv);
+                    ggml_fp32_to_fp16_row(prior_V_per_layer[il].data() + (size_t) p * n_embd_kv, Vp, n_embd_kv);
+                }
+            }
+        }
+        cx.kv.current_len = n_prior;
+
+        // ---- Allocate per-layer captures for hand path ----
+        // 32 layers + 1 final-norm slot.
+        std::vector<std::vector<float>> hand_x_per_layer(n_layer + 1, std::vector<float>(n_embd));
+        std::vector<float *> hand_cap_ptrs(n_layer + 1);
+        for (int i = 0; i <= n_layer; ++i) hand_cap_ptrs[i] = hand_x_per_layer[i].data();
+
+        std::vector<float> hand_tok_embd(n_embd);
+        std::vector<float> hand_logits(n_vocab);
+
+        if (!phi3_full_forward_f32(cx, token_id, pos, hand_logits.data(),
+                                   hand_tok_embd.data(), hand_cap_ptrs.data(), sub_err)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+
+        // ---- Oracle path: re-run independently using oracle_run_one_layer_f32 ----
+        // We dequant + cache F32 mirrors once per layer (warmup), then run the
+        // oracle sub-graph for that layer, then move on. The KV state for the
+        // oracle is held in oracle_K_per_layer / oracle_V_per_layer: each is
+        // a flat F32 buffer of length total*n_embd_kv with positions
+        // [0..n_prior) = prior + [n_prior] = new K/V from this layer (post
+        // F16 round).
+        std::vector<float> x_oracle(n_embd);
+        std::memcpy(x_oracle.data(), hand_tok_embd.data(), n_embd * sizeof(float));
+
+        // We need the F32-dequantized tok_embd row to be identical to the
+        // hand path's tok_embd row, since both went through dequant_row_to_f32.
+        // Sanity check: bit-equal expected.
+        {
+            std::vector<float> tmp(n_embd);
+            if (!dequant_row_to_f32(W.tok_embd, token_id, tmp.data(), sub_err)) {
+                phi3_fused_ctx_free(cx);
+                return false;
+            }
+            if (std::memcmp(tmp.data(), hand_tok_embd.data(), (size_t) n_embd * sizeof(float)) != 0) {
+                sub_err = "phi3 full self-test: tok_embd dequant disagrees between hand path and oracle";
+                phi3_fused_ctx_free(cx);
+                return false;
+            }
+            fprintf(stderr, "phi3 full self-test: tok_embd dequant matches (bit-equal)\n");
+        }
+
+        // Per-layer compare buffers for oracle.
+        std::vector<std::vector<float>> oracle_x_per_layer(n_layer + 1, std::vector<float>(n_embd));
+
+        // Tolerance schedule.
+        auto tol_max_for_depth  = [](int d){ return 2e-2f + d * 6e-3f; };   // 0.02 -> 0.21 at il=31
+        auto tol_rmse_for_depth = [](int d){ return 5e-3f + d * 1.5e-3f; }; // 0.005 -> 0.05 at il=31
+
+        bool ok = true;
+        for (int il = 0; il < n_layer; ++il) {
+            if (!phi3_layer_warmup_f32_mirrors(cx, il, sub_err)) { ok = false; break; }
+
+            std::vector<float> K_new(n_embd_kv);
+            std::vector<float> V_new(n_embd_kv);
+            std::vector<float> x_next(n_embd);
+
+            const float * pK = (n_prior > 0) ? prior_K_per_layer[il].data() : nullptr;
+            const float * pV = (n_prior > 0) ? prior_V_per_layer[il].data() : nullptr;
+
+            if (!oracle_run_one_layer_f32(cx, pos, n_prior,
+                                          x_oracle.data(), pK, pV,
+                                          arena_layer,
+                                          x_next.data(), K_new.data(), V_new.data(),
+                                          sub_err)) { ok = false; break; }
+            x_oracle.swap(x_next);
+            std::memcpy(oracle_x_per_layer[il].data(), x_oracle.data(), n_embd * sizeof(float));
+
+            char stage[64]; std::snprintf(stage, sizeof(stage), "x_after_layer_%02d", il);
+            if (!check_close_stats(stage,
+                                   hand_x_per_layer[il].data(),
+                                   oracle_x_per_layer[il].data(),
+                                   n_embd,
+                                   tol_max_for_depth(il),
+                                   tol_rmse_for_depth(il),
+                                   sub_err)) {
+                ok = false; break;
+            }
+        }
+
+        if (!ok) { phi3_fused_ctx_free(cx); return false; }
+
+        // ---- Final RMSNorm (oracle) ----
+        {
+            std::vector<float> w_final(n_embd);
+            const ggml_tensor * onm = W.output_norm;
+            if (onm->type == GGML_TYPE_F32) {
+                std::memcpy(w_final.data(), onm->data, (size_t) n_embd * sizeof(float));
+            } else if (onm->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) onm->data, w_final.data(), n_embd);
+            } else if (!dequant_row_to_f32(onm, 0, w_final.data(), sub_err)) {
+                phi3_fused_ctx_free(cx);
+                return false;
+            }
+
+            // Build a tiny ggml graph for the final norm (independent path).
+            const size_t small_mem = 4 * 1024 * 1024;
+            std::vector<uint8_t> arena_norm(small_mem);
+            ggml_init_params ipn{ small_mem, arena_norm.data(), false };
+            ggml_context * gctx = ggml_init(ipn);
+            ggml_tensor * tx = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, n_embd);
+            std::memcpy(tx->data, x_oracle.data(), n_embd * sizeof(float));
+            ggml_tensor * tw = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, n_embd);
+            std::memcpy(tw->data, w_final.data(), n_embd * sizeof(float));
+            ggml_tensor * n = ggml_rms_norm(gctx, tx, cx.eps);
+            n = ggml_mul(gctx, n, tw);
+            ggml_cgraph * gf = ggml_new_graph(gctx);
+            ggml_build_forward_expand(gf, n);
+            ggml_graph_compute_with_ctx(gctx, gf, 1);
+            std::memcpy(oracle_x_per_layer[n_layer].data(), n->data, n_embd * sizeof(float));
+            x_oracle.assign((float *) n->data, (float *) n->data + n_embd);
+            ggml_free(gctx);
+        }
+
+        if (!check_close_stats("post_final_norm",
+                               hand_x_per_layer[n_layer].data(),
+                               oracle_x_per_layer[n_layer].data(),
+                               n_embd,
+                               5e-1f, 6e-2f,
+                               sub_err)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+
+        // ---- Oracle lm_head via ggml_mul_mat over fully-dequantized F32 matrix ----
+        std::vector<float> oracle_logits(n_vocab);
+        {
+            const ggml_tensor * lm_head = W.output;
+            const size_t lm_bytes_f32 = (size_t) n_vocab * n_embd * sizeof(float);
+            const size_t arena_lm = lm_bytes_f32 + (size_t) 32 * 1024 * 1024; // headroom for inputs+output
+            std::vector<uint8_t> arena_lm_buf(arena_lm);
+            ggml_init_params iplm{ arena_lm, arena_lm_buf.data(), false };
+            ggml_context * gctx = ggml_init(iplm);
+            ggml_tensor * t_lm = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_embd, n_vocab);
+            std::string deq_err;
+            if (!dequant_2d_to_f32(lm_head, (float *) t_lm->data, (size_t) n_vocab * n_embd, deq_err)) {
+                sub_err = "phi3 full self-test: lm_head dequant failed: " + deq_err;
+                ggml_free(gctx);
+                phi3_fused_ctx_free(cx);
+                return false;
+            }
+            ggml_tensor * t_x  = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, n_embd);
+            std::memcpy(t_x->data, x_oracle.data(), n_embd * sizeof(float));
+            ggml_tensor * t_lg = ggml_mul_mat(gctx, t_lm, t_x);
+            ggml_mul_mat_set_prec(t_lg, GGML_PREC_F32);
+            ggml_cgraph * gf = ggml_new_graph(gctx);
+            ggml_build_forward_expand(gf, t_lg);
+            ggml_graph_compute_with_ctx(gctx, gf, 1);
+            std::memcpy(oracle_logits.data(), t_lg->data, n_vocab * sizeof(float));
+            ggml_free(gctx);
+        }
+
+        if (!check_close_stats("logits",
+                               hand_logits.data(),
+                               oracle_logits.data(),
+                               n_vocab,
+                               2.0f, 3e-1f,
+                               sub_err)) {
+            phi3_fused_ctx_free(cx);
+            return false;
+        }
+
+        const int am_h = argmax_f32(hand_logits.data(),   n_vocab);
+        const int am_o = argmax_f32(oracle_logits.data(), n_vocab);
+        auto top5_h = top_k_indices(hand_logits.data(),   n_vocab, 5);
+        auto top5_o = top_k_indices(oracle_logits.data(), n_vocab, 5);
+        int overlap = 0;
+        for (int i : top5_h) for (int j : top5_o) if (i == j) { ++overlap; break; }
+        fprintf(stderr,
+                "phi3 full self-test: argmax hand=%d oracle=%d  match=%d  top5_overlap=%d/5\n",
+                am_h, am_o, (int)(am_h == am_o), overlap);
+
+        phi3_fused_ctx_free(cx);
+        return true;
+    };
+
+    std::string sub_err;
+    if (!run_sub_test("sub-test 1 (pos=0, no prior KV)", /*pos=*/0, /*n_prior=*/0, sub_err)) {
+        error = sub_err;
+        return false;
+    }
+    if (!run_sub_test("sub-test 2 (pos=4, 4 prior K/V positions)", /*pos=*/4, /*n_prior=*/4, sub_err)) {
+        error = sub_err;
+        return false;
+    }
+
+    fprintf(stderr, "\nphi3 full self-test: PASS (2 sub-tests; %d layers + final_norm + logits each)\n", n_layer);
+    return true;
+}

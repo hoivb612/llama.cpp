@@ -337,3 +337,48 @@ bool phi3_layer_forward_f32(
 // K/V, then runs one token at pos=4 through both pipelines and compares
 // every intermediate. Returns false with the first diverging step + index.
 bool phi3_layer_self_test(const llama_model * model, std::string & error);
+
+
+// ===========================================================================
+// A2.4a — Full-network F32 forward + cross-layer self-test.
+// ===========================================================================
+// Run the full F32 hand path for ONE token:
+//   tok_embd[token_id]  ->  layer 0..n_layer-1  ->  output_norm  ->  lm_head
+// The KV cache cx.kv is updated at position `pos` for every layer. Caller
+// owns positions [0..pos) (must already be set or 0). For F32-everywhere
+// debug/decode mode this is called once per generated token; per-layer F32
+// weight mirrors are lazily warmed by phi3_layer_forward_f32 (slow: ~450
+// MiB dequant per layer per call — fine for tests, not production).
+//
+// On entry: out_logits is sized n_vocab.
+// If tok_embd_capture != nullptr, it receives the F32-dequantized token
+// embedding row (used for "tok_embd OK" stage in self-test).
+// If capture_x_per_layer != nullptr, capture_x_per_layer[il] (for il in
+// [0..n_layer)) receives the residual stream AFTER layer il. Slot index
+// n_layer (if present) receives the post-final-norm residual.
+// Pass capture_x_per_layer = nullptr to skip per-layer captures (fast path).
+bool phi3_full_forward_f32(
+        Phi3FusedCtx       & cx,
+        int                  token_id,
+        int                  pos,
+        float              * out_logits,           // [n_vocab]
+        float              * tok_embd_capture,     // optional, [n_embd]
+        float * const      * capture_x_per_layer,  // optional, length (n_layer+1)
+        std::string        & error);
+
+// Full-network self-test: runs hand path vs ggml-cpu oracle across all
+// layers and the lm_head, comparing at every layer boundary, the
+// post-final-norm residual, and the full logits vector.
+//
+// Two sub-tests:
+//   1. pos=0  with no prior KV (smoke; attention degenerates to V_cur).
+//   2. pos=4  with random F16-rounded prior K/V seeded into all 32 layers
+//             (exercises actual softmax / causal-attention / K dot
+//             products / RoPE at non-zero pos).
+//
+// Numeric primary acceptance per stage:
+//   max_abs <= tol_max  AND  rmse <= tol_rmse  (both depth-scaled)
+// Argmax + top-5 overlap reported as diagnostics (do not gate pass/fail).
+//
+// Returns false with the first diverging stage on failure.
+bool phi3_full_self_test(const llama_model * model, std::string & error);

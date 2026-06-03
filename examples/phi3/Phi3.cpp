@@ -12,7 +12,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -38,6 +38,7 @@ int main(int argc, char ** argv) {
     bool test_kernels = false;
     bool validate_fused = false;
     bool test_layer = false;
+    bool test_full = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -130,6 +131,8 @@ int main(int argc, char ** argv) {
                 validate_fused = true;
             } else if (strcmp(argv[i], "--phi3-layer-test") == 0) {
                 test_layer = true;
+            } else if (strcmp(argv[i], "--phi3-full-test") == 0) {
+                test_full = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -231,6 +234,17 @@ int main(int argc, char ** argv) {
         std::string lerr;
         if (!phi3_layer_self_test(raw_model.model, lerr)) {
             fprintf(stderr, "phi3 layer self-test: FAIL: %s\n", lerr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        phi3_unload_raw_model(raw_model);
+        return 0;
+    }
+
+    if (test_full) {
+        std::string ferr;
+        if (!phi3_full_self_test(raw_model.model, ferr)) {
+            fprintf(stderr, "phi3 full self-test: FAIL: %s\n", ferr.c_str());
             phi3_unload_raw_model(raw_model);
             return 1;
         }
