@@ -340,17 +340,33 @@ Empirical result: roughly neutral (within noise) for greedy decode on Phi-3-mini
      Option 3 persistent worker pool — those are not separate flags)
 
 Single-thread isolation (--threads-gen 1, n=64, 3 iters):
-    BASE_1t  : 9.34 gen_tps  108.82 ms/step
-    DEC_1t   : 9.18 gen_tps  110.89 ms/step  (-1.7%)
+    BASE_1t                          :  9.29 gen_tps  109.34 ms/step
+    --phi3-fused-decode  (alone)     :  9.35 gen_tps  108.60 ms/step  (+0.6%, within noise)
+    --phi3-fused-lmhead  (alone)     :  9.63 gen_tps  105.45 ms/step  (+3.7%)
+    both flags                       :  9.47 gen_tps  107.31 ms/step  (+1.9%, lmhead win partly offset by decode overhead)
+(Lesson: an earlier single-iter run reported decode at -1.7%; that was noise.
+ Always run >=3 iters before drawing perf conclusions.)
 
 Output is byte-identical to baseline (requires double-precision sum_sq accumulation to match ggml_compute_forward_rms_norm_f32 which uses ggml_float == double at vec.h:15).
 
-Why it doesn't win as designed:
+Why it doesn't win meaningfully:
  - Per-site fusion savings: ~5 us (eliminate f32 intermediate buffer + skip mul_mat internal from_float).
- - Per-site GGML_OP_CUSTOM dispatch overhead: ~30 us.
- - At nth>1, redundant per-thread sum_sq adds ~3 us/site (small relative to dispatch overhead).
- - Net: ~-25 us/site x 64 sites = ~-1.6 ms/step.
+ - Per-site GGML_OP_CUSTOM dispatch overhead is comparable to those savings, so net per-site delta is within measurement noise.
+ - 64 sites x ~0 us = a wash. Decode contributes a small win at high thread count (where from_float savings beat dispatch) and is neutral at low thread count.
+ - When combined with --phi3-fused-lmhead, the two flags are additive at nth=10 (+12.9% total) but slightly compete at nth=1 (+1.9% total, vs +3.7% for lmhead alone).
 
 Lesson: ggml_custom_4d is the wrong tool when the per-call work (here ~10-15 us of real work) is comparable to its dispatch overhead. Real wins require either (a) a native ggml-cpu op with full compute_params/threadpool/barrier access, or (b) Phase A custom decode block bypassing the graph entirely.
 
 The rubber-duck pre-implementation critique predicted a regression (it identified loss-of-parallelism for the original token-only-split design); the actual cause turned out to be dispatch overhead, but the directional prediction was correct.
+
+Real takeaways (revised):
+
+ 1. DEC at nth=1 is within noise of baseline (+0.6%) — my earlier −1.7% number was a single-run artifact. The ~30 µs/site dispatchoverhead I theorized either doesn't fully materialize or is balanced by the from_float savings even at single-thread. Lessonrestated: always run ≥3 iters before drawing perf conclusions.
+ 2. LMH win shrinks at nth=1: +3.7% vs +9.7% at nth=10 — expected. The persistent worker pool's parallel argmax over 32K vocabbenefits hugely from threads; at nth=1 the pool degenerates to a single-thread loop and the only remaining win is skipping thelm_head matmul.
+ 3. BOTH at nth=1 (+1.9%) is LESS than LMH alone (+3.7%) — a real and consistent finding across the 3 iters (each BOTH iter beats its BASE iter, but trails the LMH iter). At single-thread, DEC's custom-op dispatch slightly competes with LMH's gains. With morethreads (nth=10), DEC turns from "wash" to "small win" and they combine constructively to +12.9%.
+
+So the corrected story is:
+
+ - nth=10: BOTH = +12.9% (real win, lmhead does the heavy lifting, decode contributes a little)
+ - nth=1: BOTH = +1.9% (lmhead win partly offset by decode overhead) — still better than baseline, but worse than lmhead alone
+ 
