@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -50,6 +50,12 @@ int main(int argc, char ** argv) {
     int  fused_qquant_threads = 0;   // 0 => use n_threads_gen
     bool fused_qquant_regress = false;
     int  fused_qquant_regress_n_gen = 256;
+    // A3.x — per-op profile flag for qquant decode. Off by default; turning
+    // on adds ~389 RAII timers per token, each ~50 ns when active. Prints a
+    // bucketed µs/token + matmul-vs-other split after the gen loop. Resets
+    // accumulators between prefill and gen so the summary reflects steady-
+    // state gen costs only.
+    bool fused_qquant_profile = false;
     // A3.2 (experiment) — toggle RMSNorm+quantize+matmul fusion at the
     // two attn_norm/ffn_norm sites. Default OFF: measured impact on
     // Phi-3-mini Q2_K/Q3_K_M/Q4_K_M at 8 threads UMA was
@@ -201,6 +207,8 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-profile") == 0) {
+                fused_qquant_profile = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -583,6 +591,7 @@ int main(int argc, char ** argv) {
                         const bool qok = phi3_run_qquant_decode(raw_model.model, prompt_tokens,
                                                                 fused_qquant_n_gen, qq_threads,
                                                                 /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                                /*profile_per_op=*/fused_qquant_profile,
                                                                 gen_tokens, qerr);
                         if (!qok) {
                             fprintf(stderr, "phi3 qquant-debug: FAIL: %s\n", qerr.c_str());

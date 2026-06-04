@@ -243,6 +243,34 @@ struct Phi3ForwardScratch {
     int32_t              f32_cached_layer   = -1;
 };
 
+// A3.x — per-op profile accumulators (nanoseconds). All buckets are summed
+// across n_gen tokens; per-layer buckets are summed across all n_layer
+// invocations within each token (so the printed avg µs is "total time per
+// token spent in this op type, summed across all 32 layers"). enabled=false
+// keeps every PhiTimer call a 1-instruction branch — zero measurable cost.
+// Gated by --phi3-fused-qquant-profile.
+struct Phi3DecodeProfile {
+    bool      enabled       = false;
+    uint64_t  n_tokens      = 0;
+    // Per-token (×1):
+    uint64_t  embed_ns      = 0;
+    uint64_t  final_norm_ns = 0;
+    uint64_t  lmhead_ns     = 0;
+    // Per-layer (accumulated across n_layer × n_tokens):
+    uint64_t  attn_norm_ns  = 0;  // RMSNorm + mul (+ quantize when fused)
+    uint64_t  wqkv_ns       = 0;
+    uint64_t  rope_ns       = 0;
+    uint64_t  kv_write_ns   = 0;
+    uint64_t  attn_ns       = 0;  // QK + softmax + V combine, per-head loop
+    uint64_t  wo_ns         = 0;
+    uint64_t  res1_ns       = 0;
+    uint64_t  ffn_norm_ns   = 0;
+    uint64_t  ffn_up_ns     = 0;
+    uint64_t  swiglu_ns     = 0;
+    uint64_t  ffn_down_ns   = 0;
+    uint64_t  res2_ns       = 0;
+};
+
 // Per-context state. Borrows weights & pool; owns KV, scratch, RoPE config.
 struct Phi3FusedCtx {
     const Phi3Weights *  w           = nullptr;  // borrowed
@@ -266,6 +294,10 @@ struct Phi3FusedCtx {
     // --phi3-fused-qquant-rmsnorm-fuse 0|1 for educational reference.
     // See phi3_fused_rmsnorm_quant_q8K.
     bool                 fuse_rmsnorm_quant = false;
+
+    // A3.x per-op profile. enabled=false (default) makes every timer a
+    // no-op branch. Reset & emit are driven by phi3_run_qquant_decode.
+    Phi3DecodeProfile    prof;
 };
 
 // 24-feature validator (see __phase_A2_spec.md §1.5). Returns true if the
@@ -469,6 +501,7 @@ bool phi3_run_qquant_decode(
         int                            n_gen,
         int                            n_threads,
         bool                           fuse_rmsnorm_quant,
+        bool                           profile_per_op,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);
 

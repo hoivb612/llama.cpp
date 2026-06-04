@@ -5,12 +5,36 @@
 #include "llama.h"
 #include "llama_b612.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <string>
 
 namespace {
+
+// A3.x per-op profile timer. RAII; when `active` is false both ctor and dtor
+// reduce to a single predictable branch (zero measurable cost across the
+// ~389 timer sites per token). When active, brackets a region of code and
+// adds the elapsed nanoseconds to *dst on scope exit. Wall-clock semantics:
+// when matmul_pool is used, the bracketed call blocks until the pool joins,
+// so this captures the parallel work correctly.
+struct PhiTimer {
+    bool                                          active;
+    uint64_t *                                    dst;
+    std::chrono::steady_clock::time_point         t0;
+    PhiTimer(bool en, uint64_t & d) : active(en), dst(&d) {
+        if (active) t0 = std::chrono::steady_clock::now();
+    }
+    ~PhiTimer() {
+        if (active) {
+            *dst += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+    }
+    PhiTimer(const PhiTimer &) = delete;
+    PhiTimer & operator=(const PhiTimer &) = delete;
+};
 
 // Mirror of the static helper in src/models/phi3.cpp.
 //
@@ -3197,24 +3221,36 @@ bool phi3_layer_forward_qquant(
         if (cx.scratch.hq_buf.size() < q_bytes_attn) {
             cx.scratch.hq_buf.assign(q_bytes_attn, 0);
         }
-        if (!phi3_fused_rmsnorm_quant_q8K(x_inout, attn_norm_w.data(),
-                                          cx.scratch.hq_buf.data(),
-                                          n_embd, cx.eps, error)) {
-            std::string s = error;
-            error = "phi3_layer_forward_qquant: fused rmsnorm+quant (attn): " + s;
-            return false;
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.attn_norm_ns);
+            if (!phi3_fused_rmsnorm_quant_q8K(x_inout, attn_norm_w.data(),
+                                              cx.scratch.hq_buf.data(),
+                                              n_embd, cx.eps, error)) {
+                std::string s = error;
+                error = "phi3_layer_forward_qquant: fused rmsnorm+quant (attn): " + s;
+                return false;
+            }
         }
-        if (!q_matmul_pool_prequantized_q8K(L.wqkv, cx.scratch.hq_buf.data(),
-                                            cx.scratch.hq_buf.size(),
-                                            qkv.data(), n_qkv, n_embd,
-                                            cx.matmul_pool, error)) {
-            std::string s = error; error = "phi3_layer_forward_qquant: wqkv (fused): " + s; return false;
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.wqkv_ns);
+            if (!q_matmul_pool_prequantized_q8K(L.wqkv, cx.scratch.hq_buf.data(),
+                                                cx.scratch.hq_buf.size(),
+                                                qkv.data(), n_qkv, n_embd,
+                                                cx.matmul_pool, error)) {
+                std::string s = error; error = "phi3_layer_forward_qquant: wqkv (fused): " + s; return false;
+            }
         }
     } else {
-        phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout, attn_norm_w.data(), n_embd, cx.eps);
-        if (!q_matmul_pool(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
-                           cx.scratch.hq_buf, cx.matmul_pool, error)) {
-            std::string s = error; error = "phi3_layer_forward_qquant: wqkv: " + s; return false;
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.attn_norm_ns);
+            phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout, attn_norm_w.data(), n_embd, cx.eps);
+        }
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.wqkv_ns);
+            if (!q_matmul_pool(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
+                               cx.scratch.hq_buf, cx.matmul_pool, error)) {
+                std::string s = error; error = "phi3_layer_forward_qquant: wqkv: " + s; return false;
+            }
         }
     }
 
@@ -3223,13 +3259,16 @@ bool phi3_layer_forward_qquant(
     float * v = qkv.data() + n_embd_q + n_embd_kv;
 
     // --- 3. RoPE on Q, K ---
-    for (int h = 0; h < n_head; ++h) {
-        phi3_kernel_rope_neox_f32(q + h * head_dim, q + h * head_dim, /*factors=*/nullptr,
-                                  cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
-    }
-    for (int h = 0; h < n_head_kv; ++h) {
-        phi3_kernel_rope_neox_f32(k + h * head_dim, k + h * head_dim, /*factors=*/nullptr,
-                                  cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.rope_ns);
+        for (int h = 0; h < n_head; ++h) {
+            phi3_kernel_rope_neox_f32(q + h * head_dim, q + h * head_dim, /*factors=*/nullptr,
+                                      cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+        }
+        for (int h = 0; h < n_head_kv; ++h) {
+            phi3_kernel_rope_neox_f32(k + h * head_dim, k + h * head_dim, /*factors=*/nullptr,
+                                      cx.rope.n_rot, head_dim, pos, cx.rope.freq_base);
+        }
     }
 
     // --- 4. Write K, V to cache at position pos (F16) ---
@@ -3247,6 +3286,7 @@ bool phi3_layer_forward_qquant(
     //                 writes total, same as before, just non-contiguous).
     //                 Required to bit-match baseline V mul_mat ordering.
     {
+        PhiTimer _t(cx.prof.enabled, cx.prof.kv_write_ns);
         ggml_fp16_t * K_pos = cx.kv.K[il] + (size_t) pos * (size_t) n_embd_kv;
         ggml_fp32_to_fp16_row(k, K_pos, n_embd_kv);
 
@@ -3287,49 +3327,58 @@ bool phi3_layer_forward_qquant(
     std::vector<float>       scores((size_t) new_len);
     std::vector<ggml_fp16_t> scores_f16((size_t) new_len);
     std::vector<ggml_fp16_t> q_h_f16((size_t) head_dim);
-    for (int h = 0; h < n_head; ++h) {
-        const float * q_h = q + h * head_dim;
-        f16_traits_cpu->from_float(q_h, q_h_f16.data(), head_dim);
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.attn_ns);
+        for (int h = 0; h < n_head; ++h) {
+            const float * q_h = q + h * head_dim;
+            f16_traits_cpu->from_float(q_h, q_h_f16.data(), head_dim);
 
-        float max_s = -INFINITY;
-        for (int p = 0; p < new_len; ++p) {
-            const ggml_fp16_t * k_p = cx.kv.K[il] + ((size_t) p * n_head_kv + h) * head_dim;
-            float s = 0.0f;
-            f16_traits_cpu->vec_dot(head_dim, &s, 0, k_p, 0, q_h_f16.data(), 0, 1);
-            s *= scale_q;
-            scores[p] = s;
-            if (s > max_s) max_s = s;
-        }
-        float sum_exp = 0.0f;
-        for (int p = 0; p < new_len; ++p) {
-            scores[p] = std::exp(scores[p] - max_s);
-            sum_exp += scores[p];
-        }
-        const float inv_sum = 1.0f / sum_exp;
-        for (int p = 0; p < new_len; ++p) {
-            scores[p] *= inv_sum;
-        }
-        f16_traits_cpu->from_float(scores.data(), scores_f16.data(), new_len);
+            float max_s = -INFINITY;
+            for (int p = 0; p < new_len; ++p) {
+                const ggml_fp16_t * k_p = cx.kv.K[il] + ((size_t) p * n_head_kv + h) * head_dim;
+                float s = 0.0f;
+                f16_traits_cpu->vec_dot(head_dim, &s, 0, k_p, 0, q_h_f16.data(), 0, 1);
+                s *= scale_q;
+                scores[p] = s;
+                if (s > max_s) max_s = s;
+            }
+            float sum_exp = 0.0f;
+            for (int p = 0; p < new_len; ++p) {
+                scores[p] = std::exp(scores[p] - max_s);
+                sum_exp += scores[p];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int p = 0; p < new_len; ++p) {
+                scores[p] *= inv_sum;
+            }
+            f16_traits_cpu->from_float(scores.data(), scores_f16.data(), new_len);
 
-        float * ctx_h = attn_ctx.data() + h * head_dim;
-        ggml_fp16_t * V_base = cx.kv.V[il];
-        for (int d = 0; d < head_dim; ++d) {
-            const ggml_fp16_t * v_strip =
-                V_base + ((size_t) d * n_head_kv + h) * ctx_max_v;
-            float s = 0.0f;
-            f16_traits_cpu->vec_dot(new_len, &s, 0, v_strip, 0, scores_f16.data(), 0, 1);
-            ctx_h[d] = s;
+            float * ctx_h = attn_ctx.data() + h * head_dim;
+            ggml_fp16_t * V_base = cx.kv.V[il];
+            for (int d = 0; d < head_dim; ++d) {
+                const ggml_fp16_t * v_strip =
+                    V_base + ((size_t) d * n_head_kv + h) * ctx_max_v;
+                float s = 0.0f;
+                f16_traits_cpu->vec_dot(new_len, &s, 0, v_strip, 0, scores_f16.data(), 0, 1);
+                ctx_h[d] = s;
+            }
         }
     }
 
     // --- 6. wo (q-quant, pool-dispatched) ---
-    if (!q_matmul_pool(L.wo, attn_ctx.data(), attn_out_buf.data(), n_embd, n_embd,
-                       cx.scratch.hq_buf, cx.matmul_pool, error)) {
-        std::string s = error; error = "phi3_layer_forward_qquant: wo: " + s; return false;
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.wo_ns);
+        if (!q_matmul_pool(L.wo, attn_ctx.data(), attn_out_buf.data(), n_embd, n_embd,
+                           cx.scratch.hq_buf, cx.matmul_pool, error)) {
+            std::string s = error; error = "phi3_layer_forward_qquant: wo: " + s; return false;
+        }
     }
 
     // --- 7. Residual 1 ---
-    for (int i = 0; i < n_embd; ++i) x_after_res1[i] = x_inout[i] + attn_out_buf[i];
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.res1_ns);
+        for (int i = 0; i < n_embd; ++i) x_after_res1[i] = x_inout[i] + attn_out_buf[i];
+    }
 
     // --- 8+9. FFN RMSNorm + ffn_up (gate||up) ---
     //
@@ -3341,43 +3390,64 @@ bool phi3_layer_forward_qquant(
         if (cx.scratch.hq_buf.size() < q_bytes_ffn) {
             cx.scratch.hq_buf.assign(q_bytes_ffn, 0);
         }
-        if (!phi3_fused_rmsnorm_quant_q8K(x_after_res1.data(), ffn_norm_w.data(),
-                                          cx.scratch.hq_buf.data(),
-                                          n_embd, cx.eps, error)) {
-            std::string s = error;
-            error = "phi3_layer_forward_qquant: fused rmsnorm+quant (ffn): " + s;
-            return false;
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.ffn_norm_ns);
+            if (!phi3_fused_rmsnorm_quant_q8K(x_after_res1.data(), ffn_norm_w.data(),
+                                              cx.scratch.hq_buf.data(),
+                                              n_embd, cx.eps, error)) {
+                std::string s = error;
+                error = "phi3_layer_forward_qquant: fused rmsnorm+quant (ffn): " + s;
+                return false;
+            }
         }
-        if (!q_matmul_pool_prequantized_q8K(L.ffn_up, cx.scratch.hq_buf.data(),
-                                            cx.scratch.hq_buf.size(),
-                                            upgate.data(), 2 * n_ff, n_embd,
-                                            cx.matmul_pool, error)) {
-            std::string s = error; error = "phi3_layer_forward_qquant: ffn_up (fused): " + s; return false;
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.ffn_up_ns);
+            if (!q_matmul_pool_prequantized_q8K(L.ffn_up, cx.scratch.hq_buf.data(),
+                                                cx.scratch.hq_buf.size(),
+                                                upgate.data(), 2 * n_ff, n_embd,
+                                                cx.matmul_pool, error)) {
+                std::string s = error; error = "phi3_layer_forward_qquant: ffn_up (fused): " + s; return false;
+            }
         }
     } else {
-        phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(), ffn_norm_w.data(), n_embd, cx.eps);
-        if (!q_matmul_pool(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
-                           cx.scratch.hq_buf, cx.matmul_pool, error)) {
-            std::string s = error; error = "phi3_layer_forward_qquant: ffn_up: " + s; return false;
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.ffn_norm_ns);
+            phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(), ffn_norm_w.data(), n_embd, cx.eps);
+        }
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.ffn_up_ns);
+            if (!q_matmul_pool(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
+                               cx.scratch.hq_buf, cx.matmul_pool, error)) {
+                std::string s = error; error = "phi3_layer_forward_qquant: ffn_up: " + s; return false;
+            }
         }
     }
 
     // --- 10. SwiGLU ---
-    for (int i = 0; i < n_ff; ++i) {
-        const float g = upgate[i];
-        const float u = upgate[n_ff + i];
-        const float silu = g / (1.0f + std::exp(-g));
-        ff[i] = silu * u;
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.swiglu_ns);
+        for (int i = 0; i < n_ff; ++i) {
+            const float g = upgate[i];
+            const float u = upgate[n_ff + i];
+            const float silu = g / (1.0f + std::exp(-g));
+            ff[i] = silu * u;
+        }
     }
 
     // --- 11. ffn_down (q-quant, pool-dispatched) ---
-    if (!q_matmul_pool(L.ffn_down, ff.data(), ffn_out_buf.data(), n_embd, n_ff,
-                       cx.scratch.ffq_buf, cx.matmul_pool, error)) {
-        std::string s = error; error = "phi3_layer_forward_qquant: ffn_down: " + s; return false;
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.ffn_down_ns);
+        if (!q_matmul_pool(L.ffn_down, ff.data(), ffn_out_buf.data(), n_embd, n_ff,
+                           cx.scratch.ffq_buf, cx.matmul_pool, error)) {
+            std::string s = error; error = "phi3_layer_forward_qquant: ffn_down: " + s; return false;
+        }
     }
 
     // --- 12. Residual 2 ---
-    for (int i = 0; i < n_embd; ++i) x_inout[i] = x_after_res1[i] + ffn_out_buf[i];
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.res2_ns);
+        for (int i = 0; i < n_embd; ++i) x_inout[i] = x_after_res1[i] + ffn_out_buf[i];
+    }
 
     return true;
 }
@@ -3410,7 +3480,10 @@ bool phi3_full_forward_qquant(
 
     // 1. tok_embd lookup -> F32
     std::vector<float> x(n_embd);
-    if (!dequant_row_to_f32(W.tok_embd, token_id, x.data(), error)) return false;
+    {
+        PhiTimer _t(cx.prof.enabled, cx.prof.embed_ns);
+        if (!dequant_row_to_f32(W.tok_embd, token_id, x.data(), error)) return false;
+    }
 
     // 2. 32 layers in q-quant
     for (int il = 0; il < n_layer; ++il) {
@@ -3419,6 +3492,7 @@ bool phi3_full_forward_qquant(
 
     // 3. Final RMSNorm
     {
+        PhiTimer _t(cx.prof.enabled, cx.prof.final_norm_ns);
         std::vector<float> w_final(n_embd);
         const ggml_tensor * onm = W.output_norm;
         if (onm->type == GGML_TYPE_F32) {
@@ -3442,6 +3516,7 @@ bool phi3_run_qquant_decode(
         int                            n_gen,
         int                            n_threads,
         bool                           fuse_rmsnorm_quant,
+        bool                           profile_per_op,
         std::vector<llama_token>     & out_generated,
         std::string                  & error) {
     error.clear();
@@ -3498,6 +3573,10 @@ bool phi3_run_qquant_decode(
         return false;
     }
     cx.fuse_rmsnorm_quant = fuse_rmsnorm_quant;
+    // A3.x — per-op profile (off unless --phi3-fused-qquant-profile). Enabled
+    // for the whole prefill+gen run; the accumulators are reset after prefill
+    // so the printed summary reflects steady-state gen-step costs only.
+    cx.prof.enabled = profile_per_op;
 
     // lm_head: use the existing fused q-quant argmax helper.
     Phi3FusedLmHead lm;
@@ -3508,9 +3587,10 @@ bool phi3_run_qquant_decode(
     }
 
     fprintf(stderr,
-            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s, rmsnorm_fuse=%s)\n",
+            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s, rmsnorm_fuse=%s, profile=%s)\n",
             n_prompt, n_gen, ctx_max, n_threads, pool.initialized ? "on" : "off",
-            fuse_rmsnorm_quant ? "on" : "off");
+            fuse_rmsnorm_quant ? "on" : "off",
+            profile_per_op ? "on" : "off");
 
     std::vector<float> hidden((size_t) n_embd);
 
@@ -3526,6 +3606,7 @@ bool phi3_run_qquant_decode(
             }
         }
         if (out_tok_or_null) {
+            PhiTimer _t(cx.prof.enabled, cx.prof.lmhead_ns);
             llama_token best = 0;
             if (!phi3_fused_lmhead_argmax(lm, /*pool=*/nullptr, hidden.data(),
                                           /*n_threads=*/1, best, error)) return false;
@@ -3551,6 +3632,12 @@ bool phi3_run_qquant_decode(
             n_prompt, prefill_ms / 1000.0, prefill_ms / 1000.0 / std::max(1, n_prompt));
 
     // ---- Generation ----
+    // A3.x — reset per-op accumulators here so the printed summary reflects
+    // pure gen-step costs (prefill ctx is shorter and would bias attn down).
+    if (cx.prof.enabled) {
+        cx.prof = Phi3DecodeProfile{};
+        cx.prof.enabled = true;
+    }
     out_generated.reserve(out_generated.size() + n_gen);
     const auto t_gen_start = std::chrono::steady_clock::now();
 
@@ -3568,6 +3655,61 @@ bool phi3_run_qquant_decode(
             std::chrono::steady_clock::now() - t_gen_start).count();
     fprintf(stderr, "phi3 qquant-decode: generated %d tokens in %.2f s (%.3f s/tok)\n",
             n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+
+    // Profile accumulators saw (n_gen - 1) full forwards in the gen loop;
+    // the very first generated token came from the last prefill step (which
+    // was zeroed by the reset above).
+    cx.prof.n_tokens = (uint64_t) std::max(0, n_gen - 1);
+
+    // A3.x — per-op profile summary. Avg µs per token = total_ns / n_tokens / 1000.
+    // Per-layer buckets are summed across all n_layer × n_tokens invocations,
+    // so the printed value is "µs/token spent in this op across all 32 layers".
+    if (cx.prof.enabled && cx.prof.n_tokens > 0) {
+        const Phi3DecodeProfile & p = cx.prof;
+        const double nt    = (double) p.n_tokens;
+        const double inv_us = 1.0 / 1000.0;
+        auto avg = [&](uint64_t ns) -> double { return (double) ns / nt * inv_us; };
+
+        const double matmul_us =
+            avg(p.wqkv_ns) + avg(p.wo_ns) + avg(p.ffn_up_ns) + avg(p.ffn_down_ns) + avg(p.lmhead_ns);
+        const double other_us =
+            avg(p.embed_ns) + avg(p.attn_norm_ns) + avg(p.rope_ns) + avg(p.kv_write_ns) +
+            avg(p.attn_ns) + avg(p.res1_ns) + avg(p.ffn_norm_ns) + avg(p.swiglu_ns) +
+            avg(p.res2_ns) + avg(p.final_norm_ns);
+        const double measured_us = matmul_us + other_us;
+        const double wall_us     = gen_ms * 1000.0 / nt;
+        const double unaccounted = wall_us - measured_us;
+        const double pct = (measured_us > 0.0) ? (100.0 / measured_us) : 0.0;
+
+        fprintf(stderr, "\nphi3 qquant-decode: per-op profile (avg us/token over %llu gen tokens):\n",
+                (unsigned long long) p.n_tokens);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x1]\n",   "embed",      avg(p.embed_ns),      avg(p.embed_ns)      * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "attn_norm",  avg(p.attn_norm_ns),  avg(p.attn_norm_ns)  * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","wqkv",      avg(p.wqkv_ns),       avg(p.wqkv_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "rope",       avg(p.rope_ns),       avg(p.rope_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "kv_write",   avg(p.kv_write_ns),   avg(p.kv_write_ns)   * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "attn",       avg(p.attn_ns),       avg(p.attn_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","wo",        avg(p.wo_ns),         avg(p.wo_ns)         * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "res1",       avg(p.res1_ns),       avg(p.res1_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "ffn_norm",   avg(p.ffn_norm_ns),   avg(p.ffn_norm_ns)   * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","ffn_up",    avg(p.ffn_up_ns),     avg(p.ffn_up_ns)     * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "swiglu",     avg(p.swiglu_ns),     avg(p.swiglu_ns)     * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","ffn_down",  avg(p.ffn_down_ns),   avg(p.ffn_down_ns)   * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "res2",       avg(p.res2_ns),       avg(p.res2_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x1]\n",   "final_norm", avg(p.final_norm_ns), avg(p.final_norm_ns) * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x1 MM]\n","lmhead",     avg(p.lmhead_ns),     avg(p.lmhead_ns)     * pct);
+        fprintf(stderr, "  -----------------------------------------------------\n");
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   matmul = wqkv+wo+ffn_up+ffn_down+lmhead\n",
+                "MATMUL sum", matmul_us, matmul_us * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   everything else\n",
+                "OTHER sum",  other_us,  other_us  * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (100.00%%)  sum of all per-op buckets\n",
+                "measured",  measured_us);
+        fprintf(stderr, "  %-12s %10.2f us              wall clock per token (gen_ms/n_tokens)\n",
+                "wall/tok",  wall_us);
+        fprintf(stderr, "  %-12s %10.2f us              wall - measured (timer overhead + untracked)\n",
+                "unacctd",   unaccounted);
+    }
 
     phi3_fused_ctx_free(cx);
     phi3_matmul_pool_free(pool);
@@ -3851,6 +3993,7 @@ bool phi3_run_qquant_regress(
         std::string qerr;
         if (!phi3_run_qquant_decode(model, prompt_tokens, n_gen, n_threads_qquant,
                                     fuse_rmsnorm_quant,
+                                    /*profile_per_op=*/false,
                                     qquant_tokens, qerr)) {
             error = std::string("phi3_run_qquant_regress: qquant_decode failed: ") + qerr;
             return false;
