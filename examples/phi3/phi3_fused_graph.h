@@ -532,7 +532,9 @@ bool phi3_run_qquant_decode(
         bool                           profile_per_op,
         bool                           attn_parallel,
         std::vector<llama_token>     & out_generated,
-        std::string                  & error);
+        std::string                  & error,
+        double                       * out_prefill_ms = nullptr,
+        double                       * out_gen_ms = nullptr);
 
 // ---------------------------------------------------------------------------
 // A5.2 — KV bridge: convert llama-format KV cache state into our Phi3KV
@@ -642,6 +644,52 @@ bool phi3_run_qquant_hybrid(
         bool                             profile_per_op,
         bool                             attn_parallel,
         std::vector<llama_token>       & out_generated,
+        std::string                    & error,
+        double                         * out_prefill_ms = nullptr,
+        double                         * out_gen_ms = nullptr,
+        double                         * out_bridge_ms = nullptr);
+
+// ---------------------------------------------------------------------------
+// A5.4 — A/B harness: compare three decode paths on the same prompt + seed.
+//
+// Runs back-to-back:
+//   Mode 1 (oracle): batched llama prefill + llama gen via greedy argmax
+//                    on llama_get_logits_ith. Uses lm_head INTACT
+//                    (no phi3_fused_lmhead pruning) so the gen tokens
+//                    come from exactly llama's standard pipeline.
+//                    Created with flash_attn DISABLED to match hybrid.
+//   Mode 2 (per-token qquant): phi3_run_qquant_decode.
+//   Mode 3 (hybrid):           phi3_run_qquant_hybrid.
+//
+// Prints a summary table per mode with prefill_ms, gen_ms, total_ms
+// (wall-clock around the function call), plus two top-1 comparisons
+// for the first n_compare gen tokens:
+//   * each mode vs Mode 1 oracle (proves hybrid agrees with what a
+//     vanilla llama_cli user would see),
+//   * Mode 3 vs Mode 2 (proves the KV bridge produced bit-correct KV
+//     state, since both share the gen path and lm_head).
+//
+// On the per-stage timings: Mode 2/3 prefill_ms/gen_ms come from the
+// existing internal instrumentation (does NOT include ctx/pool setup);
+// Mode 1 prefill_ms/gen_ms are measured around llama_decode calls
+// inside this driver (same exclusion). total_ms wraps the whole
+// function call wall-clock including setup -- useful as an end-to-end
+// sanity number but not for fine-grained comparisons.
+//
+// A non-fatal failure of any single mode (e.g. hybrid fails on a
+// model the bridge doesn't support) is reported in the summary table
+// with "(failed: <err>)" and does not abort the harness; the function
+// returns true if at least Mode 1 oracle ran. error is only set when
+// the harness itself could not run any mode (e.g. bad inputs).
+bool phi3_run_qquant_ab(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_compare,        // first N gen tokens to compare top-1
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             attn_parallel,
         std::string                    & error);
 
 // ---------------------------------------------------------------------------

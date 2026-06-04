@@ -3826,7 +3826,9 @@ bool phi3_run_qquant_decode(
         bool                           profile_per_op,
         bool                           attn_parallel,
         std::vector<llama_token>     & out_generated,
-        std::string                  & error) {
+        std::string                  & error,
+        double                       * out_prefill_ms,
+        double                       * out_gen_ms) {
     error.clear();
     if (model == nullptr)        { error = "phi3_run_qquant_decode: model is null"; return false; }
     if (prompt_tokens.empty())   { error = "phi3_run_qquant_decode: prompt_tokens is empty"; return false; }
@@ -3940,6 +3942,7 @@ bool phi3_run_qquant_decode(
             std::chrono::steady_clock::now() - t_prefill_start).count();
     fprintf(stderr, "phi3 qquant-decode: prefill %d tokens in %.2f s (%.3f s/tok)\n",
             n_prompt, prefill_ms / 1000.0, prefill_ms / 1000.0 / std::max(1, n_prompt));
+    if (out_prefill_ms) *out_prefill_ms = prefill_ms;
 
     // ---- Generation ----
     // A3.x — reset per-op accumulators here so the printed summary reflects
@@ -3965,6 +3968,7 @@ bool phi3_run_qquant_decode(
             std::chrono::steady_clock::now() - t_gen_start).count();
     fprintf(stderr, "phi3 qquant-decode: generated %d tokens in %.2f s (%.3f s/tok)\n",
             n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+    if (out_gen_ms) *out_gen_ms = gen_ms;
 
     // Profile accumulators saw (n_gen - 1) full forwards in the gen loop;
     // the very first generated token came from the last prefill step (which
@@ -4045,7 +4049,10 @@ bool phi3_run_qquant_hybrid(
         bool                             profile_per_op,
         bool                             attn_parallel,
         std::vector<llama_token>       & out_generated,
-        std::string                    & error) {
+        std::string                    & error,
+        double                         * out_prefill_ms,
+        double                         * out_gen_ms,
+        double                         * out_bridge_ms) {
     error.clear();
     if (model == nullptr)        { error = "phi3_run_qquant_hybrid: model is null";       return false; }
     if (prompt_tokens.empty())   { error = "phi3_run_qquant_hybrid: prompt_tokens empty"; return false; }
@@ -4158,6 +4165,7 @@ bool phi3_run_qquant_hybrid(
     }
     const double prefill_decode_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+    if (out_prefill_ms) *out_prefill_ms = prefill_decode_ms;
 
     // ---- KV bridge: llama-format KV -> Phi3KV layout. Sets current_len
     //      via explicit assignment below (the bridge intentionally does
@@ -4176,6 +4184,7 @@ bool phi3_run_qquant_hybrid(
     cx.kv.current_len = n_prompt;
     const double bridge_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_bridge_start).count();
+    if (out_bridge_ms) *out_bridge_ms = bridge_ms;
 
     // ---- Sample first gen token from llama's last-position hidden state
     //      through the qquant lm_head (so the lm_head path is consistent
@@ -4280,6 +4289,7 @@ bool phi3_run_qquant_hybrid(
             std::chrono::steady_clock::now() - t_gen_start).count();
     fprintf(stderr, "phi3 qquant-hybrid: generated %d tokens in %.2f s (%.3f s/tok)\n",
             n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+    if (out_gen_ms) *out_gen_ms = gen_ms;
 
     cx.prof.n_tokens = (uint64_t) std::max(0, n_gen - 1);
 
@@ -4333,6 +4343,341 @@ bool phi3_run_qquant_hybrid(
 
     phi3_fused_ctx_free(cx);
     phi3_matmul_pool_free(pool);
+    return true;
+}
+
+// ===========================================================================
+// A5.4 — A/B harness: pure-llama (oracle) vs per-token qquant vs hybrid.
+// ===========================================================================
+
+namespace {
+
+// Internal: run a "pure llama batched" decode in this TU.
+// Reused only by phi3_run_qquant_ab — kept anonymous-namespace to avoid
+// adding it to the public surface.
+//
+// Setup:
+//   * llama_context with flash_attn DISABLED so we are comparing against
+//     the same code paths the hybrid driver exercises (the hybrid driver
+//     also disables FA to keep v_trans=true for the bridge).
+//   * lm_head intact (no llama_set_phi3_fused_lmhead) so gen tokens come
+//     from llama's standard logits + greedy argmax. This is what a
+//     vanilla llama_cli user would see at temp=0.
+//
+// Timings:
+//   * out_prefill_ms wraps the single batched llama_decode call (excludes
+//     ctx setup).
+//   * out_gen_ms wraps the gen loop (n_gen - 1 single-token llama_decode
+//     calls + n_gen logits-argmax sampling steps).
+bool ab_run_llama_batched(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error,
+        double                         * out_prefill_ms,
+        double                         * out_gen_ms) {
+    error.clear();
+    if (model == nullptr)        { error = "ab_run_llama_batched: model is null";       return false; }
+    if (prompt_tokens.empty())   { error = "ab_run_llama_batched: prompt empty";        return false; }
+    if (n_gen <= 0)              { error = "ab_run_llama_batched: n_gen must be > 0";   return false; }
+    if (n_threads_prefill <= 0)  { n_threads_prefill = 1; }
+    if (n_threads_gen <= 0)      { n_threads_gen     = 1; }
+
+    const int n_prompt = (int) prompt_tokens.size();
+    const int n_ctx    = n_prompt + n_gen + 64;
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "ab_run_llama_batched: llama_init_from_model failed"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = (int) llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0) {
+        error = "ab_run_llama_batched: vocab size <= 0";
+        llama_free(ctx);
+        return false;
+    }
+
+    // Greedy argmax over a logits row.
+    auto greedy_argmax = [&](const float * logits) -> llama_token {
+        int best = 0;
+        float best_v = logits[0];
+        for (int v = 1; v < n_vocab; ++v) {
+            if (logits[v] > best_v) { best_v = logits[v]; best = v; }
+        }
+        return (llama_token) best;
+    };
+
+    // ---- Batched prefill ----
+    llama_set_n_threads(ctx, n_threads_prefill, n_threads_prefill);
+    const auto t_pre = std::chrono::steady_clock::now();
+    {
+        llama_batch batch = llama_batch_get_one(
+            const_cast<llama_token *>(prompt_tokens.data()), n_prompt);
+        const int rc = llama_decode(ctx, batch);
+        if (rc != 0) {
+            std::ostringstream oss;
+            oss << "ab_run_llama_batched: llama_decode (prefill) failed rc=" << rc;
+            error = oss.str();
+            llama_free(ctx);
+            return false;
+        }
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_pre).count();
+    if (out_prefill_ms) *out_prefill_ms = prefill_ms;
+
+    // Sample first gen token from logits at last prompt position.
+    out_generated.reserve(out_generated.size() + n_gen);
+    llama_token next = 0;
+    {
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        if (!logits) {
+            error = "ab_run_llama_batched: llama_get_logits_ith returned null after prefill";
+            llama_free(ctx);
+            return false;
+        }
+        next = greedy_argmax(logits);
+        out_generated.push_back(next);
+    }
+
+    // ---- Generation ----
+    llama_set_n_threads(ctx, n_threads_gen, n_threads_gen);
+    const auto t_gen = std::chrono::steady_clock::now();
+    for (int i = 1; i < n_gen; ++i) {
+        llama_batch step = llama_batch_get_one(&next, 1);
+        if (llama_decode(ctx, step) != 0) {
+            error = "ab_run_llama_batched: llama_decode (gen) failed at step " + std::to_string(i);
+            llama_free(ctx);
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        if (!logits) {
+            error = "ab_run_llama_batched: missing logits at step " + std::to_string(i);
+            llama_free(ctx);
+            return false;
+        }
+        next = greedy_argmax(logits);
+        out_generated.push_back(next);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen).count();
+    if (out_gen_ms) *out_gen_ms = gen_ms;
+
+    llama_free(ctx);
+    return true;
+}
+
+struct Phi3ABResult {
+    std::string label;
+    std::vector<llama_token> gen;
+    double prefill_ms = 0.0;
+    double gen_ms     = 0.0;
+    double total_ms   = 0.0;       // wall-clock around the call (includes setup)
+    double bridge_ms  = 0.0;       // only meaningful for hybrid
+    bool   ok         = false;
+    std::string err;
+};
+
+// Count top-1 matches over min(n_compare, len_a, len_b) leading positions.
+int top1_match_count(const std::vector<llama_token> & a,
+                     const std::vector<llama_token> & b,
+                     int n_compare) {
+    const int n = std::min({(int) a.size(), (int) b.size(), n_compare});
+    int matches = 0;
+    for (int i = 0; i < n; ++i) if (a[i] == b[i]) ++matches;
+    return matches;
+}
+
+} // namespace
+
+bool phi3_run_qquant_ab(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_compare,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             attn_parallel,
+        std::string                    & error) {
+    error.clear();
+    if (model == nullptr)        { error = "phi3_run_qquant_ab: model is null";        return false; }
+    if (prompt_tokens.empty())   { error = "phi3_run_qquant_ab: prompt empty";         return false; }
+    if (n_gen <= 0)              { error = "phi3_run_qquant_ab: n_gen must be > 0";    return false; }
+    if (n_compare <= 0)          { n_compare = std::min(n_gen, 20); }
+    if (n_compare > n_gen)       { n_compare = n_gen; }
+    if (n_threads_prefill <= 0)  { n_threads_prefill = 1; }
+    if (n_threads_gen <= 0)      { n_threads_gen     = 1; }
+
+    const int n_prompt = (int) prompt_tokens.size();
+
+    fprintf(stderr,
+            "\nphi3 qquant-ab: starting (n_prompt=%d, n_gen=%d, n_compare=%d, prefill_threads=%d, gen_threads=%d, "
+            "rmsnorm_fuse=%s, attn_parallel=%s)\n",
+            n_prompt, n_gen, n_compare, n_threads_prefill, n_threads_gen,
+            fuse_rmsnorm_quant ? "on" : "off",
+            attn_parallel ? "on" : "off");
+
+    Phi3ABResult r1, r2, r3;
+    r1.label = "llama-batched (oracle)";
+    r2.label = "qquant-per-token";
+    r3.label = "qquant-hybrid";
+
+    // ---- Mode 1: pure llama batched (oracle) ----
+    fprintf(stderr, "\nphi3 qquant-ab: [1/3] llama-batched oracle ...\n");
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        r1.ok = ab_run_llama_batched(model, prompt_tokens, n_gen,
+                                     n_threads_prefill, n_threads_gen,
+                                     r1.gen, r1.err,
+                                     &r1.prefill_ms, &r1.gen_ms);
+        r1.total_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        if (r1.ok) {
+            fprintf(stderr, "phi3 qquant-ab: [1/3] llama-batched: prefill %.2f ms, gen %.2f ms (%d toks)\n",
+                    r1.prefill_ms, r1.gen_ms, (int) r1.gen.size());
+        } else {
+            fprintf(stderr, "phi3 qquant-ab: [1/3] llama-batched: FAILED: %s\n", r1.err.c_str());
+        }
+    }
+
+    // ---- Mode 2: per-token qquant ----
+    fprintf(stderr, "\nphi3 qquant-ab: [2/3] qquant-per-token ...\n");
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        r2.ok = phi3_run_qquant_decode(model, prompt_tokens, n_gen, n_threads_gen,
+                                       fuse_rmsnorm_quant, /*profile=*/false,
+                                       attn_parallel,
+                                       r2.gen, r2.err,
+                                       &r2.prefill_ms, &r2.gen_ms);
+        r2.total_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        if (!r2.ok) {
+            fprintf(stderr, "phi3 qquant-ab: [2/3] qquant-per-token: FAILED: %s\n", r2.err.c_str());
+        }
+    }
+
+    // ---- Mode 3: hybrid ----
+    fprintf(stderr, "\nphi3 qquant-ab: [3/3] qquant-hybrid ...\n");
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        r3.ok = phi3_run_qquant_hybrid(model, prompt_tokens, n_gen,
+                                       n_threads_prefill, n_threads_gen,
+                                       fuse_rmsnorm_quant, /*profile=*/false,
+                                       attn_parallel,
+                                       r3.gen, r3.err,
+                                       &r3.prefill_ms, &r3.gen_ms, &r3.bridge_ms);
+        r3.total_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        if (!r3.ok) {
+            fprintf(stderr, "phi3 qquant-ab: [3/3] qquant-hybrid: FAILED: %s\n", r3.err.c_str());
+        }
+    }
+
+    if (!r1.ok && !r2.ok && !r3.ok) {
+        error = "phi3_run_qquant_ab: all three modes failed (oracle: " + r1.err + ")";
+        return false;
+    }
+
+    // ---- Summary table ----
+    auto tps = [&](int n_toks, double ms) -> double {
+        return ms > 0.0 ? (1000.0 * n_toks / ms) : 0.0;
+    };
+
+    fprintf(stderr,
+        "\n=========================================================="
+        "===============================\n");
+    fprintf(stderr,
+        "phi3 qquant-ab summary  (n_prompt=%d, n_gen=%d, n_compare=%d)\n",
+        n_prompt, n_gen, n_compare);
+    fprintf(stderr,
+        "----------------------------------------------------------"
+        "-------------------------------\n");
+    fprintf(stderr, "  %-24s  %10s  %10s  %10s  %10s  %10s\n",
+            "mode", "prefill_ms", "gen_ms", "total_ms",
+            "prefill_tps", "gen_tps");
+
+    auto print_row = [&](const Phi3ABResult & r) {
+        if (r.ok) {
+            fprintf(stderr, "  %-24s  %10.2f  %10.2f  %10.2f  %10.2f  %10.2f\n",
+                    r.label.c_str(),
+                    r.prefill_ms, r.gen_ms, r.total_ms,
+                    tps(n_prompt, r.prefill_ms),
+                    tps((int) r.gen.size(), r.gen_ms));
+        } else {
+            fprintf(stderr, "  %-24s  (failed: %s)\n",
+                    r.label.c_str(), r.err.c_str());
+        }
+    };
+    print_row(r1);
+    print_row(r2);
+    print_row(r3);
+
+    if (r3.ok && r3.bridge_ms > 0.0) {
+        fprintf(stderr, "  (hybrid bridge: %.2f ms)\n", r3.bridge_ms);
+    }
+
+    // Top-1 agreement.
+    fprintf(stderr,
+        "\n  top-1 agreement on first %d gen tokens:\n", n_compare);
+    if (r1.ok) {
+        if (r2.ok) {
+            const int m = top1_match_count(r2.gen, r1.gen, n_compare);
+            fprintf(stderr, "    qquant-per-token vs oracle:  %d/%d\n", m, n_compare);
+        }
+        if (r3.ok) {
+            const int m = top1_match_count(r3.gen, r1.gen, n_compare);
+            fprintf(stderr, "    qquant-hybrid    vs oracle:  %d/%d\n", m, n_compare);
+        }
+    }
+    if (r2.ok && r3.ok) {
+        const int m = top1_match_count(r3.gen, r2.gen, n_compare);
+        fprintf(stderr,
+            "    qquant-hybrid    vs qquant-per-token:  %d/%d   (KV bridge correctness check)\n",
+            m, n_compare);
+    }
+
+    // First N gen tokens per mode (debugging).
+    auto print_first_n = [&](const Phi3ABResult & r) {
+        if (!r.ok) return;
+        fprintf(stderr, "  %-24s  first %d:", r.label.c_str(), n_compare);
+        const int n = std::min((int) r.gen.size(), n_compare);
+        for (int i = 0; i < n; ++i) fprintf(stderr, " %d", (int) r.gen[i]);
+        fprintf(stderr, "\n");
+    };
+    fprintf(stderr, "\n  gen tokens:\n");
+    print_first_n(r1);
+    print_first_n(r2);
+    print_first_n(r3);
+
+    // Acceptance heuristics (informational; not a hard PASS/FAIL).
+    if (r1.ok && r3.ok && r1.prefill_ms > 0.0) {
+        const double ratio_ttft = r3.prefill_ms / r1.prefill_ms;
+        fprintf(stderr, "\n  hybrid TTFT / oracle TTFT:      %.3fx   (target ~1.00x)\n",
+                ratio_ttft);
+    }
+    if (r2.ok && r3.ok && r2.gen_ms > 0.0 && !r3.gen.empty()) {
+        const double r3_tps = tps((int) r3.gen.size(), r3.gen_ms);
+        const double r2_tps = tps((int) r2.gen.size(), r2.gen_ms);
+        if (r2_tps > 0.0) {
+            const double ratio_gen = r3_tps / r2_tps;
+            fprintf(stderr, "  hybrid gen_tps / per-token gen_tps: %.3fx   (target ~1.00x)\n",
+                    ratio_gen);
+        }
+    }
+    fprintf(stderr,
+        "=========================================================="
+        "===============================\n");
+
     return true;
 }
 

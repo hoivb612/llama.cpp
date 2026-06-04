@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -76,6 +76,16 @@ int main(int argc, char ** argv) {
     // --phi3-fused-qquant-debug is also set (same gating as the per-token
     // qquant spot-check).
     int  fused_qquant_hybrid = 0;
+    // A5.4 — A/B harness: run llama-batched (oracle), qquant-per-token,
+    // and qquant-hybrid back-to-back on the same prompt and print a
+    // summary table with per-stage timings + top-1 agreement on the
+    // first --phi3-fused-qquant-ab-ngen-compare gen tokens.
+    // Default OFF; takes effect ONLY when set (replaces the regular
+    // --phi3-fused-qquant-debug spot-check for this run, since all three
+    // modes are run inside the harness).
+    bool fused_qquant_ab = false;
+    int  fused_qquant_ab_ngen = 32;
+    int  fused_qquant_ab_ngen_compare = 20;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -240,6 +250,30 @@ int main(int argc, char ** argv) {
                     if (fused_qquant_hybrid != 0 && fused_qquant_hybrid != 1) {
                         fprintf(stderr, "error: --phi3-fused-qquant-hybrid expects 0 or 1\n");
                         print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-ab") == 0) {
+                fused_qquant_ab = true;
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-ab-ngen") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_ab_ngen = std::stoi(argv[++i]);
+                    if (fused_qquant_ab_ngen <= 0) {
+                        fprintf(stderr, "error: --phi3-fused-qquant-ab-ngen must be > 0\n");
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-ab-ngen-compare") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_ab_ngen_compare = std::stoi(argv[++i]);
+                    if (fused_qquant_ab_ngen_compare <= 0) {
+                        fprintf(stderr, "error: --phi3-fused-qquant-ab-ngen-compare must be > 0\n");
                         return 1;
                     }
                 } else {
@@ -682,6 +716,67 @@ int main(int argc, char ** argv) {
                             }
                             fprintf(stderr, "\n");
                             fprintf(stderr, "phi3 qquant-decode: generated text: \"%s\"\n", gen_text.c_str());
+                        }
+                    }
+                }
+            }
+            free(user_cstr);
+        }
+    }
+
+    // ----- A5.4: Q-quant A/B harness (optional) -----
+    // Runs llama-batched oracle, qquant-per-token, and qquant-hybrid
+    // back-to-back on the same prompt + n_gen, then prints a summary
+    // table with per-stage timings and top-1 agreement on the first
+    // n_compare gen tokens. Validates the hybrid bridge end-to-end.
+    if (ok && fused_qquant_ab && !single_prompt.empty()) {
+        const char * chat_template = llama_model_chat_template(raw_model.model, nullptr);
+        if (chat_template == nullptr) {
+            fprintf(stderr, "phi3 qquant-ab: model has no chat template; aborting\n");
+        } else {
+            std::vector<llama_chat_message> msgs;
+            char * user_cstr = strdup(single_prompt.c_str());
+            msgs.push_back({"user", user_cstr});
+            std::vector<char> formatted(8192);
+            int n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                                  /*add_ass=*/true, formatted.data(), formatted.size());
+            if (n_fmt > (int) formatted.size()) {
+                formatted.resize((size_t) n_fmt);
+                n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                                  true, formatted.data(), formatted.size());
+            }
+            if (n_fmt < 0) {
+                fprintf(stderr, "phi3 qquant-ab: chat_apply_template failed; aborting\n");
+            } else {
+                const std::string fmt_prompt(formatted.begin(), formatted.begin() + n_fmt);
+                const llama_vocab * vocab = llama_model_get_vocab(raw_model.model);
+                const int n_neg = -llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                                  nullptr, 0, true, true);
+                if (n_neg <= 0) {
+                    fprintf(stderr, "phi3 qquant-ab: tokenize sizing failed (n_neg=%d)\n", n_neg);
+                } else {
+                    std::vector<llama_token> prompt_tokens((size_t) n_neg);
+                    const int n_tok = llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                                     prompt_tokens.data(), (int) prompt_tokens.size(),
+                                                     true, true);
+                    if (n_tok < 0) {
+                        fprintf(stderr, "phi3 qquant-ab: llama_tokenize failed\n");
+                    } else {
+                        prompt_tokens.resize((size_t) n_tok);
+                        int ab_threads_gen = fused_qquant_threads > 0 ? fused_qquant_threads : n_threads_gen;
+                        if (ab_threads_gen <= 0) ab_threads_gen = 1;
+                        int ab_threads_prefill = n_threads_prefill > 0 ? n_threads_prefill : ab_threads_gen;
+                        std::string aberr;
+                        const bool abok = phi3_run_qquant_ab(raw_model.model, prompt_tokens,
+                                                             fused_qquant_ab_ngen,
+                                                             fused_qquant_ab_ngen_compare,
+                                                             ab_threads_prefill,
+                                                             ab_threads_gen,
+                                                             /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                             /*attn_parallel=*/fused_qquant_attn_parallel != 0,
+                                                             aberr);
+                        if (!abok) {
+                            fprintf(stderr, "phi3 qquant-ab: FAIL: %s\n", aberr.c_str());
                         }
                     }
                 }
