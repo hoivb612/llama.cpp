@@ -132,4 +132,21 @@ LLAMA_API void llama_set_phi3_fused_decode(struct llama_context * ctx, bool valu
 // The returned pointer is owned by the model; do not free.
 LLAMA_API const struct ggml_tensor * llama_model_get_tensor_by_name(
         const struct llama_model * model, const char * name);
+
+// B612 / Phi3 hybrid prefill: raw access to the unified KV cache's per-layer
+// K and V tensors. Intended for advanced consumers that want to read the
+// post-prefill KV state and re-pack it into a custom decode-time format
+// (see examples/phi3 hybrid prefill path). Returns nullptr if the context
+// does not use a single unified KV cache (e.g. SWA/iSWA, hybrid memory) or
+// if the requested model-layer index has no KV slot. The returned tensor is
+// owned by the context; use ggml_backend_tensor_get to copy out the data.
+// Layout (single-stream KV cache):
+//   K       : (head_dim, n_head_kv, kv_size)  row-major, fastest dim = head_dim
+//   V trans : (kv_size,  n_head_kv, head_dim) row-major, fastest dim = pos
+//   V !trans: (head_dim, n_head_kv, kv_size)  row-major, fastest dim = head_dim
+// `llama_kv_self_v_trans` tells you which V variant the context is using;
+// it is `!cparams.flash_attn` (true by default on CPU).
+LLAMA_API struct ggml_tensor * llama_kv_self_layer_k(struct llama_context * ctx, int32_t il);
+LLAMA_API struct ggml_tensor * llama_kv_self_layer_v(struct llama_context * ctx, int32_t il);
+LLAMA_API bool                 llama_kv_self_v_trans(const struct llama_context * ctx);
 #endif // !defined(LLAMA_B612_API)

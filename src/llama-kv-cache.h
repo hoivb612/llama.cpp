@@ -155,6 +155,16 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // B612: raw access to the per-layer K / V tensors for the (single-stream)
+    // KV cache. Returns nullptr if the model layer has no KV slot (e.g. MTP).
+    // The returned tensor is owned by the cache; do not free. Layout matches
+    // ggml's KV cache convention: K is (head_dim, n_head_kv, kv_size); V is
+    // (kv_size, n_head_kv, head_dim) when v_trans()==true (the default),
+    // otherwise (head_dim, n_head_kv, kv_size).
+    ggml_tensor * get_layer_k_raw(int32_t il) const;
+    ggml_tensor * get_layer_v_raw(int32_t il) const;
+    bool          get_v_trans()              const { return v_trans; }
+
     //
     // graph_build API
     //

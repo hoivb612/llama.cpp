@@ -1126,6 +1126,22 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+ggml_tensor * llama_kv_cache::get_layer_k_raw(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    return layers[it->second].k;
+}
+
+ggml_tensor * llama_kv_cache::get_layer_v_raw(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    return layers[it->second].v;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

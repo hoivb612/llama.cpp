@@ -141,6 +141,26 @@ LLAMA_API void llama_b612_get_phi3_features(
         const struct llama_context * ctx,
         struct llama_b612_phi3_features * out);
 
+// B612 / Phi3 hybrid prefill: raw access to the unified KV cache's per-layer
+// K and V tensors. Intended for advanced consumers that want to read the
+// post-prefill KV state and re-pack it into a custom decode-time format
+// (see examples/phi3 hybrid prefill path). Returns nullptr if the context
+// does not use a single unified KV cache (e.g. SWA/iSWA, hybrid memory) or
+// if the requested model-layer index has no KV slot. The returned tensor is
+// owned by the context; use ggml_backend_tensor_get to copy out the data,
+// or read tensor->data directly when the cache lives on a CPU backend.
+// Layout (single-stream KV cache):
+//   K       : (head_dim, n_head_kv, kv_size)  row-major, fastest dim = head_dim
+//   V trans : (kv_size,  n_head_kv, head_dim) row-major, fastest dim = pos
+//              (i.e. kv_size-long contiguous strip per (h,d), strip order
+//               (h outer, d inner))
+//   V !trans: (head_dim, n_head_kv, kv_size)  row-major, fastest dim = head_dim
+// `llama_kv_self_v_trans` tells you which V variant the context is using;
+// it is `!cparams.flash_attn` (true by default on CPU).
+LLAMA_API struct ggml_tensor * llama_kv_self_layer_k(struct llama_context * ctx, int32_t il);
+LLAMA_API struct ggml_tensor * llama_kv_self_layer_v(struct llama_context * ctx, int32_t il);
+LLAMA_API bool                 llama_kv_self_v_trans(const struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif

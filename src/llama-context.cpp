@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-layer-window.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -3846,6 +3847,42 @@ int32_t llama_set_adapter_cvec(
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
+}
+
+struct ggml_tensor * llama_kv_self_layer_k(struct llama_context * ctx, int32_t il) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    auto * mem = ctx->get_memory();
+    auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        return nullptr;
+    }
+    return kv->get_layer_k_raw(il);
+}
+
+struct ggml_tensor * llama_kv_self_layer_v(struct llama_context * ctx, int32_t il) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    auto * mem = ctx->get_memory();
+    auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        return nullptr;
+    }
+    return kv->get_layer_v_raw(il);
+}
+
+bool llama_kv_self_v_trans(const struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    auto * mem = ctx->get_memory();
+    auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        return false;
+    }
+    return kv->get_v_trans();
 }
 
 void llama_memory_clear(llama_memory_t mem, bool data) {
