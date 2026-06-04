@@ -254,12 +254,18 @@ struct Phi3FusedCtx {
     Phi3ForwardScratch   scratch;
     int32_t              cur_pos     = 0;
 
-    // A3.2 — fuse RMSNorm + multiply + quantize-to-Q8K at the two
-    // attn_norm -> wqkv and ffn_norm -> ffn_up junctions. Set to false
-    // to fall back to the A2.5b unfused path for A/B comparison. The
-    // fused path is bit-identical to the unfused path; the only
-    // observable effect is gen_tps. See phi3_fused_rmsnorm_quant_q8K.
-    bool                 fuse_rmsnorm_quant = true;
+    // A3.2 (experiment) — fuse RMSNorm + multiply + quantize-to-Q8K at
+    // the two attn_norm -> wqkv and ffn_norm -> ffn_up junctions. The
+    // fused path is bit-identical to the unfused path; only gen_tps
+    // differs. Measured impact on Phi-3-mini Q2_K/Q3_K_M/Q4_K_M at 8
+    // threads UMA was neutral-to-negative (Q3_K_M: -13.6% gen_tps,
+    // Q4_K_M: flat) -- the per-block call overhead of 12x
+    // from_float(QK_K) outweighs the L1 locality win because
+    // quantize_row_q8_K on x86 is the scalar ref and the activation
+    // already fits in L1. Kept off by default and exposed via
+    // --phi3-fused-qquant-rmsnorm-fuse 0|1 for educational reference.
+    // See phi3_fused_rmsnorm_quant_q8K.
+    bool                 fuse_rmsnorm_quant = false;
 };
 
 // 24-feature validator (see __phase_A2_spec.md §1.5). Returns true if the

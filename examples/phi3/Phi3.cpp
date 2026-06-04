@@ -50,11 +50,13 @@ int main(int argc, char ** argv) {
     int  fused_qquant_threads = 0;   // 0 => use n_threads_gen
     bool fused_qquant_regress = false;
     int  fused_qquant_regress_n_gen = 256;
-    // A3.2 — toggle RMSNorm+quantize+matmul fusion at the two attn_norm/ffn_norm
-    // sites. Default ON (fused, the win). Set to 0 to fall back to the A2.5b
-    // unfused sequence for A/B comparison. Path is bit-identical (see
-    // phi3 kernel self-test "rmsnorm+quant_q8K"); only gen_tps differs.
-    int  fused_qquant_rmsnorm_fuse = 1;
+    // A3.2 (experiment) — toggle RMSNorm+quantize+matmul fusion at the
+    // two attn_norm/ffn_norm sites. Default OFF: measured impact on
+    // Phi-3-mini Q2_K/Q3_K_M/Q4_K_M at 8 threads UMA was
+    // neutral-to-negative (Q3_K_M: -13.6% gen_tps). Kept exposed for
+    // A/B comparison via --phi3-fused-qquant-rmsnorm-fuse 0|1; path is
+    // bit-identical (see "rmsnorm+quant_q8K" in --phi3-kernel-test).
+    int  fused_qquant_rmsnorm_fuse = 0;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
