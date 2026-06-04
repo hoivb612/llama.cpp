@@ -378,7 +378,7 @@ int main(int argc, char ** argv) {
         phi3_unload_raw_model(raw_model);
         return 1;
     }
-    fprintf(stderr, "phi3 runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d fused_lmhead=%d fused_decode=%d gen_autotune=%d\n",
+    fprintf(stderr, "phi3 llama runtime: prefill_threads=%d gen_threads=%d n_predict=%d seed=%u temp=%.3f min_p=%.3f fused_greedy_gen=%d fused_lmhead=%d fused_decode=%d gen_autotune=%d\n",
         runtime.n_threads_prefill, runtime.n_threads_gen, runtime.n_predict, runtime.seed, runtime_params.temp, runtime_params.min_p, (int) runtime.enable_fused_greedy_gen, (int) runtime.enable_fused_lmhead, (int) runtime.enable_fused_decode, (int) runtime.enable_gen_autotune);
 
     {
