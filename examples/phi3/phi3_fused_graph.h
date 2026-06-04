@@ -599,6 +599,52 @@ bool phi3_seed_kv_from_llama(
         std::string          & error);
 
 // ---------------------------------------------------------------------------
+// A5.3 — Hybrid prefill driver: llama-batched prefill + KV bridge + qquant
+// single-token decode.
+//
+// Same external contract as phi3_run_qquant_decode (append n_gen tokens to
+// out_generated, return false + error on failure), but the prefill path is
+// replaced:
+//   1. Create an internal llama_context with flash_attn DISABLED and
+//      lm_head pruned (llama_set_phi3_fused_lmhead(ctx, true)).
+//   2. Single llama_decode of the whole prompt as one batch with
+//      n_threads_prefill threads. llama owns the _x8 repacked mul_mat
+//      tiling on the prefill side and produces F16 K/V in its own
+//      cache layout.
+//   3. phi3_seed_kv_from_llama copies that state into cx.kv (single
+//      memcpy per layer for K; n_head_kv * head_dim strided memcpys
+//      per layer for V).
+//   4. Set cx.kv.current_len = n_prompt.
+//   5. Sample the first gen token via phi3_fused_lmhead_argmax fed
+//      from llama_get_embeddings_ith(ctx, -1) — same lm_head path as
+//      qquant, but the hidden state was produced by llama's batched
+//      forward (ulp drift vs per-token forward is expected and
+//      accepted; A5.4 measures top-1 agreement vs an oracle).
+//   6. llama_free the prefill context.
+//   7. Run the qquant gen loop exactly as phi3_run_qquant_decode does:
+//      n_gen - 1 calls to phi3_full_forward_qquant at positions
+//      n_prompt, n_prompt+1, ..., n_prompt + n_gen - 2.
+//
+// Gating + fallback: if any precondition for the bridge cannot be met
+// (model isn't Phi-3-like / SWA / GQA / non-F16 KV), the function returns
+// false with a clear error. The CLI driver in Phi3.cpp prints the error
+// and falls back to the regular per-token qquant prefill path.
+//
+// n_threads_prefill drives llama_decode; n_threads_gen drives the matmul
+// pool for the qquant gen phase.
+bool phi3_run_qquant_hybrid(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             profile_per_op,
+        bool                             attn_parallel,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error);
+
+// ---------------------------------------------------------------------------
 // A2.5c — 3-prompt × n-token regression infrastructure.
 //
 // phi3_run_baseline_decode drives the production-equivalent path:

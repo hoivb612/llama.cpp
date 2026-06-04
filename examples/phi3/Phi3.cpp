@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -68,6 +68,14 @@ int main(int argc, char ** argv) {
     // takes effect when n_threads > 1. Default OFF for first commit;
     // user opts in via --phi3-fused-qquant-attn-parallel 1.
     int  fused_qquant_attn_parallel = 0;
+    // A5.3 — hybrid prefill: replace per-token qquant prefill with a single
+    // batched llama_decode (TTFT win from the upstream _x8 repacked
+    // mul_mat) + KV bridge into Phi3KV (A5.2). Steady-state gen path is
+    // unchanged. Default OFF; user opts in via
+    // --phi3-fused-qquant-hybrid 1. Has no effect unless
+    // --phi3-fused-qquant-debug is also set (same gating as the per-token
+    // qquant spot-check).
+    int  fused_qquant_hybrid = 0;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -226,6 +234,18 @@ int main(int argc, char ** argv) {
                 }
             } else if (strcmp(argv[i], "--phi3-fused-qquant-profile") == 0) {
                 fused_qquant_profile = true;
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-hybrid") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_hybrid = std::stoi(argv[++i]);
+                    if (fused_qquant_hybrid != 0 && fused_qquant_hybrid != 1) {
+                        fprintf(stderr, "error: --phi3-fused-qquant-hybrid expects 0 or 1\n");
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -606,12 +626,38 @@ int main(int argc, char ** argv) {
                         std::string qerr;
                         int qq_threads = fused_qquant_threads > 0 ? fused_qquant_threads : n_threads_gen;
                         if (qq_threads <= 0) qq_threads = 1;
-                        const bool qok = phi3_run_qquant_decode(raw_model.model, prompt_tokens,
-                                                                fused_qquant_n_gen, qq_threads,
-                                                                /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
-                                                                /*profile_per_op=*/fused_qquant_profile,
-                                                                /*attn_parallel=*/fused_qquant_attn_parallel != 0,
-                                                                gen_tokens, qerr);
+                        bool qok = false;
+                        if (fused_qquant_hybrid != 0) {
+                            // A5.3 — llama batched prefill + KV bridge + qquant gen.
+                            int hp_prefill = n_threads_prefill > 0 ? n_threads_prefill : qq_threads;
+                            qok = phi3_run_qquant_hybrid(raw_model.model, prompt_tokens,
+                                                         fused_qquant_n_gen,
+                                                         hp_prefill,
+                                                         qq_threads,
+                                                         /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                         /*profile_per_op=*/fused_qquant_profile,
+                                                         /*attn_parallel=*/fused_qquant_attn_parallel != 0,
+                                                         gen_tokens, qerr);
+                            if (!qok) {
+                                fprintf(stderr, "phi3 qquant-hybrid: FAIL (%s); falling back to per-token qquant prefill\n",
+                                        qerr.c_str());
+                                gen_tokens.clear();
+                                qerr.clear();
+                                qok = phi3_run_qquant_decode(raw_model.model, prompt_tokens,
+                                                             fused_qquant_n_gen, qq_threads,
+                                                             /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                             /*profile_per_op=*/fused_qquant_profile,
+                                                             /*attn_parallel=*/fused_qquant_attn_parallel != 0,
+                                                             gen_tokens, qerr);
+                            }
+                        } else {
+                            qok = phi3_run_qquant_decode(raw_model.model, prompt_tokens,
+                                                         fused_qquant_n_gen, qq_threads,
+                                                         /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                         /*profile_per_op=*/fused_qquant_profile,
+                                                         /*attn_parallel=*/fused_qquant_attn_parallel != 0,
+                                                         gen_tokens, qerr);
+                        }
                         if (!qok) {
                             fprintf(stderr, "phi3 qquant-debug: FAIL: %s\n", qerr.c_str());
                         } else {

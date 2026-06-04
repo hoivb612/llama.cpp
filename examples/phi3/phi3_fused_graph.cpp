@@ -4027,6 +4027,316 @@ bool phi3_run_qquant_decode(
 }
 
 // ===========================================================================
+// A5.3 — Hybrid prefill driver
+// ===========================================================================
+//
+// llama-batched prefill (TTFT win from _x8 repacked mul_mat in the upstream
+// path) + KV bridge (A5.2) + our qquant single-token decode (steady-state
+// gen win from the fused kernels). See phi3_fused_graph.h header comment
+// for the full contract.
+
+bool phi3_run_qquant_hybrid(
+        const llama_model              * model,
+        const std::vector<llama_token> & prompt_tokens,
+        int                              n_gen,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             profile_per_op,
+        bool                             attn_parallel,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error) {
+    error.clear();
+    if (model == nullptr)        { error = "phi3_run_qquant_hybrid: model is null";       return false; }
+    if (prompt_tokens.empty())   { error = "phi3_run_qquant_hybrid: prompt_tokens empty"; return false; }
+    if (n_gen <= 0)              { error = "phi3_run_qquant_hybrid: n_gen must be > 0";   return false; }
+    if (n_threads_prefill <= 0)  { n_threads_prefill = 1; }
+    if (n_threads_gen <= 0)      { n_threads_gen     = 1; }
+
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+
+    if (W.n_head != W.n_head_kv) {
+        std::ostringstream oss;
+        oss << "phi3_run_qquant_hybrid: GQA not supported (n_head=" << W.n_head
+            << " n_head_kv=" << W.n_head_kv << ")";
+        error = oss.str();
+        return false;
+    }
+
+    const int n_embd   = W.n_embd;
+    const int n_vocab  = W.n_vocab;
+    const int n_prompt = (int) prompt_tokens.size();
+    const int ctx_max  = n_prompt + n_gen + 2;
+
+    for (int p = 0; p < n_prompt; ++p) {
+        if (prompt_tokens[p] < 0 || prompt_tokens[p] >= n_vocab) {
+            std::ostringstream oss;
+            oss << "phi3_run_qquant_hybrid: prompt token " << p << "=" << prompt_tokens[p]
+                << " out of [0," << n_vocab << ")";
+            error = oss.str();
+            return false;
+        }
+    }
+
+    // ---- llama prefill context: flash_attn DISABLED (=> v_trans=true,
+    //      our bridge's only supported source layout). n_batch == n_ctx
+    //      so the whole prompt is processed in a single llama_decode call.
+    //      lm_head pruned so the last position's hidden state is exposed
+    //      through llama_get_embeddings_ith.
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = ctx_max;
+    cp.n_batch         = ctx_max;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+
+    llama_context * lctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!lctx) { error = "phi3_run_qquant_hybrid: llama_init_from_model failed"; return false; }
+    llama_set_phi3_fused_lmhead(lctx, true);
+    llama_set_n_threads(lctx, n_threads_prefill, n_threads_prefill);
+
+    // ---- qquant context (shared between bridge target and gen loop).
+    Phi3MatmulPool pool;
+    if (n_threads_gen > 1) {
+        std::string perr;
+        if (!phi3_matmul_pool_init(pool, n_threads_gen, perr)) {
+            fprintf(stderr, "phi3 qquant-hybrid: matmul_pool_init failed (%s); serial fallback\n",
+                    perr.c_str());
+        }
+    }
+
+    Phi3FusedCtx cx;
+    if (!phi3_fused_ctx_init(cx, W, pool.initialized ? &pool : nullptr,
+                             model, /*lctx=*/nullptr,
+                             ctx_max, /*f32_debug=*/false, error)) {
+        phi3_matmul_pool_free(pool);
+        llama_free(lctx);
+        return false;
+    }
+    cx.fuse_rmsnorm_quant = fuse_rmsnorm_quant;
+    cx.attn_parallel      = attn_parallel;
+    cx.prof.enabled       = profile_per_op;
+
+    Phi3FusedLmHead lm;
+    if (!phi3_fused_lmhead_init(model, lm, error)) {
+        phi3_fused_ctx_free(cx);
+        phi3_matmul_pool_free(pool);
+        llama_free(lctx);
+        return false;
+    }
+
+    fprintf(stderr,
+            "phi3 qquant-hybrid: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, prefill_threads=%d, gen_threads=%d, "
+            "pool=%s, rmsnorm_fuse=%s, attn_parallel=%s, profile=%s)\n",
+            n_prompt, n_gen, ctx_max, n_threads_prefill, n_threads_gen,
+            pool.initialized ? "on" : "off",
+            fuse_rmsnorm_quant ? "on" : "off",
+            attn_parallel ? "on" : "off",
+            profile_per_op ? "on" : "off");
+
+    auto cleanup_fail = [&]() {
+        phi3_fused_ctx_free(cx);
+        phi3_matmul_pool_free(pool);
+        llama_free(lctx);
+    };
+
+    // ---- Batched prefill via llama_decode (single batch, whole prompt) ----
+    const auto t_prefill_start = std::chrono::steady_clock::now();
+    {
+        // llama_batch_get_one takes a non-const pointer but does not mutate
+        // the input ids for plain decode; const_cast is safe here.
+        llama_batch batch = llama_batch_get_one(
+            const_cast<llama_token *>(prompt_tokens.data()), n_prompt);
+        const int rc = llama_decode(lctx, batch);
+        if (rc != 0) {
+            std::ostringstream oss;
+            oss << "phi3_run_qquant_hybrid: llama_decode (batched prefill) failed rc=" << rc;
+            error = oss.str();
+            cleanup_fail();
+            return false;
+        }
+    }
+    const double prefill_decode_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+
+    // ---- KV bridge: llama-format KV -> Phi3KV layout. Sets current_len
+    //      via explicit assignment below (the bridge intentionally does
+    //      not touch current_len; same convention as per-token forward).
+    const auto t_bridge_start = std::chrono::steady_clock::now();
+    {
+        std::string berr;
+        if (!phi3_seed_kv_from_llama(cx, lctx, /*base_pos=*/0,
+                                     /*n_tokens=*/n_prompt,
+                                     /*src_pos_first=*/0, berr)) {
+            error = "phi3_run_qquant_hybrid: KV bridge failed: " + berr;
+            cleanup_fail();
+            return false;
+        }
+    }
+    cx.kv.current_len = n_prompt;
+    const double bridge_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_bridge_start).count();
+
+    // ---- Sample first gen token from llama's last-position hidden state
+    //      through the qquant lm_head (so the lm_head path is consistent
+    //      with the per-token qquant decode driver). hidden state was
+    //      produced by llama's batched _x8 forward; ulp-level drift vs
+    //      pure qquant prefill is expected and accepted (A5.4 measures
+    //      top-1 agreement vs an oracle).
+    const float * h_last = llama_get_embeddings_ith(lctx, -1);
+    if (!h_last) {
+        error = "phi3_run_qquant_hybrid: llama_get_embeddings_ith returned null after prefill";
+        cleanup_fail();
+        return false;
+    }
+    {
+        // Finite check on the hidden state — same defensive policy as the
+        // per-token qquant path.
+        for (int i = 0; i < n_embd; ++i) {
+            if (!std::isfinite(h_last[i])) {
+                std::ostringstream oss;
+                oss << "phi3 qquant-hybrid: non-finite hidden state from llama at dim " << i
+                    << " val=" << h_last[i];
+                error = oss.str();
+                cleanup_fail();
+                return false;
+            }
+        }
+    }
+    llama_token next_tok = 0;
+    {
+        Phi3LmHeadPool lm_pool;
+        if (n_threads_gen > 1) {
+            std::string perr;
+            if (!phi3_fused_lmhead_pool_init(lm_pool, n_threads_gen, perr)) {
+                fprintf(stderr, "phi3 qquant-hybrid: lmhead pool init failed (%s); serial\n",
+                        perr.c_str());
+            }
+        }
+        const bool ok = phi3_fused_lmhead_argmax(lm,
+            lm_pool.initialized ? &lm_pool : nullptr,
+            h_last, n_threads_gen, next_tok, error);
+        phi3_fused_lmhead_pool_free(lm_pool);
+        if (!ok) {
+            cleanup_fail();
+            return false;
+        }
+    }
+
+    fprintf(stderr,
+            "phi3 qquant-hybrid: prefill (batched) %d tokens in %.2f s decode + %.2f ms bridge\n",
+            n_prompt, prefill_decode_ms / 1000.0, bridge_ms);
+
+    // llama context no longer needed past this point. Freeing here keeps
+    // memory tight during the (much longer) gen phase.
+    llama_free(lctx);
+    lctx = nullptr;
+
+    // ---- Generation (same code path as phi3_run_qquant_decode) ----
+    // Reset per-op accumulators so the printed summary reflects steady-
+    // state gen costs only (consistent with phi3_run_qquant_decode).
+    if (cx.prof.enabled) {
+        cx.prof = Phi3DecodeProfile{};
+        cx.prof.enabled = true;
+    }
+
+    std::vector<float> hidden((size_t) n_embd);
+    auto step = [&](int tok, int pos) -> bool {
+        if (!phi3_full_forward_qquant(cx, tok, pos, hidden.data(), error)) return false;
+        for (int i = 0; i < n_embd; ++i) {
+            if (!std::isfinite(hidden[i])) {
+                std::ostringstream oss;
+                oss << "phi3 qquant-hybrid: non-finite hidden at pos=" << pos
+                    << " dim=" << i << " val=" << hidden[i];
+                error = oss.str();
+                return false;
+            }
+        }
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.lmhead_ns);
+            llama_token best = 0;
+            if (!phi3_fused_lmhead_argmax(lm, /*pool=*/nullptr, hidden.data(),
+                                          /*n_threads=*/1, best, error)) return false;
+            tok = best;
+        }
+        next_tok = tok;
+        return true;
+    };
+
+    out_generated.reserve(out_generated.size() + n_gen);
+    out_generated.push_back(next_tok);
+
+    const auto t_gen_start = std::chrono::steady_clock::now();
+    for (int i = 1; i < n_gen; ++i) {
+        const int pos = n_prompt + i - 1;
+        if (!step(next_tok, pos)) {
+            phi3_fused_ctx_free(cx);
+            phi3_matmul_pool_free(pool);
+            return false;
+        }
+        out_generated.push_back(next_tok);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen_start).count();
+    fprintf(stderr, "phi3 qquant-hybrid: generated %d tokens in %.2f s (%.3f s/tok)\n",
+            n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+
+    cx.prof.n_tokens = (uint64_t) std::max(0, n_gen - 1);
+
+    // ---- Per-op profile summary (identical layout to phi3_run_qquant_decode).
+    if (cx.prof.enabled && cx.prof.n_tokens > 0) {
+        const Phi3DecodeProfile & p = cx.prof;
+        const double nt    = (double) p.n_tokens;
+        const double inv_us = 1.0 / 1000.0;
+        auto avg = [&](uint64_t ns) -> double { return (double) ns / nt * inv_us; };
+
+        const double matmul_us =
+            avg(p.wqkv_ns) + avg(p.wo_ns) + avg(p.ffn_up_ns) + avg(p.ffn_down_ns) + avg(p.lmhead_ns);
+        const double other_us =
+            avg(p.embed_ns) + avg(p.attn_norm_ns) + avg(p.rope_ns) + avg(p.kv_write_ns) +
+            avg(p.attn_ns) + avg(p.res1_ns) + avg(p.ffn_norm_ns) + avg(p.swiglu_ns) +
+            avg(p.res2_ns) + avg(p.final_norm_ns);
+        const double measured_us = matmul_us + other_us;
+        const double wall_us     = gen_ms * 1000.0 / nt;
+        const double unaccounted = wall_us - measured_us;
+        const double pct = (measured_us > 0.0) ? (100.0 / measured_us) : 0.0;
+
+        fprintf(stderr, "\nphi3 qquant-hybrid: per-op profile (avg us/token over %llu gen tokens):\n",
+                (unsigned long long) p.n_tokens);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x1]\n",   "embed",      avg(p.embed_ns),      avg(p.embed_ns)      * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "attn_norm",  avg(p.attn_norm_ns),  avg(p.attn_norm_ns)  * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","wqkv",      avg(p.wqkv_ns),       avg(p.wqkv_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "rope",       avg(p.rope_ns),       avg(p.rope_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "kv_write",   avg(p.kv_write_ns),   avg(p.kv_write_ns)   * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "attn",       avg(p.attn_ns),       avg(p.attn_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","wo",        avg(p.wo_ns),         avg(p.wo_ns)         * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "res1",       avg(p.res1_ns),       avg(p.res1_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "ffn_norm",   avg(p.ffn_norm_ns),   avg(p.ffn_norm_ns)   * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","ffn_up",    avg(p.ffn_up_ns),     avg(p.ffn_up_ns)     * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "swiglu",     avg(p.swiglu_ns),     avg(p.swiglu_ns)     * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32 MM]\n","ffn_down",  avg(p.ffn_down_ns),   avg(p.ffn_down_ns)   * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x32]\n",  "res2",       avg(p.res2_ns),       avg(p.res2_ns)       * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x1]\n",   "final_norm", avg(p.final_norm_ns), avg(p.final_norm_ns) * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   [x1 MM]\n","lmhead",     avg(p.lmhead_ns),     avg(p.lmhead_ns)     * pct);
+        fprintf(stderr, "  -----------------------------------------------------\n");
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   matmul = wqkv+wo+ffn_up+ffn_down+lmhead\n",
+                "MATMUL sum", matmul_us, matmul_us * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (%5.2f%%)   everything else\n",
+                "OTHER sum",  other_us,  other_us  * pct);
+        fprintf(stderr, "  %-12s %10.2f us  (100.00%%)  sum of all per-op buckets\n",
+                "measured",  measured_us);
+        fprintf(stderr, "  %-12s %10.2f us              wall clock per token (gen_ms/n_tokens)\n",
+                "wall/tok",  wall_us);
+        fprintf(stderr, "  %-12s %10.2f us              wall - measured (timer overhead + untracked)\n",
+                "unacctd",   unaccounted);
+    }
+
+    phi3_fused_ctx_free(cx);
+    phi3_matmul_pool_free(pool);
+    return true;
+}
+
+// ===========================================================================
 // A2.5c — Baseline oracle + 3-prompt regression driver.
 // ===========================================================================
 
