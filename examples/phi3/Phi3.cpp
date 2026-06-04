@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -63,6 +63,11 @@ int main(int argc, char ** argv) {
     // A/B comparison via --phi3-fused-qquant-rmsnorm-fuse 0|1; path is
     // bit-identical (see "rmsnorm+quant_q8K" in --phi3-kernel-test).
     int  fused_qquant_rmsnorm_fuse = 0;
+    // A3.y — parallelize the per-head attention loop in the qquant decode
+    // path across the matmul pool's workers. Bit-identical to serial; only
+    // takes effect when n_threads > 1. Default OFF for first commit;
+    // user opts in via --phi3-fused-qquant-attn-parallel 1.
+    int  fused_qquant_attn_parallel = 0;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -200,6 +205,18 @@ int main(int argc, char ** argv) {
                     fused_qquant_rmsnorm_fuse = std::stoi(argv[++i]);
                     if (fused_qquant_rmsnorm_fuse != 0 && fused_qquant_rmsnorm_fuse != 1) {
                         fprintf(stderr, "error: --phi3-fused-qquant-rmsnorm-fuse expects 0 or 1\n");
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-attn-parallel") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_attn_parallel = std::stoi(argv[++i]);
+                    if (fused_qquant_attn_parallel != 0 && fused_qquant_attn_parallel != 1) {
+                        fprintf(stderr, "error: --phi3-fused-qquant-attn-parallel expects 0 or 1\n");
                         print_usage(argc, argv);
                         return 1;
                     }
@@ -351,6 +368,7 @@ int main(int argc, char ** argv) {
                                                      fused_qquant_regress_n_gen,
                                                      reg_t_prefill, reg_t_gen, reg_t_qquant,
                                                      /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                     /*attn_parallel=*/fused_qquant_attn_parallel != 0,
                                                      pass, rerr);
         if (!ok_call) {
             fprintf(stderr, "phi3 qquant-regress: HARNESS ERROR: %s\n", rerr.c_str());
@@ -592,6 +610,7 @@ int main(int argc, char ** argv) {
                                                                 fused_qquant_n_gen, qq_threads,
                                                                 /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
                                                                 /*profile_per_op=*/fused_qquant_profile,
+                                                                /*attn_parallel=*/fused_qquant_attn_parallel != 0,
                                                                 gen_tokens, qerr);
                         if (!qok) {
                             fprintf(stderr, "phi3 qquant-debug: FAIL: %s\n", qerr.c_str());

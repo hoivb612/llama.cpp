@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -400,6 +401,68 @@ void phi3_matmul_compute_range(const Phi3MatmulJob & j, int lo, int hi) {
     }
 }
 
+// A3.y — per-head attention worker. Computes K*Q -> softmax -> V*scores for
+// heads [h_lo, h_hi) using this worker's private scratch slice. Bit-identical
+// to the serial loop in phi3_layer_forward_qquant section 5: same op order
+// per head, same per-head F32/F16 reductions, and each head writes a
+// disjoint slice of `ctx_base` so the cross-head order is irrelevant.
+void phi3_attn_compute_heads(const Phi3AttnJob & j, int wid, int W) {
+    if (W <= 0 || j.f16_traits == nullptr || j.f16_traits->vec_dot == nullptr ||
+        j.f16_traits->from_float == nullptr) {
+        return;
+    }
+    const int n_head    = j.n_head;
+    const int n_head_kv = j.n_head_kv;
+    const int head_dim  = j.head_dim;
+    const int new_len   = j.new_len;
+    const int ctx_max_v = j.ctx_max_v;
+    const float scale_q = j.scale_q;
+
+    const int h_lo = (int) (((int64_t) wid       * n_head) / W);
+    const int h_hi = (int) (((int64_t) (wid + 1) * n_head) / W);
+    if (h_lo >= h_hi) return;
+
+    ggml_fp16_t * q_h_f16    = j.q_h_f16_base    + (size_t) wid * (size_t) j.stride_q_f16;
+    float       * scores     = j.scores_base     + (size_t) wid * (size_t) j.stride_s_f32;
+    ggml_fp16_t * scores_f16 = j.scores_f16_base + (size_t) wid * (size_t) j.stride_s_f16;
+
+    const auto * tr = j.f16_traits;
+
+    for (int h = h_lo; h < h_hi; ++h) {
+        const float * q_h = j.q_base + (size_t) h * (size_t) head_dim;
+        tr->from_float(q_h, q_h_f16, head_dim);
+
+        float max_s = -std::numeric_limits<float>::infinity();
+        for (int p = 0; p < new_len; ++p) {
+            const ggml_fp16_t * k_p = j.K_base + ((size_t) p * (size_t) n_head_kv + (size_t) h) * (size_t) head_dim;
+            float s = 0.0f;
+            tr->vec_dot(head_dim, &s, 0, k_p, 0, q_h_f16, 0, 1);
+            s *= scale_q;
+            scores[p] = s;
+            if (s > max_s) max_s = s;
+        }
+        float sum_exp = 0.0f;
+        for (int p = 0; p < new_len; ++p) {
+            scores[p] = std::exp(scores[p] - max_s);
+            sum_exp += scores[p];
+        }
+        const float inv_sum = 1.0f / sum_exp;
+        for (int p = 0; p < new_len; ++p) {
+            scores[p] *= inv_sum;
+        }
+        tr->from_float(scores, scores_f16, new_len);
+
+        float * ctx_h = j.ctx_base + (size_t) h * (size_t) head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            const ggml_fp16_t * v_strip =
+                j.V_base + ((size_t) d * (size_t) n_head_kv + (size_t) h) * (size_t) ctx_max_v;
+            float s = 0.0f;
+            tr->vec_dot(new_len, &s, 0, v_strip, 0, scores_f16, 0, 1);
+            ctx_h[d] = s;
+        }
+    }
+}
+
 void phi3_matmul_worker_loop(Phi3MatmulPool * pool, int wid) {
     uint64_t last_seq = 0;
     while (true) {
@@ -466,12 +529,18 @@ void phi3_matmul_worker_loop(Phi3MatmulPool * pool, int wid) {
 
         // Acquire on job_seq above synchronizes with the driver's release store,
         // so the job struct fields are safe to read.
-        const Phi3MatmulJob j = pool->job;
-        const int N = j.N_total;
-        const int W = pool->n_threads;
-        const int lo = (int) (((int64_t) wid * N) / W);
-        const int hi = (int) (((int64_t) (wid + 1) * N) / W);
-        phi3_matmul_compute_range(j, lo, hi);
+        const Phi3PoolJobKind kind = pool->job_kind;
+        if (kind == Phi3PoolJobKind::ATTN) {
+            const Phi3AttnJob j = pool->attn_job;
+            phi3_attn_compute_heads(j, wid, pool->n_threads);
+        } else {
+            const Phi3MatmulJob j = pool->job;
+            const int N = j.N_total;
+            const int W = pool->n_threads;
+            const int lo = (int) (((int64_t) wid * N) / W);
+            const int hi = (int) (((int64_t) (wid + 1) * N) / W);
+            phi3_matmul_compute_range(j, lo, hi);
+        }
 
         pool->done_count.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -529,7 +598,8 @@ void phi3_matmul_pool_run(Phi3MatmulPool * pool, const Phi3MatmulJob & job) {
         return;
     }
 
-    pool->job = job;
+    pool->job      = job;
+    pool->job_kind = Phi3PoolJobKind::MATMUL;
     pool->done_count.store(0, std::memory_order_release);
     // Publish job under cv mutex so phase-3-parked workers see the seq bump
     // AND get woken. Workers in phases 1/2 observe via the acquire load.
@@ -540,6 +610,31 @@ void phi3_matmul_pool_run(Phi3MatmulPool * pool, const Phi3MatmulJob & job) {
     pool->cv_work.notify_all();
 
     // Driver tight-spins on done_count for the short matmul burst.
+    const int target = pool->n_threads;
+    while (pool->done_count.load(std::memory_order_acquire) < target) {
+        phi3_cpu_pause();
+    }
+}
+
+void phi3_attn_pool_run(Phi3MatmulPool * pool, const Phi3AttnJob & job) {
+    if (!pool || !pool->initialized || pool->n_threads <= 1) {
+        // Fallback: run on the calling thread. The driver supplies its own
+        // scratch slice at wid=0; pool stride fields may be unset in that
+        // case, but the helper only indexes wid * stride = 0.
+        phi3_attn_compute_heads(job, /*wid=*/0, /*W=*/1);
+        return;
+    }
+
+    pool->attn_job = job;
+    pool->job_kind = Phi3PoolJobKind::ATTN;
+    pool->done_count.store(0, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(pool->mtx);
+        pool->job_seq.fetch_add(1, std::memory_order_acq_rel);
+    }
+    pool->cv_work.notify_all();
+
+    // Driver tight-spins on done_count for the attention burst.
     const int target = pool->n_threads;
     while (pool->done_count.load(std::memory_order_acquire) < target) {
         phi3_cpu_pause();

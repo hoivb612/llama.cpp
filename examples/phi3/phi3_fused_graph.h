@@ -241,6 +241,24 @@ struct Phi3ForwardScratch {
     std::vector<float>   w_f32_vocab_chunk;   // [f32_vocab_chunk * n_embd]
     int32_t              f32_vocab_chunk    = 256;
     int32_t              f32_cached_layer   = -1;
+
+    // A3.y — per-thread attention scratch for the parallel per-head dispatch
+    // in phi3_layer_forward_qquant section 5. Allocated when the matmul pool
+    // is present (n_threads > 1). Each worker w reads/writes its own slice:
+    //   q_h_f16    = attn_q_h_f16_pool.data()    + w * attn_stride_q_f16
+    //   scores     = attn_scores_pool.data()     + w * attn_stride_s_f32
+    //   scores_f16 = attn_scores_f16_pool.data() + w * attn_stride_s_f16
+    // Strides are rounded up so each slice starts on a 64-byte boundary;
+    // this avoids false sharing between adjacent workers' scratch.
+    // Off-path when pool is null/single-threaded or --phi3-fused-qquant-
+    // attn-parallel is 0 — the existing serial loop allocates per-call.
+    int                  attn_pool_workers  = 0;
+    int                  attn_stride_q_f16  = 0;  // padded head_dim (F16 elts)
+    int                  attn_stride_s_f32  = 0;  // padded ctx_max (F32 elts)
+    int                  attn_stride_s_f16  = 0;  // padded ctx_max (F16 elts)
+    std::vector<ggml_fp16_t> attn_q_h_f16_pool;
+    std::vector<float>       attn_scores_pool;
+    std::vector<ggml_fp16_t> attn_scores_f16_pool;
 };
 
 // A3.x — per-op profile accumulators (nanoseconds). All buckets are summed
@@ -294,6 +312,15 @@ struct Phi3FusedCtx {
     // --phi3-fused-qquant-rmsnorm-fuse 0|1 for educational reference.
     // See phi3_fused_rmsnorm_quant_q8K.
     bool                 fuse_rmsnorm_quant = false;
+
+    // A3.y (experiment) — split the per-head attention loop in
+    // phi3_layer_forward_qquant section 5 across the matmul pool's
+    // workers. Each thread handles a contiguous range of heads and
+    // writes to disjoint slices of `attn_ctx`, so the dispatch is
+    // bit-identical to the serial loop. Only takes effect when the
+    // pool is initialized with n_threads > 1. Default OFF for the
+    // first commit; gated by --phi3-fused-qquant-attn-parallel 0|1.
+    bool                 attn_parallel = false;
 
     // A3.x per-op profile. enabled=false (default) makes every timer a
     // no-op branch. Reset & emit are driven by phi3_run_qquant_decode.
@@ -502,6 +529,7 @@ bool phi3_run_qquant_decode(
         int                            n_threads,
         bool                           fuse_rmsnorm_quant,
         bool                           profile_per_op,
+        bool                           attn_parallel,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);
 
@@ -542,5 +570,6 @@ bool phi3_run_qquant_regress(
         int                 n_threads_gen,
         int                 n_threads_qquant,
         bool                fuse_rmsnorm_quant,
+        bool                attn_parallel,
         bool              & out_pass,
         std::string       & error);

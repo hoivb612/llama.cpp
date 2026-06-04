@@ -11,6 +11,7 @@
 #include <vector>
 
 struct ggml_tensor;
+struct ggml_type_traits_cpu;
 
 // Fused lm_head + greedy argmax for Phi3 Phase C.
 //
@@ -125,11 +126,56 @@ struct Phi3MatmulJob {
     int                                 N_total  = 0;        // total output rows
 };
 
+// A3.y — per-head attention job dispatched through the same persistent pool.
+// Workers each take a contiguous range of attention heads; outputs write to
+// disjoint slices of `ctx_base` so no synchronization is needed inside the
+// dispatch. Scratch (q_h_f16 / scores / scores_f16) is per-thread, cache-line
+// padded by the caller to avoid false sharing.
+//
+// Bit-identical to the serial per-head loop in phi3_layer_forward_qquant
+// section 5: each head's K*Q -> softmax -> V*scores sequence is preserved
+// in op order; only the order between heads (which writes to disjoint
+// output) changes.
+struct Phi3AttnJob {
+    // Per-attention inputs.
+    const float *                       q_base    = nullptr;  // [n_head * head_dim] F32
+    const ggml_fp16_t *                 K_base    = nullptr;  // K cache layer base, pos-major [new_len, n_head_kv, head_dim] F16
+    const ggml_fp16_t *                 V_base    = nullptr;  // V cache layer base, transposed [head_dim, n_head_kv, ctx_max_v] F16
+    float *                             ctx_base  = nullptr;  // [n_head * head_dim] F32 output
+
+    int                                 n_head     = 0;
+    int                                 n_head_kv  = 0;
+    int                                 head_dim   = 0;
+    int                                 new_len    = 0;
+    int                                 ctx_max_v  = 0;
+    float                               scale_q    = 0.0f;
+
+    // F16 type traits (vec_dot + from_float). Same pointer used for K*Q,
+    // V*scores, and the per-head Q quantization step.
+    const struct ggml_type_traits_cpu * f16_traits = nullptr;
+
+    // Per-thread scratch. Each worker w reads/writes its own slice starting
+    // at base + w * stride. Strides are in element units.
+    ggml_fp16_t *                       q_h_f16_base    = nullptr;  // [W * stride_q_f16]
+    float *                             scores_base     = nullptr;  // [W * stride_s_f32]
+    ggml_fp16_t *                       scores_f16_base = nullptr;  // [W * stride_s_f16]
+    int                                 stride_q_f16    = 0;
+    int                                 stride_s_f32    = 0;
+    int                                 stride_s_f16    = 0;
+};
+
+enum class Phi3PoolJobKind : int {
+    MATMUL = 0,
+    ATTN   = 1,
+};
+
 struct Phi3MatmulPool {
     int  n_threads   = 0;
     bool initialized = false;
 
-    Phi3MatmulJob job;
+    Phi3MatmulJob   job;          // populated when job_kind == MATMUL
+    Phi3AttnJob     attn_job;     // populated when job_kind == ATTN
+    Phi3PoolJobKind job_kind = Phi3PoolJobKind::MATMUL;
 
     std::vector<std::thread>          workers;
     std::mutex                        mtx;
@@ -160,3 +206,11 @@ void phi3_matmul_pool_free(Phi3MatmulPool & pool);
 // copied into the pool; caller may reuse its storage immediately after this
 // returns.
 void phi3_matmul_pool_run(Phi3MatmulPool * pool, const Phi3MatmulJob & job);
+
+// Dispatch one per-head attention job and wait for completion. Workers split
+// the head range [0, n_head) evenly. When pool is null/uninitialized/single-
+// threaded, runs the whole head range on the calling thread (the caller's
+// per-thread scratch slice at wid=0 is used in that case). The job struct
+// is copied into the pool; caller may reuse its storage immediately after
+// this returns.
+void phi3_attn_pool_run(Phi3MatmulPool * pool, const Phi3AttnJob & job);

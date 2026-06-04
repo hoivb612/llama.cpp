@@ -1352,6 +1352,26 @@ bool phi3_fused_ctx_init(
     out.scratch.upgate_buf.assign((size_t) 2 * w.n_ff,   0.0f);
     out.scratch.ff_buf    .assign(w.n_ff,                0.0f);
 
+    // A3.y — per-thread attention scratch. Sized for the pool's worker
+    // count so each worker has a cache-line-padded private slice. When the
+    // pool is null or single-threaded we leave the buffers empty: the
+    // section-5 serial path will use its own per-call std::vector
+    // allocations (unchanged from A2.5c).
+    if (matmul_pool != nullptr && matmul_pool->initialized && matmul_pool->n_threads > 1) {
+        const int W        = matmul_pool->n_threads;
+        const int head_dim = w.n_embd_head;
+        // Round up so each per-thread slice starts on a 64-byte boundary
+        // (16 F32 elts or 32 F16 elts). Eliminates false sharing.
+        auto align_up = [](int n, int a) { return (n + a - 1) / a * a; };
+        out.scratch.attn_pool_workers = W;
+        out.scratch.attn_stride_q_f16 = align_up(head_dim, 32);
+        out.scratch.attn_stride_s_f32 = align_up(ctx_max,  16);
+        out.scratch.attn_stride_s_f16 = align_up(ctx_max,  32);
+        out.scratch.attn_q_h_f16_pool   .assign((size_t) W * (size_t) out.scratch.attn_stride_q_f16, (ggml_fp16_t) 0);
+        out.scratch.attn_scores_pool    .assign((size_t) W * (size_t) out.scratch.attn_stride_s_f32, 0.0f);
+        out.scratch.attn_scores_f16_pool.assign((size_t) W * (size_t) out.scratch.attn_stride_s_f16, (ggml_fp16_t) 0);
+    }
+
     if (f32_debug) {
         out.scratch.f32_debug = true;
         // Per-layer transient F32 mirrors. Allocated once; overwritten per layer.
@@ -1388,6 +1408,10 @@ void phi3_fused_ctx_free(Phi3FusedCtx & cx) {
     cx.scratch.w_f32_ffn_down.clear();  cx.scratch.w_f32_ffn_down.shrink_to_fit();
     cx.scratch.w_f32_vocab_chunk.clear();
     cx.scratch.w_f32_vocab_chunk.shrink_to_fit();
+    cx.scratch.attn_q_h_f16_pool.clear();    cx.scratch.attn_q_h_f16_pool.shrink_to_fit();
+    cx.scratch.attn_scores_pool.clear();     cx.scratch.attn_scores_pool.shrink_to_fit();
+    cx.scratch.attn_scores_f16_pool.clear(); cx.scratch.attn_scores_f16_pool.shrink_to_fit();
+    cx.scratch.attn_pool_workers = 0;
     cx.w           = nullptr;
     cx.matmul_pool = nullptr;
     cx.cur_pos     = 0;
@@ -3317,13 +3341,54 @@ bool phi3_layer_forward_qquant(
     //            is contiguous along pos under the transposed cache layout.
     //            This bit-matches baseline's V mul_mat (V is F16, scores
     //            quantized to vec_dot_type=F16, contiguous reduction over pos).
+    const int ctx_max_v = cx.kv.ctx_max;
+    const float scale_q = 1.0f / std::sqrt((float) head_dim);
+
+    // A3.y — when the matmul pool is initialized with > 1 worker AND the
+    // user opted in via --phi3-fused-qquant-attn-parallel 1, dispatch the
+    // per-head attention loop through the same persistent pool. Workers
+    // split the head range evenly; each writes to a disjoint slice of
+    // attn_ctx. Bit-identical to the serial loop below: per-head op order
+    // is preserved, only the cross-head order changes (and that's
+    // irrelevant because outputs are disjoint).
+    //
+    // Trivial-work guard: at new_len == 1 the per-head work is just
+    // 1 vec_dot for K*Q + head_dim vec_dots of length 1 for V*scores --
+    // dispatch overhead would dominate. Skip the pool path in that case.
+    const bool use_attn_pool = cx.attn_parallel
+        && cx.matmul_pool && cx.matmul_pool->initialized
+        && cx.matmul_pool->n_threads > 1
+        && cx.scratch.attn_pool_workers == cx.matmul_pool->n_threads
+        && new_len > 1;
+
     const auto * f16_traits_cpu = ggml_get_type_traits_cpu(GGML_TYPE_F16);
     if (!f16_traits_cpu || !f16_traits_cpu->vec_dot || !f16_traits_cpu->from_float) {
         error = "phi3_layer_forward_qquant: F16 type traits missing";
         return false;
     }
-    const int ctx_max_v = cx.kv.ctx_max;
-    const float scale_q = 1.0f / std::sqrt((float) head_dim);
+
+    if (use_attn_pool) {
+        PhiTimer _t(cx.prof.enabled, cx.prof.attn_ns);
+        Phi3AttnJob aj;
+        aj.q_base          = q;
+        aj.K_base          = cx.kv.K[il];
+        aj.V_base          = cx.kv.V[il];
+        aj.ctx_base        = attn_ctx.data();
+        aj.n_head          = n_head;
+        aj.n_head_kv       = n_head_kv;
+        aj.head_dim        = head_dim;
+        aj.new_len         = new_len;
+        aj.ctx_max_v       = ctx_max_v;
+        aj.scale_q         = scale_q;
+        aj.f16_traits      = f16_traits_cpu;
+        aj.q_h_f16_base    = cx.scratch.attn_q_h_f16_pool.data();
+        aj.scores_base     = cx.scratch.attn_scores_pool.data();
+        aj.scores_f16_base = cx.scratch.attn_scores_f16_pool.data();
+        aj.stride_q_f16    = cx.scratch.attn_stride_q_f16;
+        aj.stride_s_f32    = cx.scratch.attn_stride_s_f32;
+        aj.stride_s_f16    = cx.scratch.attn_stride_s_f16;
+        phi3_attn_pool_run(cx.matmul_pool, aj);
+    } else {
     std::vector<float>       scores((size_t) new_len);
     std::vector<ggml_fp16_t> scores_f16((size_t) new_len);
     std::vector<ggml_fp16_t> q_h_f16((size_t) head_dim);
@@ -3363,6 +3428,7 @@ bool phi3_layer_forward_qquant(
                 ctx_h[d] = s;
             }
         }
+    }
     }
 
     // --- 6. wo (q-quant, pool-dispatched) ---
@@ -3517,6 +3583,7 @@ bool phi3_run_qquant_decode(
         int                            n_threads,
         bool                           fuse_rmsnorm_quant,
         bool                           profile_per_op,
+        bool                           attn_parallel,
         std::vector<llama_token>     & out_generated,
         std::string                  & error) {
     error.clear();
@@ -3573,6 +3640,7 @@ bool phi3_run_qquant_decode(
         return false;
     }
     cx.fuse_rmsnorm_quant = fuse_rmsnorm_quant;
+    cx.attn_parallel      = attn_parallel;
     // A3.x — per-op profile (off unless --phi3-fused-qquant-profile). Enabled
     // for the whole prefill+gen run; the accumulators are reset after prefill
     // so the printed summary reflects steady-state gen-step costs only.
@@ -3587,9 +3655,10 @@ bool phi3_run_qquant_decode(
     }
 
     fprintf(stderr,
-            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s, rmsnorm_fuse=%s, profile=%s)\n",
+            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s, rmsnorm_fuse=%s, attn_parallel=%s, profile=%s)\n",
             n_prompt, n_gen, ctx_max, n_threads, pool.initialized ? "on" : "off",
             fuse_rmsnorm_quant ? "on" : "off",
+            attn_parallel ? "on" : "off",
             profile_per_op ? "on" : "off");
 
     std::vector<float> hidden((size_t) n_embd);
@@ -3906,6 +3975,7 @@ bool phi3_run_qquant_regress(
         int                 n_threads_gen,
         int                 n_threads_qquant,
         bool                fuse_rmsnorm_quant,
+        bool                attn_parallel,
         bool              & out_pass,
         std::string       & error) {
     error.clear();
@@ -3994,6 +4064,7 @@ bool phi3_run_qquant_regress(
         if (!phi3_run_qquant_decode(model, prompt_tokens, n_gen, n_threads_qquant,
                                     fuse_rmsnorm_quant,
                                     /*profile_per_op=*/false,
+                                    attn_parallel,
                                     qquant_tokens, qerr)) {
             error = std::string("phi3_run_qquant_regress: qquant_decode failed: ") + qerr;
             return false;
