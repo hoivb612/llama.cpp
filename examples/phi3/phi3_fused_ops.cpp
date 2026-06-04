@@ -375,6 +375,24 @@ void phi3_fused_lmhead_pool_free(Phi3LmHeadPool & pool) {
 // See header for design rationale.
 // ---------------------------------------------------------------------------
 
+// A4.1 — returns true iff weight type `t` is in the _x8 repacked family. For
+// these types BOTH the trait-pointed vec_dot variants (xx_vec_dot_q{N}_k_q8_k_x8
+// and its _dc fallback) accept the batched call signature with `by=ncols` and
+// `nrc=nrows`. The cp variant tiles 4 activation cols per weight load (the win);
+// the dc variant iterates cols one-at-a-time but still emits correct output.
+// Either way our batched call is safe regardless of which #if branch was compiled.
+// Public so callers (e.g., phi3_fused_graph.cpp) can gate batched prefill setup.
+bool phi3_x8_batched_eligible(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_K_x8:
+        case GGML_TYPE_Q3_K_x8:
+        case GGML_TYPE_Q6_K_x8:
+            return true;
+        default:
+            return false;
+    }
+}
+
 namespace {
 
 inline void phi3_cpu_pause() {
@@ -392,6 +410,25 @@ void phi3_matmul_compute_range(const Phi3MatmulJob & j, int lo, int hi) {
     if (!j.w_traits || !j.w_traits->vec_dot || lo >= hi) {
         return;
     }
+
+    // A4.1 — batched path: one trait-pointer call per worker for the full row
+    // slice * all M_act columns. Eligibility requires the caller to have laid
+    // out src_q (M_act columns of q8_K_repack super-blocks back-to-back) and
+    // dst (column-major, stride dst_col_stride_bytes between cols). The trait
+    // pointer's signature is positionally compatible: `bs -> nr_nb1`,
+    // `by -> ncols`, `nrc -> nrows`.
+    if (j.M_act > 1 && phi3_x8_batched_eligible(j.w_type) && j.dst_col_stride_bytes != 0) {
+        j.w_traits->vec_dot(
+            j.K,
+            j.dst + lo,
+            j.dst_col_stride_bytes,
+            j.w_base + (size_t) lo * j.w_row_bytes, 0,
+            j.src_q,
+            (size_t) j.M_act,
+            hi - lo);
+        return;
+    }
+
     for (int v = lo; v < hi; ++v) {
         float s = 0.0f;
         j.w_traits->vec_dot(j.K, &s, 0,

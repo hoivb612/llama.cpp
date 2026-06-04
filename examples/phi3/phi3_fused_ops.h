@@ -121,10 +121,29 @@ struct Phi3MatmulJob {
     const uint8_t *                     w_base   = nullptr;  // base of weight matrix (row-contiguous K-quant)
     size_t                              w_row_bytes = 0;     // ggml_row_size(w->type, K)
     const void *                        src_q    = nullptr;  // pre-quantized src (q_type = w_traits->vec_dot_type)
-    float *                             dst      = nullptr;  // F32 output, length N_total
+    float *                             dst      = nullptr;  // F32 output, length N_total (or N_total * M_act if batched)
     int                                 K        = 0;        // inner dim
     int                                 N_total  = 0;        // total output rows
+
+    // A4.1 — batched prefill matmul support. When M_act > 1 AND w_type is in the
+    // x8 repacked family (--repack-ggml or --repack-xbcg), the worker calls into
+    // xx_vec_dot_q{N}_k_q8_k_x8 once per row slice for ALL M_act activation
+    // columns at once, amortizing weight memory traffic ~4x. When M_act == 1 or
+    // w_type is not in the x8 family, falls back to the existing per-row path.
+    //   - src_q layout when M_act>1: M_act columns laid back-to-back, each column
+    //     is `nb` consecutive `block_q{N}_K_repack` super-blocks.
+    //   - dst layout when M_act>1: column-major, dst[col*N_total + row].
+    //   - dst_col_stride_bytes = N_total * sizeof(float) for the standard layout.
+    int                                 M_act               = 1;
+    size_t                              dst_col_stride_bytes = 0;
+    enum ggml_type                      w_type              = GGML_TYPE_COUNT;
 };
+
+// A4.1 — returns true iff weight type `t` has an associated batched _x8 matmul
+// kernel that this module can dispatch directly. Callers should use this to
+// decide whether to lay out activations + dst in batched form before calling
+// into the pool with M_act > 1. False for non-repacked types (NONE or XBOX).
+bool phi3_x8_batched_eligible(enum ggml_type t);
 
 // A3.y — per-head attention job dispatched through the same persistent pool.
 // Workers each take a contiguous range of attention heads; outputs write to
