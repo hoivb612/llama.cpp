@@ -253,6 +253,13 @@ struct Phi3FusedCtx {
     Phi3KV               kv;
     Phi3ForwardScratch   scratch;
     int32_t              cur_pos     = 0;
+
+    // A3.2 — fuse RMSNorm + multiply + quantize-to-Q8K at the two
+    // attn_norm -> wqkv and ffn_norm -> ffn_up junctions. Set to false
+    // to fall back to the A2.5b unfused path for A/B comparison. The
+    // fused path is bit-identical to the unfused path; the only
+    // observable effect is gen_tps. See phi3_fused_rmsnorm_quant_q8K.
+    bool                 fuse_rmsnorm_quant = true;
 };
 
 // 24-feature validator (see __phase_A2_spec.md §1.5). Returns true if the
@@ -455,6 +462,7 @@ bool phi3_run_qquant_decode(
         const std::vector<llama_token> & prompt_tokens,
         int                            n_gen,
         int                            n_threads,
+        bool                           fuse_rmsnorm_quant,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);
 
@@ -494,5 +502,6 @@ bool phi3_run_qquant_regress(
         int                 n_threads_prefill,
         int                 n_threads_gen,
         int                 n_threads_qquant,
+        bool                fuse_rmsnorm_quant,
         bool              & out_pass,
         std::string       & error);

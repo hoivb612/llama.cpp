@@ -658,6 +658,77 @@ void phi3_kernel_rmsnorm_mul_f32(float * dst, const float * src, const float * w
     }
 }
 
+// A3.2 — Fused RMSNorm + multiply + quantize-to-Q8_K.
+//
+// Mathematically equivalent to (and intended to be bit-identical to):
+//   std::vector<float> tmp(n);
+//   phi3_kernel_rmsnorm_mul_f32(tmp.data(), src, w_norm, n, eps);
+//   q8K_traits->from_float(tmp.data(), y_q8k, n);
+//
+// Memory-traffic win: the intermediate F32 normalized vector is never
+// materialized in main memory. After the sum-of-squares pass over src,
+// each block of QK_K=256 elements is normalized into a small stack-
+// resident scratch and immediately quantized into the corresponding
+// Q8_K block of y_q8k. Per-block scratch stays L1-hot.
+//
+// Pre: n % QK_K == 0. Caller must ensure y_q8k has at least
+// ggml_row_size(GGML_TYPE_Q8_K, n) bytes.
+//
+// Returns false with `error` populated on contract violation or if Q8_K
+// from_float lookup fails (should never happen — Q8_K is unconditionally
+// registered in ggml-cpu's type traits).
+bool phi3_fused_rmsnorm_quant_q8K(
+        const float * src,
+        const float * w_norm,
+        void        * y_q8k,
+        int           n,
+        float         eps,
+        std::string & error) {
+    constexpr int QKK = 256; // ggml-common.h: #define QK_K 256
+
+    if (src == nullptr || w_norm == nullptr || y_q8k == nullptr) {
+        error = "phi3_fused_rmsnorm_quant_q8K: null pointer";
+        return false;
+    }
+    if (n <= 0 || (n % QKK) != 0) {
+        std::ostringstream oss;
+        oss << "phi3_fused_rmsnorm_quant_q8K: n=" << n
+            << " not a positive multiple of QK_K=" << QKK;
+        error = oss.str();
+        return false;
+    }
+    const auto * q_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!q_traits || !q_traits->from_float) {
+        error = "phi3_fused_rmsnorm_quant_q8K: Q8_K from_float not registered";
+        return false;
+    }
+
+    // Pass 1: sum-of-squares (double accumulator to match
+    // ggml_compute_forward_rms_norm_f32 / phi3_kernel_rmsnorm_mul_f32).
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += (double) src[i] * (double) src[i];
+    }
+    const float mean  = (float) (sum / (double) n);
+    const float scale = 1.0f / std::sqrt(mean + eps);
+
+    // Pass 2: per-block normalize+mul into a stack-resident scratch
+    // (1 KB, stays in L1), then quantize that one block to Q8_K.
+    const size_t block_bytes = ggml_row_size(GGML_TYPE_Q8_K, QKK); // == sizeof(block_q8_K)
+    uint8_t * y_bytes = (uint8_t *) y_q8k;
+    alignas(16) float tmp[QKK];
+    const int nb = n / QKK;
+    for (int b = 0; b < nb; ++b) {
+        const float * src_b = src    + (size_t) b * QKK;
+        const float * w_b   = w_norm + (size_t) b * QKK;
+        for (int j = 0; j < QKK; ++j) {
+            tmp[j] = src_b[j] * scale * w_b[j];
+        }
+        q_traits->from_float(tmp, y_bytes + (size_t) b * block_bytes, QKK);
+    }
+    return true;
+}
+
 // ---- Helper 2: token embedding row dequant -------------------------------
 // Reads one row of length n_embd from a quantized weight matrix of shape
 // {n_embd, n_vocab} and writes n_embd F32 floats. tok_embd is stored
@@ -758,6 +829,63 @@ bool test_rmsnorm(std::string & error) {
 
     // Reduction order differs vs ggml SIMD path -> small relative tolerance.
     return kernel_close(ours.data(), oracle.data(), n_embd, 1e-4f, 1e-4f, error, "rmsnorm");
+}
+
+// A3.2 self-test: phi3_fused_rmsnorm_quant_q8K must be byte-identical
+// to the explicit (rmsnorm + separate from_float) sequence it replaces.
+// Runs for several block-aligned sizes and a couple of seeds.
+bool test_rmsnorm_quant_q8K(std::string & error) {
+    const auto * q_traits = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    if (!q_traits || !q_traits->from_float) {
+        error = "rmsnorm_quant_q8K: Q8_K from_float not registered";
+        return false;
+    }
+    const float eps = 1e-5f;
+    const int sizes[]   = { 256, 512, 3072, 8192 };  // n_embd, n_ff for Phi-3-mini
+    const uint32_t seeds[] = { 0xC0FFEEu, 0xDEADBEEFu };
+
+    for (uint32_t seed : seeds) {
+        for (int n : sizes) {
+            std::mt19937 rng(seed ^ (uint32_t) n);
+            std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+            std::vector<float> src(n), w(n);
+            for (auto & v : src) v = uni(rng);
+            for (auto & v : w)   v = uni(rng) * 0.5f + 1.0f;
+
+            const size_t q_bytes = ggml_row_size(GGML_TYPE_Q8_K, n);
+            std::vector<uint8_t> y_fused(q_bytes, 0xCD);
+            std::vector<uint8_t> y_unfused(q_bytes, 0xCD);
+
+            // Fused
+            std::string ferr;
+            if (!phi3_fused_rmsnorm_quant_q8K(src.data(), w.data(),
+                                              y_fused.data(), n, eps, ferr)) {
+                error = "rmsnorm_quant_q8K: fused failed: " + ferr;
+                return false;
+            }
+            // Unfused reference: rmsnorm_mul to F32 tmp, then from_float
+            std::vector<float> tmp(n);
+            phi3_kernel_rmsnorm_mul_f32(tmp.data(), src.data(), w.data(), n, eps);
+            q_traits->from_float(tmp.data(), y_unfused.data(), n);
+
+            if (std::memcmp(y_fused.data(), y_unfused.data(), q_bytes) != 0) {
+                // Find first differing byte for diag
+                size_t first = q_bytes;
+                for (size_t i = 0; i < q_bytes; ++i) {
+                    if (y_fused[i] != y_unfused[i]) { first = i; break; }
+                }
+                std::ostringstream oss;
+                oss << "rmsnorm_quant_q8K: byte mismatch at seed=0x" << std::hex << seed
+                    << std::dec << " n=" << n
+                    << " first_diff_byte=" << first
+                    << " fused=0x" << std::hex << (int) y_fused[first]
+                    << " unfused=0x" << (int) y_unfused[first] << std::dec;
+                error = oss.str();
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool test_tok_embd_dequant(std::string & error) {
@@ -879,13 +1007,15 @@ bool test_rope_neox(const char * tag, bool with_factors, std::string & error) {
 bool phi3_kernel_self_test(std::string & error) {
     if (!test_rmsnorm(error))                                 return false;
     fprintf(stderr, "phi3 kernel self-test: rmsnorm                       OK\n");
+    if (!test_rmsnorm_quant_q8K(error))                       return false;
+    fprintf(stderr, "phi3 kernel self-test: rmsnorm+quant_q8K (A3.2)      OK\n");
     if (!test_tok_embd_dequant(error))                        return false;
     fprintf(stderr, "phi3 kernel self-test: tok_embd_dequant (F16)        OK\n");
     if (!test_rope_neox("rope_neox_no_factors", false, error)) return false;
     fprintf(stderr, "phi3 kernel self-test: rope_neox (factors=NULL)      OK\n");
     if (!test_rope_neox("rope_neox_with_factors", true, error)) return false;
     fprintf(stderr, "phi3 kernel self-test: rope_neox (factors=synth)     OK\n");
-    fprintf(stderr, "phi3 kernel self-test: PASS (rmsnorm + tok_embd + 2x rope_neox)\n");
+    fprintf(stderr, "phi3 kernel self-test: PASS (rmsnorm + rmsnorm+quant + tok_embd + 2x rope_neox)\n");
     error.clear();
     return true;
 }
@@ -2795,6 +2925,80 @@ bool q_matmul_pool(
     return true;
 }
 
+// A3.2 — Same as q_matmul_pool, but takes a pre-quantized Q8_K scratch
+// directly. Used after phi3_fused_rmsnorm_quant_q8K has already
+// produced the Q8_K block buffer. Verifies that vec_dot_type matches
+// Q8_K before dispatching (so this can't be silently misused with a
+// non-K-quant weight).
+bool q_matmul_pool_prequantized_q8K(
+        const ggml_tensor   * w,
+        const void          * src_q8k,
+        size_t                src_q8k_bytes,
+        float               * y_out,
+        int                   M,
+        int                   K,
+        Phi3MatmulPool      * pool,
+        std::string         & error) {
+    if (w == nullptr)        { error = "q_matmul_pool_prequantized_q8K: w is null"; return false; }
+    if (w->data == nullptr)  { error = "q_matmul_pool_prequantized_q8K: w->data is null"; return false; }
+    if (src_q8k == nullptr)  { error = "q_matmul_pool_prequantized_q8K: src_q8k is null"; return false; }
+    if (y_out == nullptr)    { error = "q_matmul_pool_prequantized_q8K: y_out is null"; return false; }
+    if (M <= 0 || K <= 0)    { error = "q_matmul_pool_prequantized_q8K: M or K <= 0"; return false; }
+
+    if ((int) w->ne[0] != K || (int) w->ne[1] != M) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool_prequantized_q8K: shape mismatch: w->ne=("
+            << w->ne[0] << "," << w->ne[1] << ") expected (K=" << K << ", M=" << M << ")";
+        error = oss.str();
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(w->type, K);
+    if ((size_t) w->nb[1] != row_bytes) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool_prequantized_q8K: w->nb[1]=" << w->nb[1]
+            << " != ggml_row_size=" << row_bytes;
+        error = oss.str();
+        return false;
+    }
+    const auto * w_traits = ggml_get_type_traits_cpu(w->type);
+    if (!w_traits || !w_traits->vec_dot) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool_prequantized_q8K: no CPU vec_dot for type "
+            << ggml_type_name(w->type);
+        error = oss.str();
+        return false;
+    }
+    if (w_traits->vec_dot_type != GGML_TYPE_Q8_K) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool_prequantized_q8K: weight type "
+            << ggml_type_name(w->type) << " has vec_dot_type="
+            << ggml_type_name(w_traits->vec_dot_type)
+            << " (expected Q8_K)";
+        error = oss.str();
+        return false;
+    }
+    const size_t q_bytes = ggml_row_size(GGML_TYPE_Q8_K, K);
+    if (src_q8k_bytes < q_bytes) {
+        std::ostringstream oss;
+        oss << "q_matmul_pool_prequantized_q8K: src_q8k_bytes=" << src_q8k_bytes
+            << " < required " << q_bytes;
+        error = oss.str();
+        return false;
+    }
+
+    Phi3MatmulJob job;
+    job.w_traits    = w_traits;
+    job.w_base      = (const uint8_t *) w->data;
+    job.w_row_bytes = row_bytes;
+    job.src_q       = (const uint8_t *) src_q8k;
+    job.dst         = y_out;
+    job.K           = K;
+    job.N_total     = M;
+
+    phi3_matmul_pool_run(pool, job);
+    return true;
+}
+
 } // namespace
 
 
@@ -2977,13 +3181,41 @@ bool phi3_layer_forward_qquant(
     std::vector<float> ff(n_ff);
     std::vector<float> ffn_out_buf(n_embd);
 
-    // --- 1. Pre-attn RMSNorm ---
-    phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout, attn_norm_w.data(), n_embd, cx.eps);
-
-    // --- 2. wqkv (q-quant, pool-dispatched) ---
-    if (!q_matmul_pool(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
-                       cx.scratch.hq_buf, cx.matmul_pool, error)) {
-        std::string s = error; error = "phi3_layer_forward_qquant: wqkv: " + s; return false;
+    // --- 1+2. Pre-attn RMSNorm + wqkv ---
+    //
+    // A3.2: when cx.fuse_rmsnorm_quant is on (default), fuse the rmsnorm,
+    // the per-element norm-weight multiply, and the Q8_K quantization into
+    // one walk over x_inout. The intermediate F32 normalized vector is
+    // never materialized in main memory; the per-256-block scratch stays
+    // L1-hot. The matmul then runs on the pre-quantized Q8_K scratch.
+    //
+    // When the toggle is off (--phi3-fused-qquant-rmsnorm-fuse 0), fall
+    // back to the A2.5b unfused sequence for A/B comparison. The two
+    // paths are bit-identical (see test_rmsnorm_quant_q8K).
+    if (cx.fuse_rmsnorm_quant) {
+        const size_t q_bytes_attn = ggml_row_size(GGML_TYPE_Q8_K, n_embd);
+        if (cx.scratch.hq_buf.size() < q_bytes_attn) {
+            cx.scratch.hq_buf.assign(q_bytes_attn, 0);
+        }
+        if (!phi3_fused_rmsnorm_quant_q8K(x_inout, attn_norm_w.data(),
+                                          cx.scratch.hq_buf.data(),
+                                          n_embd, cx.eps, error)) {
+            std::string s = error;
+            error = "phi3_layer_forward_qquant: fused rmsnorm+quant (attn): " + s;
+            return false;
+        }
+        if (!q_matmul_pool_prequantized_q8K(L.wqkv, cx.scratch.hq_buf.data(),
+                                            cx.scratch.hq_buf.size(),
+                                            qkv.data(), n_qkv, n_embd,
+                                            cx.matmul_pool, error)) {
+            std::string s = error; error = "phi3_layer_forward_qquant: wqkv (fused): " + s; return false;
+        }
+    } else {
+        phi3_kernel_rmsnorm_mul_f32(norm1.data(), x_inout, attn_norm_w.data(), n_embd, cx.eps);
+        if (!q_matmul_pool(L.wqkv, norm1.data(), qkv.data(), n_qkv, n_embd,
+                           cx.scratch.hq_buf, cx.matmul_pool, error)) {
+            std::string s = error; error = "phi3_layer_forward_qquant: wqkv: " + s; return false;
+        }
     }
 
     float * q = qkv.data();
@@ -3099,13 +3331,35 @@ bool phi3_layer_forward_qquant(
     // --- 7. Residual 1 ---
     for (int i = 0; i < n_embd; ++i) x_after_res1[i] = x_inout[i] + attn_out_buf[i];
 
-    // --- 8. FFN RMSNorm ---
-    phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(), ffn_norm_w.data(), n_embd, cx.eps);
-
-    // --- 9. ffn_up (q-quant, gate||up fused, pool-dispatched) ---
-    if (!q_matmul_pool(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
-                       cx.scratch.hq_buf, cx.matmul_pool, error)) {
-        std::string s = error; error = "phi3_layer_forward_qquant: ffn_up: " + s; return false;
+    // --- 8+9. FFN RMSNorm + ffn_up (gate||up) ---
+    //
+    // A3.2: same fusion as steps 1+2 — fuse rmsnorm+mul+quantize at the
+    // ffn_norm -> ffn_up junction. Note the input to ffn_up is x_after_res1
+    // (size n_embd), same dim as attn_norm input, so the q_bytes match.
+    if (cx.fuse_rmsnorm_quant) {
+        const size_t q_bytes_ffn = ggml_row_size(GGML_TYPE_Q8_K, n_embd);
+        if (cx.scratch.hq_buf.size() < q_bytes_ffn) {
+            cx.scratch.hq_buf.assign(q_bytes_ffn, 0);
+        }
+        if (!phi3_fused_rmsnorm_quant_q8K(x_after_res1.data(), ffn_norm_w.data(),
+                                          cx.scratch.hq_buf.data(),
+                                          n_embd, cx.eps, error)) {
+            std::string s = error;
+            error = "phi3_layer_forward_qquant: fused rmsnorm+quant (ffn): " + s;
+            return false;
+        }
+        if (!q_matmul_pool_prequantized_q8K(L.ffn_up, cx.scratch.hq_buf.data(),
+                                            cx.scratch.hq_buf.size(),
+                                            upgate.data(), 2 * n_ff, n_embd,
+                                            cx.matmul_pool, error)) {
+            std::string s = error; error = "phi3_layer_forward_qquant: ffn_up (fused): " + s; return false;
+        }
+    } else {
+        phi3_kernel_rmsnorm_mul_f32(norm2.data(), x_after_res1.data(), ffn_norm_w.data(), n_embd, cx.eps);
+        if (!q_matmul_pool(L.ffn_up, norm2.data(), upgate.data(), 2 * n_ff, n_embd,
+                           cx.scratch.hq_buf, cx.matmul_pool, error)) {
+            std::string s = error; error = "phi3_layer_forward_qquant: ffn_up: " + s; return false;
+        }
     }
 
     // --- 10. SwiGLU ---
@@ -3187,6 +3441,7 @@ bool phi3_run_qquant_decode(
         const std::vector<llama_token> & prompt_tokens,
         int                            n_gen,
         int                            n_threads,
+        bool                           fuse_rmsnorm_quant,
         std::vector<llama_token>     & out_generated,
         std::string                  & error) {
     error.clear();
@@ -3242,6 +3497,7 @@ bool phi3_run_qquant_decode(
         phi3_matmul_pool_free(pool);
         return false;
     }
+    cx.fuse_rmsnorm_quant = fuse_rmsnorm_quant;
 
     // lm_head: use the existing fused q-quant argmax helper.
     Phi3FusedLmHead lm;
@@ -3252,8 +3508,9 @@ bool phi3_run_qquant_decode(
     }
 
     fprintf(stderr,
-            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s)\n",
-            n_prompt, n_gen, ctx_max, n_threads, pool.initialized ? "on" : "off");
+            "phi3 qquant-decode: starting (n_prompt=%d, n_gen=%d, ctx_max=%d, n_threads=%d, pool=%s, rmsnorm_fuse=%s)\n",
+            n_prompt, n_gen, ctx_max, n_threads, pool.initialized ? "on" : "off",
+            fuse_rmsnorm_quant ? "on" : "off");
 
     std::vector<float> hidden((size_t) n_embd);
 
@@ -3506,6 +3763,7 @@ bool phi3_run_qquant_regress(
         int                 n_threads_prefill,
         int                 n_threads_gen,
         int                 n_threads_qquant,
+        bool                fuse_rmsnorm_quant,
         bool              & out_pass,
         std::string       & error) {
     error.clear();
@@ -3592,6 +3850,7 @@ bool phi3_run_qquant_regress(
         std::vector<llama_token> qquant_tokens;
         std::string qerr;
         if (!phi3_run_qquant_decode(model, prompt_tokens, n_gen, n_threads_qquant,
+                                    fuse_rmsnorm_quant,
                                     qquant_tokens, qerr)) {
             error = std::string("phi3_run_qquant_regress: qquant_decode failed: ") + qerr;
             return false;
