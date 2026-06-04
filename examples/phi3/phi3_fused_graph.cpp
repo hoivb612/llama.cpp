@@ -4052,7 +4052,9 @@ bool phi3_run_qquant_hybrid(
         std::string                    & error,
         double                         * out_prefill_ms,
         double                         * out_gen_ms,
-        double                         * out_bridge_ms) {
+        double                         * out_bridge_ms,
+        const char                     * save_kv_path,
+        uint64_t                         prompt_hash) {
     error.clear();
     if (model == nullptr)        { error = "phi3_run_qquant_hybrid: model is null";       return false; }
     if (prompt_tokens.empty())   { error = "phi3_run_qquant_hybrid: prompt_tokens empty"; return false; }
@@ -4235,6 +4237,27 @@ bool phi3_run_qquant_hybrid(
     fprintf(stderr,
             "phi3 qquant-hybrid: prefill (batched) %d tokens in %.2f s decode + %.2f ms bridge\n",
             n_prompt, prefill_decode_ms / 1000.0, bridge_ms);
+
+    // A5.5 — optional save of the post-prefill KV state. We pull from
+    // llama (the source of truth) BEFORE llama_free so the cache reflects
+    // exactly what the bridge consumed. Save failure is non-fatal: warn
+    // and continue with the regular gen flow.
+    if (save_kv_path != nullptr && save_kv_path[0] != '\0') {
+        const uint64_t march = phi3_kv_compute_model_arch_hash(model);
+        std::string serr;
+        if (!phi3_save_llama_kv_to_disk(lctx, n_prompt, (int) next_tok,
+                                        prompt_hash, march,
+                                        std::string(save_kv_path), serr)) {
+            fprintf(stderr,
+                    "phi3 qquant-hybrid: WARNING save_kv to '%s' failed: %s "
+                    "(continuing without cache)\n",
+                    save_kv_path, serr.c_str());
+        } else {
+            fprintf(stderr,
+                    "phi3 qquant-hybrid: saved cache (%d tokens, first_gen=%d) -> '%s'\n",
+                    n_prompt, (int) next_tok, save_kv_path);
+        }
+    }
 
     // llama context no longer needed past this point. Freeing here keeps
     // memory tight during the (much longer) gen phase.
@@ -5084,5 +5107,822 @@ bool phi3_run_qquant_regress(
             pass_count, n_prompts, n_prompts - pass_count, n_prompts, n_gen);
 
     out_pass = (pass_count == n_prompts);
+    return true;
+}
+
+
+// ===========================================================================
+// A5.5 — Cached prefill: serialise post-prefill KV state to disk, load and
+// skip prefill at runtime. See header for the design contract; the on-disk
+// format is a 64-byte fixed header (field-by-field LE) followed by per-
+// layer K then V slabs (compact, n_tokens long).
+// ===========================================================================
+
+namespace {
+
+constexpr char     kPhi3KVMagic[8]    = { 'P','H','I','3','K','V','0','1' };
+constexpr uint32_t kPhi3KVHeaderSize  = 64;
+
+// All header fields as fixed-width LE ints. Sized so total == 64 bytes.
+// Field order MUST match read_header / write_header below.
+//
+//   offset  size  field
+//   ------  ----  --------------------------------------------------------
+//    0..7    8    magic                "PHI3KV01"   (8 raw bytes, no NUL)
+//    8..11   4    hdr_size             u32           = 64
+//   12..15   4    flags                u32           bit 0: greedy first-tok
+//   16..19   4    n_layer              u32
+//   20..23   4    n_head_kv            u32
+//   24..27   4    head_dim             u32
+//   28..31   4    n_tokens             u32
+//   32..35   4    kv_type              u32           = GGML_TYPE_F16 (1)
+//   36..39   4    v_trans              u32           = 1
+//   40..43   4    first_gen_token      i32           >= 0 required
+//   44..47   4    n_vocab              u32           (advisory, dim check)
+//   48..55   8    prompt_hash          u64           FNV-1a; 0 = unknown
+//   56..63   8    model_arch_hash      u64           FNV-1a; 0 = unknown
+
+struct Phi3KVCacheHeader {
+    char     magic[8];
+    uint32_t hdr_size;
+    uint32_t flags;
+    uint32_t n_layer;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t n_tokens;
+    uint32_t kv_type;
+    uint32_t v_trans;
+    int32_t  first_gen_token;
+    uint32_t n_vocab;
+    uint64_t prompt_hash;
+    uint64_t model_arch_hash;
+};
+static_assert(sizeof(Phi3KVCacheHeader) == 64, "Phi3KVCacheHeader must be 64 bytes");
+
+// Field-by-field LE serialisation via memcpy on a 64-byte buffer. Avoids
+// any reliance on struct layout / alignment / padding.
+void write_le_u32(uint8_t * dst, uint32_t v) {
+    dst[0] = (uint8_t)(v       & 0xff);
+    dst[1] = (uint8_t)(v >>  8 & 0xff);
+    dst[2] = (uint8_t)(v >> 16 & 0xff);
+    dst[3] = (uint8_t)(v >> 24 & 0xff);
+}
+void write_le_i32(uint8_t * dst, int32_t v) {
+    write_le_u32(dst, (uint32_t) v);
+}
+void write_le_u64(uint8_t * dst, uint64_t v) {
+    for (int i = 0; i < 8; ++i) dst[i] = (uint8_t)((v >> (8 * i)) & 0xff);
+}
+uint32_t read_le_u32(const uint8_t * src) {
+    return (uint32_t) src[0]
+         | ((uint32_t) src[1] << 8)
+         | ((uint32_t) src[2] << 16)
+         | ((uint32_t) src[3] << 24);
+}
+int32_t read_le_i32(const uint8_t * src) {
+    return (int32_t) read_le_u32(src);
+}
+uint64_t read_le_u64(const uint8_t * src) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= ((uint64_t) src[i]) << (8 * i);
+    return v;
+}
+
+void pack_header(const Phi3KVCacheHeader & h, uint8_t buf[64]) {
+    std::memcpy(buf + 0, h.magic, 8);
+    write_le_u32(buf +  8, h.hdr_size);
+    write_le_u32(buf + 12, h.flags);
+    write_le_u32(buf + 16, h.n_layer);
+    write_le_u32(buf + 20, h.n_head_kv);
+    write_le_u32(buf + 24, h.head_dim);
+    write_le_u32(buf + 28, h.n_tokens);
+    write_le_u32(buf + 32, h.kv_type);
+    write_le_u32(buf + 36, h.v_trans);
+    write_le_i32(buf + 40, h.first_gen_token);
+    write_le_u32(buf + 44, h.n_vocab);
+    write_le_u64(buf + 48, h.prompt_hash);
+    write_le_u64(buf + 56, h.model_arch_hash);
+}
+void unpack_header(const uint8_t buf[64], Phi3KVCacheHeader & h) {
+    std::memcpy(h.magic, buf + 0, 8);
+    h.hdr_size        = read_le_u32(buf +  8);
+    h.flags           = read_le_u32(buf + 12);
+    h.n_layer         = read_le_u32(buf + 16);
+    h.n_head_kv       = read_le_u32(buf + 20);
+    h.head_dim        = read_le_u32(buf + 24);
+    h.n_tokens        = read_le_u32(buf + 28);
+    h.kv_type         = read_le_u32(buf + 32);
+    h.v_trans         = read_le_u32(buf + 36);
+    h.first_gen_token = read_le_i32(buf + 40);
+    h.n_vocab         = read_le_u32(buf + 44);
+    h.prompt_hash     = read_le_u64(buf + 48);
+    h.model_arch_hash = read_le_u64(buf + 56);
+}
+
+// FNV-1a 64-bit.
+uint64_t fnv1a_64(const void * data, size_t bytes) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= (uint64_t) p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+} // namespace
+
+uint64_t phi3_kv_compute_prompt_hash(const std::vector<llama_token> & prompt_tokens) {
+    if (prompt_tokens.empty()) return 0;
+    return fnv1a_64(prompt_tokens.data(),
+                    prompt_tokens.size() * sizeof(llama_token));
+}
+
+uint64_t phi3_kv_compute_model_arch_hash(const struct llama_model * model) {
+    if (model == nullptr) return 0;
+    const ggml_tensor * t = llama_model_get_tensor_by_name(model, "output_norm.weight");
+    if (t == nullptr || t->data == nullptr) return 0;
+    const size_t bytes = ggml_nbytes(t);
+    if (bytes == 0) return 0;
+    return fnv1a_64(t->data, bytes);
+}
+
+bool phi3_save_llama_kv_to_disk(
+        struct llama_context * lctx,
+        int                    n_tokens,
+        int                    first_gen_token,
+        uint64_t               prompt_hash,
+        uint64_t               model_arch_hash,
+        const std::string    & path,
+        std::string          & error) {
+    error.clear();
+    if (lctx == nullptr)   { error = "phi3_save_llama_kv_to_disk: lctx is null"; return false; }
+    if (n_tokens <= 0)     { error = "phi3_save_llama_kv_to_disk: n_tokens must be > 0"; return false; }
+    if (first_gen_token < 0) {
+        error = "phi3_save_llama_kv_to_disk: first_gen_token must be >= 0 "
+                "(loader requires it to seed the gen loop without a forward step)";
+        return false;
+    }
+    if (path.empty()) { error = "phi3_save_llama_kv_to_disk: path is empty"; return false; }
+
+    // ---- Pre-validate the llama KV state via the same checks the bridge
+    //      uses. Collect layer pointers + dims in one pass. (Failing here
+    //      keeps a half-written file from ever appearing on disk.)
+    if (!llama_kv_self_v_trans(lctx)) {
+        error = "phi3_save_llama_kv_to_disk: v_trans=false on source context "
+                "(flash_attn enabled?); rerun with flash_attn disabled";
+        return false;
+    }
+
+    const llama_model * model = llama_get_model(lctx);
+    if (model == nullptr) { error = "phi3_save_llama_kv_to_disk: llama_get_model returned null"; return false; }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = (vocab ? (int) llama_vocab_n_tokens(vocab) : 0);
+    if (n_vocab <= 0) { error = "phi3_save_llama_kv_to_disk: invalid n_vocab"; return false; }
+    if (first_gen_token >= n_vocab) {
+        std::ostringstream oss;
+        oss << "phi3_save_llama_kv_to_disk: first_gen_token=" << first_gen_token
+            << " out of [0," << n_vocab << ")";
+        error = oss.str();
+        return false;
+    }
+
+    // Walk layer 0 first to pin n_layer / dims / src_kv_size.
+    int    n_layer    = 0;
+    int    n_head_kv  = 0;
+    int    head_dim   = 0;
+    size_t src_kv_size = 0;
+    std::vector<const ggml_fp16_t *> Ks;
+    std::vector<const ggml_fp16_t *> Vs;
+    for (int il = 0; ; ++il) {
+        ggml_tensor * k = llama_kv_self_layer_k(lctx, il);
+        ggml_tensor * v = llama_kv_self_layer_v(lctx, il);
+        if (k == nullptr && v == nullptr) {
+            if (il == 0) {
+                error = "phi3_save_llama_kv_to_disk: no KV layers exposed "
+                        "(SWA/iSWA/hybrid memory not supported)";
+                return false;
+            }
+            n_layer = il;
+            break;
+        }
+        if (k == nullptr || v == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_save_llama_kv_to_disk: layer " << il << " has K or V missing";
+            error = oss.str();
+            return false;
+        }
+        if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+            std::ostringstream oss;
+            oss << "phi3_save_llama_kv_to_disk: layer " << il
+                << " KV not F16 (k=" << (int) k->type << " v=" << (int) v->type << ")";
+            error = oss.str();
+            return false;
+        }
+        if (k->ne[2] != 1 || v->ne[2] != 1) {
+            error = "phi3_save_llama_kv_to_disk: multi-stream KV not supported";
+            return false;
+        }
+        if (k->ne[0] != v->ne[0] || k->ne[1] != v->ne[1]) {
+            std::ostringstream oss;
+            oss << "phi3_save_llama_kv_to_disk: layer " << il
+                << " K/V shape mismatch ne0=" << k->ne[0] << "/" << v->ne[0]
+                << " ne1=" << k->ne[1] << "/" << v->ne[1];
+            error = oss.str();
+            return false;
+        }
+        if (k->data == nullptr || v->data == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_save_llama_kv_to_disk: layer " << il
+                << " tensor data null (non-CPU backend not supported)";
+            error = oss.str();
+            return false;
+        }
+        if (il == 0) {
+            const int64_t n_embd_kv = k->ne[0];
+            if (n_embd_kv <= 0 || n_embd_kv > (256 * 256)) {
+                error = "phi3_save_llama_kv_to_disk: unreasonable n_embd_kv";
+                return false;
+            }
+            // Phi-3-mini convention: head_dim = 96, n_head_kv = n_embd_kv/96.
+            // First cut targets Phi-3-mini only; revisit if we extend to
+            // models with different head_dim.
+            head_dim = 96;
+            if (n_embd_kv % head_dim != 0) {
+                std::ostringstream oss;
+                oss << "phi3_save_llama_kv_to_disk: n_embd_kv=" << n_embd_kv
+                    << " not divisible by head_dim=" << head_dim;
+                error = oss.str();
+                return false;
+            }
+            n_head_kv   = (int) (n_embd_kv / head_dim);
+            src_kv_size = (size_t) k->ne[1];
+            if (src_kv_size < (size_t) n_tokens) {
+                std::ostringstream oss;
+                oss << "phi3_save_llama_kv_to_disk: src_kv_size=" << src_kv_size
+                    << " < n_tokens=" << n_tokens;
+                error = oss.str();
+                return false;
+            }
+        } else {
+            if ((size_t) k->ne[1] != src_kv_size) {
+                std::ostringstream oss;
+                oss << "phi3_save_llama_kv_to_disk: layer " << il
+                    << " src_kv_size mismatch (" << k->ne[1] << " vs " << src_kv_size << ")";
+                error = oss.str();
+                return false;
+            }
+        }
+        Ks.push_back((const ggml_fp16_t *) k->data);
+        Vs.push_back((const ggml_fp16_t *) v->data);
+    }
+
+    if (n_layer <= 0 || n_layer > 512) {
+        error = "phi3_save_llama_kv_to_disk: unreasonable n_layer";
+        return false;
+    }
+
+    // ---- Build header.
+    Phi3KVCacheHeader hdr{};
+    std::memcpy(hdr.magic, kPhi3KVMagic, 8);
+    hdr.hdr_size        = kPhi3KVHeaderSize;
+    hdr.flags           = 0x1;                         // bit 0: greedy first-tok
+    hdr.n_layer         = (uint32_t) n_layer;
+    hdr.n_head_kv       = (uint32_t) n_head_kv;
+    hdr.head_dim        = (uint32_t) head_dim;
+    hdr.n_tokens        = (uint32_t) n_tokens;
+    hdr.kv_type         = (uint32_t) GGML_TYPE_F16;
+    hdr.v_trans         = 1u;
+    hdr.first_gen_token = (int32_t) first_gen_token;
+    hdr.n_vocab         = (uint32_t) n_vocab;
+    hdr.prompt_hash     = prompt_hash;
+    hdr.model_arch_hash = model_arch_hash;
+
+    const size_t n_embd_kv      = (size_t) n_head_kv * (size_t) head_dim;
+    const size_t k_slab_bytes   = (size_t) n_tokens * n_embd_kv * sizeof(ggml_fp16_t);
+    const size_t v_strip_bytes  = (size_t) n_tokens * sizeof(ggml_fp16_t);
+    const size_t v_slab_bytes   = n_embd_kv * v_strip_bytes;
+    // Overflow guard: payload = n_layer * (k_slab + v_slab) must fit in uint64.
+    const uint64_t per_layer    = (uint64_t) k_slab_bytes + (uint64_t) v_slab_bytes;
+    if (per_layer < (uint64_t) k_slab_bytes) {
+        error = "phi3_save_llama_kv_to_disk: per-layer slab size overflow"; return false;
+    }
+    const uint64_t payload_bytes = per_layer * (uint64_t) n_layer;
+    if (per_layer > 0 && payload_bytes / per_layer != (uint64_t) n_layer) {
+        error = "phi3_save_llama_kv_to_disk: payload size overflow"; return false;
+    }
+
+    // ---- Write to "<path>.tmp" then rename. Use stdio so we don't add a
+    //      mmap dependency for the first cut; ~400 MB per file is fine.
+    const std::string tmp_path = path + ".tmp";
+    FILE * f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        std::ostringstream oss;
+        oss << "phi3_save_llama_kv_to_disk: fopen('" << tmp_path << "') failed";
+        error = oss.str();
+        return false;
+    }
+
+    auto cleanup_fail = [&](const std::string & msg) -> bool {
+        std::fclose(f);
+        std::remove(tmp_path.c_str());
+        error = msg;
+        return false;
+    };
+
+    // Header.
+    uint8_t hdr_buf[kPhi3KVHeaderSize] = {0};
+    pack_header(hdr, hdr_buf);
+    if (std::fwrite(hdr_buf, 1, kPhi3KVHeaderSize, f) != kPhi3KVHeaderSize) {
+        return cleanup_fail("phi3_save_llama_kv_to_disk: header write failed");
+    }
+
+    // Per-layer K + V.
+    for (int il = 0; il < n_layer; ++il) {
+        // K is naturally compact: llama stores [n_embd_kv, kv_size, 1] so
+        // the first n_tokens cols form a contiguous prefix of length
+        // n_tokens*n_embd_kv F16s.
+        const size_t k_count = (size_t) n_tokens * n_embd_kv;
+        if (std::fwrite(Ks[(size_t) il], sizeof(ggml_fp16_t), k_count, f) != k_count) {
+            std::ostringstream oss;
+            oss << "phi3_save_llama_kv_to_disk: K write failed at layer " << il;
+            return cleanup_fail(oss.str());
+        }
+        // V (v_trans=true): strips are length src_kv_size, BUT we only
+        // want the first n_tokens elements of each strip. Loop over the
+        // n_embd_kv strips and write n_tokens F16s of each.
+        const ggml_fp16_t * src_V = Vs[(size_t) il];
+        for (size_t strip = 0; strip < n_embd_kv; ++strip) {
+            const ggml_fp16_t * strip_p = src_V + strip * src_kv_size;
+            if (std::fwrite(strip_p, sizeof(ggml_fp16_t), (size_t) n_tokens, f)
+                    != (size_t) n_tokens) {
+                std::ostringstream oss;
+                oss << "phi3_save_llama_kv_to_disk: V write failed at layer "
+                    << il << " strip " << strip;
+                return cleanup_fail(oss.str());
+            }
+        }
+    }
+
+    if (std::fflush(f) != 0) {
+        return cleanup_fail("phi3_save_llama_kv_to_disk: fflush failed");
+    }
+    std::fclose(f);
+
+    // std::rename on Windows does NOT replace an existing target, so
+    // remove first. There's a small TOCTOU window but for the cache-file
+    // use case (single writer at a time) it's acceptable.
+    std::remove(path.c_str());
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::ostringstream oss;
+        oss << "phi3_save_llama_kv_to_disk: rename('" << tmp_path << "' -> '"
+            << path << "') failed";
+        std::remove(tmp_path.c_str());
+        error = oss.str();
+        return false;
+    }
+
+    fprintf(stderr,
+            "phi3_save_llama_kv_to_disk: wrote %llu bytes header + payload "
+            "(n_layer=%d n_head_kv=%d head_dim=%d n_tokens=%d) -> '%s'\n",
+            (unsigned long long)((uint64_t) kPhi3KVHeaderSize + payload_bytes),
+            n_layer, n_head_kv, head_dim, n_tokens, path.c_str());
+    return true;
+}
+
+bool phi3_load_kv_from_disk(
+        Phi3FusedCtx        & cx,
+        const std::string   & path,
+        uint64_t              expected_prompt_hash,
+        uint64_t              expected_model_arch_hash,
+        bool                  strict_model_match,
+        int                 & out_n_tokens,
+        int                 & out_first_gen_token,
+        uint64_t            & out_prompt_hash,
+        std::string         & error) {
+    error.clear();
+    out_n_tokens = 0;
+    out_first_gen_token = -1;
+    out_prompt_hash = 0;
+
+    if (cx.kv.n_layer <= 0 || cx.kv.K[0] == nullptr || cx.kv.V[0] == nullptr) {
+        error = "phi3_load_kv_from_disk: cx.kv is not initialized";
+        return false;
+    }
+    if (path.empty()) { error = "phi3_load_kv_from_disk: path is empty"; return false; }
+
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: fopen('" << path << "') failed";
+        error = oss.str();
+        return false;
+    }
+
+    // ---- Read & validate header.
+    uint8_t hdr_buf[kPhi3KVHeaderSize] = {0};
+    if (std::fread(hdr_buf, 1, kPhi3KVHeaderSize, f) != kPhi3KVHeaderSize) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: header read failed (file too small?)";
+        return false;
+    }
+    Phi3KVCacheHeader h{};
+    unpack_header(hdr_buf, h);
+
+    if (std::memcmp(h.magic, kPhi3KVMagic, 8) != 0) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: magic mismatch (not a PHI3KV01 file)";
+        return false;
+    }
+    if (h.hdr_size != kPhi3KVHeaderSize) {
+        std::fclose(f);
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: unsupported hdr_size=" << h.hdr_size
+            << " (expected " << kPhi3KVHeaderSize << ")";
+        error = oss.str();
+        return false;
+    }
+    if (h.kv_type != (uint32_t) GGML_TYPE_F16) {
+        std::fclose(f);
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: unsupported kv_type=" << h.kv_type
+            << " (expected GGML_TYPE_F16=" << (int) GGML_TYPE_F16 << ")";
+        error = oss.str();
+        return false;
+    }
+    if (h.v_trans != 1) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: v_trans=0 not supported";
+        return false;
+    }
+    if ((int) h.n_layer != cx.kv.n_layer
+        || (int) h.n_head_kv != cx.kv.n_head_kv
+        || (int) h.head_dim != cx.kv.head_dim) {
+        std::fclose(f);
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: dim mismatch (file n_layer/n_head_kv/head_dim="
+            << h.n_layer << "/" << h.n_head_kv << "/" << h.head_dim
+            << " vs ctx " << cx.kv.n_layer << "/" << cx.kv.n_head_kv << "/" << cx.kv.head_dim
+            << ")";
+        error = oss.str();
+        return false;
+    }
+    if (h.n_tokens == 0 || (int) h.n_tokens > cx.kv.ctx_max) {
+        std::fclose(f);
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: n_tokens=" << h.n_tokens
+            << " out of [1," << cx.kv.ctx_max << "]";
+        error = oss.str();
+        return false;
+    }
+    if (h.first_gen_token < 0 || (uint32_t) h.first_gen_token >= h.n_vocab) {
+        std::fclose(f);
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: first_gen_token=" << h.first_gen_token
+            << " out of [0," << h.n_vocab << ")";
+        error = oss.str();
+        return false;
+    }
+
+    // Compute & verify file size.
+    const size_t n_embd_kv     = (size_t) h.n_head_kv * (size_t) h.head_dim;
+    const size_t k_slab_bytes  = (size_t) h.n_tokens * n_embd_kv * sizeof(ggml_fp16_t);
+    const size_t v_slab_bytes  = n_embd_kv * (size_t) h.n_tokens * sizeof(ggml_fp16_t);
+    const uint64_t per_layer   = (uint64_t) k_slab_bytes + (uint64_t) v_slab_bytes;
+    const uint64_t payload_b   = per_layer * (uint64_t) h.n_layer;
+    const uint64_t expected_sz = (uint64_t) kPhi3KVHeaderSize + payload_b;
+
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: fseek(END) failed";
+        return false;
+    }
+#ifdef _WIN32
+    const long long actual = _ftelli64(f);
+#else
+    const long long actual = (long long) std::ftell(f);
+#endif
+    if (actual < 0) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: ftell failed";
+        return false;
+    }
+    if ((uint64_t) actual != expected_sz) {
+        std::fclose(f);
+        std::ostringstream oss;
+        oss << "phi3_load_kv_from_disk: file size " << (uint64_t) actual
+            << " != expected " << expected_sz << " (truncated or corrupt)";
+        error = oss.str();
+        return false;
+    }
+    if (std::fseek(f, (long) kPhi3KVHeaderSize, SEEK_SET) != 0) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: fseek(payload) failed";
+        return false;
+    }
+
+    // Soft / strict model fingerprint match.
+    if (expected_model_arch_hash != 0 && h.model_arch_hash != 0
+        && expected_model_arch_hash != h.model_arch_hash) {
+        if (strict_model_match) {
+            std::fclose(f);
+            std::ostringstream oss;
+            oss << "phi3_load_kv_from_disk: model_arch_hash mismatch "
+                << "(file=" << std::hex << h.model_arch_hash
+                << " expected=" << expected_model_arch_hash << std::dec
+                << "); cache was built with a different model";
+            error = oss.str();
+            return false;
+        }
+        fprintf(stderr,
+                "phi3_load_kv_from_disk: WARNING model_arch_hash mismatch "
+                "(file=%016llx expected=%016llx); proceeding because strict=off\n",
+                (unsigned long long) h.model_arch_hash,
+                (unsigned long long) expected_model_arch_hash);
+    }
+    if (expected_prompt_hash != 0 && h.prompt_hash != 0
+        && expected_prompt_hash != h.prompt_hash) {
+        fprintf(stderr,
+                "phi3_load_kv_from_disk: NOTE prompt_hash mismatch "
+                "(file=%016llx caller=%016llx); cache is for a different prompt "
+                "(legal for shared-context game-level blobs)\n",
+                (unsigned long long) h.prompt_hash,
+                (unsigned long long) expected_prompt_hash);
+    }
+
+    // ---- Read whole payload into a heap buffer. For first cut this is
+    //      simpler than mmap and bounded (~400 MB at n_tokens=1000).
+    std::vector<uint8_t> payload((size_t) payload_b);
+    if (std::fread(payload.data(), 1, payload.size(), f) != payload.size()) {
+        std::fclose(f);
+        error = "phi3_load_kv_from_disk: payload read failed";
+        return false;
+    }
+    std::fclose(f);
+
+    // ---- Build per-layer K/V pointer arrays and feed the bridge.
+    std::vector<const void *> Ks((size_t) h.n_layer, nullptr);
+    std::vector<const void *> Vs((size_t) h.n_layer, nullptr);
+    {
+        uint8_t * cursor = payload.data();
+        for (uint32_t il = 0; il < h.n_layer; ++il) {
+            Ks[il] = cursor;
+            cursor += k_slab_bytes;
+            Vs[il] = cursor;
+            cursor += v_slab_bytes;
+        }
+    }
+
+    // Bridge in. src_kv_size = n_tokens because we wrote V compactly.
+    if (!phi3_seed_kv_from_raw(cx,
+                                /*base_pos=*/0,
+                                /*n_tokens=*/(int) h.n_tokens,
+                                /*src_pos_first=*/0,
+                                /*src_v_trans=*/true,
+                                /*src_kv_size=*/(size_t) h.n_tokens,
+                                /*src_type=*/GGML_TYPE_F16,
+                                Ks.data(), Vs.data(), error)) {
+        // error already populated
+        return false;
+    }
+    cx.kv.current_len = (int) h.n_tokens;
+
+    out_n_tokens        = (int) h.n_tokens;
+    out_first_gen_token = (int) h.first_gen_token;
+    out_prompt_hash     = h.prompt_hash;
+
+    fprintf(stderr,
+            "phi3_load_kv_from_disk: loaded %llu bytes (n_tokens=%u first_gen=%d "
+            "prompt_hash=%016llx model_arch_hash=%016llx) from '%s'\n",
+            (unsigned long long) expected_sz, h.n_tokens, h.first_gen_token,
+            (unsigned long long) h.prompt_hash,
+            (unsigned long long) h.model_arch_hash, path.c_str());
+    return true;
+}
+
+bool phi3_run_qquant_cached(
+        const llama_model              * model,
+        const std::string              & cache_path,
+        int                              n_gen,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             profile_per_op,
+        bool                             attn_parallel,
+        uint64_t                         expected_prompt_hash,
+        bool                             strict_model_match,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error,
+        double                         * out_load_ms,
+        double                         * out_gen_ms) {
+    error.clear();
+    if (model == nullptr) { error = "phi3_run_qquant_cached: model is null"; return false; }
+    if (n_gen <= 0)       { error = "phi3_run_qquant_cached: n_gen must be > 0"; return false; }
+    if (cache_path.empty()) { error = "phi3_run_qquant_cached: cache_path empty"; return false; }
+    if (n_threads_gen <= 0) n_threads_gen = 1;
+
+    Phi3Weights W;
+    if (!phi3_weights_resolve(model, W, error)) return false;
+
+    if (W.n_head != W.n_head_kv) {
+        std::ostringstream oss;
+        oss << "phi3_run_qquant_cached: GQA not supported (n_head=" << W.n_head
+            << " n_head_kv=" << W.n_head_kv << ")";
+        error = oss.str();
+        return false;
+    }
+
+    // ---- Peek the header for n_tokens so we can size ctx_max correctly
+    //      (before we allocate Phi3KV, which is sized at init time).
+    int peek_n_tokens = 0;
+    {
+        FILE * f = std::fopen(cache_path.c_str(), "rb");
+        if (f == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_run_qquant_cached: fopen('" << cache_path << "') failed";
+            error = oss.str();
+            return false;
+        }
+        uint8_t hdr_buf[kPhi3KVHeaderSize] = {0};
+        const size_t got = std::fread(hdr_buf, 1, kPhi3KVHeaderSize, f);
+        std::fclose(f);
+        if (got != kPhi3KVHeaderSize) {
+            error = "phi3_run_qquant_cached: header peek failed";
+            return false;
+        }
+        Phi3KVCacheHeader hp{};
+        unpack_header(hdr_buf, hp);
+        if (std::memcmp(hp.magic, kPhi3KVMagic, 8) != 0) {
+            error = "phi3_run_qquant_cached: magic mismatch in header";
+            return false;
+        }
+        peek_n_tokens = (int) hp.n_tokens;
+        if (peek_n_tokens <= 0) {
+            error = "phi3_run_qquant_cached: header n_tokens <= 0";
+            return false;
+        }
+    }
+    const int ctx_max = peek_n_tokens + n_gen + 2;
+
+    // ---- Matmul pool + ctx.
+    Phi3MatmulPool pool;
+    if (n_threads_gen > 1) {
+        std::string perr;
+        if (!phi3_matmul_pool_init(pool, n_threads_gen, perr)) {
+            fprintf(stderr, "phi3 qquant-cached: matmul_pool_init failed (%s); serial\n",
+                    perr.c_str());
+        }
+    }
+
+    Phi3FusedCtx cx;
+    if (!phi3_fused_ctx_init(cx, W, pool.initialized ? &pool : nullptr,
+                             model, /*lctx=*/nullptr,
+                             ctx_max, /*f32_debug=*/false, error)) {
+        phi3_matmul_pool_free(pool);
+        return false;
+    }
+    cx.fuse_rmsnorm_quant = fuse_rmsnorm_quant;
+    cx.attn_parallel      = attn_parallel;
+    cx.prof.enabled       = profile_per_op;
+
+    Phi3FusedLmHead lm;
+    if (!phi3_fused_lmhead_init(model, lm, error)) {
+        phi3_fused_ctx_free(cx);
+        phi3_matmul_pool_free(pool);
+        return false;
+    }
+
+    auto cleanup = [&]() {
+        phi3_fused_ctx_free(cx);
+        phi3_matmul_pool_free(pool);
+    };
+
+    fprintf(stderr,
+            "phi3 qquant-cached: starting (cache='%s', n_gen=%d, ctx_max=%d, "
+            "gen_threads=%d, pool=%s, rmsnorm_fuse=%s, attn_parallel=%s, profile=%s)\n",
+            cache_path.c_str(), n_gen, ctx_max, n_threads_gen,
+            pool.initialized ? "on" : "off",
+            fuse_rmsnorm_quant ? "on" : "off",
+            attn_parallel ? "on" : "off",
+            profile_per_op ? "on" : "off");
+
+    // ---- Load cache.
+    const auto t_load = std::chrono::steady_clock::now();
+    int      n_tokens         = 0;
+    int      first_gen_token  = -1;
+    uint64_t loaded_prompt    = 0;
+    const uint64_t expected_march = phi3_kv_compute_model_arch_hash(model);
+    if (!phi3_load_kv_from_disk(cx, cache_path,
+                                expected_prompt_hash,
+                                expected_march,
+                                strict_model_match,
+                                n_tokens, first_gen_token, loaded_prompt, error)) {
+        cleanup();
+        return false;
+    }
+    const double load_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_load).count();
+    if (out_load_ms) *out_load_ms = load_ms;
+
+    // ---- Sanity: invariants the gen loop depends on.
+    if (cx.kv.current_len != n_tokens) {
+        std::ostringstream oss;
+        oss << "phi3 qquant-cached: invariant violation after load: cx.kv.current_len="
+            << cx.kv.current_len << " != n_tokens=" << n_tokens;
+        error = oss.str();
+        cleanup();
+        return false;
+    }
+    if (first_gen_token < 0 || first_gen_token >= W.n_vocab) {
+        std::ostringstream oss;
+        oss << "phi3 qquant-cached: loaded first_gen_token=" << first_gen_token
+            << " out of [0," << W.n_vocab << ")";
+        error = oss.str();
+        cleanup();
+        return false;
+    }
+
+    fprintf(stderr,
+            "phi3 qquant-cached: loaded %d tokens, first_gen=%d, in %.2f ms (zero TTFT prefill)\n",
+            n_tokens, first_gen_token, load_ms);
+
+    // Reset profile so the summary reflects gen-only.
+    if (cx.prof.enabled) {
+        cx.prof = Phi3DecodeProfile{};
+        cx.prof.enabled = true;
+    }
+
+    out_generated.reserve(out_generated.size() + n_gen);
+    out_generated.push_back((llama_token) first_gen_token);
+
+    // ---- Gen loop. Mirrors phi3_run_qquant_hybrid's gen loop but with
+    //      an explicit pos == cx.kv.current_len assert at each step.
+    std::vector<float> hidden((size_t) W.n_embd);
+    llama_token next_tok = (llama_token) first_gen_token;
+
+    const auto t_gen = std::chrono::steady_clock::now();
+    for (int i = 1; i < n_gen; ++i) {
+        const int pos = n_tokens + i - 1;
+        if (pos != cx.kv.current_len) {
+            std::ostringstream oss;
+            oss << "phi3 qquant-cached: pos invariant violated at step " << i
+                << " (pos=" << pos << " current_len=" << cx.kv.current_len << ")";
+            error = oss.str();
+            cleanup();
+            return false;
+        }
+        if (!phi3_full_forward_qquant(cx, (int) next_tok, pos, hidden.data(), error)) {
+            cleanup();
+            return false;
+        }
+        for (int d = 0; d < W.n_embd; ++d) {
+            if (!std::isfinite(hidden[d])) {
+                std::ostringstream oss;
+                oss << "phi3 qquant-cached: non-finite hidden at pos=" << pos
+                    << " dim=" << d << " val=" << hidden[d];
+                error = oss.str();
+                cleanup();
+                return false;
+            }
+        }
+        {
+            PhiTimer _t(cx.prof.enabled, cx.prof.lmhead_ns);
+            llama_token best = 0;
+            if (!phi3_fused_lmhead_argmax(lm, /*pool=*/nullptr, hidden.data(),
+                                          /*n_threads=*/1, best, error)) {
+                cleanup();
+                return false;
+            }
+            next_tok = best;
+        }
+        out_generated.push_back(next_tok);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen).count();
+    if (out_gen_ms) *out_gen_ms = gen_ms;
+
+    fprintf(stderr, "phi3 qquant-cached: generated %d tokens in %.2f s (%.3f s/tok)\n",
+            n_gen, gen_ms / 1000.0, gen_ms / 1000.0 / std::max(1, n_gen));
+
+    cx.prof.n_tokens = (uint64_t) std::max(0, n_gen - 1);
+    if (cx.prof.enabled && cx.prof.n_tokens > 0) {
+        const Phi3DecodeProfile & p = cx.prof;
+        const double nt    = (double) p.n_tokens;
+        const double inv_us = 1.0 / 1000.0;
+        auto avg = [&](uint64_t ns) -> double { return (double) ns / nt * inv_us; };
+        const double matmul_us =
+            avg(p.wqkv_ns) + avg(p.wo_ns) + avg(p.ffn_up_ns) + avg(p.ffn_down_ns) + avg(p.lmhead_ns);
+        const double other_us =
+            avg(p.embed_ns) + avg(p.attn_norm_ns) + avg(p.rope_ns) + avg(p.kv_write_ns) +
+            avg(p.attn_ns) + avg(p.res1_ns) + avg(p.ffn_norm_ns) + avg(p.swiglu_ns) +
+            avg(p.res2_ns) + avg(p.final_norm_ns);
+        const double measured_us = matmul_us + other_us;
+        const double wall_us     = gen_ms * 1000.0 / nt;
+        fprintf(stderr,
+                "\nphi3 qquant-cached: per-op profile (avg us/token over %llu gen tokens):\n"
+                "  matmul=%.2f us  other=%.2f us  measured=%.2f us  wall/tok=%.2f us\n",
+                (unsigned long long) p.n_tokens, matmul_us, other_us, measured_us, wall_us);
+    }
+
+    cleanup();
     return true;
 }

@@ -634,6 +634,12 @@ bool phi3_seed_kv_from_llama(
 //
 // n_threads_prefill drives llama_decode; n_threads_gen drives the matmul
 // pool for the qquant gen phase.
+// save_kv_path / prompt_hash (A5.5): if save_kv_path is non-null and non-
+// empty, the llama-format raw K/V (post-prefill) plus the first sampled gen
+// token are serialised to that path BEFORE the bridge runs (so the source
+// of truth is llama's own K/V, not the bridge output). prompt_hash is
+// stamped into the header; pass 0 if unknown. Save failure is non-fatal —
+// the function logs a warning and continues with the regular hybrid flow.
 bool phi3_run_qquant_hybrid(
         const llama_model              * model,
         const std::vector<llama_token> & prompt_tokens,
@@ -647,7 +653,105 @@ bool phi3_run_qquant_hybrid(
         std::string                    & error,
         double                         * out_prefill_ms = nullptr,
         double                         * out_gen_ms = nullptr,
-        double                         * out_bridge_ms = nullptr);
+        double                         * out_bridge_ms = nullptr,
+        const char                     * save_kv_path = nullptr,
+        uint64_t                         prompt_hash = 0);
+
+// ---------------------------------------------------------------------------
+// A5.5 — Cached prefill: serialise post-prefill KV state to disk, mmap/load
+// at runtime, skip prefill entirely. Online (hybrid) and offline (cached)
+// paths both flow through phi3_seed_kv_from_raw so the bridge is the single
+// canonical "ready-to-decode" entry point.
+//
+// Greedy-only by design: the first sampled gen token (greedy argmax over the
+// qquant lm_head) is stored alongside the KV so the cached driver can seed
+// the gen loop without re-running any forward step. Non-greedy sampling on
+// load is not supported in this first cut (would require storing logits or
+// the last-position hidden state).
+//
+// First cut scope: Phi-3-mini-only, x64 little-endian, F16 KV, v_trans=true
+// (flash_attn disabled on the source side). Multi-stream / SWA / flash_attn
+// are out of scope; the loader rejects mismatches with a clear error.
+
+// FNV-1a 64-bit over the raw bytes of the prompt token ids. Used to detect
+// accidental mismatches between a cached prefill and the prompt the caller
+// thinks it cached (warn-only by default; the cache is still usable as a
+// shared-context blob across different continuations).
+uint64_t phi3_kv_compute_prompt_hash(const std::vector<llama_token> & prompt_tokens);
+
+// FNV-1a 64-bit over the raw bytes of `output_norm.weight` (a small per-
+// model tensor that's present in every Phi-3 GGUF). Used as the model
+// fingerprint stored in the cache header so dim-only validation can't pass
+// a different fine-tune with matching n_layer/n_head_kv/head_dim. Returns 0
+// on failure (e.g. tensor missing or data null); caller should treat 0 as
+// "unknown" and not enforce strict equality.
+uint64_t phi3_kv_compute_model_arch_hash(const struct llama_model * model);
+
+// Serialise the post-prefill K/V state plus a few model/prompt fingerprints
+// to a 64-byte-header + per-layer-slab file. Caller must guarantee the
+// llama_context is alive, has v_trans=true, F16 KV, single stream, and has
+// n_tokens populated positions. Writes the file atomically via "<path>.tmp"
+// + rename so a partial write never leaves a half-baked cache on disk.
+//
+// On success returns true. On any failure returns false and writes a
+// descriptive message to `error`; no partial file is left behind.
+bool phi3_save_llama_kv_to_disk(
+        struct llama_context * lctx,
+        int                    n_tokens,
+        int                    first_gen_token,        // -1 if not stored
+        uint64_t               prompt_hash,            // 0 if unknown
+        uint64_t               model_arch_hash,        // 0 if unknown
+        const std::string    & path,
+        std::string          & error);
+
+// Read a cache file produced by phi3_save_llama_kv_to_disk, validate the
+// header against cx.kv (dims + dtype) and the model fingerprint, then feed
+// the per-layer K/V slabs through phi3_seed_kv_from_raw. On success sets
+// cx.kv.current_len = n_tokens (the bridge intentionally leaves current_len
+// alone; this loader sets it explicitly to match the per-token convention).
+//
+// Strict validations (hard fail with clear error): magic, hdr_size, dims
+// match cx.kv, kv_type=F16, v_trans=1, n_tokens in [1, cx.kv.ctx_max],
+// first_gen_token in [0, n_vocab) (-1 in file is rejected — required for
+// cached driver to skip the first qquant forward step), file size matches
+// header.
+//
+// Soft validations (warn only):
+//   * prompt_hash mismatch (valid use case for shared-context game levels)
+//   * model_arch_hash mismatch when the caller passes a non-zero
+//     expected_model_arch_hash AND the file has a non-zero stored hash
+//   * In strict mode (strict_model_match=true), model_arch_hash mismatch is
+//     a hard fail.
+bool phi3_load_kv_from_disk(
+        Phi3FusedCtx        & cx,
+        const std::string   & path,
+        uint64_t              expected_prompt_hash,      // 0 to skip
+        uint64_t              expected_model_arch_hash,  // 0 to skip
+        bool                  strict_model_match,        // true => hard-fail mismatch
+        int                 & out_n_tokens,
+        int                 & out_first_gen_token,
+        uint64_t            & out_prompt_hash,
+        std::string         & error);
+
+// Run qquant gen entirely from a cached KV blob — no prefill, no llama
+// context. Loads the cache, asserts pos == cx.kv.current_len before every
+// forward step, then runs the standard qquant gen loop for (n_gen - 1)
+// more tokens after the cached first_gen_token. Validates the loaded
+// first_gen_token is in [0, n_vocab) before pushing it.
+bool phi3_run_qquant_cached(
+        const llama_model              * model,
+        const std::string              & cache_path,
+        int                              n_gen,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             profile_per_op,
+        bool                             attn_parallel,
+        uint64_t                         expected_prompt_hash,     // 0 to skip
+        bool                             strict_model_match,
+        std::vector<llama_token>       & out_generated,
+        std::string                    & error,
+        double                         * out_load_ms = nullptr,
+        double                         * out_gen_ms  = nullptr);
 
 // ---------------------------------------------------------------------------
 // A5.4 — A/B harness: compare three decode paths on the same prompt + seed.

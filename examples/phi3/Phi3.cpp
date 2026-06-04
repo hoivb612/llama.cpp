@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -86,6 +86,16 @@ int main(int argc, char ** argv) {
     bool fused_qquant_ab = false;
     int  fused_qquant_ab_ngen = 32;
     int  fused_qquant_ab_ngen_compare = 20;
+    // A5.5 — cached prefill: save/load the post-prefill Phi3KV state to/
+    // from disk. save_kv requires --phi3-fused-qquant-hybrid 1 (the cache
+    // is written from llama's K/V before the bridge runs). load_kv is a
+    // standalone path that skips all prefill and runs gen straight from
+    // the cached state -- it does NOT need a prompt unless the user wants
+    // an advisory prompt-hash check. save_kv and load_kv are mutually
+    // exclusive in a single run.
+    std::string fused_qquant_save_kv_path;
+    std::string fused_qquant_load_kv_path;
+    bool        fused_qquant_load_kv_strict = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -280,6 +290,22 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-save-kv") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_save_kv_path = argv[++i];
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-load-kv") == 0) {
+                if (i + 1 < argc) {
+                    fused_qquant_load_kv_path = argv[++i];
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-load-kv-strict") == 0) {
+                fused_qquant_load_kv_strict = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -299,6 +325,25 @@ int main(int argc, char ** argv) {
 
     if (model_path.empty()) {
         print_usage(argc, argv);
+        return 1;
+    }
+
+    // A5.5 CLI validation (fail fast before model load).
+    if (!fused_qquant_save_kv_path.empty() && !fused_qquant_load_kv_path.empty()) {
+        fprintf(stderr, "error: --phi3-fused-qquant-save-kv and "
+                        "--phi3-fused-qquant-load-kv are mutually exclusive\n");
+        return 1;
+    }
+    if (!fused_qquant_save_kv_path.empty() && fused_qquant_hybrid == 0) {
+        fprintf(stderr, "error: --phi3-fused-qquant-save-kv requires "
+                        "--phi3-fused-qquant-hybrid 1 (cache is written from "
+                        "llama's K/V before the bridge runs)\n");
+        return 1;
+    }
+    if (!fused_qquant_save_kv_path.empty() && !fused_qquant_debug) {
+        fprintf(stderr, "error: --phi3-fused-qquant-save-kv requires "
+                        "--phi3-fused-qquant-debug to be set (the save piggybacks "
+                        "on the hybrid spot-check)\n");
         return 1;
     }
 
@@ -406,6 +451,74 @@ int main(int argc, char ** argv) {
             phi3_unload_raw_model(raw_model);
             return 1;
         }
+        phi3_unload_raw_model(raw_model);
+        return 0;
+    }
+
+    // A5.5 — cached prefill driver. Runs INSTEAD of the normal runtime path
+    // when --phi3-fused-qquant-load-kv PATH is provided. Skips prefill
+    // entirely; loads the saved KV blob, asserts current_len matches, and
+    // runs the qquant gen loop. Does not require a prompt; if -p is given,
+    // the prompt-hash is computed and checked against the cached value
+    // (warn-only unless --phi3-fused-qquant-load-kv-strict is set, which
+    // also makes the model-arch-hash mismatch fatal).
+    if (!fused_qquant_load_kv_path.empty()) {
+        int gen_threads = fused_qquant_threads > 0
+                              ? fused_qquant_threads
+                              : (n_threads_gen > 0 ? n_threads_gen : 1);
+
+        std::vector<llama_token> advisory_prompt_tokens;
+        if (!single_prompt.empty()) {
+            const llama_vocab * vocab = llama_model_get_vocab(raw_model.model);
+            const int n_neg = -llama_tokenize(vocab, single_prompt.c_str(),
+                                              (int) single_prompt.size(),
+                                              nullptr, 0,
+                                              /*add_special=*/true,
+                                              /*parse_special=*/true);
+            if (n_neg > 0) {
+                advisory_prompt_tokens.resize(n_neg);
+                const int n_tok = llama_tokenize(vocab, single_prompt.c_str(),
+                                                 (int) single_prompt.size(),
+                                                 advisory_prompt_tokens.data(), n_neg,
+                                                 true, true);
+                if (n_tok < 0) advisory_prompt_tokens.clear();
+            }
+        }
+        uint64_t advisory_prompt_hash =
+            advisory_prompt_tokens.empty() ? 0
+                                           : phi3_kv_compute_prompt_hash(advisory_prompt_tokens);
+
+        std::vector<llama_token> gen_tokens;
+        std::string cerr;
+        const bool cok = phi3_run_qquant_cached(raw_model.model,
+                                                fused_qquant_load_kv_path,
+                                                fused_qquant_n_gen,
+                                                gen_threads,
+                                                /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                                /*profile_per_op=*/fused_qquant_profile,
+                                                /*attn_parallel=*/fused_qquant_attn_parallel != 0,
+                                                advisory_prompt_hash,
+                                                /*strict_model_match=*/fused_qquant_load_kv_strict,
+                                                gen_tokens, cerr);
+        if (!cok) {
+            fprintf(stderr, "phi3 qquant-cached: FAIL: %s\n", cerr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(raw_model.model);
+        fprintf(stdout, "\nphi3 qquant-cached: generated %d tokens from '%s':\n",
+                (int) gen_tokens.size(), fused_qquant_load_kv_path.c_str());
+        for (llama_token tok : gen_tokens) {
+            char piece[256];
+            const int n = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
+            if (n > 0) {
+                fwrite(piece, 1, (size_t) n, stdout);
+            }
+        }
+        fputc('\n', stdout);
+        fflush(stdout);
+
         phi3_unload_raw_model(raw_model);
         return 0;
     }
@@ -663,7 +776,15 @@ int main(int argc, char ** argv) {
                         bool qok = false;
                         if (fused_qquant_hybrid != 0) {
                             // A5.3 — llama batched prefill + KV bridge + qquant gen.
+                            // A5.5 — optionally save the post-prefill Phi3KV state
+                            // to disk for cached-prefill load on subsequent runs.
                             int hp_prefill = n_threads_prefill > 0 ? n_threads_prefill : qq_threads;
+                            const char * save_kv_path = fused_qquant_save_kv_path.empty()
+                                                            ? nullptr
+                                                            : fused_qquant_save_kv_path.c_str();
+                            uint64_t prompt_hash = save_kv_path
+                                                       ? phi3_kv_compute_prompt_hash(prompt_tokens)
+                                                       : 0;
                             qok = phi3_run_qquant_hybrid(raw_model.model, prompt_tokens,
                                                          fused_qquant_n_gen,
                                                          hp_prefill,
@@ -671,7 +792,12 @@ int main(int argc, char ** argv) {
                                                          /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
                                                          /*profile_per_op=*/fused_qquant_profile,
                                                          /*attn_parallel=*/fused_qquant_attn_parallel != 0,
-                                                         gen_tokens, qerr);
+                                                         gen_tokens, qerr,
+                                                         /*out_prefill_ms=*/nullptr,
+                                                         /*out_gen_ms=*/nullptr,
+                                                         /*out_bridge_ms=*/nullptr,
+                                                         save_kv_path,
+                                                         prompt_hash);
                             if (!qok) {
                                 fprintf(stderr, "phi3 qquant-hybrid: FAIL (%s); falling back to per-token qquant prefill\n",
                                         qerr.c_str());
