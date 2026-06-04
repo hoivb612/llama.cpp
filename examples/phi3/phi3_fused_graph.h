@@ -158,6 +158,7 @@ inline void phi3_kv_keep_prefix(Phi3KV & kv, int n_keep) { phi3_kv_truncate(kv, 
 // Prints PASS/FAIL to stderr. Returns true on PASS.
 bool   phi3_kv_self_test (const Phi3Weights & w, std::string & error);
 
+
 // ---------------------------------------------------------------------------
 // Phi3MatmulPool self-test — Phase A.
 // Builds a small F32 weight matrix + F32 src vector, dispatches many matmul
@@ -532,6 +533,70 @@ bool phi3_run_qquant_decode(
         bool                           attn_parallel,
         std::vector<llama_token>     & out_generated,
         std::string                  & error);
+
+// ---------------------------------------------------------------------------
+// A5.2 — KV bridge: convert llama-format KV cache state into our Phi3KV
+// layout so qquant-decode can pick up where llama_decode left off.
+//
+// LAYOUT NOTES (single-stream, F16):
+//   llama K (per layer): linear[d + head*head_dim + pos*n_embd_kv]
+//                        (= our K layout — straight memcpy per layer).
+//   llama V (per layer, v_trans=true, the default for non-FA contexts):
+//                        linear[pos + (head*head_dim + d)*src_kv_size]
+//                        i.e. src_kv_size-long contiguous strip per (h,d),
+//                        with strip order (h outer, d inner).
+//   our V[il]:           linear[pos + (d*n_head_kv + h)*ctx_max]
+//                        ctx_max-long strip per (h,d), strip order
+//                        (d outer, h inner). Same strip CONTENT, different
+//                        strip ORDER — the bridge re-arranges strips.
+//
+// The bridge is independent of llama — operates on raw F16 buffers + layout
+// descriptors, so the same function will later serve a disk-loaded KV blob
+// path (cached prefill / level cache).
+//
+// Low-level: copy `n_tokens` of K/V state from raw llama-format per-layer
+// buffers into `cx.kv`, writing to destination positions
+// [base_pos, base_pos + n_tokens) sourced from positions
+// [src_pos_first, src_pos_first + n_tokens) of the source.
+//
+// Requirements (asserted; clear error on mismatch):
+//   - src_type == GGML_TYPE_F16 (the only path exercised today).
+//   - src_v_trans == true (we don't implement on-the-fly transpose yet).
+//   - cx.kv.n_head_kv * cx.kv.head_dim is the per-token K row size (no GQA).
+//   - base_pos >= 0 and base_pos + n_tokens <= cx.kv.ctx_max.
+//   - src_pos_first + n_tokens <= src_kv_size.
+//
+// Does NOT update cx.kv.current_len. Caller is responsible for that
+// (consistent with the per-token forward path which sets current_len
+// explicitly after writing).
+bool phi3_seed_kv_from_raw(
+        Phi3FusedCtx       & cx,
+        int                  base_pos,
+        int                  n_tokens,
+        int                  src_pos_first,
+        bool                 src_v_trans,
+        size_t               src_kv_size,           // source V (h,d) strip length, in elements
+        enum ggml_type       src_type,              // must be GGML_TYPE_F16
+        const void * const * src_K_layers,          // [cx.kv.n_layer] base ptrs to each layer's K data
+        const void * const * src_V_layers,          // [cx.kv.n_layer] base ptrs to each layer's V data
+        std::string        & error);
+
+struct llama_context;
+
+// Convenience wrapper: pull raw K/V layer pointers + v_trans flag from a
+// llama_context (via llama_kv_self_layer_k / _layer_v / _v_trans) and feed
+// them to phi3_seed_kv_from_raw. The context's KV cache must be the single
+// unified (non-SWA, non-iSWA, non-hybrid) variety — Phi-3-mini qualifies.
+//
+// Reports a clear error on mismatch (e.g. flash_attn enabled -> v_trans=false;
+// SWA model; non-F16 KV cache; n_head != n_head_kv).
+bool phi3_seed_kv_from_llama(
+        Phi3FusedCtx         & cx,
+        struct llama_context * lctx,
+        int                    base_pos,
+        int                    n_tokens,
+        int                    src_pos_first,
+        std::string          & error);
 
 // ---------------------------------------------------------------------------
 // A2.5c — 3-prompt × n-token regression infrastructure.

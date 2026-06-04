@@ -3576,6 +3576,247 @@ bool phi3_full_forward_qquant(
 }
 
 
+// ---------------------------------------------------------------------------
+// A5.2 — KV bridge implementation.
+// ---------------------------------------------------------------------------
+bool phi3_seed_kv_from_raw(
+        Phi3FusedCtx       & cx,
+        int                  base_pos,
+        int                  n_tokens,
+        int                  src_pos_first,
+        bool                 src_v_trans,
+        size_t               src_kv_size,
+        enum ggml_type       src_type,
+        const void * const * src_K_layers,
+        const void * const * src_V_layers,
+        std::string        & error) {
+    error.clear();
+
+    if (cx.kv.n_layer <= 0 || cx.kv.K[0] == nullptr || cx.kv.V[0] == nullptr) {
+        error = "phi3_seed_kv_from_raw: cx.kv is not initialized";
+        return false;
+    }
+    if (n_tokens == 0) {
+        // No-op is valid (e.g. zero-length prefill); current_len untouched.
+        return true;
+    }
+    if (n_tokens < 0) {
+        error = "phi3_seed_kv_from_raw: n_tokens < 0";
+        return false;
+    }
+    if (src_type != GGML_TYPE_F16) {
+        std::ostringstream oss;
+        oss << "phi3_seed_kv_from_raw: only GGML_TYPE_F16 is supported (got "
+            << (int) src_type << "); enable F16 KV cache on the source side";
+        error = oss.str();
+        return false;
+    }
+    if (!src_v_trans) {
+        error = "phi3_seed_kv_from_raw: only src_v_trans=true is implemented "
+                "(flash_attn=true on the source context produces v_trans=false; "
+                "rerun the source with flash_attn disabled)";
+        return false;
+    }
+    if (base_pos < 0 || base_pos + n_tokens > cx.kv.ctx_max) {
+        std::ostringstream oss;
+        oss << "phi3_seed_kv_from_raw: write range [" << base_pos << ","
+            << (base_pos + n_tokens) << ") exceeds cx.kv.ctx_max=" << cx.kv.ctx_max;
+        error = oss.str();
+        return false;
+    }
+    if (src_pos_first < 0 || (size_t)(src_pos_first + n_tokens) > src_kv_size) {
+        std::ostringstream oss;
+        oss << "phi3_seed_kv_from_raw: source range [" << src_pos_first << ","
+            << (src_pos_first + n_tokens) << ") exceeds src_kv_size=" << src_kv_size;
+        error = oss.str();
+        return false;
+    }
+    if (src_K_layers == nullptr || src_V_layers == nullptr) {
+        error = "phi3_seed_kv_from_raw: src_K_layers or src_V_layers is null";
+        return false;
+    }
+
+    const int n_layer    = cx.kv.n_layer;
+    const int n_head_kv  = cx.kv.n_head_kv;
+    const int head_dim   = cx.kv.head_dim;
+    const int ctx_max    = cx.kv.ctx_max;
+    const size_t n_embd_kv = (size_t) n_head_kv * (size_t) head_dim;
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (src_K_layers[il] == nullptr || src_V_layers[il] == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_raw: layer " << il << " src K or V is null";
+            error = oss.str();
+            return false;
+        }
+        if (cx.kv.K[il] == nullptr || cx.kv.V[il] == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_raw: layer " << il << " dst K or V is null";
+            error = oss.str();
+            return false;
+        }
+
+        // --- K copy ---
+        // llama layout: linear[d + h*head_dim + pos*n_embd_kv]
+        // ours       : linear[d + h*head_dim + pos*n_embd_kv]
+        // Tokens are contiguous in both, per-token stride = n_embd_kv*sizeof(fp16).
+        // One memcpy of n_tokens*n_embd_kv F16s.
+        {
+            const ggml_fp16_t * src = (const ggml_fp16_t *) src_K_layers[il]
+                                    + (size_t) src_pos_first * n_embd_kv;
+            ggml_fp16_t       * dst = cx.kv.K[il]
+                                    + (size_t) base_pos * n_embd_kv;
+            std::memcpy(dst, src, n_tokens * n_embd_kv * sizeof(ggml_fp16_t));
+        }
+
+        // --- V copy (strip reorder) ---
+        // llama layout (v_trans=true): linear[pos + (h*head_dim + d)*src_kv_size]
+        //   -> strip src_V + (h*head_dim + d)*src_kv_size + src_pos_first, length n_tokens
+        // ours: linear[pos + (d*n_head_kv + h)*ctx_max]
+        //   -> strip cx.kv.V[il] + (d*n_head_kv + h)*ctx_max + base_pos, length n_tokens
+        // (head_dim * n_head_kv) strided memcpys per layer.
+        {
+            const ggml_fp16_t * src_V = (const ggml_fp16_t *) src_V_layers[il];
+            ggml_fp16_t       * dst_V = cx.kv.V[il];
+            for (int h = 0; h < n_head_kv; ++h) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const ggml_fp16_t * src_strip = src_V
+                        + ((size_t) h * head_dim + (size_t) d) * src_kv_size
+                        + (size_t) src_pos_first;
+                    ggml_fp16_t * dst_strip = dst_V
+                        + ((size_t) d * n_head_kv + (size_t) h) * (size_t) ctx_max
+                        + (size_t) base_pos;
+                    std::memcpy(dst_strip, src_strip, n_tokens * sizeof(ggml_fp16_t));
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool phi3_seed_kv_from_llama(
+        Phi3FusedCtx         & cx,
+        struct llama_context * lctx,
+        int                    base_pos,
+        int                    n_tokens,
+        int                    src_pos_first,
+        std::string          & error) {
+    error.clear();
+    if (lctx == nullptr) {
+        error = "phi3_seed_kv_from_llama: lctx is null";
+        return false;
+    }
+    if (cx.kv.n_layer <= 0 || cx.kv.K[0] == nullptr || cx.kv.V[0] == nullptr) {
+        error = "phi3_seed_kv_from_llama: cx.kv is not initialized";
+        return false;
+    }
+
+    const int n_layer = cx.kv.n_layer;
+
+    // Walk each model layer, collect raw K/V data pointers. Verify shape,
+    // type, and v_trans agree with our expectations. We rely on F16 KV.
+    const bool v_trans = llama_kv_self_v_trans(lctx);
+
+    std::vector<const void *> Ks((size_t) n_layer, nullptr);
+    std::vector<const void *> Vs((size_t) n_layer, nullptr);
+    size_t    src_kv_size = 0;
+    ggml_type src_type    = GGML_TYPE_F16;
+    bool      first       = true;
+
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * k = llama_kv_self_layer_k(lctx, il);
+        ggml_tensor * v = llama_kv_self_layer_v(lctx, il);
+        if (k == nullptr || v == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " K/V tensor unavailable from context "
+                << "(SWA/iSWA/hybrid memory or missing KV slot)";
+            error = oss.str();
+            return false;
+        }
+        if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " KV type is not F16 (k->type=" << (int) k->type
+                << " v->type=" << (int) v->type
+                << "); rebuild source context with --type-k f16 --type-v f16";
+            error = oss.str();
+            return false;
+        }
+        // Both K and V are allocated as 3-D (n_embd_*_gqa, kv_size, n_stream).
+        // We require single-stream for the bridge.
+        if (k->ne[2] != 1 || v->ne[2] != 1) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " multi-stream KV not supported (k->ne[2]=" << k->ne[2]
+                << " v->ne[2]=" << v->ne[2] << ")";
+            error = oss.str();
+            return false;
+        }
+        // Per-layer dim cross-check: K is (n_embd_k_gqa, kv_size, n_stream).
+        // We need n_embd_k_gqa == n_head_kv * head_dim (no GQA path).
+        const int64_t expect_n_embd = (int64_t) cx.kv.n_head_kv * (int64_t) cx.kv.head_dim;
+        if (k->ne[0] != expect_n_embd) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " K->ne[0]=" << k->ne[0]
+                << " does not match n_head_kv*head_dim=" << expect_n_embd
+                << " (GQA or mismatched model)";
+            error = oss.str();
+            return false;
+        }
+        if (v->ne[0] != expect_n_embd) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " V->ne[0]=" << v->ne[0]
+                << " does not match n_head_kv*head_dim=" << expect_n_embd;
+            error = oss.str();
+            return false;
+        }
+        if (k->ne[1] != v->ne[1]) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " K->ne[1]=" << k->ne[1] << " != V->ne[1]=" << v->ne[1];
+            error = oss.str();
+            return false;
+        }
+
+        if (first) {
+            src_kv_size = (size_t) k->ne[1];
+            src_type    = k->type;
+            first       = false;
+        } else {
+            if ((size_t) k->ne[1] != src_kv_size) {
+                std::ostringstream oss;
+                oss << "phi3_seed_kv_from_llama: layer " << il
+                    << " kv_size mismatch across layers (got " << k->ne[1]
+                    << " expected " << src_kv_size << ")";
+                error = oss.str();
+                return false;
+            }
+        }
+
+        if (k->data == nullptr || v->data == nullptr) {
+            std::ostringstream oss;
+            oss << "phi3_seed_kv_from_llama: layer " << il
+                << " tensor data pointer is null (non-CPU backend?); "
+                   "this path requires the KV cache to live on a CPU-addressable buffer";
+            error = oss.str();
+            return false;
+        }
+
+        Ks[(size_t) il] = k->data;
+        Vs[(size_t) il] = v->data;
+    }
+
+    return phi3_seed_kv_from_raw(
+        cx, base_pos, n_tokens, src_pos_first,
+        v_trans, src_kv_size, src_type,
+        Ks.data(), Vs.data(), error);
+}
+
+
 bool phi3_run_qquant_decode(
         const llama_model            * model,
         const std::vector<llama_token> & prompt_tokens,
