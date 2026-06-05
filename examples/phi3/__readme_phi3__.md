@@ -733,3 +733,182 @@ Right now if I write the spec saying "MoE: out of scope, falls back", and a user
 Same logic for every row above: each is something a real Phi-3 family model could have that breaks our assumed math.
 
 ===================================================================================
+
+CLI reference — Phi3.exe
+=========================
+
+Source of truth: examples/phi3/Phi3.cpp (print_usage at line 18, dispatch lines
+105-322). One-line semantics + defaults + when to use. Group order mirrors the
+order in print_usage.
+
+Core (always honoured)
+----------------------
+  -m PATH                          GGUF model file. Required for everything
+                                   except --phi3-kernel-test and the cached
+                                   prefill load path (which still needs the
+                                   model to rebuild weights).
+  -p "TEXT"                        Single prompt. If absent, runs an internal
+                                   chat loop. Some test/debug flags treat this
+                                   as the prompt to validate against.
+  -c N                             llama context size (default model max).
+  -ngl N                           Layers to offload (default 99 = all GPU when
+                                   a GPU backend is built; -ngl 0 forces CPU).
+  -n N                             Tokens to predict in the chat/gen loop
+                                   (default 256).
+  -s SEED                          RNG seed (default 1234).
+  --temp F                         Sampling temperature (default 0.0 = greedy).
+                                   Must be 0 when --phi3-fused-lmhead is set.
+  --min-p F                        min-p sampler threshold (default 0.05).
+                                   Must be 0 when --phi3-fused-lmhead is set.
+  --threads-prefill N              Prefill thread count (default = system).
+  --threads-gen N                  Decode/gen thread count (default 0 = auto:
+                                   inherits prefill count unless overridden).
+  --threads-gen-auto               Probe a small grid (1/2/4/...) at runtime
+                                   and lock in the fastest count for steady-
+                                   state decode.
+
+Runtime fast paths (chat loop, opt-in)
+--------------------------------------
+  --phi3-fused-lmhead              Replace upstream lm_head matmul with our
+                                   AVX-512 Q4_K-aware fused lm_head+argmax.
+                                   Greedy only (requires --temp 0 --min-p 0).
+                                   Returns a single token id; skips writing
+                                   the 32064-wide logits buffer.
+  --phi3-fused-decode              Enable the full custom Phi-3 forward path
+                                   for decode steps (Phase A). Pairs with the
+                                   fused lmhead automatically.
+
+Tensor repack (one of, mutually exclusive)
+------------------------------------------
+  --repack-ggml                    Run upstream ggml repack pass after model
+                                   load (vanilla _x8 layout).
+  --repack-xbox                    Internal XBOX repack layout.
+  --repack-xbcg                    Internal XBCG repack layout.
+                                   None of the above => no repack.
+
+One-shot tests (run, print PASS/FAIL, exit; no chat loop)
+---------------------------------------------------------
+  --phi3-dump-weights              Resolve+print Phi3Weights schema. No
+                                   compute. Good first run on a new GGUF.
+  --phi3-test-kv                   Exercise the Phi3KV cache shapes against
+                                   the resolved weights.
+  --phi3-matmul-test               Compare our matmul shim against ggml on
+                                   the model's actual weight shapes.
+  --phi3-kernel-test               Pure kernel unit tests (RMSNorm, RoPE,
+                                   SwiGLU, rmsnorm+quant_q8K, ...). Does NOT
+                                   need a model file beyond what the build
+                                   links; safe to run early.
+  --phi3-qmatmul-test              Q4_K / Q6_K matmul shim parity vs upstream
+                                   ggml_mul_mat on real weight tensors.
+  --phi3-layer-test                Hand-rolled single-layer forward vs upstream
+                                   oracle, on layer 0. Prints max-abs / cos-sim.
+  --phi3-full-test                 Full hand network vs upstream last-token
+                                   logits on a baked-in prompt.
+  --phi3-validate-fused            Run the Phase A fused-forward validator
+                                   (rejects unsupported variants, ACCEPTS on
+                                   supported ones). Forces flash_attn=off so
+                                   the validator can demonstrate the ACCEPT
+                                   path on a normal model.
+
+Fused-forward debug harnesses (F32 reference path)
+--------------------------------------------------
+  --phi3-fused-f32-debug           Run the F32-reference custom forward for a
+                                   short gen and compare token-by-token to
+                                   the llama baseline. Sampling caveat: warns
+                                   if --temp > 0 (baseline is sampling so
+                                   token-level match may diverge).
+  --phi3-fused-f32-n-gen N         Tokens to generate in --phi3-fused-f32-
+                                   debug (default 4).
+
+Fused-forward debug harnesses (qquant production path)
+------------------------------------------------------
+  --phi3-fused-qquant-debug        Per-token spot-check: run our qquant decode
+                                   alongside llama baseline and report top-1
+                                   agreement + per-stage timing for the first
+                                   N tokens. Pairs with several flags below.
+  --phi3-fused-qquant-n-gen N      Tokens to spot-check (default 4).
+  --phi3-fused-qquant-threads N    Override decode thread count for the qquant
+                                   path only (default 0 = use --threads-gen).
+                                   Lets you tune qquant pool independently
+                                   from the regular llama decode pool.
+  --phi3-fused-qquant-rmsnorm-fuse 0|1
+                                   A/B switch for the fused RMSNorm + quantize
+                                   path at the two *_norm sites. Default 0;
+                                   1 enables. Bit-identical (covered by
+                                   --phi3-kernel-test's "rmsnorm+quant_q8K").
+                                   Measured net effect on Phi-3-mini was
+                                   neutral-to-negative at 8 threads.
+  --phi3-fused-qquant-attn-parallel 0|1
+                                   Parallelise the per-head attention loop in
+                                   qquant decode across the matmul pool.
+                                   Default 0. Bit-identical; only matters
+                                   when --threads-gen > 1.
+  --phi3-fused-qquant-hybrid 0|1   Replace per-token qquant prefill with a
+                                   single batched llama_decode and bridge the
+                                   resulting K/V into Phi3KV (A5.2/A5.3).
+                                   Steady-state gen path is unchanged.
+                                   Default 0. No effect unless
+                                   --phi3-fused-qquant-debug is also set.
+  --phi3-fused-qquant-profile      Enable the per-op RAII profiler in qquant
+                                   decode and print a bucketed µs/token + a
+                                   matmul-vs-other split at end of gen. Resets
+                                   counters between prefill and gen so the
+                                   summary is steady-state. Off by default.
+  --phi3-fused-qquant-regress [N]  Run-and-exit: 3-prompt agreement vs
+                                   baseline. N = tokens per prompt (default
+                                   256). Exit status 0 = PASS, 1 = FAIL.
+                                   Replaces the chat loop.
+
+Fused-forward A/B harness
+-------------------------
+  --phi3-fused-qquant-ab           Run-and-exit: llama-batched (oracle) vs
+                                   qquant-per-token vs qquant-hybrid back-to-
+                                   back and print a comparison table (timings
+                                   + top-1 agreement). Replaces the regular
+                                   --phi3-fused-qquant-debug spot-check.
+  --phi3-fused-qquant-ab-ngen N    Tokens to generate inside the AB harness
+                                   (default 32).
+  --phi3-fused-qquant-ab-ngen-compare N
+                                   Tokens to top-1 compare across the three
+                                   modes (default 20, must be <= ab-ngen).
+
+Cached prefill (A5.5/A5.6) — mutually exclusive
+-----------------------------------------------
+  --phi3-fused-qquant-save-kv PATH Save the post-prefill Phi3KV state to PATH
+                                   after prefill completes. Requires
+                                   --phi3-fused-qquant-hybrid 1 AND
+                                   --phi3-fused-qquant-debug (the hybrid path
+                                   is what populates llama's K/V before the
+                                   bridge).
+  --phi3-fused-qquant-load-kv PATH Skip prefill entirely; resume gen from a
+                                   cached Phi3KV state. -p is optional and
+                                   only used for an advisory hash check.
+  --phi3-fused-qquant-load-kv-strict
+                                   Promote the prompt-hash mismatch warning
+                                   from --phi3-fused-qquant-load-kv into a
+                                   fatal error.
+  --phi3-fused-qquant-a56          Long-prompt cached-prefill sweep harness
+                                   (A5.6). Run-and-exit; needs no prompt.
+
+Quick recipes
+-------------
+  # Sanity (no model needed beyond build)
+  Phi3.exe --phi3-kernel-test
+  # Model schema + shapes
+  Phi3.exe -m M.gguf --phi3-dump-weights
+  Phi3.exe -m M.gguf --phi3-test-kv --phi3-qmatmul-test --phi3-layer-test
+  # Hand-vs-oracle full-network smoke
+  Phi3.exe -m M.gguf --phi3-full-test
+  # Greedy chat with both runtime fast paths
+  Phi3.exe -m M.gguf -p "Hi" -n 64 --temp 0 --min-p 0 \
+           --phi3-fused-decode --phi3-fused-lmhead --threads-gen 8
+  # Qquant gen spot-check + profile
+  Phi3.exe -m M.gguf -p "Hi" --phi3-fused-qquant-debug \
+           --phi3-fused-qquant-profile --phi3-fused-qquant-n-gen 16
+  # Cached-prefill round trip
+  Phi3.exe -m M.gguf -p "long prompt..." \
+           --phi3-fused-qquant-debug --phi3-fused-qquant-hybrid 1 \
+           --phi3-fused-qquant-save-kv kv.bin
+  Phi3.exe -m M.gguf --phi3-fused-qquant-load-kv kv.bin -n 64
+  # 3-prompt regression gate
+  Phi3.exe -m M.gguf --phi3-fused-qquant-regress 256
