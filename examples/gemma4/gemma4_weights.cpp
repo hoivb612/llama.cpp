@@ -152,6 +152,14 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
     }
 
     out.n_swa             = get_meta_i32(model, "gemma4.attention.sliding_window", 0);
+    {
+        const int32_t shared = get_meta_i32(model, "gemma4.attention.shared_kv_layers", 0);
+        if (shared > 0 && shared < out.n_layer) {
+            out.n_layer_kv_from_start = out.n_layer - shared;
+        } else {
+            out.n_layer_kv_from_start = -1;
+        }
+    }
     out.rope_dim          = get_meta_i32(model, "gemma4.rope.dimension_count", 0);
     out.rope_freq_base    = get_meta_f32(model, "gemma4.rope.freq_base", 0.0f);
     out.rope_freq_base_swa = get_meta_f32(model, "gemma4.rope.freq_base_swa", out.rope_freq_base);
@@ -355,6 +363,38 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
                     << ggml_nelements(L.layer_output_scale);
                 error = oss.str();
                 return false;
+            }
+        }
+    }
+
+    // Populate per-layer kv_reuse_il using the shared-KV rule from
+    // llama-model.cpp (LLM_ARCH_GEMMA4 case):
+    //   if il >= n_layer_kv_from_start:
+    //       reuse = n_layer_kv_from_start - (is_swa(il) ? 2 : 1)
+    if (out.n_layer_kv_from_start > 0 && out.n_layer_kv_from_start < out.n_layer) {
+        for (int il = 0; il < out.n_layer; ++il) {
+            LayerWeights & L = out.layers[il];
+            if (il < out.n_layer_kv_from_start) {
+                L.kv_reuse_il = -1;
+            } else {
+                L.kv_reuse_il = out.n_layer_kv_from_start - (L.is_swa ? 2 : 1);
+                if (L.kv_reuse_il < 0 || L.kv_reuse_il >= out.n_layer_kv_from_start) {
+                    std::ostringstream oss;
+                    oss << "gemma4::resolve: layer " << il << " computed kv_reuse_il="
+                        << L.kv_reuse_il << " out of valid range [0,"
+                        << out.n_layer_kv_from_start << ")";
+                    error = oss.str();
+                    return false;
+                }
+                // The source layer must be the same SWA type as us (so head_dim and RoPE match).
+                if (out.layers[L.kv_reuse_il].is_swa != L.is_swa) {
+                    std::ostringstream oss;
+                    oss << "gemma4::resolve: layer " << il << " (is_swa=" << L.is_swa
+                        << ") reuses KV from layer " << L.kv_reuse_il
+                        << " (is_swa=" << out.layers[L.kv_reuse_il].is_swa << ") -- mismatch";
+                    error = oss.str();
+                    return false;
+                }
             }
         }
     }

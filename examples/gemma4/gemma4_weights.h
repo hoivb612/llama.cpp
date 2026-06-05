@@ -40,6 +40,17 @@ struct LayerWeights {
     bool has_kv     = false;  // attn_k present (always true for dense E2B/E4B)
     bool has_v_proj = false;  // attn_v present (E2B/E4B: yes; some variants reuse K)
 
+    // Shared-KV pattern (Gemma 3n / Gemma 4):
+    //   The last N layers reuse K/V cache from earlier layers instead of
+    //   computing their own. Reuse rule (from llama-model.cpp):
+    //     if il >= n_layer_kv_from_start:
+    //         reuse = n_layer_kv_from_start - (is_swa(il) ? 2 : 1)
+    //   For Gemma-4 E2B: n_layer_kv_from_start=15 (35 layers - 20 shared);
+    //   SWA layers 15..34 reuse layer 13 (SWA); FULL layers 19,24,29,34
+    //   reuse layer 14 (FULL).
+    //   -1 means "compute own K/V" (the default).
+    int  kv_reuse_il = -1;
+
     // Norms (all F32).
     const ggml_tensor * attn_norm        = nullptr; // [n_embd]
     const ggml_tensor * attn_q_norm      = nullptr; // [head_dim] -- applied per-head along last dim
@@ -77,6 +88,7 @@ struct Weights {
     int  n_embd_per_layer   = 0;
     int  n_vocab            = 0;
     int  n_swa              = 0;       // sliding-window size (e.g. 512)
+    int  n_layer_kv_from_start = -1;   // Gemma-4 shared-KV boundary. -1 == all layers own their KV.
     int  rope_dim           = 0;       // rope.dimension_count (e.g. 256 or head_dim)
     float rope_freq_base    = 0.0f;    // e.g. 1e6 (full-attn layers)
     float rope_freq_base_swa = 0.0f;   // e.g. 1e4 (SWA layers)

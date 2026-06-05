@@ -23,6 +23,7 @@
 #include <vector>
 
 struct llama_model;
+struct ggml_tensor;
 
 namespace gemma4 {
 
@@ -71,6 +72,11 @@ struct LayerF32 {
     // Optional scalar [1] -- multiplies hidden before next layer.
     bool  has_layer_output_scale = false;
     float layer_output_scale     = 1.0f;
+
+    // Shared-KV pattern: if >=0, this layer reuses K/V computed by an earlier
+    // layer (does NOT call wk/wv). Forward-pass storage of K/V at the
+    // owning layer is the caller's responsibility (see network_forward_f32).
+    int kv_reuse_il = -1;
 };
 
 // Dequantize layer `il` of the model into LayerF32. Reads w_global for
@@ -88,13 +94,30 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
 //   hidden_out       : [n_embd, n_tokens] (written)
 // G3.3 does NOT take past K/V -- attention is computed over the n_tokens
 // in-batch with causal masking (no past tokens).
+//
+// G3.4a: optional KV-sharing args for Gemma-4's n_layer_kv_from_start pattern.
+//   kv_K_self_out / kv_V_self_out  : if non-null, the function writes its
+//                                    computed K (post-norm + post-RoPE) and
+//                                    V (post-norm; no RoPE) into these
+//                                    buffers, sized [n_head_kv * head_dim * n_tokens].
+//   kv_K_reuse / kv_V_reuse        : if non-null, the function SKIPS its
+//                                    own K/V projection and reuses these
+//                                    instead. Pass these for layers with
+//                                    L.kv_reuse_il >= 0 (taken from the
+//                                    owning layer's kv_K_self_out / kv_V_self_out).
+// All four nullptr -> classic behaviour (compute and discard locally),
+// used by the G3.3 single-layer self-test.
 bool layer_forward_f32(const LayerF32 & L,
                        int n_tokens,
                        const float * hidden_in,
                        const int32_t * pos,
                        const float * per_layer_input,
                        float * hidden_out,
-                       std::string & error);
+                       std::string & error,
+                       float * kv_K_self_out = nullptr,
+                       float * kv_V_self_out = nullptr,
+                       const float * kv_K_reuse = nullptr,
+                       const float * kv_V_reuse = nullptr);
 
 // ggml-graph oracle: same inputs and same F32 weights, but lowers each
 // op to a ggml_* call and runs ggml_graph_compute_with_ctx. Used as the
@@ -113,5 +136,99 @@ bool oracle_layer_forward_f32(const LayerF32 & L,
 // On failure, prints first-mismatch diagnostic to stderr.
 bool layer_self_test(const llama_model * model, const Weights & w,
                      int il, int n_tokens, std::string & error);
+
+// ---------------------------------------------------------------------
+// G3.4 -- whole-network F32 forward.
+// ---------------------------------------------------------------------
+//
+// ModelF32 holds dequantized F32 weights for every layer plus a few
+// small F32 globals. Two large tensors (tok_embd and per_layer_tok_embd)
+// are NOT dequantized eagerly to save ~3-4 GB on E4B; we keep pointers
+// to the original ggml tensors and dequantize on-demand:
+//   * tok_embd:           used per-token-row for input embedding lookup
+//                         and per-vocab-row for the tied lm_head matmul
+//   * per_layer_tok_embd: F32 in gemma4 already, so we just point at it
+//
+// As a result, ModelF32 requires the source llama_model to stay alive
+// for the entire lifetime of ModelF32 -- we hold raw ggml_tensor * back
+// at it. dequant_model() copies what it needs out of `Weights` so the
+// `Weights` struct itself can be dropped if desired.
+
+struct ModelF32 {
+    // Hparams (copied from Weights so ModelF32 is self-describing).
+    int   n_layer            = 0;
+    int   n_embd             = 0;
+    int   n_head             = 0;
+    int   n_head_kv          = 0;
+    int   n_vocab            = 0;
+    int   n_embd_per_layer   = 0;
+    int   n_swa              = 0;
+    float rms_eps            = 1e-6f;
+    float final_logit_softcap = 0.0f;
+    bool  output_tied_to_embd = true;
+
+    // Small global F32 buffers.
+    std::vector<float> output_norm;           // [n_embd]
+    std::vector<float> per_layer_model_proj;  // [n_embd, n_embd_per_layer * n_layer]  (dequantized)
+    std::vector<float> per_layer_proj_norm;   // [n_embd_per_layer]
+    std::vector<float> freq_factors_data;     // copy of rope_freqs->data (or empty)
+
+    // Layer weights. LayerF32.freq_factors points INTO this->freq_factors_data
+    // for non-SWA layers (or nullptr for SWA layers). Do not move ModelF32
+    // after dequant_model() returns.
+    std::vector<LayerF32> layers;
+
+    // Pointers to quant tensors in the original model (NOT owned, do not free).
+    // tok_embd is the embedding matrix; also used as the tied lm_head.
+    const ggml_tensor * tok_embd_quant            = nullptr; // [n_embd, n_vocab]
+    const ggml_tensor * per_layer_tok_embd_quant  = nullptr; // F32 [n_embd_per_layer * n_layer, n_vocab]
+};
+
+// Dequant the whole model into ModelF32. Does not copy tok_embd or
+// per_layer_tok_embd (held as pointers to the live llama_model).
+// Memory footprint: roughly 5.6 GB on E2B Q4_K_M, ~8 GB on E4B Q4_K_M.
+bool dequant_model(const llama_model * model, const Weights & w,
+                   ModelF32 & out, std::string & error);
+
+// Full-network F32 forward over a single batch of n_tokens.
+//   token_ids[n_tokens] - token IDs (used for tok_embd + PLE lookups)
+//   pos[n_tokens]       - positions (used for RoPE)
+//   logits_out          - if last_token_only == true:  [n_vocab]
+//                         else:                         [n_vocab * n_tokens]
+//
+// Asserts n_tokens <= model.n_swa (SWA masking is NOT implemented for
+// G3.4a; only causal masking inside each layer). Use small prompts for
+// the first round.
+//
+// Note: this function does no allocation amortization between calls --
+// it allocates and frees scratch per call. For a one-shot test that's
+// fine; G3.4b will manage scratch + KV cache.
+bool network_forward_f32(const ModelF32 & model,
+                         int n_tokens,
+                         const int32_t * token_ids,
+                         const int32_t * pos,
+                         bool last_token_only,
+                         float * logits_out,
+                         std::string & error);
+
+// Network self-test: tokenize a fixed prompt with the model's tokenizer,
+// run hand-coded network_forward_f32, run upstream llama_decode on the
+// same prompt, compare the last-token logits with multi-metric reporting:
+//   * top-1 token match
+//   * top-5 / top-10 overlap (set agreement)
+//   * upstream-top-1 rank in hand's ranking
+//   * max_abs / mean_abs / RMS error on FULL logits
+//   * cosine similarity on FULL logits
+//
+// Returns true if top-1 token matches; prints all metrics regardless.
+// (Top-1 match is the user-visible correctness check; quantitative
+// metrics are diagnostic.)
+//
+// `prompt` is a raw text prompt (no chat template applied). Choose a
+// prompt where the model's continuation is high-confidence to maximize
+// signal (e.g. "The capital of France is", "1, 2, 3, 4,").
+bool network_self_test(const llama_model * model, const Weights & w,
+                       const std::string & prompt, int n_threads,
+                       std::string & error);
 
 } // namespace gemma4

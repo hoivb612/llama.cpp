@@ -47,6 +47,8 @@ int main(int argc, char ** argv) {
     bool layer_test         = false;  // G3.3: hand-coded layer vs ggml oracle
     int  layer_test_il      = 0;
     int  layer_test_ntok    = 8;
+    bool network_test       = false;  // G3.4a: full-network hand vs upstream
+    std::string network_test_prompt = "The capital of France is";
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -76,6 +78,11 @@ int main(int argc, char ** argv) {
                 }
             } else if (std::strcmp(argv[i], "--gemma4-layer-test-ntok") == 0 && i + 1 < argc) {
                 layer_test_ntok = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-network-test") == 0) {
+                network_test = true;
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    network_test_prompt = argv[++i];
+                }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -168,6 +175,31 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "gemma4 layer_self_test: PASS (il=%d n_tokens=%d)\n",
                      layer_test_il, layer_test_ntok);
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G3.4a: --gemma4-network-test [PROMPT] -----------------
+    // Run hand-coded full-network F32 forward over the prompt; compare
+    // last-token logits against upstream llama_decode. Multi-metric.
+    if (network_test) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+        const bool ok = gemma4::network_self_test(raw.model, w, network_test_prompt,
+                                                  n_threads, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 network_self_test: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 network_self_test: PASS\n");
         gemma4_unload_raw_model(raw);
         return 0;
     }
