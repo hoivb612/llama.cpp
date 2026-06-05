@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "gemma4_baseline.h"
 #include "gemma4_loader.h"
+#include "gemma4_weights.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,7 @@ int main(int argc, char ** argv) {
     int  ngl                = 99;
     int  n_threads_prefill  = 0;   // 0 = let llama pick
     int  n_threads_gen      = 0;
+    bool dump_weights       = false;  // G3.1: resolve + print schema, skip decode
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -56,6 +58,8 @@ int main(int argc, char ** argv) {
                 n_threads_prefill = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--threads-gen") == 0 && i + 1 < argc) {
                 n_threads_gen = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-dump-weights") == 0) {
+                dump_weights = true;
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -97,6 +101,22 @@ int main(int argc, char ** argv) {
                      "upstream llama graph and will still work, but our "
                      "custom-forward work in this directory targets the "
                      "dense variants (E2B/E4B) first.\n");
+    }
+
+    // ---------- G3.1: --gemma4-dump-weights ----------
+    // Resolve every tensor we need for the custom forward, validate
+    // shapes/types, and print the schema. Exits before running decode.
+    if (dump_weights) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        gemma4::dump(w);
+        gemma4_unload_raw_model(raw);
+        return 0;
     }
 
     // ---------- Apply chat template ----------
