@@ -925,7 +925,8 @@ bool layer_self_test(const llama_model * model, const Weights & w,
 // =====================================================================
 
 bool dequant_model(const llama_model * model, const Weights & w,
-                   ModelF32 & out, std::string & error) {
+                   ModelF32 & out, std::string & error,
+                   int n_threads) {
     out = ModelF32{};
     out.n_layer            = w.n_layer;
     out.n_embd             = w.n_embd;
@@ -987,9 +988,10 @@ bool dequant_model(const llama_model * model, const Weights & w,
     //     dominated by intermediate per-row partials. Empirically a few MiB.
     //   * tensor metadata + graph nodes (~kilobytes).
     // 32 MiB gives comfortable headroom and one-time allocation cost.
+    // The threadpool is sized for n_threads and reused across every
+    // subsequent matmul_qf32 call.
     const std::size_t arena_bytes = 32ull << 20;
-    int mm_threads = 1; // single-threaded default; caller can override later
-    if (!matmul_ctx_init(out.mm, arena_bytes, mm_threads, error)) {
+    if (!matmul_ctx_init(out.mm, arena_bytes, n_threads, error)) {
         return false;
     }
 
@@ -1211,8 +1213,7 @@ bool network_self_test(const llama_model * model, const Weights & w,
 
     // -------- Dequant + hand path --------
     ModelF32 mf;
-    if (!dequant_model(model, w, mf, error)) return false;
-    mf.mm.n_threads = n_threads;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
 
     std::vector<float> hand_logits((size_t) n_vocab, 0.0f);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1490,8 +1491,7 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
 
     // -------- Dequant + reserve state --------
     ModelF32 mf;
-    if (!dequant_model(model, w, mf, error)) return false;
-    mf.mm.n_threads = n_threads;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
     NetworkState st;
     const int cap = n_prompt + n_gen + 4;
     if (!network_state_reserve(st, mf, cap, error)) return false;
@@ -1621,8 +1621,7 @@ bool network_profile(const llama_model * model, const Weights & w,
                  prompt.c_str(), n_prompt, n_decode);
 
     ModelF32 mf;
-    if (!dequant_model(model, w, mf, error)) return false;
-    mf.mm.n_threads = n_threads;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
     NetworkState st;
     const int cap = n_prompt + n_decode + 4;
     if (!network_state_reserve(st, mf, cap, error)) return false;

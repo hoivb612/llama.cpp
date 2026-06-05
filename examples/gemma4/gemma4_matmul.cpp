@@ -9,6 +9,10 @@
 
 namespace gemma4 {
 
+void GgmlThreadpoolDeleter::operator()(ggml_threadpool * p) const noexcept {
+    if (p) ggml_threadpool_free(p);
+}
+
 bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,
                      std::string & error) {
     if (arena_bytes < (1u << 20)) {
@@ -16,7 +20,24 @@ bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,
         return false;
     }
     mm.arena.assign(arena_bytes, 0);
+    mm.work_buf.clear();
     mm.n_threads = std::max(1, n_threads);
+
+    // Tear down any old pool first (init may be called more than once).
+    mm.pool.reset();
+
+    // Spin up a persistent threadpool when we have real parallelism. For
+    // n_threads == 1 we stay on the single-thread compute path (saves a
+    // worker thread sitting idle and one extra dependency tear-down).
+    if (mm.n_threads > 1) {
+        ggml_threadpool_params params = ggml_threadpool_params_default(mm.n_threads);
+        ggml_threadpool * raw = ggml_threadpool_new(&params);
+        if (!raw) {
+            error = "matmul_ctx_init: ggml_threadpool_new failed";
+            return false;
+        }
+        mm.pool.reset(raw);
+    }
     return true;
 }
 
@@ -50,9 +71,24 @@ bool matmul_qf32(MatmulCtx & mm, const ggml_tensor * W,
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y_t);
 
-    const ggml_status status = ggml_graph_compute_with_ctx(ctx, gf, mm.n_threads);
+    ggml_status status;
+    if (mm.pool) {
+        // Multi-thread path: plan with the persistent pool and reuse the
+        // shared work_buf. The pool's worker threads stay alive across
+        // calls, eliminating the per-call spawn/join.
+        ggml_cplan cplan = ggml_graph_plan(gf, mm.n_threads, mm.pool.get());
+        if (cplan.work_size > mm.work_buf.size()) {
+            mm.work_buf.assign(cplan.work_size, 0);
+        }
+        cplan.work_data = mm.work_buf.empty() ? nullptr : mm.work_buf.data();
+        status = ggml_graph_compute(gf, &cplan);
+    } else {
+        // Single-thread fallback (n_threads <= 1): no need for a pool.
+        status = ggml_graph_compute_with_ctx(ctx, gf, mm.n_threads);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
-        error = "matmul_qf32: ggml_graph_compute_with_ctx failed";
+        error = "matmul_qf32: graph compute failed";
         ggml_free(ctx);
         return false;
     }

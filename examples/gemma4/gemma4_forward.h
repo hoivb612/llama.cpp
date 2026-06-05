@@ -225,8 +225,12 @@ struct ModelF32 {
 // Dequant the whole model into ModelF32. Does not copy tok_embd or
 // per_layer_tok_embd (held as pointers to the live llama_model).
 // Memory footprint: roughly 5.6 GB on E2B Q4_K_M, ~8 GB on E4B Q4_K_M.
+// n_threads is used to size the persistent ggml_threadpool inside
+// ModelF32::mm that powers the qquant matmul shim (matmul_qf32). Pass
+// the same value you would pass to llama_set_n_threads.
 bool dequant_model(const llama_model * model, const Weights & w,
-                   ModelF32 & out, std::string & error);
+                   ModelF32 & out, std::string & error,
+                   int n_threads = 1);
 
 // Full-network F32 forward over a single batch of n_tokens.
 //   token_ids[n_tokens] - token IDs (used for tok_embd + PLE lookups)
