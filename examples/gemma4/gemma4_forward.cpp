@@ -19,6 +19,112 @@
 namespace gemma4 {
 
 // ---------------------------------------------------------------------
+// Profiling (opt-in; zero overhead in the disabled fast path)
+// ---------------------------------------------------------------------
+//
+// Single-thread, gemma4-namespace-local counters. Each accumulator is
+// a sum of wall-clock nanoseconds spent in that stage across all
+// network_step calls since the last reset.
+namespace prof {
+
+struct Accum {
+    int64_t embed_ns      = 0;   // tok_embd lookup + sqrt(n_embd) scale
+    int64_t ple_ns        = 0;   // compute_per_layer_inputs
+    int64_t lf_total_ns   = 0;   // sum of layer_forward_f32_cached
+    int64_t lf_attn_norm_ns = 0;
+    int64_t lf_qproj_ns   = 0;
+    int64_t lf_kproj_ns   = 0;   // (skipped on reuse layers)
+    int64_t lf_vproj_ns   = 0;   // (skipped on reuse layers)
+    int64_t lf_qknv_norm_ns = 0; // q/k/v rms-per-head
+    int64_t lf_rope_ns    = 0;   // RoPE on Q + K
+    int64_t lf_attn_ns    = 0;   // softmax + Q.K + scores.V
+    int64_t lf_wo_ns      = 0;
+    int64_t lf_post_attn_ns = 0; // post_attn_norm + residual
+    int64_t lf_ffn_norm_ns  = 0;
+    int64_t lf_gate_ns    = 0;
+    int64_t lf_up_ns      = 0;
+    int64_t lf_gelu_mul_ns = 0;
+    int64_t lf_ffn_down_ns = 0;
+    int64_t lf_post_ffw_ns = 0;
+    int64_t lf_ple_ns     = 0;   // PLE inp_gate + proj + post_norm
+    int64_t lf_out_scale_ns = 0;
+    int64_t out_norm_ns   = 0;   // final output rmsnorm
+    int64_t lm_head_ns    = 0;   // tok_embd^T @ hidden
+    int64_t softcap_ns    = 0;   // 30 * tanh(x/30)
+};
+
+static bool  g_enabled = false;
+static Accum g_acc;
+
+using clk = std::chrono::steady_clock;
+
+struct Scope {
+    int64_t * counter;
+    clk::time_point t0;
+    Scope(int64_t * c) : counter(c) {
+        if (g_enabled && counter) t0 = clk::now();
+    }
+    ~Scope() {
+        if (g_enabled && counter) {
+            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clk::now() - t0).count();
+            *counter += dt;
+        }
+    }
+};
+
+} // namespace prof
+
+void profile_set_enabled(bool on) { prof::g_enabled = on; }
+void profile_reset()              { prof::g_acc = prof::Accum{}; }
+
+void profile_print(const char * tag, int n_step, int n_total_tokens) {
+    const auto & a = prof::g_acc;
+    auto ms = [](int64_t ns){ return (double) ns / 1.0e6; };
+    auto pct = [](int64_t part, int64_t whole){
+        return whole > 0 ? 100.0 * (double) part / (double) whole : 0.0;
+    };
+    const int64_t lf_sum = a.lf_attn_norm_ns + a.lf_qproj_ns + a.lf_kproj_ns
+        + a.lf_vproj_ns + a.lf_qknv_norm_ns + a.lf_rope_ns + a.lf_attn_ns
+        + a.lf_wo_ns + a.lf_post_attn_ns + a.lf_ffn_norm_ns + a.lf_gate_ns
+        + a.lf_up_ns + a.lf_gelu_mul_ns + a.lf_ffn_down_ns + a.lf_post_ffw_ns
+        + a.lf_ple_ns + a.lf_out_scale_ns;
+    const int64_t total = a.embed_ns + a.ple_ns + a.lf_total_ns
+        + a.out_norm_ns + a.lm_head_ns + a.softcap_ns;
+    std::fprintf(stderr,
+        "\ngemma4 profile [%s] over %d step(s), %d total token(s):\n",
+        tag, n_step, n_total_tokens);
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "embed",       ms(a.embed_ns),    pct(a.embed_ns,    total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "ple",         ms(a.ple_ns),      pct(a.ple_ns,      total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "layer_loop",  ms(a.lf_total_ns), pct(a.lf_total_ns, total));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "attn_norm",     ms(a.lf_attn_norm_ns),  pct(a.lf_attn_norm_ns,  lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "Q proj (wq)",   ms(a.lf_qproj_ns),      pct(a.lf_qproj_ns,      lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "K proj (wk)",   ms(a.lf_kproj_ns),      pct(a.lf_kproj_ns,      lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "V proj (wv)",   ms(a.lf_vproj_ns),      pct(a.lf_vproj_ns,      lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "q/k/v rms-norm", ms(a.lf_qknv_norm_ns),  pct(a.lf_qknv_norm_ns,  lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "RoPE (Q+K)",    ms(a.lf_rope_ns),       pct(a.lf_rope_ns,       lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "attention",     ms(a.lf_attn_ns),       pct(a.lf_attn_ns,       lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "wo",            ms(a.lf_wo_ns),         pct(a.lf_wo_ns,         lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "post_attn+res", ms(a.lf_post_attn_ns),  pct(a.lf_post_attn_ns,  lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_norm",      ms(a.lf_ffn_norm_ns),   pct(a.lf_ffn_norm_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_gate",      ms(a.lf_gate_ns),       pct(a.lf_gate_ns,       lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_up",        ms(a.lf_up_ns),         pct(a.lf_up_ns,         lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "gelu*up",       ms(a.lf_gelu_mul_ns),   pct(a.lf_gelu_mul_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_down",      ms(a.lf_ffn_down_ns),   pct(a.lf_ffn_down_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "post_ffw+res",  ms(a.lf_post_ffw_ns),   pct(a.lf_post_ffw_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "PLE merge",     ms(a.lf_ple_ns),        pct(a.lf_ple_ns,        lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "out_scale",     ms(a.lf_out_scale_ns),  pct(a.lf_out_scale_ns,  lf_sum));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "out_norm",    ms(a.out_norm_ns), pct(a.out_norm_ns, total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "lm_head",     ms(a.lm_head_ns),  pct(a.lm_head_ns,  total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "softcap",     ms(a.softcap_ns),  pct(a.softcap_ns,  total));
+    std::fprintf(stderr, "  ---------------------- %10.2f ms\n", ms(total));
+    if (n_total_tokens > 0 && n_step > 0) {
+        std::fprintf(stderr, "  per token (mean)       %10.2f ms\n",
+                     ms(total) / (double) n_total_tokens);
+    }
+}
+
+// ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
 
@@ -255,20 +361,27 @@ bool layer_forward_f32_cached(const LayerF32 & L,
 
     // -------- attn_norm: norm1[t,:] = rmsnorm(hidden_in[t,:]) * attn_norm --
     std::vector<float> norm1((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_attn_norm_ns);
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_mul_f32(norm1.data() + (size_t) t * n_embd,
                         hidden_in + (size_t) t * n_embd,
                         L.attn_norm.data(), n_embd, eps);
     }
+    }
 
     // -------- Q = wq @ norm1, then q_norm + RoPE (always own) --------
     std::vector<float> Q((size_t) n_q * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_qproj_ns);
     matmul_f32(L.wq.data(), norm1.data(), Q.data(), n_embd, n_q, n_new);
+    }
+    { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_per_head_f32(Q.data() + (size_t) t * n_q,
                              Q.data() + (size_t) t * n_q,
                              L.attn_q_norm.data(), head_dim, n_head, eps);
     }
+    }
+    { prof::Scope _s(&prof::g_acc.lf_rope_ns);
     for (int t = 0; t < n_new; ++t) {
         const int p = pos_all[n_past + t];
         for (int h = 0; h < n_head; ++h) {
@@ -277,14 +390,18 @@ bool layer_forward_f32_cached(const LayerF32 & L,
                           L.rope_dim, head_dim, p, L.rope_base);
         }
     }
+    }
 
     // -------- K, V for new tokens (skip entirely on reuse layers) --------
     if (!reuse_kv) {
         float * K_new = K_cache + (size_t) n_past * n_kv;
         float * V_new = V_cache + (size_t) n_past * n_kv;
 
+        { prof::Scope _s(&prof::g_acc.lf_kproj_ns);
         matmul_f32(L.wk.data(), norm1.data(), K_new, n_embd, n_kv, n_new);
+        }
 
+        { prof::Scope _s(&prof::g_acc.lf_vproj_ns);
         std::vector<float> V_scratch;
         if (!L.wv.empty()) {
             matmul_f32(L.wv.data(), norm1.data(), V_new, n_embd, n_kv, n_new);
@@ -292,7 +409,9 @@ bool layer_forward_f32_cached(const LayerF32 & L,
             // V = K when wv missing; copy K_new -> V_new.
             std::memcpy(V_new, K_new, (size_t) n_kv * n_new * sizeof(float));
         }
+        }
 
+        { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
         // K norm (per kv-head)
         for (int t = 0; t < n_new; ++t) {
             rmsnorm_per_head_f32(K_new + (size_t) t * n_kv,
@@ -305,7 +424,9 @@ bool layer_forward_f32_cached(const LayerF32 & L,
                                  V_new + (size_t) t * n_kv,
                                  /*w=*/nullptr, head_dim, n_head_kv, eps);
         }
+        }
         // RoPE on K (new positions only)
+        { prof::Scope _s(&prof::g_acc.lf_rope_ns);
         for (int t = 0; t < n_new; ++t) {
             const int p = pos_all[n_past + t];
             for (int h = 0; h < n_head_kv; ++h) {
@@ -314,6 +435,7 @@ bool layer_forward_f32_cached(const LayerF32 & L,
                               L.rope_dim, head_dim, p, L.rope_base);
             }
         }
+        }
     }
 
     // -------- Self-attention over n_total cached positions --------
@@ -321,6 +443,7 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     std::vector<float> attn_ctx((size_t) n_q * n_new, 0.0f);
     std::vector<float> scores((size_t) n_total, 0.0f);
     const bool apply_swa = L.is_swa;
+    { prof::Scope _s(&prof::g_acc.lf_attn_ns);
     for (int t = 0; t < n_new; ++t) {
         const int p_t = pos_all[n_past + t];
         for (int h = 0; h < n_head; ++h) {
@@ -364,13 +487,17 @@ bool layer_forward_f32_cached(const LayerF32 & L,
             }
         }
     }
+    } // close attn scope
 
     // -------- wo: attn_out = wo @ attn_ctx --------
     std::vector<float> attn_out((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_wo_ns);
     matmul_f32(L.wo.data(), attn_ctx.data(), attn_out.data(), n_q, n_embd, n_new);
+    }
 
     // -------- post_attn_norm + residual1 --------
     std::vector<float> attn_out2((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_post_attn_ns);
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_mul_f32(attn_out2.data() + (size_t) t * n_embd,
                         attn_out.data() + (size_t) t * n_embd,
@@ -379,29 +506,41 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
         attn_out2[i] += hidden_in[i];
     }
+    }
 
     // -------- ffn_norm --------
     std::vector<float> ff_in((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_ffn_norm_ns);
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_mul_f32(ff_in.data() + (size_t) t * n_embd,
                         attn_out2.data() + (size_t) t * n_embd,
                         L.ffn_norm.data(), n_embd, eps);
     }
+    }
 
     // -------- gate, up, gelu(gate)*up --------
     std::vector<float> gate((size_t) n_ff * n_new, 0.0f);
     std::vector<float> up  ((size_t) n_ff * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_gate_ns);
     matmul_f32(L.ffn_gate.data(), ff_in.data(), gate.data(), n_embd, n_ff, n_new);
+    }
+    { prof::Scope _s(&prof::g_acc.lf_up_ns);
     matmul_f32(L.ffn_up.data(),   ff_in.data(), up.data(),   n_embd, n_ff, n_new);
+    }
+    { prof::Scope _s(&prof::g_acc.lf_gelu_mul_ns);
     gelu_f32(gate.data(), gate.data(), n_ff * n_new);
     for (size_t i = 0; i < (size_t) n_ff * n_new; ++i) gate[i] *= up[i];
+    }
 
     // -------- ffn_down --------
     std::vector<float> ff_out((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_ffn_down_ns);
     matmul_f32(L.ffn_down.data(), gate.data(), ff_out.data(), n_ff, n_embd, n_new);
+    }
 
     // -------- post_ffw_norm + residual2 --------
     std::vector<float> pe_in((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_post_ffw_ns);
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_mul_f32(pe_in.data() + (size_t) t * n_embd,
                         ff_out.data() + (size_t) t * n_embd,
@@ -410,8 +549,10 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
         pe_in[i] += attn_out2[i];
     }
+    }
 
     // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
+    { prof::Scope _s(&prof::g_acc.lf_ple_ns);
     std::vector<float> ple_a((size_t) n_epl * n_new, 0.0f);
     matmul_f32(L.inp_gate.data(), pe_in.data(), ple_a.data(), n_embd, n_epl, n_new);
     gelu_f32(ple_a.data(), ple_a.data(), n_epl * n_new);
@@ -428,13 +569,16 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
         pe_in[i] += ple_b[i];
     }
+    }
 
     // -------- layer_output_scale --------
+    { prof::Scope _s(&prof::g_acc.lf_out_scale_ns);
     if (L.has_layer_output_scale) {
         const float s = L.layer_output_scale;
         for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
             pe_in[i] *= s;
         }
+    }
     }
 
     std::memcpy(hidden_out, pe_in.data(), (size_t) n_embd * n_new * sizeof(float));
@@ -883,144 +1027,16 @@ static bool compute_per_layer_inputs(const ModelF32 & m,
 bool network_forward_f32(const ModelF32 & m,
                          int n_tokens,
                          const int32_t * token_ids,
-                         const int32_t * pos,
                          bool last_token_only,
                          float * logits_out,
                          std::string & error) {
-    if (n_tokens <= 0) { error = "network_forward_f32: n_tokens<=0"; return false; }
-    if (n_tokens > m.n_swa) {
-        std::ostringstream ss;
-        ss << "network_forward_f32: n_tokens=" << n_tokens << " exceeds n_swa="
-           << m.n_swa << "; SWA masking not implemented in G3.4a";
-        error = ss.str();
-        return false;
-    }
-    if (!m.tok_embd_quant) { error = "network_forward_f32: tok_embd not set"; return false; }
-    if (m.output_norm.empty()) { error = "network_forward_f32: output_norm empty"; return false; }
-    if (!m.output_tied_to_embd) {
-        // gemma4 E2B/E4B always tie output to tok_embd; if a variant ever
-        // ships untied, add a separate output matrix to ModelF32.
-        error = "network_forward_f32: untied output not supported (no separate lm_head loaded)";
-        return false;
-    }
-    const int n_embd  = m.n_embd;
-    const int n_vocab = m.n_vocab;
-    const float eps   = m.rms_eps;
-
-    // ---- 1. Input embedding: inpL = tok_embd[token_ids] * sqrt(n_embd) ----
-    std::vector<float> inpL((size_t) n_embd * n_tokens, 0.0f);
-    const float emb_scale = std::sqrt((float) n_embd);
-    for (int t = 0; t < n_tokens; ++t) {
-        const int tok = token_ids[t];
-        if (tok < 0 || tok >= n_vocab) {
-            std::ostringstream ss;
-            ss << "network_forward_f32: token_ids[" << t << "]=" << tok
-               << " out of range";
-            error = ss.str();
-            return false;
-        }
-        dequant_row(m.tok_embd_quant, tok, inpL.data() + (size_t) t * n_embd);
-        for (int e = 0; e < n_embd; ++e) {
-            inpL[(size_t) t * n_embd + e] *= emb_scale;
-        }
-    }
-
-    // ---- 2. PLE preprocessing ----
-    std::vector<float> per_layer_final;
-    if (!compute_per_layer_inputs(m, n_tokens, token_ids, inpL.data(),
-                                  per_layer_final, error)) {
-        return false;
-    }
-    const int n_epl = m.n_embd_per_layer;
-
-    // ---- 3. Layer loop ----
-    // Allocate per-layer K/V storage for layers that own their KV.
-    // For E2B: n_layer_kv_from_start = 15, so K_storage[0..14] are used.
-    // Shared-KV layers (15..34) point at K_storage[L.kv_reuse_il].
-    std::vector<std::vector<float>> K_storage(m.n_layer);
-    std::vector<std::vector<float>> V_storage(m.n_layer);
-
-    std::vector<float> hidden_out((size_t) n_embd * n_tokens, 0.0f);
-    for (int il = 0; il < m.n_layer; ++il) {
-        const LayerF32 & L = m.layers[il];
-        const float * slice = per_layer_final.data()
-                            + (size_t) il * n_tokens * n_epl;
-        const int n_kv = L.n_head_kv * L.head_dim;
-
-        float * K_self_out = nullptr;
-        float * V_self_out = nullptr;
-        const float * K_reuse_in = nullptr;
-        const float * V_reuse_in = nullptr;
-        if (L.kv_reuse_il < 0) {
-            // Own KV: allocate storage and let layer_forward fill it.
-            K_storage[il].assign((size_t) n_kv * n_tokens, 0.0f);
-            V_storage[il].assign((size_t) n_kv * n_tokens, 0.0f);
-            K_self_out = K_storage[il].data();
-            V_self_out = V_storage[il].data();
-        } else {
-            // Shared-KV: reuse the source layer's stored K, V (must already
-            // be populated since kv_reuse_il < il by Gemma-4's design).
-            const int src = L.kv_reuse_il;
-            if (K_storage[src].empty() || V_storage[src].empty()) {
-                std::ostringstream ss;
-                ss << "network_forward_f32: layer " << il
-                   << " reuses KV from layer " << src
-                   << " but that source has empty storage";
-                error = ss.str();
-                return false;
-            }
-            K_reuse_in = K_storage[src].data();
-            V_reuse_in = V_storage[src].data();
-        }
-
-        if (!layer_forward_f32(L, n_tokens, inpL.data(), pos, slice,
-                               hidden_out.data(), error,
-                               K_self_out, V_self_out,
-                               K_reuse_in, V_reuse_in)) {
-            std::ostringstream ss;
-            ss << "network_forward_f32: layer " << il << ": " << error;
-            error = ss.str();
-            return false;
-        }
-        std::swap(inpL, hidden_out);  // inpL <- this layer's output
-    }
-
-    // ---- 4. Final output norm ----
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_mul_f32(hidden_out.data() + (size_t) t * n_embd,
-                        inpL.data() + (size_t) t * n_embd,
-                        m.output_norm.data(), n_embd, eps);
-    }
-    std::swap(inpL, hidden_out);
-
-    // ---- 5. lm_head: logits = tok_embd @ inpL (tied output) ----
-    //   tok_embd : [n_embd, n_vocab]  (potentially quantized; dequant per row)
-    //   inpL     : [n_embd, n_tokens]
-    //   logits   : [n_vocab, n_tokens]  or [n_vocab] if last_token_only
-    const int t_start = last_token_only ? n_tokens - 1 : 0;
-    const int t_count = last_token_only ? 1 : n_tokens;
-    std::vector<float> row(n_embd);
-    for (int v = 0; v < n_vocab; ++v) {
-        dequant_row(m.tok_embd_quant, v, row.data());
-        for (int tc = 0; tc < t_count; ++tc) {
-            const int t = t_start + tc;
-            const float * xt = inpL.data() + (size_t) t * n_embd;
-            double s = 0.0;
-            for (int e = 0; e < n_embd; ++e) s += (double) row[e] * (double) xt[e];
-            logits_out[(size_t) tc * n_vocab + v] = (float) s;
-        }
-    }
-
-    // ---- 6. Final logit softcap (gemma4: cap = 30.0) ----
-    if (m.final_logit_softcap > 0.0f) {
-        const float cap = m.final_logit_softcap;
-        const float inv = 1.0f / cap;
-        const size_t total = (size_t) n_vocab * t_count;
-        for (size_t i = 0; i < total; ++i) {
-            logits_out[i] = cap * std::tanh(logits_out[i] * inv);
-        }
-    }
-    return true;
+    // One-shot delegate to network_step. Single canonical layer-loop
+    // implementation in network_step; positions [0..n_tokens) are
+    // auto-generated. SWA mask is applied inside layer_forward_f32_cached.
+    NetworkState s;
+    if (!network_state_reserve(s, m, n_tokens, error)) return false;
+    return network_step(s, m, n_tokens, token_ids, last_token_only,
+                        logits_out, error);
 }
 
 // ---------------------------------------------------------------------
@@ -1094,12 +1110,10 @@ bool network_self_test(const llama_model * model, const Weights & w,
     if (n_tok < 0) { error = "network_self_test: tokenize failed"; return false; }
     tokens.resize(n_tok);
     if (n_tok > w.n_swa) {
-        std::ostringstream ss;
-        ss << "network_self_test: prompt tokenizes to " << n_tok
-           << " tokens, exceeds n_swa=" << w.n_swa
-           << "; pick a shorter prompt or wait for SWA mask in G3.4b";
-        error = ss.str();
-        return false;
+        std::fprintf(stderr,
+            "gemma4 network_self_test: NOTE: prompt tokenizes to %d tokens > "
+            "n_swa=%d; SWA layers will apply windowed attention.\n",
+            n_tok, w.n_swa);
     }
     std::fprintf(stderr, "gemma4 network_self_test: prompt=\"%s\" -> %d tokens (n_vocab=%d)\n",
                  prompt.c_str(), n_tok, n_vocab);
@@ -1114,12 +1128,9 @@ bool network_self_test(const llama_model * model, const Weights & w,
     ModelF32 mf;
     if (!dequant_model(model, w, mf, error)) return false;
 
-    std::vector<int32_t> pos(n_tok);
-    for (int i = 0; i < n_tok; ++i) pos[i] = i;
-
     std::vector<float> hand_logits((size_t) n_vocab, 0.0f);
     const auto t0 = std::chrono::steady_clock::now();
-    if (!network_forward_f32(mf, n_tok, tokens.data(), pos.data(),
+    if (!network_forward_f32(mf, n_tok, tokens.data(),
                              /*last_token_only=*/true,
                              hand_logits.data(), error)) {
         return false;
@@ -1262,6 +1273,7 @@ bool network_step(NetworkState & s, const ModelF32 & m,
 
     // ---- 1. Input embedding * sqrt(n_embd) ----
     std::vector<float> inpL((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.embed_ns);
     const float emb_scale = std::sqrt((float) n_embd);
     for (int t = 0; t < n_new; ++t) {
         const int tok = token_ids[t];
@@ -1274,14 +1286,18 @@ bool network_step(NetworkState & s, const ModelF32 & m,
         dequant_row(m.tok_embd_quant, tok, inpL.data() + (size_t) t * n_embd);
         for (int e = 0; e < n_embd; ++e) inpL[(size_t) t * n_embd + e] *= emb_scale;
     }
+    }
 
     // ---- 2. PLE preprocessing on the n_new new tokens ----
     std::vector<float> per_layer_final;
+    { prof::Scope _s(&prof::g_acc.ple_ns);
     if (!compute_per_layer_inputs(m, n_new, token_ids, inpL.data(),
                                   per_layer_final, error)) return false;
+    }
 
     // ---- 3. Layer loop with cached K/V ----
     std::vector<float> hidden_out((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_total_ns);
     for (int il = 0; il < m.n_layer; ++il) {
         const LayerF32 & L = m.layers[il];
         const float * slice = per_layer_final.data()
@@ -1318,18 +1334,22 @@ bool network_step(NetworkState & s, const ModelF32 & m,
         }
         std::swap(inpL, hidden_out);
     }
+    }
 
     // ---- 4. Final output norm on n_new tokens ----
+    { prof::Scope _s(&prof::g_acc.out_norm_ns);
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_mul_f32(hidden_out.data() + (size_t) t * n_embd,
                         inpL.data() + (size_t) t * n_embd,
                         m.output_norm.data(), n_embd, eps);
     }
     std::swap(inpL, hidden_out);
+    }
 
     // ---- 5. lm_head (tied to tok_embd) ----
     const int t_start = last_token_only ? n_new - 1 : 0;
     const int t_count = last_token_only ? 1 : n_new;
+    { prof::Scope _s(&prof::g_acc.lm_head_ns);
     std::vector<float> row(n_embd);
     for (int v = 0; v < n_vocab; ++v) {
         dequant_row(m.tok_embd_quant, v, row.data());
@@ -1341,8 +1361,10 @@ bool network_step(NetworkState & s, const ModelF32 & m,
             logits_out[(size_t) tc * n_vocab + v] = (float) s;
         }
     }
+    }
 
     // ---- 6. Final logit softcap ----
+    { prof::Scope _s(&prof::g_acc.softcap_ns);
     if (m.final_logit_softcap > 0.0f) {
         const float cap = m.final_logit_softcap;
         const float inv = 1.0f / cap;
@@ -1350,6 +1372,7 @@ bool network_step(NetworkState & s, const ModelF32 & m,
         for (size_t i = 0; i < total; ++i) {
             logits_out[i] = cap * std::tanh(logits_out[i] * inv);
         }
+    }
     }
 
     s.n_past += n_new;
@@ -1483,6 +1506,66 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
         error = ss.str();
         return false;
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Profiling driver: prefill + N decode steps with per-stage timing
+// ---------------------------------------------------------------------
+
+bool network_profile(const llama_model * model, const Weights & w,
+                     const std::string & prompt, int n_decode,
+                     int /*n_threads*/, std::string & error) {
+    if (n_decode < 0) { error = "network_profile: n_decode<0"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_profile: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr, "gemma4 network_profile: prompt=\"%s\" -> %d tokens, n_decode=%d\n",
+                 prompt.c_str(), n_prompt, n_decode);
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_decode + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    const int n_vocab = mf.n_vocab;
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+
+    // ---- Prefill (n_prompt tokens) ----
+    profile_reset();
+    profile_set_enabled(true);
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, logits.data(), error)) {
+        profile_set_enabled(false);
+        return false;
+    }
+    profile_set_enabled(false);
+    profile_print("prefill", 1, n_prompt);
+
+    if (n_decode <= 0) return true;
+
+    // ---- Decode: N single-token steps ----
+    int32_t next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+    profile_reset();
+    profile_set_enabled(true);
+    for (int g = 0; g < n_decode; ++g) {
+        if (!network_step(st, mf, 1, &next, /*last_token_only=*/true,
+                          logits.data(), error)) {
+            profile_set_enabled(false);
+            return false;
+        }
+        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+    }
+    profile_set_enabled(false);
+    profile_print("decode", n_decode, n_decode);
     return true;
 }
 

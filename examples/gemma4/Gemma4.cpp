@@ -30,7 +30,18 @@
 static void print_usage(int /*argc*/, char ** argv) {
     std::printf(
         "\n  %s -m gemma-4-E2B-it-Q4_K_M.gguf [-p \"why is the sky blue?\"] "
-        "[-n 64] [-c 0] [-ngl 99] [--threads-prefill N] [--threads-gen N]\n\n",
+        "[-n 64] [-c 0] [-ngl 99] [--threads-prefill N] [--threads-gen N]\n"
+        "\n"
+        "  Hand-coded F32 self-tests (custom forward path):\n"
+        "    --gemma4-dump-weights              resolve+print tensor schema\n"
+        "    --gemma4-kernel-test               run kernel unit-tests (no model needed)\n"
+        "    --gemma4-layer-test [IL]           hand vs ggml oracle for layer IL (default 0)\n"
+        "    --gemma4-layer-test-ntok N         tokens for layer-test (default 8)\n"
+        "    --gemma4-network-test [PROMPT]     hand vs upstream last-token logits\n"
+        "    --gemma4-network-gen [PROMPT] [N]  greedy decode hand vs upstream (N tokens)\n"
+        "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
+        "                                       per-stage timing for prefill + N_DECODE decode steps\n"
+        "\n",
         argv[0]);
 }
 
@@ -52,6 +63,9 @@ int main(int argc, char ** argv) {
     bool network_gen_test   = false;  // G3.4b: greedy decode with KV cache vs upstream
     std::string network_gen_prompt  = "The capital of France is";
     int  network_gen_n      = 32;
+    bool network_profile    = false;  // profile prefill + N decode steps
+    std::string profile_prompt = "The capital of France is";
+    int  profile_n_decode   = 4;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -96,6 +110,15 @@ int main(int argc, char ** argv) {
                 if (i + 1 < argc && argv[i+1][0] != '-' &&
                     (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
                     network_gen_n = std::stoi(argv[++i]);
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-network-profile") == 0) {
+                network_profile = true;
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    profile_prompt = argv[++i];
+                }
+                if (i + 1 < argc && argv[i+1][0] != '-' &&
+                    (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
+                    profile_n_decode = std::stoi(argv[++i]);
                 }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
@@ -241,6 +264,31 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::fprintf(stderr, "gemma4 network_gen_self_test: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- Profiling: --gemma4-network-profile [PROMPT] [N_DECODE] ----
+    // Run prefill + N_DECODE decode steps with per-stage timing turned on.
+    // Prints two breakdowns (prefill, decode) for hot-spot identification.
+    if (network_profile) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+        const bool ok = gemma4::network_profile(raw.model, w, profile_prompt,
+                                                profile_n_decode, n_threads, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 network_profile: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 network_profile: DONE\n");
         gemma4_unload_raw_model(raw);
         return 0;
     }

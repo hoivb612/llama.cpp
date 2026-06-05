@@ -198,4 +198,99 @@ bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf
 bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-network-gen "The capital of France is" 8 -ngl 0 --threads-prefill 8
 bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-network-gen "1, 2, 3, 4," 16 -ngl 0 --threads-prefill 8
 
+│ Commit G3.4b                                                                                                                        │
+│ ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ │
+│ │ cd D:\llama.cpp\b612_052026; $msg = @"                                                                                          │ │
+│ │ gemma4 G3.4b: greedy decode with persistent KV cache                                                                            │ │
+│ │                                                                                                                                 │ │
+│ │ Refactor + extend the hand-coded F32 forward to support multi-step                                                              │ │
+│ │ decode with a persistent per-layer K/V cache, mirroring the staged                                                              │ │
+│ │ Phi-3 approach.                                                                                                                 │ │
+│ │                                                                                                                                 │ │
+│ │ * layer_forward_f32 split:                                                                                                      │ │
+│ │   - layer_forward_f32_cached(L, n_new, n_past, n_swa, ..., K_cache,                                                             │ │
+│ │     V_cache, reuse_kv): single source of truth. Writes new K/V at                                                               │ │
+│ │     offset n_past*n_kv into the caller-supplied buffer. Applies SWA                                                             │ │
+│ │     mask when L.is_swa (pos_t - pos_k >= n_swa => -INF). Pass                                                                   │ │
+│ │     n_swa=INT32_MAX to disable.                                                                                                 │ │
+│ │   - layer_forward_f32 reduced to a thin wrapper: allocates local                                                                │ │
+│ │     K/V scratch (or uses external buffers via the 4 optional                                                                    │ │
+│ │     pointer args) and calls the cached path with n_past=0,                                                                      │ │
+│ │     n_swa=INT32_MAX. Preserves G3.3 / G3.4a behaviour byte-for-byte.                                                            │ │
+│ │                                                                                                                                 │ │
+│ │ * New NetworkState struct: per-layer K_cache / V_cache vectors                                                                  │ │
+│ │   (only owning layers; shared-KV layers read from their source),                                                                │ │
+│ │   pos_all vector, n_past counter, cap_seq.                                                                                      │ │
+│ │                                                                                                                                 │ │
+│ │ * network_state_reserve allocates K_cache / V_cache up front for                                                                │ │
+│ │   cap_seq tokens so the inner loop never reallocates.                                                                           │ │
+│ │                                                                                                                                 │ │
+│ │ * network_step performs one forward pass over n_new new tokens at                                                               │ │
+│ │   positions [n_past, n_past+n_new), produces logits for either the                                                              │ │
+│ │   last new token or all new tokens, and advances s.n_past. Uniform                                                              │ │
+│ │   for prefill (n_new = n_prompt) and decode (n_new = 1).                                                                        │ │
+│ │                                                                                                                                 │ │
+│ │ * network_gen_self_test runs greedy decode on both the hand path                                                                │ │
+│ │   (network_step prefill + n_gen steps of size 1) and the upstream                                                               │ │
+│ │   path (persistent llama_context + llama_decode + argmax), then                                                                 │ │
+│ │   compares token sequences position-by-position. PASS iff all                                                                   │ │
+│ │   n_gen tokens match.                                                                                                           │ │
+│ │                                                                                                                                 │ │
+│ │ * CLI: --gemma4-network-gen [PROMPT] [N] (default PROMPT=                                                                       │ │
+│ │   "The capital of France is", N=32).                                                                                            │ │
+│ │                                                                                                                                 │ │
+│ │ * dequant_row + compute_per_layer_inputs lifted from anonymous to                                                               │ │
+│ │   file-scope static so both network_forward_f32 and network_step                                                                │ │
+│ │   can reuse them.                                                                                                               │ │
+│ │                                                                                                                                 │ │
+│ │ Validation (all PASS):                                                                                                          │ │
+│ │   E2B "The capital of France is" n_gen=8  -> 8/8 match                                                                          │ │
+│ │   E2B "1, 2, 3, 4,"              n_gen=16 -> 16/16 match                                                                        │ │
+│ │   E4B "1, 2, 3, 4,"              n_gen=16 -> 16/16 match                                                                        │ │
+│ │                                                                                                                                 │ │
+│ │ All prior self-tests still PASS:                                                                                                │ │
+│ │   --gemma4-kernel-test                                                                                                          │ │
+│ │   --gemma4-layer-test 4                                                                                                         │ │
+│ │   --gemma4-network-test "The capital of France is"                                                                              │ │
+│ │     (E2B top-1=" Paris" MATCH, cos_sim=0.9995)                                                                                  │ │
+│ │                                                                                                                                 │ │
+│ │ Hand path is ~2 s/tok (E2B) / ~4.5 s/tok (E4B) - correctness scaffold                                                           │ │
+│ │ only; G4 will bring in qquant + cached prefill from A5.x for speed.     
 
+Summary:
+
+ - Refactored layer_forward_f32 into layer_forward_f32_cached (new source of truth with n_past, n_swa, K/V cache writes at offset) +thin wrapper preserving G3.3/G3.4a behaviour byte-for-byte.
+ - New API: NetworkState, network_state_reserve, network_step (uniform prefill/decode), network_gen_self_test.
+ - CLI: --gemma4-network-gen [PROMPT] [N].
+
+Validation:
+
+┌───────┬────────────────────────────┬────┬─────────────┐
+│ Model │ Prompt                     │ N  │ Result      │
+├───────┼────────────────────────────┼────┼─────────────┤
+│ E2B   │ "The capital of France is" │ 8  │ 8/8 match   │
+├───────┼────────────────────────────┼────┼─────────────┤
+│ E2B   │ "1, 2, 3, 4,"              │ 16 │ 16/16 match │
+├───────┼────────────────────────────┼────┼─────────────┤
+│ E4B   │ "1, 2, 3, 4,"              │ 16 │ 16/16 match │
+└───────┴────────────────────────────┴────┴─────────────┘
+
+All prior self-tests (kernel, layer, network) still PASS.
+
+Hand path is ~2 s/tok (E2B), correctness-only scaffold. Ready for G3.5 multi-prompt parity gate, then G4 brings qquant + cachedprefill from A5.x for speed.
+
+@ Profile prefill + 4 decode
+bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-network-profile "The capital of France is" 4 -ngl 0 --threads-prefill 8
+
+◐ Looking at the performance profile, the decode step is taking about 1485 milliseconds per token, with the computational bottleneck spread across the feed-forward network layers—the down, gate, and up projections each consuming roughly a fifth of the total time, while the language model head contributes the remainder.
+
+  The real insight here is that nearly all of the decode latency comes from matrix multiplications: the four FFN operations account for about 63% of the time, the output projection adds another 23%, and the Q/wo projections bring it to 97% combined. The attention mechanism itself is negligible at just 0.06% because the KV cache is doing its job effectively. When I look at the lm_head timing more carefully—accounting for the fact that the decode profile is summed across multiple steps—the per-step cost aligns reasonably well between prefill and decode phases, both around 350 milliseconds for a single token output.
+
+  The bottleneck is clear: these matmuls are dequantizing Q4_K weights to F32 before doing the multiplication, which is expensive. The A5.x quantized matmul patterns could apply directly here—skipping the dequantization step and using specialized Q4_K × F32 operations instead. The lm_head is particularly interesting because it scans all 262,144 vocabulary rows with dequantization overhead, but could be restructured as a proper matrix multiply of [vocab, embedding] × [embedding, 1]. Prefill shows the same matmul dominance, just scaled linearly with the token count, so the per-token costs are comparable even though the absolute numbers are higher.
+
+  For G4, I'm thinking a staged approach: first, a quantized matmul shim that replaces the dequant-then-matmul pattern by keeping the original quantized tensors and doing row-by-row dequantization inline during the multiply. Then, a second stage that leverages ggml's native mul_mat path for Q4_K to get the real speedup.
+
+  The key insight is that for repeated decode, we're already caching the F32 weights, so we could skip dequantization entirely and just use the quantized weights with ggml's mul_mat directly. The lm_head optimization comes along for free since it uses the same Q4_K weights. Before moving forward, I need to verify that the profiling scope hasn't broken the layer self-test.
+
+  

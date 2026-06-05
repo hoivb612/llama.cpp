@@ -197,16 +197,16 @@ bool dequant_model(const llama_model * model, const Weights & w,
 //                         else:                         [n_vocab * n_tokens]
 //
 // Asserts n_tokens <= model.n_swa (SWA masking is NOT implemented for
-// G3.4a; only causal masking inside each layer). Use small prompts for
-// the first round.
+// G3.4a; SWA mask is now applied per layer (delegates to
+// network_step which keeps the persistent K/V cache). Use small prompts
+// for the first round.
 //
 // Note: this function does no allocation amortization between calls --
-// it allocates and frees scratch per call. For a one-shot test that's
-// fine; G3.4b will manage scratch + KV cache.
+// it allocates a NetworkState scratch per call. For a one-shot test
+// that's fine; multi-step generation should use network_step directly.
 bool network_forward_f32(const ModelF32 & model,
                          int n_tokens,
                          const int32_t * token_ids,
-                         const int32_t * pos,
                          bool last_token_only,
                          float * logits_out,
                          std::string & error);
@@ -278,5 +278,25 @@ bool network_step(NetworkState & s, const ModelF32 & m,
 bool network_gen_self_test(const llama_model * model, const Weights & w,
                            const std::string & prompt, int n_gen,
                            int n_threads, std::string & error);
+
+// ---------------------------------------------------------------------
+// Profiling support (opt-in; zero overhead when disabled)
+// ---------------------------------------------------------------------
+//
+// When enabled, network_step + layer_forward_f32_cached accumulate
+// per-stage wall-time into a global counter set (single-thread). Use
+// profile_reset() before the measurement window, profile_set_enabled()
+// to toggle, and profile_print() to emit a breakdown.
+
+void profile_set_enabled(bool on);
+void profile_reset();
+void profile_print(const char * tag, int n_step, int n_total_tokens);
+
+// Driver that loads, dequants, runs 1 prefill + n_decode decode steps
+// with profiling on, then prints the breakdown. Returns false on any
+// hand-path failure.
+bool network_profile(const llama_model * model, const Weights & w,
+                     const std::string & prompt, int n_decode,
+                     int n_threads, std::string & error);
 
 } // namespace gemma4
