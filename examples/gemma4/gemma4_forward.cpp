@@ -242,7 +242,8 @@ bool compare_f32(const char * tag, const float * a, const float * b, size_t n,
 // ---------------------------------------------------------------------
 
 bool dequant_layer(const llama_model * model, const Weights & w_global,
-                   int il, LayerF32 & out, std::string & error) {
+                   int il, LayerF32 & out, std::string & error,
+                   bool dequant_to_f32) {
     (void) model;
     if (il < 0 || il >= (int) w_global.layers.size()) {
         error = "dequant_layer: il out of range";
@@ -282,22 +283,38 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
     if (!copy_f32(L.post_ffw_norm,  out.post_ffw_norm,  error)) return false;
     if (!copy_f32(L.post_norm,      out.post_norm,      error)) return false;
 
-    if (!dequant_f32(L.wq,       out.wq,       error)) return false;
-    if (out.kv_reuse_il < 0) {
-        // Own KV: dequant K and (optional) V projection.
-        if (!dequant_f32(L.wk, out.wk, error)) return false;
-        if (L.has_v_proj) {
-            if (!dequant_f32(L.wv, out.wv, error)) return false;
+    // Tensor pointers are ALWAYS populated -- the qquant path needs them
+    // even when the F32 vectors are skipped. Shared-KV layers also
+    // populate wk_t/wv_t for completeness (the forward never reads them).
+    out.wq_t       = L.wq;
+    out.wk_t       = L.wk;
+    out.wv_t       = L.wv;
+    out.wo_t       = L.wo;
+    out.ffn_gate_t = L.ffn_gate;
+    out.ffn_up_t   = L.ffn_up;
+    out.ffn_down_t = L.ffn_down;
+    out.inp_gate_t = L.inp_gate;
+    out.proj_t     = L.proj;
+
+    if (dequant_to_f32) {
+        if (!dequant_f32(L.wq,       out.wq,       error)) return false;
+        if (out.kv_reuse_il < 0) {
+            // Own KV: dequant K and (optional) V projection.
+            if (!dequant_f32(L.wk, out.wk, error)) return false;
+            if (L.has_v_proj) {
+                if (!dequant_f32(L.wv, out.wv, error)) return false;
+            }
         }
+        // else: shared-KV layer -- skip wk/wv dequant (memory saver; they
+        // exist in the GGUF but upstream graph never reads them for these
+        // layers).
+        if (!dequant_f32(L.wo,       out.wo,       error)) return false;
+        if (!dequant_f32(L.ffn_gate, out.ffn_gate, error)) return false;
+        if (!dequant_f32(L.ffn_up,   out.ffn_up,   error)) return false;
+        if (!dequant_f32(L.ffn_down, out.ffn_down, error)) return false;
+        if (!copy_f32(L.inp_gate,    out.inp_gate, error)) return false;
+        if (!copy_f32(L.proj,        out.proj,     error)) return false;
     }
-    // else: shared-KV layer -- skip wk/wv dequant (memory saver; they exist
-    // in the GGUF but upstream graph never reads them for these layers).
-    if (!dequant_f32(L.wo,       out.wo,       error)) return false;
-    if (!dequant_f32(L.ffn_gate, out.ffn_gate, error)) return false;
-    if (!dequant_f32(L.ffn_up,   out.ffn_up,   error)) return false;
-    if (!dequant_f32(L.ffn_down, out.ffn_down, error)) return false;
-    if (!copy_f32(L.inp_gate,    out.inp_gate, error)) return false;
-    if (!copy_f32(L.proj,        out.proj,     error)) return false;
 
     if (L.layer_output_scale) {
         std::vector<float> s;
@@ -327,6 +344,37 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
 //                    populated by the earlier owning layer.
 //   n_swa          = SWA window. Only consulted for L.is_swa layers.
 //                    Pass INT32_MAX to disable (no SWA mask).
+//   mm             = optional matmul shim. When non-null, the four large
+//                    matmuls (Q proj, K proj, V proj, wo, FFN gate/up/down,
+//                    PLE inp_gate/proj) dispatch to matmul_qf32 using the
+//                    layer's raw (possibly quantized) ggml tensors. When
+//                    null (default; used by layer_self_test) the F32
+//                    matmul_f32 path runs against L.wq.data() etc.
+
+// Helper: dispatch a single (n_in -> n_out) @ n_cols matmul to either
+// matmul_qf32 (qquant path) or matmul_f32 (F32 fallback). Asserts that
+// the chosen back-end has its inputs populated.
+static bool dispatch_matmul(MatmulCtx * mm,
+                            const ggml_tensor * W_t,
+                            const float * W_f32,
+                            const float * x_in, float * y_out,
+                            int n_in, int n_out, int n_cols,
+                            const char * tag, std::string & error) {
+    if (mm) {
+        if (!W_t) {
+            error = std::string("dispatch_matmul: ") + tag + ": W_t is null in qquant path";
+            return false;
+        }
+        return matmul_qf32(*mm, W_t, x_in, y_out, n_in, n_out, n_cols, error);
+    }
+    if (!W_f32) {
+        error = std::string("dispatch_matmul: ") + tag + ": F32 weights empty in F32 path";
+        return false;
+    }
+    matmul_f32(W_f32, x_in, y_out, n_in, n_out, n_cols);
+    return true;
+}
+
 bool layer_forward_f32_cached(const LayerF32 & L,
                               int n_new, int n_past, int n_swa,
                               const float * hidden_in,
@@ -335,6 +383,7 @@ bool layer_forward_f32_cached(const LayerF32 & L,
                               float * hidden_out,
                               float * K_cache, float * V_cache,
                               bool reuse_kv,
+                              MatmulCtx * mm,
                               std::string & error) {
     if (n_new <= 0) { error = "layer_forward_f32_cached: n_new<=0"; return false; }
     if (n_past < 0) { error = "layer_forward_f32_cached: n_past<0"; return false; }
@@ -372,7 +421,9 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- Q = wq @ norm1, then q_norm + RoPE (always own) --------
     std::vector<float> Q((size_t) n_q * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_qproj_ns);
-    matmul_f32(L.wq.data(), norm1.data(), Q.data(), n_embd, n_q, n_new);
+    if (!dispatch_matmul(mm, L.wq_t, L.wq.empty() ? nullptr : L.wq.data(),
+                         norm1.data(), Q.data(), n_embd, n_q, n_new,
+                         "wq", error)) return false;
     }
     { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
     for (int t = 0; t < n_new; ++t) {
@@ -398,13 +449,17 @@ bool layer_forward_f32_cached(const LayerF32 & L,
         float * V_new = V_cache + (size_t) n_past * n_kv;
 
         { prof::Scope _s(&prof::g_acc.lf_kproj_ns);
-        matmul_f32(L.wk.data(), norm1.data(), K_new, n_embd, n_kv, n_new);
+        if (!dispatch_matmul(mm, L.wk_t, L.wk.empty() ? nullptr : L.wk.data(),
+                             norm1.data(), K_new, n_embd, n_kv, n_new,
+                             "wk", error)) return false;
         }
 
         { prof::Scope _s(&prof::g_acc.lf_vproj_ns);
-        std::vector<float> V_scratch;
-        if (!L.wv.empty()) {
-            matmul_f32(L.wv.data(), norm1.data(), V_new, n_embd, n_kv, n_new);
+        const bool has_wv = (L.wv_t != nullptr);
+        if (has_wv) {
+            if (!dispatch_matmul(mm, L.wv_t, L.wv.empty() ? nullptr : L.wv.data(),
+                                 norm1.data(), V_new, n_embd, n_kv, n_new,
+                                 "wv", error)) return false;
         } else {
             // V = K when wv missing; copy K_new -> V_new.
             std::memcpy(V_new, K_new, (size_t) n_kv * n_new * sizeof(float));
@@ -492,7 +547,9 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- wo: attn_out = wo @ attn_ctx --------
     std::vector<float> attn_out((size_t) n_embd * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_wo_ns);
-    matmul_f32(L.wo.data(), attn_ctx.data(), attn_out.data(), n_q, n_embd, n_new);
+    if (!dispatch_matmul(mm, L.wo_t, L.wo.empty() ? nullptr : L.wo.data(),
+                         attn_ctx.data(), attn_out.data(), n_q, n_embd, n_new,
+                         "wo", error)) return false;
     }
 
     // -------- post_attn_norm + residual1 --------
@@ -522,10 +579,14 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     std::vector<float> gate((size_t) n_ff * n_new, 0.0f);
     std::vector<float> up  ((size_t) n_ff * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_gate_ns);
-    matmul_f32(L.ffn_gate.data(), ff_in.data(), gate.data(), n_embd, n_ff, n_new);
+    if (!dispatch_matmul(mm, L.ffn_gate_t, L.ffn_gate.empty() ? nullptr : L.ffn_gate.data(),
+                         ff_in.data(), gate.data(), n_embd, n_ff, n_new,
+                         "ffn_gate", error)) return false;
     }
     { prof::Scope _s(&prof::g_acc.lf_up_ns);
-    matmul_f32(L.ffn_up.data(),   ff_in.data(), up.data(),   n_embd, n_ff, n_new);
+    if (!dispatch_matmul(mm, L.ffn_up_t, L.ffn_up.empty() ? nullptr : L.ffn_up.data(),
+                         ff_in.data(), up.data(), n_embd, n_ff, n_new,
+                         "ffn_up", error)) return false;
     }
     { prof::Scope _s(&prof::g_acc.lf_gelu_mul_ns);
     gelu_f32(gate.data(), gate.data(), n_ff * n_new);
@@ -535,7 +596,9 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- ffn_down --------
     std::vector<float> ff_out((size_t) n_embd * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_ffn_down_ns);
-    matmul_f32(L.ffn_down.data(), gate.data(), ff_out.data(), n_ff, n_embd, n_new);
+    if (!dispatch_matmul(mm, L.ffn_down_t, L.ffn_down.empty() ? nullptr : L.ffn_down.data(),
+                         gate.data(), ff_out.data(), n_ff, n_embd, n_new,
+                         "ffn_down", error)) return false;
     }
 
     // -------- post_ffw_norm + residual2 --------
@@ -554,13 +617,17 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
     { prof::Scope _s(&prof::g_acc.lf_ple_ns);
     std::vector<float> ple_a((size_t) n_epl * n_new, 0.0f);
-    matmul_f32(L.inp_gate.data(), pe_in.data(), ple_a.data(), n_embd, n_epl, n_new);
+    if (!dispatch_matmul(mm, L.inp_gate_t, L.inp_gate.empty() ? nullptr : L.inp_gate.data(),
+                         pe_in.data(), ple_a.data(), n_embd, n_epl, n_new,
+                         "inp_gate", error)) return false;
     gelu_f32(ple_a.data(), ple_a.data(), n_epl * n_new);
     for (size_t i = 0; i < (size_t) n_epl * n_new; ++i) {
         ple_a[i] *= per_layer_input[i];
     }
     std::vector<float> ple_b((size_t) n_embd * n_new, 0.0f);
-    matmul_f32(L.proj.data(), ple_a.data(), ple_b.data(), n_epl, n_embd, n_new);
+    if (!dispatch_matmul(mm, L.proj_t, L.proj.empty() ? nullptr : L.proj.data(),
+                         ple_a.data(), ple_b.data(), n_epl, n_embd, n_new,
+                         "proj", error)) return false;
     for (int t = 0; t < n_new; ++t) {
         rmsnorm_mul_f32(ple_b.data() + (size_t) t * n_embd,
                         ple_b.data() + (size_t) t * n_embd,
@@ -624,7 +691,8 @@ bool layer_forward_f32(const LayerF32 & L,
     return layer_forward_f32_cached(L, n_tokens, /*n_past=*/0,
                                     /*n_swa=*/std::numeric_limits<int>::max(),
                                     hidden_in, pos, per_layer_input,
-                                    hidden_out, K_buf, V_buf, reuse, error);
+                                    hidden_out, K_buf, V_buf, reuse,
+                                    /*mm=*/nullptr, error);
 }
 
 // ---------------------------------------------------------------------
@@ -892,9 +960,13 @@ bool dequant_model(const llama_model * model, const Weights & w,
     // Dequant every layer. layer_forward_f32 needs LayerF32.freq_factors
     // pointing at OUR freq_factors_data (so the original model could in
     // principle be unloaded). We rebuild this pointer after dequant.
+    // Skip F32 dequant of the large matmul weights -- the network path
+    // routes those through MatmulCtx + ggml_mul_mat on the raw quant
+    // tensors (which keeps memory comparable to the source model).
     out.layers.resize(w.n_layer);
     for (int il = 0; il < w.n_layer; ++il) {
-        if (!dequant_layer(model, w, il, out.layers[il], error)) {
+        if (!dequant_layer(model, w, il, out.layers[il], error,
+                           /*dequant_to_f32=*/false)) {
             std::ostringstream ss;
             ss << "dequant_model: layer " << il << ": " << error;
             error = ss.str();
@@ -906,6 +978,19 @@ bool dequant_model(const llama_model * model, const Weights & w,
         } else {
             out.layers[il].freq_factors = nullptr;
         }
+    }
+
+    // Initialise the shared matmul shim. Single ggml arena must hold:
+    //   * one F32 activation copy (worst case lm_head input: n_embd*1 = 6 KiB on E4B)
+    //   * one F32 result (worst case lm_head output: n_vocab = 262 144 * 4 = 1 MiB)
+    //   * ggml's per-call work buffer (Q8_K activation quant + scratch),
+    //     dominated by intermediate per-row partials. Empirically a few MiB.
+    //   * tensor metadata + graph nodes (~kilobytes).
+    // 32 MiB gives comfortable headroom and one-time allocation cost.
+    const std::size_t arena_bytes = 32ull << 20;
+    int mm_threads = 1; // single-threaded default; caller can override later
+    if (!matmul_ctx_init(out.mm, arena_bytes, mm_threads, error)) {
+        return false;
     }
 
     std::fprintf(stderr,
@@ -1127,6 +1212,7 @@ bool network_self_test(const llama_model * model, const Weights & w,
     // -------- Dequant + hand path --------
     ModelF32 mf;
     if (!dequant_model(model, w, mf, error)) return false;
+    mf.mm.n_threads = n_threads;
 
     std::vector<float> hand_logits((size_t) n_vocab, 0.0f);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1326,7 +1412,7 @@ bool network_step(NetworkState & s, const ModelF32 & m,
         if (!layer_forward_f32_cached(L, n_new, s.n_past, m.n_swa,
                                       inpL.data(), s.pos_all.data(), slice,
                                       hidden_out.data(),
-                                      K_buf, V_buf, reuse, error)) {
+                                      K_buf, V_buf, reuse, &m.mm, error)) {
             std::ostringstream ss;
             ss << "network_step: layer " << il << ": " << error;
             error = ss.str();
@@ -1347,19 +1433,22 @@ bool network_step(NetworkState & s, const ModelF32 & m,
     }
 
     // ---- 5. lm_head (tied to tok_embd) ----
+    //
+    // logits[v, tc] = sum_e tok_embd[v, e] * hidden[t_start+tc, e]
+    //
+    // ggml shape of tok_embd is [n_embd, n_vocab] (n_embd innermost).
+    // matmul_qf32 with x = hidden_slice[n_embd, t_count] produces
+    // y[n_vocab, t_count] -- exactly the layout we want.
+    //
+    // The slice [t_start .. t_start+t_count) in inpL is contiguous
+    // (inpL layout is [n_embd, n_new] with n_embd innermost).
     const int t_start = last_token_only ? n_new - 1 : 0;
     const int t_count = last_token_only ? 1 : n_new;
     { prof::Scope _s(&prof::g_acc.lm_head_ns);
-    std::vector<float> row(n_embd);
-    for (int v = 0; v < n_vocab; ++v) {
-        dequant_row(m.tok_embd_quant, v, row.data());
-        for (int tc = 0; tc < t_count; ++tc) {
-            const int t = t_start + tc;
-            const float * xt = inpL.data() + (size_t) t * n_embd;
-            double s = 0.0;
-            for (int e = 0; e < n_embd; ++e) s += (double) row[e] * (double) xt[e];
-            logits_out[(size_t) tc * n_vocab + v] = (float) s;
-        }
+    const float * hidden_slice = inpL.data() + (size_t) t_start * n_embd;
+    if (!matmul_qf32(m.mm, m.tok_embd_quant, hidden_slice, logits_out,
+                     n_embd, n_vocab, t_count, error)) {
+        return false;
     }
     }
 
@@ -1402,6 +1491,7 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
     // -------- Dequant + reserve state --------
     ModelF32 mf;
     if (!dequant_model(model, w, mf, error)) return false;
+    mf.mm.n_threads = n_threads;
     NetworkState st;
     const int cap = n_prompt + n_gen + 4;
     if (!network_state_reserve(st, mf, cap, error)) return false;
@@ -1515,7 +1605,7 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
 
 bool network_profile(const llama_model * model, const Weights & w,
                      const std::string & prompt, int n_decode,
-                     int /*n_threads*/, std::string & error) {
+                     int n_threads, std::string & error) {
     if (n_decode < 0) { error = "network_profile: n_decode<0"; return false; }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1532,6 +1622,7 @@ bool network_profile(const llama_model * model, const Weights & w,
 
     ModelF32 mf;
     if (!dequant_model(model, w, mf, error)) return false;
+    mf.mm.n_threads = n_threads;
     NetworkState st;
     const int cap = n_prompt + n_decode + 4;
     if (!network_state_reserve(st, mf, cap, error)) return false;

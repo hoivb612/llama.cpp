@@ -18,6 +18,8 @@
 // math only. For multi-token attention the test uses n_tokens >= 8
 // with causal masking so attention has non-trivial structure.
 
+#include "gemma4_matmul.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -58,7 +60,11 @@ struct LayerF32 {
     std::vector<float> post_ffw_norm;    // [n_embd]
     std::vector<float> post_norm;        // [n_embd]  (per-layer post-PLE)
 
-    // Matmul weights (dequantized to F32).
+    // Matmul weights (dequantized to F32). Populated only when
+    // dequant_layer is called with dequant_to_f32=true (the default,
+    // used by layer_self_test). The qquant network path skips F32
+    // dequant to save memory and matmul-driven inference goes through
+    // the *_t ggml_tensor pointers below + MatmulCtx instead.
     std::vector<float> wq;               // [n_embd, n_head * head_dim]
     std::vector<float> wk;               // [n_embd, n_head_kv * head_dim]
     std::vector<float> wv;               // [n_embd, n_head_kv * head_dim] (may be empty)
@@ -68,6 +74,21 @@ struct LayerF32 {
     std::vector<float> ffn_down;         // [n_ff,   n_embd]
     std::vector<float> inp_gate;         // [n_embd, n_embd_per_layer]
     std::vector<float> proj;             // [n_embd_per_layer, n_embd]
+
+    // Raw (possibly quantized) weight tensors from the source model.
+    // Non-owning. layer_forward_f32_cached reads these via matmul_qf32
+    // when its MatmulCtx parameter is non-null (qquant path). They are
+    // also valid for shared-KV layers (wk_t/wv_t still pointer-set but
+    // not consumed). The source llama_model must outlive ModelF32.
+    const ggml_tensor * wq_t       = nullptr;
+    const ggml_tensor * wk_t       = nullptr;
+    const ggml_tensor * wv_t       = nullptr;
+    const ggml_tensor * wo_t       = nullptr;
+    const ggml_tensor * ffn_gate_t = nullptr;
+    const ggml_tensor * ffn_up_t   = nullptr;
+    const ggml_tensor * ffn_down_t = nullptr;
+    const ggml_tensor * inp_gate_t = nullptr;
+    const ggml_tensor * proj_t     = nullptr;
 
     // Optional scalar [1] -- multiplies hidden before next layer.
     bool  has_layer_output_scale = false;
@@ -83,8 +104,16 @@ struct LayerF32 {
 // hparams + rope settings. Returns false + error on any tensor type the
 // installed ggml-cpu traits cannot dequant (should not happen for the
 // K-quant family used by Q4_K_M).
+//
+// When dequant_to_f32 is true (default; used by layer_self_test) the
+// matmul weights are dequantized into the LayerF32 std::vector<float>
+// buffers AND the *_t ggml_tensor pointers are set. When false, ONLY
+// the *_t pointers + norm/PLE F32 buffers are populated; the matmul
+// weight vectors stay empty, saving ~5.6 GB on E2B. The qquant network
+// path uses the latter to keep memory comparable to the original model.
 bool dequant_layer(const llama_model * model, const Weights & w_global,
-                   int il, LayerF32 & out, std::string & error);
+                   int il, LayerF32 & out, std::string & error,
+                   bool dequant_to_f32 = true);
 
 // Hand-coded single-layer F32 forward (uses gemma4 kernels under the hood).
 // Inputs/outputs are all F32, contiguous in ggml [innermost, n_tokens] order.
@@ -182,6 +211,15 @@ struct ModelF32 {
     // tok_embd is the embedding matrix; also used as the tied lm_head.
     const ggml_tensor * tok_embd_quant            = nullptr; // [n_embd, n_vocab]
     const ggml_tensor * per_layer_tok_embd_quant  = nullptr; // F32 [n_embd_per_layer * n_layer, n_vocab]
+
+    // Persistent matmul shim used by the qquant network path. Initialised
+    // in dequant_model; sized once to comfortably hold the largest single
+    // matmul (lm_head: x[n_embd] -> y[n_vocab], plus ggml's per-call work
+    // buffer and graph metadata). Marked mutable because the per-call
+    // ggml_init reuses the arena as scratch -- the call is observationally
+    // pure from the model's perspective so we keep network_step's
+    // ModelF32 by const-ref.
+    mutable MatmulCtx mm;
 };
 
 // Dequant the whole model into ModelF32. Does not copy tok_embd or
