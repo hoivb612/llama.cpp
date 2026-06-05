@@ -231,4 +231,52 @@ bool network_self_test(const llama_model * model, const Weights & w,
                        const std::string & prompt, int n_threads,
                        std::string & error);
 
+// ---------------------------------------------------------------------
+// G3.4b -- greedy generation with persistent KV cache.
+// ---------------------------------------------------------------------
+//
+// NetworkState holds the persistent per-layer K/V cache so successive
+// network_step calls can do single-token decode without recomputing the
+// prompt. Only "owning" layers (kv_reuse_il == -1) have non-empty
+// K_cache[il] / V_cache[il]; shared-KV layers read from their source.
+//
+// pos_all is the position vector for every cached token (size n_past).
+// Typical use: positions [0, 1, ..., n_past-1] for a clean greedy run.
+
+struct NetworkState {
+    // Owning-layer cache. K_cache[il] sized [n_kv * cap_seq], grown as needed.
+    std::vector<std::vector<float>> K_cache;
+    std::vector<std::vector<float>> V_cache;
+    std::vector<int32_t> pos_all;          // [n_past]
+    int n_past = 0;
+    int cap_seq = 0;                       // current allocated capacity (per-layer)
+};
+
+// Reserve K/V cache space for cap_seq total tokens. Called by the test
+// driver up front so the inner loop doesn't reallocate.
+bool network_state_reserve(NetworkState & s, const ModelF32 & m,
+                           int cap_seq, std::string & error);
+
+// One forward pass over n_new new tokens at positions [n_past..n_past+n_new).
+// Appends K/V to the cache for owning layers; reuses shared-KV layers'
+// stored K/V. SWA mask uses model.n_swa for is_swa layers.
+//
+// last_token_only=true writes [n_vocab] logits for the LAST new token.
+// last_token_only=false writes [n_vocab * n_new] for every new token.
+//
+// On success, advances s.n_past by n_new.
+bool network_step(NetworkState & s, const ModelF32 & m,
+                  int n_new,
+                  const int32_t * token_ids,         // [n_new]
+                  bool last_token_only,
+                  float * logits_out,
+                  std::string & error);
+
+// Self-test: run greedy generation for n_gen tokens with both the hand
+// path (network_step) and upstream (llama_decode + argmax), and compare
+// the generated token sequences. PASS if all n_gen tokens match.
+bool network_gen_self_test(const llama_model * model, const Weights & w,
+                           const std::string & prompt, int n_gen,
+                           int n_threads, std::string & error);
+
 } // namespace gemma4

@@ -49,6 +49,9 @@ int main(int argc, char ** argv) {
     int  layer_test_ntok    = 8;
     bool network_test       = false;  // G3.4a: full-network hand vs upstream
     std::string network_test_prompt = "The capital of France is";
+    bool network_gen_test   = false;  // G3.4b: greedy decode with KV cache vs upstream
+    std::string network_gen_prompt  = "The capital of France is";
+    int  network_gen_n      = 32;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -82,6 +85,17 @@ int main(int argc, char ** argv) {
                 network_test = true;
                 if (i + 1 < argc && argv[i+1][0] != '-') {
                     network_test_prompt = argv[++i];
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-network-gen") == 0) {
+                network_gen_test = true;
+                // Optional next-arg: prompt (if not starting with '-').
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    network_gen_prompt = argv[++i];
+                }
+                // Optional next-arg: N (if numeric).
+                if (i + 1 < argc && argv[i+1][0] != '-' &&
+                    (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
+                    network_gen_n = std::stoi(argv[++i]);
                 }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
@@ -200,6 +214,33 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::fprintf(stderr, "gemma4 network_self_test: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G3.4b: --gemma4-network-gen [PROMPT] [N] ---------------
+    // Greedy decode with persistent KV cache; compare hand-path token
+    // sequence against upstream llama_decode greedy.
+    if (network_gen_test) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+        const bool ok = gemma4::network_gen_self_test(raw.model, w,
+                                                      network_gen_prompt,
+                                                      network_gen_n,
+                                                      n_threads, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 network_gen_self_test: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 network_gen_self_test: PASS\n");
         gemma4_unload_raw_model(raw);
         return 0;
     }

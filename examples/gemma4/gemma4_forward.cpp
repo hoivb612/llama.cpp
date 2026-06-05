@@ -205,9 +205,246 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
 }
 
 // ---------------------------------------------------------------------
-// Hand-coded F32 layer forward
+// Hand-coded F32 layer forward (cached version is the source of truth)
 // ---------------------------------------------------------------------
+//
+// Conventions for layer_forward_f32_cached:
+//   n_new          = number of new tokens this call (n_prompt for prefill,
+//                    1 for a decode step).
+//   n_past         = number of tokens already in K_cache (0 for prefill).
+//   n_total        = n_past + n_new
+//   pos_all[i]     = position of cached token i (i in [0..n_total))
+//   K_cache,V_cache: size [n_kv * n_total]. For an owning layer, this call
+//                    writes the new K (post-norm + post-RoPE) and V
+//                    (post-norm) at offset n_past * n_kv. For a reuse layer
+//                    (reuse_kv==true), the buffer is assumed already
+//                    populated by the earlier owning layer.
+//   n_swa          = SWA window. Only consulted for L.is_swa layers.
+//                    Pass INT32_MAX to disable (no SWA mask).
+bool layer_forward_f32_cached(const LayerF32 & L,
+                              int n_new, int n_past, int n_swa,
+                              const float * hidden_in,
+                              const int32_t * pos_all,
+                              const float * per_layer_input,
+                              float * hidden_out,
+                              float * K_cache, float * V_cache,
+                              bool reuse_kv,
+                              std::string & error) {
+    if (n_new <= 0) { error = "layer_forward_f32_cached: n_new<=0"; return false; }
+    if (n_past < 0) { error = "layer_forward_f32_cached: n_past<0"; return false; }
+    if (!K_cache || !V_cache) { error = "layer_forward_f32_cached: null K/V cache"; return false; }
+    if (reuse_kv && L.kv_reuse_il < 0) {
+        error = "layer_forward_f32_cached: reuse_kv=true for an own-KV layer";
+        return false;
+    }
+    if (!reuse_kv && L.kv_reuse_il >= 0) {
+        error = "layer_forward_f32_cached: shared-KV layer requires reuse_kv=true";
+        return false;
+    }
 
+    const int n_embd    = L.n_embd;
+    const int n_head    = L.n_head;
+    const int n_head_kv = L.n_head_kv;
+    const int head_dim  = L.head_dim;
+    const int n_ff      = L.n_ff;
+    const int n_epl     = L.n_embd_per_layer;
+    const int n_q       = n_head * head_dim;
+    const int n_kv      = n_head_kv * head_dim;
+    const int n_total   = n_past + n_new;
+    const float eps     = L.rms_eps;
+
+    // -------- attn_norm: norm1[t,:] = rmsnorm(hidden_in[t,:]) * attn_norm --
+    std::vector<float> norm1((size_t) n_embd * n_new, 0.0f);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(norm1.data() + (size_t) t * n_embd,
+                        hidden_in + (size_t) t * n_embd,
+                        L.attn_norm.data(), n_embd, eps);
+    }
+
+    // -------- Q = wq @ norm1, then q_norm + RoPE (always own) --------
+    std::vector<float> Q((size_t) n_q * n_new, 0.0f);
+    matmul_f32(L.wq.data(), norm1.data(), Q.data(), n_embd, n_q, n_new);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_per_head_f32(Q.data() + (size_t) t * n_q,
+                             Q.data() + (size_t) t * n_q,
+                             L.attn_q_norm.data(), head_dim, n_head, eps);
+    }
+    for (int t = 0; t < n_new; ++t) {
+        const int p = pos_all[n_past + t];
+        for (int h = 0; h < n_head; ++h) {
+            float * q_th = Q.data() + (size_t) t * n_q + (size_t) h * head_dim;
+            rope_neox_f32(q_th, q_th, L.freq_factors,
+                          L.rope_dim, head_dim, p, L.rope_base);
+        }
+    }
+
+    // -------- K, V for new tokens (skip entirely on reuse layers) --------
+    if (!reuse_kv) {
+        float * K_new = K_cache + (size_t) n_past * n_kv;
+        float * V_new = V_cache + (size_t) n_past * n_kv;
+
+        matmul_f32(L.wk.data(), norm1.data(), K_new, n_embd, n_kv, n_new);
+
+        std::vector<float> V_scratch;
+        if (!L.wv.empty()) {
+            matmul_f32(L.wv.data(), norm1.data(), V_new, n_embd, n_kv, n_new);
+        } else {
+            // V = K when wv missing; copy K_new -> V_new.
+            std::memcpy(V_new, K_new, (size_t) n_kv * n_new * sizeof(float));
+        }
+
+        // K norm (per kv-head)
+        for (int t = 0; t < n_new; ++t) {
+            rmsnorm_per_head_f32(K_new + (size_t) t * n_kv,
+                                 K_new + (size_t) t * n_kv,
+                                 L.attn_k_norm.data(), head_dim, n_head_kv, eps);
+        }
+        // V norm (no weight, gemma4 quirk)
+        for (int t = 0; t < n_new; ++t) {
+            rmsnorm_per_head_f32(V_new + (size_t) t * n_kv,
+                                 V_new + (size_t) t * n_kv,
+                                 /*w=*/nullptr, head_dim, n_head_kv, eps);
+        }
+        // RoPE on K (new positions only)
+        for (int t = 0; t < n_new; ++t) {
+            const int p = pos_all[n_past + t];
+            for (int h = 0; h < n_head_kv; ++h) {
+                float * k_th = K_new + (size_t) t * n_kv + (size_t) h * head_dim;
+                rope_neox_f32(k_th, k_th, L.freq_factors,
+                              L.rope_dim, head_dim, p, L.rope_base);
+            }
+        }
+    }
+
+    // -------- Self-attention over n_total cached positions --------
+    // scale = 1.0 (gemma4 hparams.f_attention_scale = 1.0).
+    std::vector<float> attn_ctx((size_t) n_q * n_new, 0.0f);
+    std::vector<float> scores((size_t) n_total, 0.0f);
+    const bool apply_swa = L.is_swa;
+    for (int t = 0; t < n_new; ++t) {
+        const int p_t = pos_all[n_past + t];
+        for (int h = 0; h < n_head; ++h) {
+            const int h_kv = h * n_head_kv / n_head;
+            const float * q_th = Q.data() + (size_t) t * n_q + (size_t) h * head_dim;
+            float max_s = -std::numeric_limits<float>::infinity();
+            for (int k = 0; k < n_total; ++k) {
+                const int p_k = pos_all[k];
+                const bool masked = (p_k > p_t) ||
+                                    (apply_swa && (p_t - p_k >= n_swa));
+                if (masked) {
+                    scores[k] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                const float * k_th = K_cache + (size_t) k * n_kv + (size_t) h_kv * head_dim;
+                double s = 0.0;
+                for (int d = 0; d < head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
+                const float sf = (float) s;
+                scores[k] = sf;
+                if (sf > max_s) max_s = sf;
+            }
+            double sum = 0.0;
+            for (int k = 0; k < n_total; ++k) {
+                if (scores[k] == -std::numeric_limits<float>::infinity()) {
+                    scores[k] = 0.0f;
+                } else {
+                    scores[k] = std::exp(scores[k] - max_s);
+                    sum += (double) scores[k];
+                }
+            }
+            const float inv_sum = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+            for (int k = 0; k < n_total; ++k) scores[k] *= inv_sum;
+            float * out_th = attn_ctx.data() + (size_t) t * n_q + (size_t) h * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                double acc = 0.0;
+                for (int k = 0; k < n_total; ++k) {
+                    const float * v_th = V_cache + (size_t) k * n_kv + (size_t) h_kv * head_dim;
+                    acc += (double) scores[k] * (double) v_th[d];
+                }
+                out_th[d] = (float) acc;
+            }
+        }
+    }
+
+    // -------- wo: attn_out = wo @ attn_ctx --------
+    std::vector<float> attn_out((size_t) n_embd * n_new, 0.0f);
+    matmul_f32(L.wo.data(), attn_ctx.data(), attn_out.data(), n_q, n_embd, n_new);
+
+    // -------- post_attn_norm + residual1 --------
+    std::vector<float> attn_out2((size_t) n_embd * n_new, 0.0f);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(attn_out2.data() + (size_t) t * n_embd,
+                        attn_out.data() + (size_t) t * n_embd,
+                        L.post_attn_norm.data(), n_embd, eps);
+    }
+    for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
+        attn_out2[i] += hidden_in[i];
+    }
+
+    // -------- ffn_norm --------
+    std::vector<float> ff_in((size_t) n_embd * n_new, 0.0f);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(ff_in.data() + (size_t) t * n_embd,
+                        attn_out2.data() + (size_t) t * n_embd,
+                        L.ffn_norm.data(), n_embd, eps);
+    }
+
+    // -------- gate, up, gelu(gate)*up --------
+    std::vector<float> gate((size_t) n_ff * n_new, 0.0f);
+    std::vector<float> up  ((size_t) n_ff * n_new, 0.0f);
+    matmul_f32(L.ffn_gate.data(), ff_in.data(), gate.data(), n_embd, n_ff, n_new);
+    matmul_f32(L.ffn_up.data(),   ff_in.data(), up.data(),   n_embd, n_ff, n_new);
+    gelu_f32(gate.data(), gate.data(), n_ff * n_new);
+    for (size_t i = 0; i < (size_t) n_ff * n_new; ++i) gate[i] *= up[i];
+
+    // -------- ffn_down --------
+    std::vector<float> ff_out((size_t) n_embd * n_new, 0.0f);
+    matmul_f32(L.ffn_down.data(), gate.data(), ff_out.data(), n_ff, n_embd, n_new);
+
+    // -------- post_ffw_norm + residual2 --------
+    std::vector<float> pe_in((size_t) n_embd * n_new, 0.0f);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(pe_in.data() + (size_t) t * n_embd,
+                        ff_out.data() + (size_t) t * n_embd,
+                        L.post_ffw_norm.data(), n_embd, eps);
+    }
+    for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
+        pe_in[i] += attn_out2[i];
+    }
+
+    // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
+    std::vector<float> ple_a((size_t) n_epl * n_new, 0.0f);
+    matmul_f32(L.inp_gate.data(), pe_in.data(), ple_a.data(), n_embd, n_epl, n_new);
+    gelu_f32(ple_a.data(), ple_a.data(), n_epl * n_new);
+    for (size_t i = 0; i < (size_t) n_epl * n_new; ++i) {
+        ple_a[i] *= per_layer_input[i];
+    }
+    std::vector<float> ple_b((size_t) n_embd * n_new, 0.0f);
+    matmul_f32(L.proj.data(), ple_a.data(), ple_b.data(), n_epl, n_embd, n_new);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(ple_b.data() + (size_t) t * n_embd,
+                        ple_b.data() + (size_t) t * n_embd,
+                        L.post_norm.data(), n_embd, eps);
+    }
+    for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
+        pe_in[i] += ple_b[i];
+    }
+
+    // -------- layer_output_scale --------
+    if (L.has_layer_output_scale) {
+        const float s = L.layer_output_scale;
+        for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
+            pe_in[i] *= s;
+        }
+    }
+
+    std::memcpy(hidden_out, pe_in.data(), (size_t) n_embd * n_new * sizeof(float));
+    return true;
+}
+
+// Backwards-compatible G3.3 / G3.4a API: prefill-only (no past KV), no
+// SWA mask. Delegates to layer_forward_f32_cached with n_past=0 and
+// n_swa=INT32_MAX. The four optional KV pointers select between
+// "compute K/V into caller-supplied buffer" and "reuse caller-supplied K/V".
 bool layer_forward_f32(const LayerF32 & L,
                        int n_tokens,
                        const float * hidden_in,
@@ -219,228 +456,31 @@ bool layer_forward_f32(const LayerF32 & L,
                        float * kv_V_self_out,
                        const float * kv_K_reuse,
                        const float * kv_V_reuse) {
-    if (n_tokens <= 0) { error = "layer_forward_f32: n_tokens<=0"; return false; }
-    const int n_embd    = L.n_embd;
-    const int n_head    = L.n_head;
-    const int n_head_kv = L.n_head_kv;
-    const int head_dim  = L.head_dim;
-    const int n_ff      = L.n_ff;
-    const int n_epl     = L.n_embd_per_layer;
-    const int n_q       = n_head * head_dim;
-    const int n_kv      = n_head_kv * head_dim;
-    const float eps     = L.rms_eps;
+    const int n_kv = L.n_head_kv * L.head_dim;
+    const bool reuse = (kv_K_reuse != nullptr) && (kv_V_reuse != nullptr);
 
-    const bool reuse_kv = (kv_K_reuse != nullptr) && (kv_V_reuse != nullptr);
-    if (reuse_kv && L.kv_reuse_il < 0) {
-        error = "layer_forward_f32: kv_K_reuse provided for an own-KV layer";
-        return false;
-    }
-    if (!reuse_kv && L.kv_reuse_il >= 0) {
-        error = "layer_forward_f32: shared-KV layer requires kv_K_reuse/kv_V_reuse";
-        return false;
-    }
+    float * K_buf = nullptr;
+    float * V_buf = nullptr;
+    std::vector<float> K_local, V_local;
 
-    // -------- attn_norm: norm1[t,:] = rmsnorm(hidden_in[t,:]) * attn_norm --
-    std::vector<float> norm1((size_t) n_embd * n_tokens, 0.0f);
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_mul_f32(norm1.data() + (size_t) t * n_embd,
-                        hidden_in + (size_t) t * n_embd,
-                        L.attn_norm.data(), n_embd, eps);
-    }
-
-    // -------- Q = wq @ norm1 --------
-    std::vector<float> Q((size_t) n_q * n_tokens, 0.0f);
-    matmul_f32(L.wq.data(), norm1.data(), Q.data(), n_embd, n_q, n_tokens);
-
-    // -------- K, V (compute own, or reuse from earlier layer) -----------
-    std::vector<float> K, V;
-    const float * K_view = nullptr;
-    const float * V_view = nullptr;
-    if (reuse_kv) {
-        // Use externally-supplied K, V (already post-norm + post-RoPE for K, post-norm for V).
-        K_view = kv_K_reuse;
-        V_view = kv_V_reuse;
+    if (reuse) {
+        // Reuse path: caller already populated the buffer.
+        K_buf = const_cast<float *>(kv_K_reuse);
+        V_buf = const_cast<float *>(kv_V_reuse);
+    } else if (kv_K_self_out) {
+        K_buf = kv_K_self_out;
+        V_buf = kv_V_self_out;
     } else {
-        K.assign((size_t) n_kv * n_tokens, 0.0f);
-        matmul_f32(L.wk.data(), norm1.data(), K.data(), n_embd, n_kv, n_tokens);
-
-        if (!L.wv.empty()) {
-            V.assign((size_t) n_kv * n_tokens, 0.0f);
-            matmul_f32(L.wv.data(), norm1.data(), V.data(), n_embd, n_kv, n_tokens);
-        } else {
-            V = K;
-        }
-
-        // K norm (per kv-head, weight = attn_k_norm[head_dim])
-        for (int t = 0; t < n_tokens; ++t) {
-            rmsnorm_per_head_f32(K.data() + (size_t) t * n_kv,
-                                 K.data() + (size_t) t * n_kv,
-                                 L.attn_k_norm.data(), head_dim, n_head_kv, eps);
-        }
-        // V norm: pure rms (no weight), per kv-head, gemma4 quirk
-        for (int t = 0; t < n_tokens; ++t) {
-            rmsnorm_per_head_f32(V.data() + (size_t) t * n_kv,
-                                 V.data() + (size_t) t * n_kv,
-                                 /*w=*/nullptr, head_dim, n_head_kv, eps);
-        }
-
-        // RoPE on K (per kv-head)
-        for (int t = 0; t < n_tokens; ++t) {
-            const int p = pos[t];
-            for (int h = 0; h < n_head_kv; ++h) {
-                float * k_th = K.data() + (size_t) t * n_kv + (size_t) h * head_dim;
-                rope_neox_f32(k_th, k_th, L.freq_factors,
-                              L.rope_dim, head_dim, p, L.rope_base);
-            }
-        }
-
-        // Publish final K, V into caller's buffers (for downstream shared-KV layers).
-        if (kv_K_self_out) {
-            std::memcpy(kv_K_self_out, K.data(), (size_t) n_kv * n_tokens * sizeof(float));
-        }
-        if (kv_V_self_out) {
-            std::memcpy(kv_V_self_out, V.data(), (size_t) n_kv * n_tokens * sizeof(float));
-        }
-
-        K_view = K.data();
-        V_view = V.data();
+        K_local.assign((size_t) n_kv * n_tokens, 0.0f);
+        V_local.assign((size_t) n_kv * n_tokens, 0.0f);
+        K_buf = K_local.data();
+        V_buf = V_local.data();
     }
 
-    // -------- Q norm (always uses this layer's own attn_q_norm + RoPE config) --
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_per_head_f32(Q.data() + (size_t) t * n_q,
-                             Q.data() + (size_t) t * n_q,
-                             L.attn_q_norm.data(), head_dim, n_head, eps);
-    }
-    // RoPE on Q (always uses this layer's own RoPE config).
-    for (int t = 0; t < n_tokens; ++t) {
-        const int p = pos[t];
-        for (int h = 0; h < n_head; ++h) {
-            float * q_th = Q.data() + (size_t) t * n_q + (size_t) h * head_dim;
-            rope_neox_f32(q_th, q_th, L.freq_factors,
-                          L.rope_dim, head_dim, p, L.rope_base);
-        }
-    }
-
-    // -------- Self-attention (no past KV; n_tokens new tokens, causal). --
-    // scale = 1.0 (gemma4 hparams.f_attention_scale = 1.0).
-    std::vector<float> attn_ctx((size_t) n_q * n_tokens, 0.0f);
-    std::vector<float> scores((size_t) n_tokens, 0.0f);
-    for (int t = 0; t < n_tokens; ++t) {
-        const int p_t = pos[t];
-        for (int h = 0; h < n_head; ++h) {
-            const int h_kv = h * n_head_kv / n_head;
-            const float * q_th = Q.data() + (size_t) t * n_q + (size_t) h * head_dim;
-            float max_s = -std::numeric_limits<float>::infinity();
-            for (int k = 0; k < n_tokens; ++k) {
-                if (pos[k] > p_t) {
-                    scores[k] = -std::numeric_limits<float>::infinity();
-                    continue;
-                }
-                const float * k_th = K_view + (size_t) k * n_kv + (size_t) h_kv * head_dim;
-                double s = 0.0;
-                for (int d = 0; d < head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
-                const float sf = (float) s;
-                scores[k] = sf;
-                if (sf > max_s) max_s = sf;
-            }
-            double sum = 0.0;
-            for (int k = 0; k < n_tokens; ++k) {
-                if (scores[k] == -std::numeric_limits<float>::infinity()) {
-                    scores[k] = 0.0f;
-                } else {
-                    scores[k] = std::exp(scores[k] - max_s);
-                    sum += (double) scores[k];
-                }
-            }
-            const float inv_sum = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
-            for (int k = 0; k < n_tokens; ++k) scores[k] *= inv_sum;
-            float * out_th = attn_ctx.data() + (size_t) t * n_q + (size_t) h * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                double acc = 0.0;
-                for (int k = 0; k < n_tokens; ++k) {
-                    const float * v_th = V_view + (size_t) k * n_kv + (size_t) h_kv * head_dim;
-                    acc += (double) scores[k] * (double) v_th[d];
-                }
-                out_th[d] = (float) acc;
-            }
-        }
-    }
-
-    // -------- wo: attn_out = wo @ attn_ctx --------
-    std::vector<float> attn_out((size_t) n_embd * n_tokens, 0.0f);
-    matmul_f32(L.wo.data(), attn_ctx.data(), attn_out.data(), n_q, n_embd, n_tokens);
-
-    // -------- post_attn_norm + residual1: attn_out2 = post_norm(attn_out) + hidden_in --
-    std::vector<float> attn_out2((size_t) n_embd * n_tokens, 0.0f);
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_mul_f32(attn_out2.data() + (size_t) t * n_embd,
-                        attn_out.data() + (size_t) t * n_embd,
-                        L.post_attn_norm.data(), n_embd, eps);
-    }
-    for (size_t i = 0; i < (size_t) n_embd * n_tokens; ++i) {
-        attn_out2[i] += hidden_in[i];
-    }
-
-    // -------- ffn_norm --------
-    std::vector<float> ff_in((size_t) n_embd * n_tokens, 0.0f);
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_mul_f32(ff_in.data() + (size_t) t * n_embd,
-                        attn_out2.data() + (size_t) t * n_embd,
-                        L.ffn_norm.data(), n_embd, eps);
-    }
-
-    // -------- gate, up, gelu(gate)*up --------
-    std::vector<float> gate((size_t) n_ff * n_tokens, 0.0f);
-    std::vector<float> up  ((size_t) n_ff * n_tokens, 0.0f);
-    matmul_f32(L.ffn_gate.data(), ff_in.data(), gate.data(), n_embd, n_ff, n_tokens);
-    matmul_f32(L.ffn_up.data(),   ff_in.data(), up.data(),   n_embd, n_ff, n_tokens);
-    gelu_f32(gate.data(), gate.data(), n_ff * n_tokens);
-    for (size_t i = 0; i < (size_t) n_ff * n_tokens; ++i) gate[i] *= up[i];
-
-    // -------- ffn_down --------
-    std::vector<float> ff_out((size_t) n_embd * n_tokens, 0.0f);
-    matmul_f32(L.ffn_down.data(), gate.data(), ff_out.data(), n_ff, n_embd, n_tokens);
-
-    // -------- post_ffw_norm + residual2 --------
-    std::vector<float> pe_in((size_t) n_embd * n_tokens, 0.0f);
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_mul_f32(pe_in.data() + (size_t) t * n_embd,
-                        ff_out.data() + (size_t) t * n_embd,
-                        L.post_ffw_norm.data(), n_embd, eps);
-    }
-    for (size_t i = 0; i < (size_t) n_embd * n_tokens; ++i) {
-        pe_in[i] += attn_out2[i];
-    }
-
-    // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
-    std::vector<float> ple_a((size_t) n_epl * n_tokens, 0.0f);
-    matmul_f32(L.inp_gate.data(), pe_in.data(), ple_a.data(), n_embd, n_epl, n_tokens);
-    gelu_f32(ple_a.data(), ple_a.data(), n_epl * n_tokens);
-    for (size_t i = 0; i < (size_t) n_epl * n_tokens; ++i) {
-        ple_a[i] *= per_layer_input[i];
-    }
-    std::vector<float> ple_b((size_t) n_embd * n_tokens, 0.0f);
-    matmul_f32(L.proj.data(), ple_a.data(), ple_b.data(), n_epl, n_embd, n_tokens);
-    for (int t = 0; t < n_tokens; ++t) {
-        rmsnorm_mul_f32(ple_b.data() + (size_t) t * n_embd,
-                        ple_b.data() + (size_t) t * n_embd,
-                        L.post_norm.data(), n_embd, eps);
-    }
-    for (size_t i = 0; i < (size_t) n_embd * n_tokens; ++i) {
-        pe_in[i] += ple_b[i];
-    }
-
-    // -------- layer_output_scale --------
-    if (L.has_layer_output_scale) {
-        const float s = L.layer_output_scale;
-        for (size_t i = 0; i < (size_t) n_embd * n_tokens; ++i) {
-            pe_in[i] *= s;
-        }
-    }
-
-    std::memcpy(hidden_out, pe_in.data(), (size_t) n_embd * n_tokens * sizeof(float));
-    return true;
+    return layer_forward_f32_cached(L, n_tokens, /*n_past=*/0,
+                                    /*n_swa=*/std::numeric_limits<int>::max(),
+                                    hidden_in, pos, per_layer_input,
+                                    hidden_out, K_buf, V_buf, reuse, error);
 }
 
 // ---------------------------------------------------------------------
@@ -734,11 +774,9 @@ bool dequant_model(const llama_model * model, const Weights & w,
     return true;
 }
 
-namespace {
-
 // Dequant one row of a 2D weight (shape [n_inner, n_outer]) into dst.
 // Used for tok_embd lookups (per-token) and per-vocab-row lm_head matmul.
-void dequant_row(const ggml_tensor * t, int row_idx, float * dst) {
+static void dequant_row(const ggml_tensor * t, int row_idx, float * dst) {
     if (t->type == GGML_TYPE_F32) {
         const float * base = (const float *) t->data;
         std::memcpy(dst, base + (size_t) row_idx * t->ne[0], (size_t) t->ne[0] * sizeof(float));
@@ -755,7 +793,7 @@ void dequant_row(const ggml_tensor * t, int row_idx, float * dst) {
 // in contiguous memory, so slice for layer il is
 //   per_layer_final.data() + (size_t) il * n_tokens * n_embd_per_layer
 // and within that slice, token t starts at offset t * n_embd_per_layer.
-bool compute_per_layer_inputs(const ModelF32 & m,
+static bool compute_per_layer_inputs(const ModelF32 & m,
                               int n_tokens,
                               const int32_t * token_ids,
                               const float * inpL,            // [n_embd, n_tokens]
@@ -841,8 +879,6 @@ bool compute_per_layer_inputs(const ModelF32 & m,
     }
     return true;
 }
-
-} // anonymous namespace
 
 bool network_forward_f32(const ModelF32 & m,
                          int n_tokens,
@@ -1166,6 +1202,285 @@ bool network_self_test(const llama_model * model, const Weights & w,
 
     if (top1_h != top1_u) {
         error = "network_self_test: top-1 token mismatch";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// G3.4b -- greedy decode with persistent KV cache
+// ---------------------------------------------------------------------
+
+bool network_state_reserve(NetworkState & s, const ModelF32 & m,
+                           int cap_seq, std::string & error) {
+    if (cap_seq <= 0) { error = "network_state_reserve: cap_seq<=0"; return false; }
+    s.K_cache.assign(m.n_layer, {});
+    s.V_cache.assign(m.n_layer, {});
+    s.pos_all.clear();
+    s.pos_all.reserve((size_t) cap_seq);
+    s.n_past  = 0;
+    s.cap_seq = cap_seq;
+    for (int il = 0; il < m.n_layer; ++il) {
+        const LayerF32 & L = m.layers[il];
+        if (L.kv_reuse_il >= 0) continue;     // shared-KV layer: no own storage
+        const int n_kv = L.n_head_kv * L.head_dim;
+        s.K_cache[il].assign((size_t) n_kv * cap_seq, 0.0f);
+        s.V_cache[il].assign((size_t) n_kv * cap_seq, 0.0f);
+    }
+    return true;
+}
+
+bool network_step(NetworkState & s, const ModelF32 & m,
+                  int n_new,
+                  const int32_t * token_ids,
+                  bool last_token_only,
+                  float * logits_out,
+                  std::string & error) {
+    if (n_new <= 0) { error = "network_step: n_new<=0"; return false; }
+    if (s.cap_seq <= 0) { error = "network_step: state not reserved"; return false; }
+    if (s.n_past + n_new > s.cap_seq) {
+        std::ostringstream ss;
+        ss << "network_step: n_past+n_new=" << (s.n_past+n_new)
+           << " exceeds cap_seq=" << s.cap_seq;
+        error = ss.str();
+        return false;
+    }
+    if (!m.tok_embd_quant) { error = "network_step: tok_embd not set"; return false; }
+    if (m.output_norm.empty()) { error = "network_step: output_norm empty"; return false; }
+    if (!m.output_tied_to_embd) {
+        error = "network_step: untied output not supported";
+        return false;
+    }
+    const int n_embd  = m.n_embd;
+    const int n_vocab = m.n_vocab;
+    const int n_epl   = m.n_embd_per_layer;
+    const float eps   = m.rms_eps;
+
+    // Append positions [n_past .. n_past+n_new) to pos_all.
+    for (int i = 0; i < n_new; ++i) s.pos_all.push_back(s.n_past + i);
+    const int n_total = s.n_past + n_new;
+
+    // ---- 1. Input embedding * sqrt(n_embd) ----
+    std::vector<float> inpL((size_t) n_embd * n_new, 0.0f);
+    const float emb_scale = std::sqrt((float) n_embd);
+    for (int t = 0; t < n_new; ++t) {
+        const int tok = token_ids[t];
+        if (tok < 0 || tok >= n_vocab) {
+            std::ostringstream ss;
+            ss << "network_step: token_ids[" << t << "]=" << tok << " out of range";
+            error = ss.str();
+            return false;
+        }
+        dequant_row(m.tok_embd_quant, tok, inpL.data() + (size_t) t * n_embd);
+        for (int e = 0; e < n_embd; ++e) inpL[(size_t) t * n_embd + e] *= emb_scale;
+    }
+
+    // ---- 2. PLE preprocessing on the n_new new tokens ----
+    std::vector<float> per_layer_final;
+    if (!compute_per_layer_inputs(m, n_new, token_ids, inpL.data(),
+                                  per_layer_final, error)) return false;
+
+    // ---- 3. Layer loop with cached K/V ----
+    std::vector<float> hidden_out((size_t) n_embd * n_new, 0.0f);
+    for (int il = 0; il < m.n_layer; ++il) {
+        const LayerF32 & L = m.layers[il];
+        const float * slice = per_layer_final.data()
+                            + (size_t) il * n_new * n_epl;
+
+        float * K_buf = nullptr;
+        float * V_buf = nullptr;
+        bool reuse = false;
+        if (L.kv_reuse_il < 0) {
+            K_buf = s.K_cache[il].data();
+            V_buf = s.V_cache[il].data();
+        } else {
+            const int src = L.kv_reuse_il;
+            if (s.K_cache[src].empty() || s.V_cache[src].empty()) {
+                std::ostringstream ss;
+                ss << "network_step: layer " << il << " reuses KV from layer "
+                   << src << " but source has empty storage";
+                error = ss.str();
+                return false;
+            }
+            K_buf = s.K_cache[src].data();
+            V_buf = s.V_cache[src].data();
+            reuse = true;
+        }
+
+        if (!layer_forward_f32_cached(L, n_new, s.n_past, m.n_swa,
+                                      inpL.data(), s.pos_all.data(), slice,
+                                      hidden_out.data(),
+                                      K_buf, V_buf, reuse, error)) {
+            std::ostringstream ss;
+            ss << "network_step: layer " << il << ": " << error;
+            error = ss.str();
+            return false;
+        }
+        std::swap(inpL, hidden_out);
+    }
+
+    // ---- 4. Final output norm on n_new tokens ----
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(hidden_out.data() + (size_t) t * n_embd,
+                        inpL.data() + (size_t) t * n_embd,
+                        m.output_norm.data(), n_embd, eps);
+    }
+    std::swap(inpL, hidden_out);
+
+    // ---- 5. lm_head (tied to tok_embd) ----
+    const int t_start = last_token_only ? n_new - 1 : 0;
+    const int t_count = last_token_only ? 1 : n_new;
+    std::vector<float> row(n_embd);
+    for (int v = 0; v < n_vocab; ++v) {
+        dequant_row(m.tok_embd_quant, v, row.data());
+        for (int tc = 0; tc < t_count; ++tc) {
+            const int t = t_start + tc;
+            const float * xt = inpL.data() + (size_t) t * n_embd;
+            double s = 0.0;
+            for (int e = 0; e < n_embd; ++e) s += (double) row[e] * (double) xt[e];
+            logits_out[(size_t) tc * n_vocab + v] = (float) s;
+        }
+    }
+
+    // ---- 6. Final logit softcap ----
+    if (m.final_logit_softcap > 0.0f) {
+        const float cap = m.final_logit_softcap;
+        const float inv = 1.0f / cap;
+        const size_t total = (size_t) n_vocab * t_count;
+        for (size_t i = 0; i < total; ++i) {
+            logits_out[i] = cap * std::tanh(logits_out[i] * inv);
+        }
+    }
+
+    s.n_past += n_new;
+    return true;
+}
+
+bool network_gen_self_test(const llama_model * model, const Weights & w,
+                           const std::string & prompt, int n_gen,
+                           int n_threads, std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_gen_self_test: n_gen<=0"; return false; }
+
+    // -------- Tokenize prompt --------
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_gen_self_test: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr, "gemma4 network_gen_self_test: prompt=\"%s\" -> %d tokens, n_gen=%d\n",
+                 prompt.c_str(), n_prompt, n_gen);
+
+    // -------- Dequant + reserve state --------
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_gen + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    // -------- Hand path: prefill + greedy decode loop --------
+    std::vector<int32_t> hand_gen;
+    hand_gen.reserve(n_gen);
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, logits.data(), error)) {
+        return false;
+    }
+    int next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+    hand_gen.push_back(next);
+    for (int g = 1; g < n_gen; ++g) {
+        int32_t tok = next;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          logits.data(), error)) return false;
+        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        hand_gen.push_back(next);
+    }
+    const double hand_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    // -------- Upstream path: persistent llama_context, greedy decode --------
+    const int n_ctx = n_prompt + n_gen + 32;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "network_gen_self_test: llama_init_from_model failed"; return false; }
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    std::vector<int32_t> up_gen;
+    up_gen.reserve(n_gen);
+    const auto u0 = std::chrono::steady_clock::now();
+    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
+    if (llama_decode(ctx, batch) != 0) {
+        error = "network_gen_self_test: prompt llama_decode failed";
+        llama_free(ctx); return false;
+    }
+    {
+        const float * src = llama_get_logits_ith(ctx, n_prompt - 1);
+        if (!src) { error = "network_gen_self_test: get_logits_ith null"; llama_free(ctx); return false; }
+        int up_next = (int) (std::max_element(src, src + n_vocab) - src);
+        up_gen.push_back(up_next);
+        for (int g = 1; g < n_gen; ++g) {
+            int32_t tok = up_next;
+            llama_batch one = llama_batch_get_one(&tok, 1);
+            if (llama_decode(ctx, one) != 0) {
+                error = "network_gen_self_test: gen llama_decode failed";
+                llama_free(ctx); return false;
+            }
+            const float * s2 = llama_get_logits_ith(ctx, -1);
+            if (!s2) { error = "network_gen_self_test: get_logits_ith(-1) null"; llama_free(ctx); return false; }
+            up_next = (int) (std::max_element(s2, s2 + n_vocab) - s2);
+            up_gen.push_back(up_next);
+        }
+    }
+    const double up_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - u0).count();
+    llama_free(ctx);
+
+    // -------- Compare token-by-token --------
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+
+    std::string hand_text, up_text;
+    int matched = 0;
+    int first_diverge = -1;
+    for (int g = 0; g < n_gen; ++g) {
+        if (hand_gen[g] == up_gen[g]) ++matched;
+        else if (first_diverge < 0) first_diverge = g;
+        hand_text += piece(hand_gen[g]);
+        up_text   += piece(up_gen[g]);
+    }
+
+    std::fprintf(stderr, "gemma4 network_gen_self_test results:\n");
+    std::fprintf(stderr, "  hand path took     %.1f ms (prefill %d + %d gen tokens)\n",
+                 hand_ms, n_prompt, n_gen);
+    std::fprintf(stderr, "  upstream path took %.1f ms\n", up_ms);
+    std::fprintf(stderr, "  match              %d/%d tokens\n", matched, n_gen);
+    if (first_diverge >= 0) {
+        std::fprintf(stderr, "  first divergence at gen step %d: hand=%d(%s) up=%d(%s)\n",
+                     first_diverge,
+                     hand_gen[first_diverge], piece(hand_gen[first_diverge]).c_str(),
+                     up_gen[first_diverge],   piece(up_gen[first_diverge]).c_str());
+    }
+    std::fprintf(stderr, "  hand text     : \"%s\"\n", hand_text.c_str());
+    std::fprintf(stderr, "  upstream text : \"%s\"\n", up_text.c_str());
+
+    if (matched != n_gen) {
+        std::ostringstream ss;
+        ss << "network_gen_self_test: " << matched << "/" << n_gen << " tokens matched";
+        error = ss.str();
         return false;
     }
     return true;

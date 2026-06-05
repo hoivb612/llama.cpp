@@ -142,3 +142,60 @@ bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf
 
 @ Run E2B network test with another prompt
 bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-network-test "1, 2, 3, 4," -ngl 0 --threads-prefill 8 
+
+● Committed as ec6e8a0b3.
+
+  Summary
+
+  Root cause: Gemma-4 dense uses a shared-KV pattern. For E2B (n_layer=35), gemma4.attention.shared_kv_layers=20 means layers 0–14 ownKV; layers 15–34 reuse K/V from earlier layers (SWA→13, FULL→14). My hand-path was recomputing fresh K/V from wk/wv for every layer,which silently consumed unused weights and produced wrong attention.
+
+  Fix:
+
+   - gemma4_weights reads shared_kv_layers; sets n_layer_kv_from_start and per-layer kv_reuse_il (with is_swa-match sanity check).
+   - layer_forward_f32 gains 4 optional pointer args for KV in/out; reused layers skip wk/wv projection.
+   - network_forward_f32 manages per-owning-layer K/V storage; threads pointers based on kv_reuse_il.
+   - dequant_layer skips wk/wv for reuse layers (memory saver).
+
+  Results (E2B, "The capital of France is"):
+
+   - Before: top-1=" the", cos_sim=0.94, upstream top-1 rank 10202
+   - After: top-1=" Paris" ✓ MATCH, cos_sim=0.9995, top-10 overlap 9/10
+
+  E4B same prompt: top-1 MATCH, top-10=10/10, cos_sim=0.9998. All prior self-tests still PASS.
+
+  ==================================================
+◐ I'm shifting focus to design the greedy decode loop with KV cache support. The key challenge is moving from stateless forward passes to persistent K/V buffers that accumulate across decode steps, where each layer maintains its own storage for all previously computed key-value pairs.
+
+  During prefill, I compute K/V for all prompt tokens and store them; then in decode steps, I process one token at a time, appending its K/V to the persistent buffer and attending over all cached tokens with a causal mask. For SWA layers, I'll restrict attention to only the last 512 tokens by filtering which cached positions contribute to each query. Since layers 15-34 reuse K/V from layers 13-14, those layers just read from the shared buffer while the owning layers handle the appends.
+
+Now I'm thinking through the storage layout and whether to pre-allocate buffers or grow them dynamically during prefill. For SWA layers, I need to enforce both causal masking and the sliding window constraint, so positions outside the window get skipped. During prefill with 6 tokens, each layer computes and stores its own K/V, while shared KV layers reuse storage from their paired layers. For decode steps, new tokens append to existing K/V storage, and attention masks based on the SWA window size to only attend to recent positions. Now I'm ready to implement this.
+
+I'm setting up a `NetworkState` struct to hold the K/V caches per layer along with tracking how many positions have been processed and the maximum sequence length. The main `network_step` function will handle both prefill and decode by appending new K/V entries to the caches and applying the appropriate attention masks. I'm also planning a CLI command to run token generation with this network while comparing outputs against the upstream model in parallel, printing token-by-token matches.
+
+Refactoring layer forward... Refining the API design...
+
+I'm simplifying this by always passing pre-sized K/V cache buffers for the full sequence length (n_past + n_new), having the function write new entries at offset n_past, then using the entire buffer for attention. The reuse_kv flag controls whether the function writes the new K/V or assumes they're already populated. This unifies prefill and decode into a single code path where prefill has n_past=0 and decode has n_past equal to the prompt length. Writing the layer forward function... I'm deciding whether to keep the original layer_forward_f32 function unchanged for backward compatibility with existing tests, or refactor everything into a single cached version. The cleaner approach is to add a new layer_forward_f32_cached function that handles the KV cache logic while leaving the original function intact for the single-layer self-test, then eventually phase out the legacy network_forward_f32 once the new cached network_step is in place. Writing the wrapper function...
+
+The wrapper handles three cases for K and V buffers: reusing externally-provided ones, writing to caller-supplied storage, or allocating local scratch space. Then it delegates to the cached implementation with prefill mode (n_past=0) and a very large SWA window to effectively disable the mask. For a 6-token prompt with n_swa=512, the sliding window never activates anyway, so this approach is sound.
+
+Now I need to implement the cached function itself, add the NetworkState struct, and create the network_step entry point for G3.4b.
+
+ I'll create a unified cached layer forward function, then refactor the existing layer forward to be a simple wrapper that allocates its own scratch space, and update the network forward to use the cached version with n_past initialized to zero.
+
+Defining the cached layer forward function... Setting up the cache logic to handle reuse cases, local allocation, or external buffers, then calling the cached version with n_past set to 0 and SWA disabled to preserve the original behavior. I'm reconsidering the approach to keep layer_forward_f32 simpler. pos_all[n_past + t], and for sliding window attention, the distance between query and key positions must be less than n_swa. In the typical case where pos_all is just [0, 1, 2, ...], a new token at position n_past + t attends to all prior keys within the window.
+
+Key design:
+
+ 1. Refactor layer_forward_f32 to delegate to a new layer_forward_f32_cached(n_past, n_swa, K_cache, V_cache, reuse_kv) — singlesource of truth.
+ 2. Add NetworkState { K_cache[per_layer], V_cache[per_layer], n_past, pos_all }.
+ 3. Add network_step(state, m, n_new, token_ids, ...) — handles both prefill and 1-token decode.
+ 4. Add network_generate_and_compare(m, prompt, n_gen) and CLI --gemma4-network-gen.
+
+@ Run layer self-test to verify refactor
+bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-layer-test 4 -ngl 0 --threads-prefill 8
+
+@ Run greedy decode self-test (8 tokens)
+bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-network-gen "The capital of France is" 8 -ngl 0 --threads-prefill 8
+bin\Release\Gemma4.exe -m D:\llama.cpp\models\gemma-4\gemma-4-E2B-it-Q4_K_M.gguf --gemma4-network-gen "1, 2, 3, 4," 16 -ngl 0 --threads-prefill 8
+
+
