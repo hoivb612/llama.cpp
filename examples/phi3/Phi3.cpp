@@ -15,7 +15,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--phi3-fused-qquant-a56] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -96,6 +96,8 @@ int main(int argc, char ** argv) {
     std::string fused_qquant_save_kv_path;
     std::string fused_qquant_load_kv_path;
     bool        fused_qquant_load_kv_strict = false;
+    // A5.6 — long-prompt cached prefill sweep (run-and-exit harness).
+    bool        fused_qquant_a56 = false;
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -306,6 +308,8 @@ int main(int argc, char ** argv) {
                 }
             } else if (strcmp(argv[i], "--phi3-fused-qquant-load-kv-strict") == 0) {
                 fused_qquant_load_kv_strict = true;
+            } else if (strcmp(argv[i], "--phi3-fused-qquant-a56") == 0) {
+                fused_qquant_a56 = true;
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -519,6 +523,36 @@ int main(int argc, char ** argv) {
         fputc('\n', stdout);
         fflush(stdout);
 
+        phi3_unload_raw_model(raw_model);
+        return 0;
+    }
+
+    if (fused_qquant_a56) {
+        // A5.6 — long-prompt cached prefill sweep. Run-and-exit; no
+        // runtime init, no prompt required. Reuses the hybrid+save path
+        // and the cached driver from A5.5.
+        int reg_t_prefill = n_threads_prefill > 0 ? n_threads_prefill : 1;
+        int reg_t_gen     = fused_qquant_threads > 0
+                                ? fused_qquant_threads
+                                : (n_threads_gen > 0 ? n_threads_gen : 1);
+        const std::vector<int> ladder = { 200, 500, 1000 };
+        const int sweep_n_gen =
+            fused_qquant_n_gen > 1 ? fused_qquant_n_gen : 20;
+        std::vector<Phi3A56Row> rows;
+        std::string aerr;
+        const bool aok = phi3_run_qquant_a56(raw_model.model,
+                                             ladder,
+                                             sweep_n_gen,
+                                             /*n_compare=*/sweep_n_gen,
+                                             reg_t_prefill, reg_t_gen,
+                                             /*fuse_rmsnorm_quant=*/fused_qquant_rmsnorm_fuse != 0,
+                                             /*attn_parallel=*/fused_qquant_attn_parallel != 0,
+                                             rows, aerr);
+        if (!aok) {
+            fprintf(stderr, "phi3 qquant-a56: FAIL: %s\n", aerr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
         phi3_unload_raw_model(raw_model);
         return 0;
     }

@@ -754,6 +754,51 @@ bool phi3_run_qquant_cached(
         double                         * out_gen_ms  = nullptr);
 
 // ---------------------------------------------------------------------------
+// A5.6 — long-prompt cached prefill sweep.
+//
+// For each target length L in `target_lengths`, synthesise a chat-templated
+// prompt of approximately L tokens, then back-to-back:
+//   Run A: phi3_run_qquant_hybrid + save_kv_path -> temp cache file.
+//   Run B: phi3_run_qquant_cached from that temp file.
+// Then top-1 compare the first n_compare gen tokens (cached MUST match
+// hybrid exactly; mismatch is a harness failure). Per-row results land
+// in out_rows; a summary table is also printed to stderr.
+//
+// Timing contract (matches the qquant-ab harness): hybrid_prefill_ms /
+// hybrid_bridge_ms / hybrid_gen_ms come from internal instrumentation,
+// cached_load_ms / cached_gen_ms come from the cached driver. Gen times
+// are CONTINUATION cost only (first token sampled outside the timed
+// loop), so per-token reports use n_gen - 1 in the denominator.
+//
+// CAVEAT: cached_load_ms measured here reflects WARM page cache (the
+// cached load runs in the same process immediately after save). True
+// cold-disk TTFT may be higher; advertise accordingly.
+struct Phi3A56Row {
+    int      n_prompt;             // actual chat-templated prompt token count
+    int      n_gen;
+    int      n_compare;
+    double   hybrid_prefill_ms;    // internal: llama batched prefill only
+    double   hybrid_bridge_ms;     // internal: K/V bridge memcpy/transpose
+    double   hybrid_gen_ms;        // internal: continuation gen (qquant)
+    double   cached_load_ms;       // internal: file read + bridge
+    double   cached_gen_ms;        // internal: continuation gen (qquant)
+    size_t   cache_size_bytes;     // disk size of the saved blob
+    int      top1_match;           // count of cached==hybrid (out of n_compare)
+};
+
+bool phi3_run_qquant_a56(
+        const llama_model              * model,
+        const std::vector<int>         & target_lengths,
+        int                              n_gen,
+        int                              n_compare,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             attn_parallel,
+        std::vector<Phi3A56Row>        & out_rows,
+        std::string                    & error);
+
+// ---------------------------------------------------------------------------
 // A5.4 — A/B harness: compare three decode paths on the same prompt + seed.
 //
 // Runs back-to-back:

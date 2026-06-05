@@ -5926,3 +5926,307 @@ bool phi3_run_qquant_cached(
     cleanup();
     return true;
 }
+
+// ===========================================================================
+// A5.6 — long-prompt cached prefill sweep.
+// ===========================================================================
+
+namespace {
+
+// Synthesise a chat-templatable prompt that tokenises to >= target_tokens.
+// Strategy: prepend a brief setup line, then append numbered narrative
+// sections from a small fixed base. We re-tokenise after each addition
+// (cheap relative to the prefill we're benchmarking) and stop once the
+// raw-text token count meets the target. The caller still wraps the
+// result in the chat template, which adds a small fixed overhead, so the
+// post-template count will be slightly above target -- we report the
+// actual count, not the synthesis target.
+static std::string phi3_a56_synth_prompt(int target_tokens, const llama_vocab * vocab) {
+    static const char * setup =
+        "You are the game master narrating a fantasy adventure. "
+        "Here is the current level's world setting and lore the player should know:\n\n";
+    static const char * base =
+        "The dwarven city of Ironhold lies beneath the Frostpeak mountains. "
+        "Its forges burn with everlasting fire and its halls echo with the songs "
+        "of old. Travelers seeking shelter must answer three riddles at the iron gate. "
+        "The high steward, Brunhilde Stoneforge, keeps the Hall of Records sealed "
+        "behind a door of pale moonstone. Only those who carry a token of the "
+        "Mountainkin may pass freely between the upper galleries and the deep mines. ";
+
+    std::string out;
+    out += setup;
+    int section = 1;
+    while (true) {
+        char header[64];
+        snprintf(header, sizeof(header), "Section %d. ", section++);
+        out += header;
+        out += base;
+        out += "\n";
+        const int n_neg = -llama_tokenize(vocab, out.c_str(), (int) out.size(),
+                                          nullptr, 0,
+                                          /*add_special=*/false,
+                                          /*parse_special=*/false);
+        if (n_neg >= target_tokens) break;
+        if (section > 4096) break;  // safety: never grow unbounded
+    }
+    return out;
+}
+
+}  // namespace
+
+bool phi3_run_qquant_a56(
+        const llama_model              * model,
+        const std::vector<int>         & target_lengths,
+        int                              n_gen,
+        int                              n_compare,
+        int                              n_threads_prefill,
+        int                              n_threads_gen,
+        bool                             fuse_rmsnorm_quant,
+        bool                             attn_parallel,
+        std::vector<Phi3A56Row>        & out_rows,
+        std::string                    & error) {
+    error.clear();
+    out_rows.clear();
+    if (model == nullptr) { error = "phi3_run_qquant_a56: model is null"; return false; }
+    if (target_lengths.empty()) {
+        error = "phi3_run_qquant_a56: target_lengths is empty";
+        return false;
+    }
+    if (n_gen <= 1) {
+        // Need at least 2 generated tokens because the first is sampled
+        // outside the timed gen loop; per-token continuation rate would
+        // divide by zero otherwise.
+        error = "phi3_run_qquant_a56: n_gen must be >= 2 (first token excluded from timed gen)";
+        return false;
+    }
+    if (n_compare <= 0)        n_compare = n_gen;
+    if (n_compare > n_gen)     n_compare = n_gen;
+    if (n_threads_prefill <= 0) n_threads_prefill = 1;
+    if (n_threads_gen     <= 0) n_threads_gen     = 1;
+
+    const char * chat_template = llama_model_chat_template(model, nullptr);
+    if (!chat_template) {
+        error = "phi3_run_qquant_a56: model has no chat template";
+        return false;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    fprintf(stderr,
+            "\nphi3 qquant-a56: long-prompt cached prefill sweep "
+            "(n_gen=%d, n_compare=%d, threads_prefill=%d, threads_gen=%d, "
+            "rmsnorm_fuse=%s, attn_parallel=%s)\n",
+            n_gen, n_compare, n_threads_prefill, n_threads_gen,
+            fuse_rmsnorm_quant ? "on" : "off",
+            attn_parallel      ? "on" : "off");
+    fprintf(stderr,
+            "phi3 qquant-a56: NOTE cached_TTFT_ms reflects WARM page cache "
+            "(load runs immediately after save in the same process); "
+            "true cold-disk cost may be higher.\n");
+    fprintf(stderr,
+            "phi3 qquant-a56: timing contract: TTFT = prefill+bridge (hybrid) "
+            "or load (cached); excludes model load, ctx/pool setup, and "
+            "first-token argmax. gen_ms/tok divides by (n_gen-1).\n");
+
+    const char * tmp_path = "phi3_a56_tmp.kvc";
+
+    for (size_t li = 0; li < target_lengths.size(); ++li) {
+        const int target = target_lengths[li];
+        if (target <= 0) {
+            error = "phi3_run_qquant_a56: target_lengths must all be > 0";
+            return false;
+        }
+
+        fprintf(stderr,
+                "\n=== phi3 qquant-a56: row %zu/%zu  target_prompt_tokens=%d ===\n",
+                li + 1, target_lengths.size(), target);
+
+        // 1) Synthesise + chat-template + tokenise.
+        std::string user_text = phi3_a56_synth_prompt(target, vocab);
+
+        std::vector<llama_chat_message> msgs;
+        char * user_cstr = strdup(user_text.c_str());
+        msgs.push_back({"user", user_cstr});
+
+        // Generously size the formatted buffer; chat template overhead is
+        // tiny relative to the prompt body.
+        std::vector<char> formatted(user_text.size() + 1024);
+        int n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                              /*add_assistant=*/true,
+                                              formatted.data(), (int32_t) formatted.size());
+        if (n_fmt > (int) formatted.size()) {
+            formatted.resize((size_t) n_fmt);
+            n_fmt = llama_chat_apply_template(chat_template, msgs.data(), msgs.size(),
+                                              true, formatted.data(), (int32_t) formatted.size());
+        }
+        free(user_cstr);
+        if (n_fmt < 0) {
+            error = "phi3_run_qquant_a56: chat_apply_template failed";
+            return false;
+        }
+        const std::string fmt_prompt(formatted.begin(), formatted.begin() + n_fmt);
+
+        const int n_neg = -llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                          nullptr, 0,
+                                          /*add_special=*/true,
+                                          /*parse_special=*/true);
+        if (n_neg <= 0) {
+            error = "phi3_run_qquant_a56: tokenize sizing failed";
+            return false;
+        }
+        std::vector<llama_token> prompt_tokens((size_t) n_neg);
+        const int n_tok = llama_tokenize(vocab, fmt_prompt.c_str(), (int) fmt_prompt.size(),
+                                         prompt_tokens.data(), (int) prompt_tokens.size(),
+                                         true, true);
+        if (n_tok < 0) {
+            error = "phi3_run_qquant_a56: llama_tokenize failed";
+            return false;
+        }
+        prompt_tokens.resize((size_t) n_tok);
+        const int n_prompt = (int) prompt_tokens.size();
+
+        fprintf(stderr,
+                "phi3 qquant-a56: synthesised prompt: target=%d  actual=%d tokens "
+                "(post chat-template)\n", target, n_prompt);
+
+        // 2) Run A — hybrid + save.
+        std::remove(tmp_path);  // ensure no stale file from a prior aborted run
+
+        std::vector<llama_token> hybrid_tokens;
+        std::string herr;
+        double hybrid_prefill_ms = 0.0;
+        double hybrid_gen_ms     = 0.0;
+        double hybrid_bridge_ms  = 0.0;
+        const uint64_t prompt_hash = phi3_kv_compute_prompt_hash(prompt_tokens);
+        const bool hok = phi3_run_qquant_hybrid(model, prompt_tokens, n_gen,
+                                                n_threads_prefill, n_threads_gen,
+                                                fuse_rmsnorm_quant,
+                                                /*profile_per_op=*/false,
+                                                attn_parallel,
+                                                hybrid_tokens, herr,
+                                                &hybrid_prefill_ms,
+                                                &hybrid_gen_ms,
+                                                &hybrid_bridge_ms,
+                                                tmp_path,
+                                                prompt_hash);
+        if (!hok) {
+            error = std::string("phi3_run_qquant_a56: hybrid+save failed at target=") +
+                    std::to_string(target) + ": " + herr;
+            std::remove(tmp_path);
+            return false;
+        }
+        if ((int) hybrid_tokens.size() != n_gen) {
+            error = "phi3_run_qquant_a56: hybrid returned wrong gen count";
+            std::remove(tmp_path);
+            return false;
+        }
+
+        // Stat the cache file (size on disk).
+        size_t cache_bytes = 0;
+        {
+            FILE * f = std::fopen(tmp_path, "rb");
+            if (!f) {
+                error = std::string("phi3_run_qquant_a56: cache file '") +
+                        tmp_path + "' missing after hybrid+save";
+                return false;
+            }
+#ifdef _WIN32
+            _fseeki64(f, 0, SEEK_END);
+            const long long sz = _ftelli64(f);
+#else
+            std::fseek(f, 0, SEEK_END);
+            const long long sz = std::ftell(f);
+#endif
+            std::fclose(f);
+            if (sz <= 0) {
+                error = "phi3_run_qquant_a56: cache file empty";
+                std::remove(tmp_path);
+                return false;
+            }
+            cache_bytes = (size_t) sz;
+        }
+
+        // 3) Run B — cached load.
+        std::vector<llama_token> cached_tokens;
+        std::string cerr;
+        double cached_load_ms = 0.0;
+        double cached_gen_ms  = 0.0;
+        const bool cok = phi3_run_qquant_cached(model, std::string(tmp_path), n_gen,
+                                                n_threads_gen,
+                                                fuse_rmsnorm_quant,
+                                                /*profile_per_op=*/false,
+                                                attn_parallel,
+                                                /*expected_prompt_hash=*/prompt_hash,
+                                                /*strict_model_match=*/false,
+                                                cached_tokens, cerr,
+                                                &cached_load_ms,
+                                                &cached_gen_ms);
+        if (!cok) {
+            error = std::string("phi3_run_qquant_a56: cached load failed at target=") +
+                    std::to_string(target) + ": " + cerr;
+            std::remove(tmp_path);
+            return false;
+        }
+        if ((int) cached_tokens.size() != n_gen) {
+            error = "phi3_run_qquant_a56: cached returned wrong gen count";
+            std::remove(tmp_path);
+            return false;
+        }
+
+        // 4) Top-1 compare (hard gate).
+        int match = 0;
+        for (int i = 0; i < n_compare; ++i) {
+            if (hybrid_tokens[i] == cached_tokens[i]) ++match;
+            else break;  // stop at first divergence
+        }
+        if (match != n_compare) {
+            std::ostringstream oss;
+            oss << "phi3_run_qquant_a56: cached output diverged from hybrid at gen-token "
+                << match << "/" << n_compare
+                << " (hybrid=" << hybrid_tokens[match]
+                << " cached=" << cached_tokens[match] << ")";
+            error = oss.str();
+            std::remove(tmp_path);
+            return false;
+        }
+
+        // 5) Append row, clean up.
+        Phi3A56Row row{};
+        row.n_prompt          = n_prompt;
+        row.n_gen             = n_gen;
+        row.n_compare         = n_compare;
+        row.hybrid_prefill_ms = hybrid_prefill_ms;
+        row.hybrid_bridge_ms  = hybrid_bridge_ms;
+        row.hybrid_gen_ms     = hybrid_gen_ms;
+        row.cached_load_ms    = cached_load_ms;
+        row.cached_gen_ms     = cached_gen_ms;
+        row.cache_size_bytes  = cache_bytes;
+        row.top1_match        = match;
+        out_rows.push_back(row);
+
+        std::remove(tmp_path);
+    }
+
+    // 6) Print summary table.
+    fprintf(stderr,
+            "\nphi3 qquant-a56: SUMMARY  (TTFT_speedup = hybrid_TTFT / cached_TTFT)\n");
+    fprintf(stderr,
+            "  n_prompt | hybrid_TTFT_ms | cached_TTFT_ms | TTFT_speedup | cache_MiB | "
+            "hybrid_gen_ms/tok | cached_gen_ms/tok | top1_match\n");
+    fprintf(stderr,
+            "  ---------+----------------+----------------+--------------+-----------+"
+            "-------------------+-------------------+-----------\n");
+    for (const Phi3A56Row & r : out_rows) {
+        const double h_ttft   = r.hybrid_prefill_ms + r.hybrid_bridge_ms;
+        const double c_ttft   = r.cached_load_ms;
+        const double speedup  = c_ttft > 0.0 ? (h_ttft / c_ttft) : 0.0;
+        const double cache_mb = (double) r.cache_size_bytes / (1024.0 * 1024.0);
+        const double h_per    = r.hybrid_gen_ms / (double) (r.n_gen - 1);
+        const double c_per    = r.cached_gen_ms / (double) (r.n_gen - 1);
+        fprintf(stderr,
+                "  %8d | %14.2f | %14.2f | %11.1fx | %9.1f | %17.2f | %17.2f | %4d/%-4d\n",
+                r.n_prompt, h_ttft, c_ttft, speedup, cache_mb,
+                h_per, c_per, r.top1_match, r.n_compare);
+    }
+    fprintf(stderr, "\n");
+    return true;
+}
