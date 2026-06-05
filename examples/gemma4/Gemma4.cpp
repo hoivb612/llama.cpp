@@ -15,6 +15,7 @@
 
 #include "llama.h"
 #include "gemma4_baseline.h"
+#include "gemma4_kernels.h"
 #include "gemma4_loader.h"
 #include "gemma4_weights.h"
 
@@ -41,6 +42,7 @@ int main(int argc, char ** argv) {
     int  n_threads_prefill  = 0;   // 0 = let llama pick
     int  n_threads_gen      = 0;
     bool dump_weights       = false;  // G3.1: resolve + print schema, skip decode
+    bool kernel_test        = false;  // G3.2: run kernel self-tests, skip everything else
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -60,6 +62,8 @@ int main(int argc, char ** argv) {
                 n_threads_gen = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-dump-weights") == 0) {
                 dump_weights = true;
+            } else if (std::strcmp(argv[i], "--gemma4-kernel-test") == 0) {
+                kernel_test = true;
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -73,7 +77,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (model_path.empty()) { print_usage(argc, argv); return 1; }
+    if (!kernel_test && model_path.empty()) { print_usage(argc, argv); return 1; }
 
     // Quiet llama log noise: surface errors only.
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
@@ -81,6 +85,17 @@ int main(int argc, char ** argv) {
     }, nullptr);
 
     ggml_backend_load_all();
+
+    // ---------- G3.2: --gemma4-kernel-test ----------
+    // Self-tests are model-independent; run before loading anything.
+    if (kernel_test) {
+        std::string kerr;
+        if (!gemma4::kernel_self_test(kerr)) {
+            std::fprintf(stderr, "gemma4 kernel self-test: FAIL: %s\n", kerr.c_str());
+            return 1;
+        }
+        return 0;
+    }
 
     // ---------- Load model ----------
     Gemma4LoadParams lp;
