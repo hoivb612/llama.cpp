@@ -15,6 +15,7 @@
 
 #include "llama.h"
 #include "gemma4_baseline.h"
+#include "gemma4_forward.h"
 #include "gemma4_kernels.h"
 #include "gemma4_loader.h"
 #include "gemma4_weights.h"
@@ -43,6 +44,9 @@ int main(int argc, char ** argv) {
     int  n_threads_gen      = 0;
     bool dump_weights       = false;  // G3.1: resolve + print schema, skip decode
     bool kernel_test        = false;  // G3.2: run kernel self-tests, skip everything else
+    bool layer_test         = false;  // G3.3: hand-coded layer vs ggml oracle
+    int  layer_test_il      = 0;
+    int  layer_test_ntok    = 8;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -64,6 +68,14 @@ int main(int argc, char ** argv) {
                 dump_weights = true;
             } else if (std::strcmp(argv[i], "--gemma4-kernel-test") == 0) {
                 kernel_test = true;
+            } else if (std::strcmp(argv[i], "--gemma4-layer-test") == 0) {
+                layer_test = true;
+                // Optional next-arg: layer index. Default 0.
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    layer_test_il = std::stoi(argv[++i]);
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-layer-test-ntok") == 0 && i + 1 < argc) {
+                layer_test_ntok = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -130,6 +142,32 @@ int main(int argc, char ** argv) {
             return 1;
         }
         gemma4::dump(w);
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G3.3: --gemma4-layer-test [IL] [--gemma4-layer-test-ntok N] ----
+    // Run hand-coded single-layer F32 forward vs ggml-graph oracle on the
+    // specified layer; both consume dequantized F32 weights so the only
+    // numeric drift is op order. Skip baseline decode on success.
+    if (layer_test) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const bool ok = gemma4::layer_self_test(raw.model, w, layer_test_il,
+                                                layer_test_ntok, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 layer_self_test: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 layer_self_test: PASS (il=%d n_tokens=%d)\n",
+                     layer_test_il, layer_test_ntok);
         gemma4_unload_raw_model(raw);
         return 0;
     }

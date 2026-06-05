@@ -5,6 +5,7 @@ add_executable(${TARGET}
     gemma4_baseline.cpp
     gemma4_weights.cpp
     gemma4_kernels.cpp
+    gemma4_forward.cpp
 )
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME Gemma4)
 install(TARGETS ${TARGET} RUNTIME)

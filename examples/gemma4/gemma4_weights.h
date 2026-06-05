@@ -78,7 +78,8 @@ struct Weights {
     int  n_vocab            = 0;
     int  n_swa              = 0;       // sliding-window size (e.g. 512)
     int  rope_dim           = 0;       // rope.dimension_count (e.g. 256 or head_dim)
-    float rope_freq_base    = 0.0f;    // e.g. 1e6
+    float rope_freq_base    = 0.0f;    // e.g. 1e6 (full-attn layers)
+    float rope_freq_base_swa = 0.0f;   // e.g. 1e4 (SWA layers)
     float rms_eps           = 0.0f;    // attention.layer_norm_rms_epsilon
     float final_logit_softcap = 0.0f;  // 0 means no softcap
 

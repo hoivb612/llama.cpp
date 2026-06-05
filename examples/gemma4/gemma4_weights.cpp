@@ -154,6 +154,7 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
     out.n_swa             = get_meta_i32(model, "gemma4.attention.sliding_window", 0);
     out.rope_dim          = get_meta_i32(model, "gemma4.rope.dimension_count", 0);
     out.rope_freq_base    = get_meta_f32(model, "gemma4.rope.freq_base", 0.0f);
+    out.rope_freq_base_swa = get_meta_f32(model, "gemma4.rope.freq_base_swa", out.rope_freq_base);
     out.rms_eps           = get_meta_f32(model, "gemma4.attention.layer_norm_rms_epsilon", 1e-6f);
     out.final_logit_softcap = get_meta_f32(model, "gemma4.final_logit_softcapping", 0.0f);
 
@@ -368,10 +369,11 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
 void dump(const Weights & w) {
     std::fprintf(stderr,
         "gemma4 weights: n_layer=%d n_embd=%d n_head=%d n_head_kv=%d "
-        "n_vocab=%d n_embd_per_layer=%d swa=%d rope_dim=%d rope_base=%.0f "
+        "n_vocab=%d n_embd_per_layer=%d swa=%d rope_dim=%d rope_base=%.0f rope_base_swa=%.0f "
         "rms_eps=%g softcap=%.1f tied_output=%d rope_freqs=%s\n",
         w.n_layer, w.n_embd, w.n_head, w.n_head_kv, w.n_vocab, w.n_embd_per_layer,
-        w.n_swa, w.rope_dim, (double) w.rope_freq_base, (double) w.rms_eps,
+        w.n_swa, w.rope_dim, (double) w.rope_freq_base, (double) w.rope_freq_base_swa,
+        (double) w.rms_eps,
         (double) w.final_logit_softcap, (int) w.output_tied_to_embd,
         w.rope_freqs ? "present" : "absent");
 
