@@ -1,0 +1,3 @@
+xcopy /s \\hydrango\public\reuse\GameCore\so2001\slmapp\CLIP\clip_assets .\clip_assets
+
+clipindex.exe -t 8 -m OpenAI-clip-vit-base-patch32-f16.gguf clip_assets 

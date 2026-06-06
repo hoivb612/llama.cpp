@@ -1,0 +1,40 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+
+    "configurePresets": [
+        {
+            "name": "msvc-x64",
+            "displayName": "MSVC x64 (Visual Studio 2022)",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/msvc-x64",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "msvc-x64-ninja",
+            "displayName": "MSVC x64 (Ninja, single-config Release)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/ninja-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER":   "cl",
+                "CMAKE_CXX_COMPILER": "cl"
+            }
+        }
+    ],
+
+    "buildPresets": [
+        {
+            "name": "msvc-x64-release",
+            "configurePreset": "msvc-x64",
+            "configuration": "Release"
+        },
+        {
+            "name": "msvc-x64-ninja-release",
+            "configurePreset": "msvc-x64-ninja"
+        }
+    ]
+}

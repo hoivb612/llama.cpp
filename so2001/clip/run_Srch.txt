@@ -1,0 +1,1 @@
+clipSrch.exe -t 8 -m OpenAI-clip-vit-base-patch32-f16.gguf -s clip_assets
