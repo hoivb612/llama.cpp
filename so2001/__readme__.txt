@@ -38,3 +38,21 @@ To build:
  cmake --build build\ninja-release
 
 Build was verified end-to-end against MSVC 19.50 (VS 2022 v18 / 14.50.35717) — all 118 compile + link steps succeededwith zero CMake/linker errors.
+
+Summary — three ways to get RelWithDebInfo:
+
+┌──────────────────┬─────────────────────────────────────────────────────────────────────┐
+│ Method                  │ Command                                                                                       │
+├──────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ Ninja preset            │ cmake --preset msvc-x64-ninja-relwithdebinfo then cmake --build build\ninja-relwithdebinfo    │
+│ (new)                   │                                                                                               │
+├──────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ VS solution             │ cmake --preset msvc-x64 then cmake --build build\msvc-x64 --config RelWithDebInfo             │
+│ preset                  │                                                                                               │
+├──────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ Ad-hoc (no              │ cmake -S . -B build\rwdi -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo then cmake --build        │
+│ preset)                 │ build\rwdi                                                                                    │
+└──────────────────┴─────────────────────────────────────────────────────────────────────┘
+
+Output lands in build\ninja-relwithdebinfo\bin\ with matching .pdb files alongside each .exe/.dll. Flags become /O2 /Ob1 /Zi /DEBUG (Razzle-equivalent optimization plus full debug info).
+

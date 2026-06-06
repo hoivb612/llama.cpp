@@ -23,6 +23,17 @@
                 "CMAKE_C_COMPILER":   "cl",
                 "CMAKE_CXX_COMPILER": "cl"
             }
+        },
+        {
+            "name": "msvc-x64-ninja-relwithdebinfo",
+            "displayName": "MSVC x64 (Ninja, single-config RelWithDebInfo)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/ninja-relwithdebinfo",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_C_COMPILER":   "cl",
+                "CMAKE_CXX_COMPILER": "cl"
+            }
         }
     ],
 
@@ -35,6 +46,10 @@
         {
             "name": "msvc-x64-ninja-release",
             "configurePreset": "msvc-x64-ninja"
+        },
+        {
+            "name": "msvc-x64-ninja-relwithdebinfo",
+            "configurePreset": "msvc-x64-ninja-relwithdebinfo"
         }
     ]
 }
