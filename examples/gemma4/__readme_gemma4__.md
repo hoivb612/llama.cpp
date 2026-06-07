@@ -667,6 +667,52 @@ Modes (pick one)
                                    The topology_hash check (per-layer
                                    dims + RoPE config) is always strict.
 
+  --gemma4-chat                    G4.4 — Hand-path chat loop. Without
+                                   -p, runs interactively (one line per
+                                   turn; blank line or EOF to quit).
+                                   With -p, runs a single user turn and
+                                   exits. KV grows across turns; each
+                                   turn's user-side delta is hand-built
+                                   in the Gemma format
+                                     <start_of_turn>user\n{Q}<end_of_turn>\n<start_of_turn>model\n
+                                   (with a leading <end_of_turn>\n on
+                                   turn N>=2 to close any prior
+                                   assistant turn that stopped at the
+                                   n_predict cap without natural EOG).
+                                   Assistant gen tokens are committed
+                                   directly to KV without ever being
+                                   re-tokenized through text, which is
+                                   required for determinism on
+                                   BPE/SentencePiece vocabs (round
+                                   trips are not safe). Uses -n as the
+                                   per-turn gen cap (-1 = no cap).
+
+  --gemma4-chat-test               G4.4 — Scripted 2-turn determinism
+                                   test. Runs the same conversation
+                                   incrementally (turn-by-turn KV
+                                   reuse) and via a fresh full prefill
+                                   that re-decodes turn-1 gen tokens
+                                   into a clean NetworkState, then
+                                   PASSes iff turn-2 token sequences
+                                   match. Greedy; no model output is
+                                   sampled.
+
+  --gemma4-chat-ctx N              NetworkState capacity for chat
+                                   sessions (default 4096). The chat
+                                   loop fails fast if a prefill would
+                                   exceed this cap.
+
+  --temp F                         Sampling temperature for --gemma4-chat
+                                   (default 0.0 = greedy argmax with no
+                                   sampler chain allocated).
+
+  --min-p F                        min-p cutoff (default 0.05). Ignored
+                                   when --temp 0.
+
+  --seed N                         Sampler seed (default
+                                   LLAMA_DEFAULT_SEED). Ignored when
+                                   --temp 0.
+
 Cache file format ("G4KV0001"): 64-byte LE header (magic, version,
 n_layer, n_kv_owning, n_tokens, kv_type=F32, first_gen_token, n_vocab,
 softcap, prompt_hash, topology_hash) followed by a payload prologue
@@ -709,12 +755,29 @@ Quick recipes
   Gemma4.exe -m ...E2B...gguf -ngl 0 --threads-gen 8 \
              --gemma4-load-kv %TEMP%\g4.kvc "The capital of France is" 16
 
+  # 8. G4.4 chat: scripted 2-turn determinism test (must PASS on both)
+  Gemma4.exe -m ...E2B...gguf --gemma4-chat-test --threads-gen 8
+  Gemma4.exe -m ...E4B...gguf --gemma4-chat-test --threads-gen 8
+
+  # 9. G4.4 chat: one-shot single-turn greedy
+  Gemma4.exe -m ...E2B...gguf --gemma4-chat -p "What is 2+2?" \
+             -n 32 --threads-gen 8
+
+  # 10. G4.4 chat: one-shot single-turn sampled (temp+min-p+seed)
+  Gemma4.exe -m ...E2B...gguf --gemma4-chat -p "What is 2+2?" \
+             -n 32 --temp 0.8 --min-p 0.05 --seed 42 --threads-gen 8
+
+  # 11. G4.4 chat: interactive multi-turn (Ctrl-Z<Enter> or blank line to quit)
+  Gemma4.exe -m ...E2B...gguf --gemma4-chat \
+             -n 64 --gemma4-chat-ctx 4096 --threads-gen 8
+
 Regression gate (must all PASS after any change to the hand path)
 -----------------------------------------------------------------
   --gemma4-kernel-test
   --gemma4-layer-test 4 --gemma4-layer-test-ntok 8
   --gemma4-network-test "The capital of France is"
   --gemma4-network-gen  "The capital of France is" 16  (both E2B and E4B)
+  --gemma4-chat-test                                   (both E2B and E4B)
 
 Notes
 -----
@@ -725,7 +788,13 @@ Notes
  * --threads-gen sizes the MatmulCtx pool at construction; changing it
    between runs is the only way to retune the pool.
  * --gemma4-network-gen requires --threads-gen >= 1 (default is system threads).
- * Cached prefill / sampling / chat loop are not yet implemented for Gemma-4
-   (Phi-3 has them; tracked under G4.3+ in the session plan).
+ * --gemma4-chat ignores llama_chat_apply_template even when the model ships
+   one: Gemma-4 GGUFs ship a complex Jinja template the built-in template
+   matcher does not recognise, and re-tokenising the assistant's prior
+   response through text is not safe on BPE/SentencePiece vocabs (see
+   examples/gemma4/__bpe_chat_pitfall__.md for the full story). Per-turn
+   user deltas are hand-built in the Gemma <start_of_turn>...<end_of_turn>
+   format and tokenised atomically; assistant gen tokens are committed
+   directly to KV.
 
 

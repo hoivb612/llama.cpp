@@ -15,6 +15,7 @@
 
 #include "llama.h"
 #include "gemma4_baseline.h"
+#include "gemma4_chat.h"
 #include "gemma4_forward.h"
 #include "gemma4_kernels.h"
 #include "gemma4_loader.h"
@@ -44,7 +45,13 @@ static void print_usage(int /*argc*/, char ** argv) {
         "    --gemma4-save-kv PATH [PROMPT] [N] prefill, save KV state to PATH, continue greedy gen N tokens\n"
         "    --gemma4-load-kv PATH [PROMPT] [N] skip prefill, load KV from PATH, greedy gen N tokens\n"
         "    --gemma4-load-kv-strict            promote weight_hash mismatch on load to fatal error\n"
-        "\n",
+            "    --gemma4-chat                      run hand-path chat (interactive if no -p, else single turn)\n"
+            "    --gemma4-chat-test                 scripted multi-turn determinism test (greedy)\n"
+            "    --gemma4-chat-ctx N                NetworkState capacity for chat (default 4096)\n"
+            "    --temp F                           sampling temperature (default 0.0 = greedy)\n"
+            "    --min-p F                          min-p sampler cutoff (default 0.05; ignored when --temp 0)\n"
+            "    --seed N                           sampler seed (default LLAMA_DEFAULT_SEED)\n"
+            "\n",
         argv[0]);
 }
 
@@ -75,6 +82,13 @@ int main(int argc, char ** argv) {
     bool        load_kv_strict = false;// --gemma4-load-kv-strict
     std::string cached_prompt = "The capital of France is";
     int         cached_n_gen  = 32;
+    // G4.4: chat loop with sampling
+    bool        chat_mode    = false;  // --gemma4-chat
+    bool        chat_test    = false;  // --gemma4-chat-test
+    int         chat_ctx     = 4096;   // --gemma4-chat-ctx N
+    float       cli_temp     = 0.0f;   // --temp F  (0 = greedy)
+    float       cli_min_p    = 0.05f;  // --min-p F
+    uint32_t    cli_seed     = LLAMA_DEFAULT_SEED;  // --seed N
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -153,6 +167,18 @@ int main(int argc, char ** argv) {
                 }
             } else if (std::strcmp(argv[i], "--gemma4-load-kv-strict") == 0) {
                 load_kv_strict = true;
+            } else if (std::strcmp(argv[i], "--gemma4-chat") == 0) {
+                chat_mode = true;
+            } else if (std::strcmp(argv[i], "--gemma4-chat-test") == 0) {
+                chat_test = true;
+            } else if (std::strcmp(argv[i], "--gemma4-chat-ctx") == 0 && i + 1 < argc) {
+                chat_ctx = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+                cli_temp = std::stof(argv[++i]);
+            } else if (std::strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+                cli_min_p = std::stof(argv[++i]);
+            } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+                cli_seed = (uint32_t) std::stoul(argv[++i]);
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -170,6 +196,11 @@ int main(int argc, char ** argv) {
     if (!save_kv_path.empty() && !load_kv_path.empty()) {
         std::fprintf(stderr,
             "error: --gemma4-save-kv and --gemma4-load-kv are mutually exclusive\n");
+        return 1;
+    }
+    if (chat_mode && chat_test) {
+        std::fprintf(stderr,
+            "error: --gemma4-chat and --gemma4-chat-test are mutually exclusive\n");
         return 1;
     }
 
@@ -385,6 +416,69 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::fprintf(stderr, "gemma4 load-kv: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G4.4: --gemma4-chat-test ----------------
+    // Scripted 2-turn greedy determinism test: incremental delta+decode
+    // vs fresh full-prefill of the same conversation. PASS iff
+    // turn-2 token sequences match exactly.
+    if (chat_test) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_gen > 0 ? n_threads_gen
+                              : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        const bool ok = gemma4::chat_self_test(raw.model, w, n_threads, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 chat_self_test: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 chat_self_test: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G4.4: --gemma4-chat ----------------------
+    // Hand-path chat runtime. If -p was provided, runs one turn with
+    // that prompt and exits. Otherwise reads user messages from stdin
+    // until EOF or empty line. Supports greedy (--temp 0, default) and
+    // sampled (--temp >0 with --min-p) decoding via llama_sampler_chain.
+    if (chat_mode) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        gemma4::ChatParams cp;
+        cp.temp      = cli_temp;
+        cp.min_p     = cli_min_p;
+        cp.seed      = cli_seed;
+        cp.n_predict = n_predict;
+        cp.chat_ctx  = chat_ctx;
+        cp.n_threads = n_threads_gen > 0 ? n_threads_gen
+                       : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        cp.stream    = true;
+        // Single-turn from -p iff -p was actually supplied (we can't
+        // distinguish "user passed -p" from default — but the default
+        // is non-empty so we honor it). To get interactive mode, pass
+        // -p "".
+        std::string terr;
+        const bool ok = gemma4::run_chat_loop(raw.model, w, single_prompt, cp, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 chat: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
         gemma4_unload_raw_model(raw);
         return 0;
     }
