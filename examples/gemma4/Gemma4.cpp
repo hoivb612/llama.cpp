@@ -41,6 +41,9 @@ static void print_usage(int /*argc*/, char ** argv) {
         "    --gemma4-network-gen [PROMPT] [N]  greedy decode hand vs upstream (N tokens)\n"
         "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
         "                                       per-stage timing for prefill + N_DECODE decode steps\n"
+        "    --gemma4-save-kv PATH [PROMPT] [N] prefill, save KV state to PATH, continue greedy gen N tokens\n"
+        "    --gemma4-load-kv PATH [PROMPT] [N] skip prefill, load KV from PATH, greedy gen N tokens\n"
+        "    --gemma4-load-kv-strict            promote weight_hash mismatch on load to fatal error\n"
         "\n",
         argv[0]);
 }
@@ -66,6 +69,12 @@ int main(int argc, char ** argv) {
     bool network_profile    = false;  // profile prefill + N decode steps
     std::string profile_prompt = "The capital of France is";
     int  profile_n_decode   = 4;
+    // G4.3: cached prefill
+    std::string save_kv_path;          // --gemma4-save-kv PATH
+    std::string load_kv_path;          // --gemma4-load-kv PATH
+    bool        load_kv_strict = false;// --gemma4-load-kv-strict
+    std::string cached_prompt = "The capital of France is";
+    int         cached_n_gen  = 32;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -120,6 +129,30 @@ int main(int argc, char ** argv) {
                     (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
                     profile_n_decode = std::stoi(argv[++i]);
                 }
+            } else if (std::strcmp(argv[i], "--gemma4-save-kv") == 0 && i + 1 < argc) {
+                save_kv_path = argv[++i];
+                // Optional next-arg: prompt (if not starting with '-').
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    cached_prompt = argv[++i];
+                }
+                // Optional next-arg: N (if numeric).
+                if (i + 1 < argc && argv[i+1][0] != '-' &&
+                    (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
+                    cached_n_gen = std::stoi(argv[++i]);
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-load-kv") == 0 && i + 1 < argc) {
+                load_kv_path = argv[++i];
+                // Optional next-arg: prompt (advisory hash check only).
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    cached_prompt = argv[++i];
+                }
+                // Optional next-arg: N (if numeric).
+                if (i + 1 < argc && argv[i+1][0] != '-' &&
+                    (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
+                    cached_n_gen = std::stoi(argv[++i]);
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-load-kv-strict") == 0) {
+                load_kv_strict = true;
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -134,6 +167,11 @@ int main(int argc, char ** argv) {
         }
     }
     if (!kernel_test && model_path.empty()) { print_usage(argc, argv); return 1; }
+    if (!save_kv_path.empty() && !load_kv_path.empty()) {
+        std::fprintf(stderr,
+            "error: --gemma4-save-kv and --gemma4-load-kv are mutually exclusive\n");
+        return 1;
+    }
 
     // Quiet llama log noise: surface errors only.
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
@@ -289,6 +327,64 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::fprintf(stderr, "gemma4 network_profile: DONE\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G4.3: --gemma4-save-kv PATH [PROMPT] [N] ----------------
+    // Run prefill on PROMPT, save NetworkState+first_gen_token to PATH,
+    // then continue greedy gen for N total tokens (hand-only; no
+    // upstream comparison). The on-disk cache is exactly what a fresh
+    // --gemma4-load-kv run would consume.
+    if (!save_kv_path.empty()) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_gen > 0 ? n_threads_gen
+                              : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        const bool ok = gemma4::network_gen_save_kv(raw.model, w, cached_prompt,
+                                                    cached_n_gen, n_threads,
+                                                    save_kv_path, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 save-kv: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 save-kv: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- G4.3: --gemma4-load-kv PATH [PROMPT] [N] ----------------
+    // Skip prefill entirely; load NetworkState from PATH and continue
+    // greedy gen for N total tokens (first token comes from the cache).
+    // PROMPT is optional and only used for an advisory prompt-hash
+    // mismatch warning.
+    if (!load_kv_path.empty()) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_gen > 0 ? n_threads_gen
+                              : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        const bool ok = gemma4::network_gen_load_kv(raw.model, w, cached_prompt,
+                                                    cached_n_gen, n_threads,
+                                                    load_kv_path, load_kv_strict, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 load-kv: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 load-kv: PASS\n");
         gemma4_unload_raw_model(raw);
         return 0;
     }

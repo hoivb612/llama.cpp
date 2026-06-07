@@ -638,6 +638,44 @@ Modes (pick one)
                                    residual. Use this to choose the next
                                    optimisation target.
 
+  --gemma4-save-kv PATH [PROMPT] [N]
+                                   G4.3 — Cached prefill (save side).
+                                   Run prefill on PROMPT, sample
+                                   first_gen_token = argmax of the
+                                   post-softcap last-token logits, then
+                                   serialise NetworkState + first_gen_token
+                                   + model fingerprints to PATH (atomic
+                                   write via "<PATH>.tmp" + rename).
+                                   After saving, continue greedy gen for
+                                   N total tokens (hand-only; no upstream
+                                   comparison). Default N=32.
+
+  --gemma4-load-kv PATH [PROMPT] [N]
+                                   G4.3 — Cached prefill (load side).
+                                   Skip prefill entirely; restore
+                                   NetworkState from PATH, seed gen with
+                                   the cached first_gen_token, and greedy
+                                   decode N total tokens. PROMPT is
+                                   optional and used only to compute an
+                                   advisory prompt-hash mismatch warning;
+                                   the cache is valid even if PROMPT
+                                   differs from the one used at save
+                                   time. Default N=32.
+
+  --gemma4-load-kv-strict          Promote weight_hash mismatch on
+                                   --gemma4-load-kv from warning to fatal.
+                                   The topology_hash check (per-layer
+                                   dims + RoPE config) is always strict.
+
+Cache file format ("G4KV0001"): 64-byte LE header (magic, version,
+n_layer, n_kv_owning, n_tokens, kv_type=F32, first_gen_token, n_vocab,
+softcap, prompt_hash, topology_hash) followed by a payload prologue
+(weight_hash), pos_all (i32 LE, contiguous 0..n_tokens-1), then one
+slab per owning layer (kv_reuse_il == -1) carrying (il, n_head_kv,
+head_dim) + raw F32 K + V data. Shared-KV layers are not serialised.
+--gemma4-save-kv and --gemma4-load-kv are mutually exclusive in a
+single invocation.
+
 Quick recipes
 -------------
   # 1. New GGUF inspection
@@ -664,6 +702,12 @@ Quick recipes
   # 6. Decode-step profile (current G4.2 baseline ~50 ms/tok on E2B Q4_K_M, 8t)
   Gemma4.exe -m ...E2B...gguf -ngl 0 --threads-gen 8 \
              --gemma4-network-profile "The capital of France is" 4
+
+  # 7. G4.3 cached prefill round-trip (E2B; byte-identical gen text)
+  Gemma4.exe -m ...E2B...gguf -ngl 0 --threads-gen 8 \
+             --gemma4-save-kv %TEMP%\g4.kvc "The capital of France is" 16
+  Gemma4.exe -m ...E2B...gguf -ngl 0 --threads-gen 8 \
+             --gemma4-load-kv %TEMP%\g4.kvc "The capital of France is" 16
 
 Regression gate (must all PASS after any change to the hand path)
 -----------------------------------------------------------------

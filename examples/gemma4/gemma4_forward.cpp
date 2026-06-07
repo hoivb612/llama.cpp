@@ -1,5 +1,6 @@
 #include "gemma4_forward.h"
 #include "gemma4_kernels.h"
+#include "gemma4_kvcache.h"
 #include "gemma4_weights.h"
 
 #include "ggml.h"
@@ -1598,6 +1599,189 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
     }
     return true;
 }
+
+// ---------------------------------------------------------------------
+// G4.3 -- Cached prefill: save / load drivers
+// ---------------------------------------------------------------------
+//
+// Both drivers run hand-only greedy decode (no upstream comparison) so
+// the cached path can demonstrate equivalence to "warm prefill +
+// continued gen" without paying for a second forward pass via llama.
+// Use --gemma4-network-gen for the upstream comparison gate.
+
+bool network_gen_save_kv(const llama_model * model, const Weights & w,
+                         const std::string & prompt, int n_gen,
+                         int n_threads,
+                         const std::string & save_kv_path,
+                         std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_gen_save_kv: n_gen<=0"; return false; }
+    if (save_kv_path.empty()) { error = "network_gen_save_kv: save_kv_path empty"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_gen_save_kv: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr,
+        "gemma4 save-kv: prompt=\"%s\" -> %d tokens, n_gen=%d, save_kv_path=%s\n",
+        prompt.c_str(), n_prompt, n_gen, save_kv_path.c_str());
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_gen + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+    const auto t_pre0 = std::chrono::steady_clock::now();
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, logits.data(), error)) {
+        return false;
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_pre0).count();
+
+    const int first_gen_token = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+
+    // Save state BEFORE running the rest of the gen loop so the file on
+    // disk is exactly what a fresh load+continue run would consume.
+    const uint64_t prompt_hash = kv_compute_prompt_hash(prompt_tokens);
+    const uint64_t weight_hash = kv_compute_model_weight_hash(model);
+    const auto t_save0 = std::chrono::steady_clock::now();
+    if (!save_kv_to_disk(st, mf, first_gen_token, prompt_hash, weight_hash,
+                         save_kv_path, error)) {
+        return false;
+    }
+    const double save_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_save0).count();
+
+    std::vector<int32_t> gen_tokens;
+    gen_tokens.reserve(n_gen);
+    gen_tokens.push_back(first_gen_token);
+    int next = first_gen_token;
+    const auto t_gen0 = std::chrono::steady_clock::now();
+    for (int g = 1; g < n_gen; ++g) {
+        int32_t tok = next;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          logits.data(), error)) return false;
+        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        gen_tokens.push_back(next);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_gen0).count();
+
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+    std::string gen_text;
+    for (int t : gen_tokens) gen_text += piece(t);
+
+    std::fprintf(stderr,
+        "gemma4 save-kv: prefill %.1f ms  save %.1f ms  gen %.1f ms (%d toks)\n"
+        "  gen text: \"%s\"\n",
+        prefill_ms, save_ms, gen_ms, n_gen, gen_text.c_str());
+    return true;
+}
+
+bool network_gen_load_kv(const llama_model * model, const Weights & w,
+                         const std::string & prompt, int n_gen,
+                         int n_threads,
+                         const std::string & load_kv_path,
+                         bool strict_model_match,
+                         std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_gen_load_kv: n_gen<=0"; return false; }
+    if (load_kv_path.empty()) { error = "network_gen_load_kv: load_kv_path empty"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    // Optional prompt-hash for advisory check.
+    uint64_t expected_prompt_hash = 0;
+    int n_prompt_advisory = 0;
+    if (!prompt.empty()) {
+        std::vector<int32_t> ptok;
+        ptok.resize(prompt.size() + 8);
+        const int n = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                     ptok.data(), (int) ptok.size(),
+                                     /*add_special=*/true, /*parse_special=*/true);
+        if (n > 0) {
+            ptok.resize(n);
+            expected_prompt_hash = kv_compute_prompt_hash(ptok);
+            n_prompt_advisory = n;
+        }
+    }
+
+    std::fprintf(stderr,
+        "gemma4 load-kv: load_kv_path=%s prompt_advisory_tokens=%d strict=%d n_gen=%d\n",
+        load_kv_path.c_str(), n_prompt_advisory, (int) strict_model_match, n_gen);
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+
+    NetworkState st;
+    const uint64_t weight_hash = kv_compute_model_weight_hash(model);
+    int loaded_n_tokens = 0;
+    int first_gen_token = -1;
+    const auto t_load0 = std::chrono::steady_clock::now();
+    if (!load_kv_from_disk(st, mf, load_kv_path,
+                           /*continuation_capacity=*/n_gen + 4,
+                           expected_prompt_hash, weight_hash,
+                           strict_model_match,
+                           loaded_n_tokens, first_gen_token, error)) {
+        return false;
+    }
+    const double load_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_load0).count();
+
+    if (first_gen_token < 0 || first_gen_token >= n_vocab) {
+        std::ostringstream oss;
+        oss << "network_gen_load_kv: invalid first_gen_token=" << first_gen_token;
+        error = oss.str();
+        return false;
+    }
+
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+    std::vector<int32_t> gen_tokens;
+    gen_tokens.reserve(n_gen);
+    gen_tokens.push_back(first_gen_token);
+    int next = first_gen_token;
+    const auto t_gen0 = std::chrono::steady_clock::now();
+    for (int g = 1; g < n_gen; ++g) {
+        int32_t tok = next;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          logits.data(), error)) return false;
+        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        gen_tokens.push_back(next);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_gen0).count();
+
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+    std::string gen_text;
+    for (int t : gen_tokens) gen_text += piece(t);
+
+    std::fprintf(stderr,
+        "gemma4 load-kv: load %.1f ms  gen %.1f ms (%d toks)  n_past_after_load=%d\n"
+        "  gen text: \"%s\"\n",
+        load_ms, gen_ms, n_gen, loaded_n_tokens, gen_text.c_str());
+    return true;
+}
+
 
 // ---------------------------------------------------------------------
 // Profiling driver: prefill + N decode steps with per-stage timing

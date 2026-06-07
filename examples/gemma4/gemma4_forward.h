@@ -321,6 +321,35 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
                            const std::string & prompt, int n_gen,
                            int n_threads, std::string & error);
 
+// G4.3 -- Cached prefill: hand-only gen driver that piggybacks on
+// network_gen_self_test's structure but writes the post-prefill
+// NetworkState (and first sampled gen token) to `save_kv_path` BEFORE
+// the gen loop, then continues as a hand-only greedy decode (no
+// upstream comparison). Returns the generated token sequence.
+//
+// Greedy-only (first_gen_token = argmax of post-softcap last-token
+// logits). Use the load variant below to skip prefill entirely on a
+// later run.
+bool network_gen_save_kv(const llama_model * model, const Weights & w,
+                         const std::string & prompt, int n_gen,
+                         int n_threads,
+                         const std::string & save_kv_path,
+                         std::string & error);
+
+// G4.3 -- Cached prefill: skips prefill, loads NetworkState from
+// `load_kv_path`, seeds gen with the cached first_gen_token, then
+// runs the standard hand-only greedy decode for the remaining
+// n_gen-1 tokens. `prompt` is optional and only used to compute a
+// prompt-hash for advisory mismatch warnings; pass "" to skip.
+// strict_model_match=true escalates weight_hash mismatch to error.
+bool network_gen_load_kv(const llama_model * model, const Weights & w,
+                         const std::string & prompt, int n_gen,
+                         int n_threads,
+                         const std::string & load_kv_path,
+                         bool strict_model_match,
+                         std::string & error);
+
+
 // ---------------------------------------------------------------------
 // Profiling support (opt-in; zero overhead when disabled)
 // ---------------------------------------------------------------------
