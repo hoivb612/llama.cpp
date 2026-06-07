@@ -45,7 +45,8 @@ bool gemma4_run_baseline_decode(
 
     const int n_prompt = (int) prompt_tokens.size();
     const int n_ctx    = n_prompt + n_gen + 64;
-    const int n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab  = llama_vocab_n_tokens(vocab);
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx           = n_ctx;
@@ -88,11 +89,24 @@ bool gemma4_run_baseline_decode(
     }
     llama_token next = argmax_logits(logits, n_vocab);
     out_generated.reserve(out_generated.size() + n_gen);
+
+    // EOG check on the very first sampled token: if the model wants to
+    // stop immediately, we honour that and return an empty gen sequence.
+    if (llama_vocab_is_eog(vocab, next)) {
+        const double t_gen_ms = 0.0;
+        if (out_gen_ms) *out_gen_ms = t_gen_ms;
+        std::fprintf(stderr,
+                     "gemma4 baseline-decode: generated 0 tokens (immediate EOG)\n");
+        llama_free(ctx);
+        return true;
+    }
     out_generated.push_back(next);
 
     // ---------- Generation ----------
     llama_set_n_threads(ctx, n_threads_gen, n_threads_gen);
     const auto t_gen = std::chrono::steady_clock::now();
+    int produced = 1;
+    bool stopped_on_eog = false;
     for (int i = 1; i < n_gen; ++i) {
         llama_batch step = llama_batch_get_one(&next, 1);
         if (llama_decode(ctx, step) != 0) {
@@ -108,14 +122,24 @@ bool gemma4_run_baseline_decode(
             return false;
         }
         next = argmax_logits(h, n_vocab);
+        // Honour end-of-generation markers (Gemma-4 emits a multi-piece
+        // <end_of_turn>-like terminator that is_eog detects). Without
+        // this check the loop runs all the way to n_gen and renders
+        // garbage past the model's intended stop point. We deliberately
+        // do NOT push the EOG token into out_generated -- the caller
+        // wants a clean transcript.
+        if (llama_vocab_is_eog(vocab, next)) { stopped_on_eog = true; break; }
         out_generated.push_back(next);
+        ++produced;
     }
     const double t_gen_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_gen).count();
     if (out_gen_ms) *out_gen_ms = t_gen_ms;
     std::fprintf(stderr,
-                 "gemma4 baseline-decode: generated %d tokens in %.2f s (%.3f s/tok)\n",
-                 n_gen, t_gen_ms / 1000.0, t_gen_ms / 1000.0 / std::max(1, n_gen));
+                 "gemma4 baseline-decode: generated %d tokens in %.2f s (%.3f s/tok)%s\n",
+                 produced, t_gen_ms / 1000.0,
+                 t_gen_ms / 1000.0 / std::max(1, produced),
+                 stopped_on_eog ? "  [stopped on EOG]" : "");
 
     llama_free(ctx);
     return true;
