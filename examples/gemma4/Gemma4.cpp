@@ -51,6 +51,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --temp F                           sampling temperature (default 0.0 = greedy)\n"
             "    --min-p F                          min-p sampler cutoff (default 0.05; ignored when --temp 0)\n"
             "    --seed N                           sampler seed (default LLAMA_DEFAULT_SEED)\n"
+            "    --gemma4-tokenize-probe N S1 ... SN  tokenize N strings (parse_special=true) and exit\n"
             "\n",
         argv[0]);
 }
@@ -89,6 +90,13 @@ int main(int argc, char ** argv) {
     float       cli_temp     = 0.0f;   // --temp F  (0 = greedy)
     float       cli_min_p    = 0.05f;  // --min-p F
     uint32_t    cli_seed     = LLAMA_DEFAULT_SEED;  // --seed N
+
+    // Debug helper: tokenize one or more strings and print id + piece.
+    // Useful for documenting / reproducing BPE behaviour around the
+    // chat-template special tokens. Pass --gemma4-tokenize-probe N
+    // followed by N strings.
+    int                       probe_count = 0;        // 0 = disabled
+    std::vector<std::string>  probe_strings;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -179,6 +187,16 @@ int main(int argc, char ** argv) {
                 cli_min_p = std::stof(argv[++i]);
             } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
                 cli_seed = (uint32_t) std::stoul(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-tokenize-probe") == 0 && i + 1 < argc) {
+                probe_count = std::stoi(argv[++i]);
+                for (int k = 0; k < probe_count && i + 1 < argc; ++k) {
+                    probe_strings.emplace_back(argv[++i]);
+                }
+                if ((int) probe_strings.size() != probe_count) {
+                    std::fprintf(stderr,
+                        "error: --gemma4-tokenize-probe expects N strings after the count\n");
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -241,6 +259,56 @@ int main(int argc, char ** argv) {
                      "upstream llama graph and will still work, but our "
                      "custom-forward work in this directory targets the "
                      "dense variants (E2B/E4B) first.\n");
+    }
+
+    // ---------- Tokenize-probe (G4.4 doc helper) ----------
+    // Prints token ids + readable pieces for one or more strings using
+    // parse_special=true and add_special=true. Designed to surface BPE
+    // boundary effects around chat-template special tokens; e.g.
+    //   "Paris."        vs.
+    //   "Paris.<end_of_turn>"
+    // typically tokenize "Paris" + "." identically, but a multi-piece
+    // assistant response decoded one token at a time and then
+    // re-tokenized in the middle of a longer string can split
+    // differently. Useful as the live oracle for
+    // examples/gemma4/__bpe_chat_pitfall__.md.
+    if (probe_count > 0) {
+        const llama_vocab * vocab = llama_model_get_vocab(raw.model);
+        for (int pi = 0; pi < probe_count; ++pi) {
+            const std::string & s = probe_strings[pi];
+            std::vector<llama_token> ids(s.size() + 16);
+            int n = llama_tokenize(vocab, s.data(), (int) s.size(),
+                                   ids.data(), (int) ids.size(),
+                                   /*add_special=*/true,
+                                   /*parse_special=*/true);
+            if (n < 0) {
+                ids.resize((size_t) (-n + 16));
+                n = llama_tokenize(vocab, s.data(), (int) s.size(),
+                                   ids.data(), (int) ids.size(),
+                                   true, true);
+            }
+            if (n < 0) {
+                std::fprintf(stderr, "tokenize failed for #%d\n", pi);
+                continue;
+            }
+            ids.resize((size_t) n);
+            std::printf("probe[%d] in  = %s\n", pi, s.c_str());
+            std::printf("probe[%d] out = %d tokens: [", pi, n);
+            for (int k = 0; k < n; ++k) {
+                if (k) std::printf(", ");
+                std::printf("%d", (int) ids[k]);
+            }
+            std::printf("]\n");
+            for (int k = 0; k < n; ++k) {
+                char buf[256] = {0};
+                int m = llama_token_to_piece(vocab, ids[k], buf,
+                                             (int) sizeof(buf) - 1, 0, true);
+                std::printf("  [%2d] %6d -> \"%s\"\n",
+                            k, (int) ids[k], m > 0 ? buf : "");
+            }
+        }
+        llama_model_free(raw.model);
+        return 0;
     }
 
     // ---------- G3.1: --gemma4-dump-weights ----------
