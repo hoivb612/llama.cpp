@@ -1663,14 +1663,23 @@ bool network_gen_save_kv(const llama_model * model, const Weights & w,
 
     std::vector<int32_t> gen_tokens;
     gen_tokens.reserve(n_gen);
+    // first_gen_token is a cache contract -- it goes into the gen
+    // display vector unconditionally (rendered or not is up to the
+    // caller; the on-disk format stores it separately so byte-identical
+    // round trips still work even if it happens to be an EOG token).
     gen_tokens.push_back(first_gen_token);
+    bool stopped_on_eog = false;
     int next = first_gen_token;
+    if (llama_vocab_is_eog(vocab, first_gen_token)) {
+        stopped_on_eog = true;
+    }
     const auto t_gen0 = std::chrono::steady_clock::now();
-    for (int g = 1; g < n_gen; ++g) {
+    for (int g = 1; !stopped_on_eog && g < n_gen; ++g) {
         int32_t tok = next;
         if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
                           logits.data(), error)) return false;
         next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        if (llama_vocab_is_eog(vocab, next)) { stopped_on_eog = true; break; }
         gen_tokens.push_back(next);
     }
     const double gen_ms = std::chrono::duration<double, std::milli>(
@@ -1686,9 +1695,11 @@ bool network_gen_save_kv(const llama_model * model, const Weights & w,
     for (int t : gen_tokens) gen_text += piece(t);
 
     std::fprintf(stderr,
-        "gemma4 save-kv: prefill %.1f ms  save %.1f ms  gen %.1f ms (%d toks)\n"
+        "gemma4 save-kv: prefill %.1f ms  save %.1f ms  gen %.1f ms (%d toks)%s\n"
         "  gen text: \"%s\"\n",
-        prefill_ms, save_ms, gen_ms, n_gen, gen_text.c_str());
+        prefill_ms, save_ms, gen_ms, (int) gen_tokens.size(),
+        stopped_on_eog ? "  [stopped on EOG]" : "",
+        gen_text.c_str());
     return true;
 }
 
@@ -1753,14 +1764,19 @@ bool network_gen_load_kv(const llama_model * model, const Weights & w,
     std::vector<float> logits((size_t) n_vocab, 0.0f);
     std::vector<int32_t> gen_tokens;
     gen_tokens.reserve(n_gen);
+    // first_gen_token came from the cached prefill -- always render it
+    // so the load-side transcript starts at the same point as the
+    // save-side transcript (cache contract).
     gen_tokens.push_back(first_gen_token);
+    bool stopped_on_eog = llama_vocab_is_eog(vocab, first_gen_token);
     int next = first_gen_token;
     const auto t_gen0 = std::chrono::steady_clock::now();
-    for (int g = 1; g < n_gen; ++g) {
+    for (int g = 1; !stopped_on_eog && g < n_gen; ++g) {
         int32_t tok = next;
         if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
                           logits.data(), error)) return false;
         next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        if (llama_vocab_is_eog(vocab, next)) { stopped_on_eog = true; break; }
         gen_tokens.push_back(next);
     }
     const double gen_ms = std::chrono::duration<double, std::milli>(
@@ -1776,9 +1792,11 @@ bool network_gen_load_kv(const llama_model * model, const Weights & w,
     for (int t : gen_tokens) gen_text += piece(t);
 
     std::fprintf(stderr,
-        "gemma4 load-kv: load %.1f ms  gen %.1f ms (%d toks)  n_past_after_load=%d\n"
+        "gemma4 load-kv: load %.1f ms  gen %.1f ms (%d toks)  n_past_after_load=%d%s\n"
         "  gen text: \"%s\"\n",
-        load_ms, gen_ms, n_gen, loaded_n_tokens, gen_text.c_str());
+        load_ms, gen_ms, (int) gen_tokens.size(), loaded_n_tokens,
+        stopped_on_eog ? "  [stopped on EOG]" : "",
+        gen_text.c_str());
     return true;
 }
 
