@@ -61,6 +61,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --bench-backend qquant|upstream|both\n"
             "                                       which backends to bench (default both)\n"
             "    --gemma4-attn-parallel 0|1         dispatch per-head attention across the matmul threadpool (default 1)\n"
+            "    --gemma4-matmul-cache 0|1          cache per-shape mul_mat graphs across decode calls (default 1)\n"
             "\n",
         argv[0]);
 }
@@ -119,6 +120,10 @@ int main(int argc, char ** argv) {
     // Pass --gemma4-attn-parallel 0 to fall back to the original serial
     // per-head loop (used for A/B comparison).
     int gemma4_attn_parallel    = 1;
+
+    // G5.2 - cached per-shape matmul graphs. Default ON; pass 0 to fall
+    // back to the per-call build path (regression guard / A/B comparison).
+    int gemma4_matmul_cache     = 1;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -243,6 +248,13 @@ int main(int argc, char ** argv) {
                         "error: --gemma4-attn-parallel expects 0 or 1\n");
                     return 1;
                 }
+            } else if (std::strcmp(argv[i], "--gemma4-matmul-cache") == 0 && i + 1 < argc) {
+                gemma4_matmul_cache = std::stoi(argv[++i]);
+                if (gemma4_matmul_cache != 0 && gemma4_matmul_cache != 1) {
+                    std::fprintf(stderr,
+                        "error: --gemma4-matmul-cache expects 0 or 1\n");
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -271,6 +283,10 @@ int main(int argc, char ** argv) {
     // G5.1 - publish the attn-parallel toggle before any decode path runs.
     // Read by gemma4::get_attn_parallel() inside layer_forward_f32_cached.
     gemma4::set_attn_parallel(gemma4_attn_parallel != 0);
+
+    // G5.2 - publish the matmul cache toggle before any matmul runs.
+    // Read by gemma4::get_matmul_cache() inside matmul_qf32.
+    gemma4::set_matmul_cache(gemma4_matmul_cache != 0);
 
     // Quiet llama log noise: surface errors only.
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {

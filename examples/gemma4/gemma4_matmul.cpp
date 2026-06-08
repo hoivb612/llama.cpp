@@ -23,6 +23,10 @@ void GgmlThreadpoolDeleter::operator()(ggml_threadpool * p) const noexcept {
     if (p) ggml_threadpool_free(p);
 }
 
+void GgmlContextDeleter::operator()(ggml_context * c) const noexcept {
+    if (c) ggml_free(c);
+}
+
 // ---------------------------------------------------------------------------
 // G5.1 - AttnWorkerPool implementation (see gemma4_matmul.h for design).
 // ---------------------------------------------------------------------------
@@ -159,6 +163,19 @@ bool get_attn_parallel() {
 }
 
 // ---------------------------------------------------------------------------
+// G5.2 - matmul graph cache toggle. Default ON for the qquant path; pass
+// --gemma4-matmul-cache 0 to revert to the per-call build path.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_matmul_cache{true};
+
+void set_matmul_cache(bool on) {
+    g_matmul_cache.store(on, std::memory_order_relaxed);
+}
+bool get_matmul_cache() {
+    return g_matmul_cache.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
 
 bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,
                      std::string & error) {
@@ -169,6 +186,11 @@ bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,
     mm.arena.assign(arena_bytes, 0);
     mm.work_buf.clear();
     mm.n_threads = std::max(1, n_threads);
+
+    // G5.2 - drop any cached graphs first; their cplans hold a pointer to
+    // the old mm.pool and assume the old mm.work_buf sizing. Must clear
+    // BEFORE resetting pool/work_buf below.
+    mm.matmul_cache.clear();
 
     // Tear down any old pool first (init may be called more than once).
     mm.pool.reset();
@@ -197,6 +219,81 @@ bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// G5.2 - matmul graph cache helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Eligibility gate for the cache. Only cache when we have a real pool
+// (n_threads > 1: the original ggml_graph_compute_with_ctx fallback for
+// single-thread allocates its own work_data inside the per-call ctx, which
+// is not safe to reuse) and when n_cols is small enough that the per-entry
+// arena stays cheap. Prefill (n_cols >> 1) skips the cache because each
+// (W, n_cols) shape is only seen once per session, so the build cost is
+// pure overhead without amortisation.
+constexpr int kMaxCachedNCols = 1;
+
+bool cache_eligible(const MatmulCtx & mm, int n_cols) {
+    return get_matmul_cache() && mm.pool && n_cols >= 1 && n_cols <= kMaxCachedNCols;
+}
+
+// Arena size for one cached entry. Holds:
+//   * x_t metadata + data        = ggml_tensor_overhead() + n_in*n_cols*4
+//   * y_t metadata + data        = ggml_tensor_overhead() + n_out*n_cols*4
+//   * one mul_mat node           = ggml_tensor_overhead() (no extra data)
+//   * graph object               = ggml_graph_overhead_custom(4, false)
+//   * ggml internal padding/objects -- add a 16 KiB margin to be safe.
+// work_data is NOT stored here; it lives in mm.work_buf and is wired into
+// cplan.work_data per call.
+std::size_t entry_arena_bytes(int n_in, int n_out, int n_cols) {
+    const std::size_t x_bytes = (std::size_t) n_in  * (std::size_t) n_cols * sizeof(float);
+    const std::size_t y_bytes = (std::size_t) n_out * (std::size_t) n_cols * sizeof(float);
+    const std::size_t graph   = ggml_graph_overhead_custom(/*size=*/4, /*grads=*/false);
+    const std::size_t tensors = 3 * ggml_tensor_overhead();   // x, y, mul_mat node
+    const std::size_t margin  = 16u * 1024u;
+    return x_bytes + y_bytes + graph + tensors + margin;
+}
+
+// Build a fresh cache entry for (W, n_cols). Returns false on error.
+bool build_cache_entry(MatmulCtx & mm, const ggml_tensor * W,
+                       int n_in, int n_out, int n_cols,
+                       MatmulCacheEntry & e, std::string & error) {
+    e.arena.assign(entry_arena_bytes(n_in, n_out, n_cols), 0);
+
+    ggml_init_params ip{ e.arena.size(), e.arena.data(), /*no_alloc=*/false };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { error = "matmul_qf32 cache: ggml_init failed"; return false; }
+    e.ctx.reset(ctx);
+
+    e.x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_cols);
+    if (!e.x_t) { error = "matmul_qf32 cache: alloc x_t failed"; e.ctx.reset(); return false; }
+
+    e.y_t = ggml_mul_mat(ctx, const_cast<ggml_tensor *>(W), e.x_t);
+    if (!e.y_t) { error = "matmul_qf32 cache: ggml_mul_mat returned null"; e.ctx.reset(); return false; }
+
+    // Tiny custom graph -- 4 node slots is plenty for x + mul_mat + y wrap.
+    e.gf = ggml_new_graph_custom(ctx, /*size=*/4, /*grads=*/false);
+    if (!e.gf) { error = "matmul_qf32 cache: ggml_new_graph_custom failed"; e.ctx.reset(); return false; }
+    ggml_build_forward_expand(e.gf, e.y_t);
+
+    e.cplan = ggml_graph_plan(e.gf, mm.n_threads, mm.pool.get());
+    if (e.cplan.work_size > mm.work_buf.size()) {
+        mm.work_buf.assign(e.cplan.work_size, 0);
+    }
+    // work_data is refreshed per call below; leave it dangling here so a
+    // forgotten refresh trips immediately.
+
+    e.n_in      = n_in;
+    e.n_out     = n_out;
+    e.n_cols    = n_cols;
+    e.w_type    = (int) W->type;
+    e.n_threads = mm.n_threads;
+    return true;
+}
+
+} // namespace
+
 bool matmul_qf32(MatmulCtx & mm, const ggml_tensor * W,
                  const float * x_in, float * y_out,
                  int n_in, int n_out, int n_cols, std::string & error) {
@@ -210,6 +307,58 @@ bool matmul_qf32(MatmulCtx & mm, const ggml_tensor * W,
         return false;
     }
 
+    // -----------------------------------------------------------------------
+    // G5.2 - cached path. On a hit, skip every per-call build step and go
+    // straight to memcpy x -> ggml_graph_compute -> memcpy y.
+    // -----------------------------------------------------------------------
+    if (cache_eligible(mm, n_cols)) {
+        const MatmulCacheKey key{ W, n_cols };
+        auto it = mm.matmul_cache.find(key);
+        if (it != mm.matmul_cache.end()) {
+            // Invariant guard: w_type / n_threads must match the values at
+            // build time. b612 has paths that may repack W in place, so a
+            // type drift triggers a rebuild instead of using a stale cplan.
+            MatmulCacheEntry & cur = it->second;
+            if (cur.w_type != (int) W->type || cur.n_threads != mm.n_threads) {
+                mm.matmul_cache.erase(it);
+                it = mm.matmul_cache.end();
+            }
+        }
+        if (it == mm.matmul_cache.end()) {
+            MatmulCacheEntry e;
+            if (!build_cache_entry(mm, W, n_in, n_out, n_cols, e, error)) {
+                return false;
+            }
+            auto ins = mm.matmul_cache.emplace(key, std::move(e));
+            it = ins.first;
+        }
+        MatmulCacheEntry & e = it->second;
+
+        // Defensive: another entry may have grown mm.work_buf since we built
+        // this cplan; the vector may also have been reallocated, so refresh
+        // work_data each call.
+        if (e.cplan.work_size > mm.work_buf.size()) {
+            mm.work_buf.assign(e.cplan.work_size, 0);
+        }
+        e.cplan.work_data = mm.work_buf.empty() ? nullptr : mm.work_buf.data();
+
+        std::memcpy(e.x_t->data, x_in,
+                    (std::size_t) n_in * n_cols * sizeof(float));
+        const ggml_status status = ggml_graph_compute(e.gf, &e.cplan);
+        if (status != GGML_STATUS_SUCCESS) {
+            error = "matmul_qf32 cache: graph compute failed";
+            return false;
+        }
+        std::memcpy(y_out, e.y_t->data,
+                    (std::size_t) n_out * n_cols * sizeof(float));
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Original per-call build path. Used for n_cols > kMaxCachedNCols
+    // (prefill), single-thread fallback (no pool), or when caching is
+    // disabled via --gemma4-matmul-cache 0.
+    // -----------------------------------------------------------------------
     ggml_init_params ip{ mm.arena.size(), mm.arena.data(), /*no_alloc=*/false };
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) { error = "matmul_qf32: ggml_init failed"; return false; }

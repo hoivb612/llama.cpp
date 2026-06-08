@@ -22,18 +22,34 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_tensor;
+struct ggml_context;
+struct ggml_cgraph;
 struct ggml_threadpool;
+struct ggml_cplan;
+
+// Forward declare the full cplan struct's representation for inline storage.
+// We can't forward-declare a struct AND store it by value, so include the
+// canonical header form via ggml-cpu.h (which defines ggml_cplan).
+#include "ggml.h"
+#include "ggml-cpu.h"
 
 namespace gemma4 {
 
 // Custom deleter for ggml_threadpool so MatmulCtx is self-cleaning.
 struct GgmlThreadpoolDeleter {
     void operator()(ggml_threadpool * p) const noexcept;
+};
+
+// Custom deleter for ggml_context so MatmulCacheEntry is self-cleaning.
+struct GgmlContextDeleter {
+    void operator()(ggml_context * c) const noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +83,48 @@ struct AttnPoolDeleter {
     void operator()(AttnWorkerPool * p) const noexcept;
 };
 
+// ---------------------------------------------------------------------------
+// G5.2 - per-shape matmul graph cache. Each entry owns a private arena +
+// ggml_context with a permanently-built 1-op graph (y = mul_mat(W, x)) and
+// a cached cplan. On a cache hit we skip ggml_init / new_tensor /
+// mul_mat / new_graph / build_forward_expand / graph_plan and go straight
+// to memcpy x -> compute -> memcpy y. Eliminates ~7 ms/token of per-call
+// graph rebuild overhead at typical tg64 contexts (~245 matmuls/token).
+//
+// Cache is single-caller (same invariant as the shared arena/work_buf).
+// Only used when n_cols is small (decode); prefill matmuls bypass it.
+// ---------------------------------------------------------------------------
+struct MatmulCacheEntry {
+    std::vector<uint8_t>                              arena;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
+    ggml_tensor *  x_t   = nullptr;     // owned by ctx
+    ggml_tensor *  y_t   = nullptr;     // owned by ctx; result of mul_mat
+    ggml_cgraph *  gf    = nullptr;     // owned by ctx; 1-node graph
+    ggml_cplan     cplan = {};          // work_data refreshed per call
+    int            n_in     = 0;
+    int            n_out    = 0;
+    int            n_cols   = 0;
+    int            w_type   = 0;        // ggml_type at build time; rebuilds on mismatch
+    int            n_threads = 1;       // n_threads at build time
+};
+
+struct MatmulCacheKey {
+    const ggml_tensor * W      = nullptr;
+    int                 n_cols = 0;
+    bool operator==(const MatmulCacheKey & o) const noexcept {
+        return W == o.W && n_cols == o.n_cols;
+    }
+};
+
+struct MatmulCacheKeyHash {
+    std::size_t operator()(const MatmulCacheKey & k) const noexcept {
+        // FNV-1a-ish mix; W pointers are 16-byte-aligned so the low bits
+        // are zero -- shift before xoring with n_cols.
+        const std::size_t p = reinterpret_cast<std::size_t>(k.W);
+        return (p >> 4) ^ ((std::size_t) (uint32_t) k.n_cols * 0x9E3779B1u);
+    }
+};
+
 struct MatmulCtx {
     // Arena memory used by the per-call ggml_context. Sized once at init
     // and reused (ggml_init resets the bump pointer to the start of this
@@ -87,6 +145,9 @@ struct MatmulCtx {
     // Created in matmul_ctx_init alongside the ggml pool.
     std::unique_ptr<AttnWorkerPool, AttnPoolDeleter> attn_pool;
 
+    // G5.2 - matmul graph cache (see MatmulCacheEntry comment).
+    std::unordered_map<MatmulCacheKey, MatmulCacheEntry, MatmulCacheKeyHash> matmul_cache;
+
     int n_threads = 1;
 };
 
@@ -101,6 +162,12 @@ void attn_pool_run(MatmulCtx & mm, AttnJobFn fn, void * user_data);
 // fall back to the serial per-head loop for A/B comparison.
 void set_attn_parallel(bool on);
 bool get_attn_parallel();
+
+// G5.2 - global setter for the matmul graph cache. Default ON; pass 0 to
+// fall back to the per-call build path for A/B comparison. Set once at
+// startup via --gemma4-matmul-cache 0|1.
+void set_matmul_cache(bool on);
+bool get_matmul_cache();
 
 // Allocate the arena, store the thread count, and (when n_threads > 1)
 // spin up the persistent ggml_threadpool. arena_bytes should be large
