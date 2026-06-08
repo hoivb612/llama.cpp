@@ -15,6 +15,7 @@
 
 #include "llama.h"
 #include "gemma4_baseline.h"
+#include "gemma4_bench.h"
 #include "gemma4_chat.h"
 #include "gemma4_forward.h"
 #include "gemma4_kernels.h"
@@ -52,6 +53,12 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --min-p F                          min-p sampler cutoff (default 0.05; ignored when --temp 0)\n"
             "    --seed N                           sampler seed (default LLAMA_DEFAULT_SEED)\n"
             "    --gemma4-tokenize-probe N S1 ... SN  tokenize N strings (parse_special=true) and exit\n"
+            "    --gemma4-bench                     llama-bench-style pp{N}/tg{N} t/s table (qquant + upstream)\n"
+            "    --bench-pp N                       bench prefill size (default 64)\n"
+            "    --bench-tg N                       bench gen size (default 64)\n"
+            "    --bench-reps N                     measured repeats per test (default 3; warmup is implicit)\n"
+            "    --bench-backend qquant|upstream|both\n"
+            "                                       which backends to bench (default both)\n"
             "\n",
         argv[0]);
 }
@@ -97,6 +104,13 @@ int main(int argc, char ** argv) {
     // followed by N strings.
     int                       probe_count = 0;        // 0 = disabled
     std::vector<std::string>  probe_strings;
+
+    // --gemma4-bench (llama-bench-style throughput table).
+    bool bench_mode             = false;
+    int  bench_pp_n             = 64;
+    int  bench_tg_n             = 64;
+    int  bench_reps             = 3;
+    std::string bench_backend   = "both";  // qquant | upstream | both
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -195,6 +209,21 @@ int main(int argc, char ** argv) {
                 if ((int) probe_strings.size() != probe_count) {
                     std::fprintf(stderr,
                         "error: --gemma4-tokenize-probe expects N strings after the count\n");
+                    return 1;
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-bench") == 0) {
+                bench_mode = true;
+            } else if (std::strcmp(argv[i], "--bench-pp") == 0 && i + 1 < argc) {
+                bench_pp_n = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--bench-tg") == 0 && i + 1 < argc) {
+                bench_tg_n = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--bench-reps") == 0 && i + 1 < argc) {
+                bench_reps = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--bench-backend") == 0 && i + 1 < argc) {
+                bench_backend = argv[++i];
+                if (bench_backend != "qquant" && bench_backend != "upstream" && bench_backend != "both") {
+                    std::fprintf(stderr,
+                        "error: --bench-backend must be one of qquant|upstream|both\n");
                     return 1;
                 }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
@@ -426,6 +455,41 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::fprintf(stderr, "gemma4 network_profile: DONE\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- --gemma4-bench (llama-bench-style table) ----------------
+    // Runs pp{N}/tg{N} tests through the qquant hand path and/or the
+    // upstream llama_decode path with R measured reps each (warmup is
+    // implicit). Prints a markdown table matching tools/llama-bench's
+    // output format so qquant numbers can be compared side-by-side
+    // against `llama-bench.exe` runs on the same model.
+    if (bench_mode) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4 bench: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        gemma4::BenchParams bp;
+        bp.pp_n             = bench_pp_n;
+        bp.tg_n             = bench_tg_n;
+        bp.reps             = bench_reps;
+        bp.n_threads        = n_threads_gen > 0 ? n_threads_gen
+                              : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        bp.include_qquant   = (bench_backend == "qquant"   || bench_backend == "both");
+        bp.include_upstream = (bench_backend == "upstream" || bench_backend == "both");
+        bp.seed             = cli_seed != LLAMA_DEFAULT_SEED ? cli_seed : 1234u;
+
+        std::string berr;
+        const bool ok = gemma4::run_bench(raw.model, w, bp, berr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 bench: FAIL: %s\n", berr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
         gemma4_unload_raw_model(raw);
         return 0;
     }

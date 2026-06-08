@@ -771,6 +771,49 @@ Quick recipes
   Gemma4.exe -m ...E2B...gguf --gemma4-chat \
              -n 64 --gemma4-chat-ctx 4096 --threads-gen 8
 
+  # 12. llama-bench-style throughput table (qquant + upstream side-by-side)
+  Gemma4.exe -m ...E2B...gguf --gemma4-bench \
+             --bench-pp 64 --bench-tg 64 --bench-reps 3 --threads-gen 8
+
+  # 12a. qquant only (skip the upstream comparison rows)
+  Gemma4.exe -m ...E2B...gguf --gemma4-bench --bench-backend qquant \
+             --bench-pp 128 --bench-tg 128 --threads-gen 8
+
+CLI flags for --gemma4-bench (run-and-exit)
+-------------------------------------------
+  --gemma4-bench                    Enable bench harness; prints a markdown
+                                    table identical in shape to
+                                    `llama-bench.exe` output, then exits.
+  --bench-pp N                      Prefill (prompt processing) size in
+                                    tokens. One pp{N} row per backend.
+                                    Default 64.
+  --bench-tg N                      Decode (token generation) size in
+                                    tokens. One tg{N} row per backend.
+                                    Default 64.
+  --bench-reps N                    Measured repeats per test. Each test
+                                    also runs one implicit warmup pass
+                                    (always discarded). Default 3.
+  --bench-backend qquant|upstream|both
+                                    Which backends to bench. qquant drives
+                                    network_step (the hand path);
+                                    upstream drives llama_decode on the
+                                    same model. Default both.
+  --threads-gen N                   Thread count for both backends (also
+                                    sizes the qquant ModelF32::mm pool).
+                                    Falls back to --threads-prefill, then
+                                    to 4 if neither is set.
+  --seed N                          Seed for the bench's random-token
+                                    generator (qquant and upstream get
+                                    distinct seeds derived from this).
+                                    Default 1234.
+
+  Test names follow llama-bench: `pp{N}` measures a single batched prefill
+  of N random in-vocab tokens (t/s = N / prefill_ms * 1000); `tg{N}`
+  measures N single-token decode steps after a 1-token warmup
+  (t/s = N / decode_ms * 1000). Random tokens are content-agnostic --
+  this is a throughput probe, not a quality check. Use a small `--bench-reps`
+  (2-3) for a quick sanity check; reps>=5 for stable stddev.
+
 Regression gate (must all PASS after any change to the hand path)
 -----------------------------------------------------------------
   --gemma4-kernel-test

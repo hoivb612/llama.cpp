@@ -7,6 +7,7 @@ add_executable(${TARGET}
     phi3_fused_ops.cpp
     phi3_fused_graph.cpp
     phi3_runtime.cpp
+    phi3_bench.cpp
 )
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME Phi3)
 install(TARGETS ${TARGET} RUNTIME)

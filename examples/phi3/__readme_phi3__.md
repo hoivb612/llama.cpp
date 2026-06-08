@@ -890,6 +890,34 @@ Cached prefill (A5.5/A5.6) — mutually exclusive
   --phi3-fused-qquant-a56          Long-prompt cached-prefill sweep harness
                                    (A5.6). Run-and-exit; needs no prompt.
 
+  --phi3-bench                     llama-bench-style throughput table.
+                                   Run-and-exit. Prints a markdown table
+                                   identical in shape to `llama-bench.exe`
+                                   output, with one pp{N} row and one
+                                   tg{N} row per backend selected. Uses
+                                   random in-vocab tokens (content-agnostic
+                                   throughput probe; matches llama-bench's
+                                   test_prompt / test_gen helpers).
+  --bench-pp N                     Prefill size (default 64). Backed by a
+                                   single phi3_run_qquant_decode call with
+                                   prompt=N random tokens, n_gen=1
+                                   (qquant) or a single llama_decode batch
+                                   of N tokens (upstream).
+  --bench-tg N                     Decode size (default 64). N single-token
+                                   decode steps after a 1-token warmup.
+  --bench-reps N                   Measured repeats per test (default 3).
+                                   One implicit warmup pass per test is
+                                   always discarded.
+  --bench-backend qquant|upstream|both
+                                   Which backends to bench (default both).
+                                   qquant honours --phi3-fused-qquant-
+                                   rmsnorm-fuse / --phi3-fused-qquant-
+                                   attn-parallel; upstream uses
+                                   llama_decode with flash_attn DISABLED.
+                                   Thread count comes from
+                                   --phi3-fused-qquant-threads (or
+                                   --threads-gen).
+
 Quick recipes
 -------------
   # Sanity (no model needed beyond build)
@@ -912,3 +940,10 @@ Quick recipes
   Phi3.exe -m M.gguf --phi3-fused-qquant-load-kv kv.bin -n 64
   # 3-prompt regression gate
   Phi3.exe -m M.gguf --phi3-fused-qquant-regress 256
+  # llama-bench-style throughput (qquant + upstream side-by-side)
+  Phi3.exe -m M.gguf --phi3-bench --bench-pp 64 --bench-tg 64 \
+           --bench-reps 3 --threads-gen 8
+  # qquant only at a larger context, with attn-parallel on
+  Phi3.exe -m M.gguf --phi3-bench --bench-backend qquant \
+           --bench-pp 128 --bench-tg 128 \
+           --phi3-fused-qquant-attn-parallel 1 --threads-gen 8

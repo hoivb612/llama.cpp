@@ -8,6 +8,7 @@ add_executable(${TARGET}
     gemma4_matmul.cpp
     gemma4_kvcache.cpp
     gemma4_chat.cpp
+    gemma4_bench.cpp
     gemma4_forward.cpp
 )
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME Gemma4)

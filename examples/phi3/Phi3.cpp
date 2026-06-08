@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama_b612.h"
+#include "phi3_bench.h"
 #include "phi3_fused_graph.h"
 #include "phi3_loader.h"
 #include "phi3_runtime.h"
@@ -15,7 +16,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--phi3-fused-qquant-a56] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--phi3-fused-qquant-a56] [--phi3-bench [--bench-pp N] [--bench-tg N] [--bench-reps N] [--bench-backend qquant|upstream|both]] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -98,6 +99,18 @@ int main(int argc, char ** argv) {
     bool        fused_qquant_load_kv_strict = false;
     // A5.6 — long-prompt cached prefill sweep (run-and-exit harness).
     bool        fused_qquant_a56 = false;
+
+    // --phi3-bench (llama-bench-style throughput table). When set, Phi3.exe
+    // runs the bench harness and exits. Mirrors examples/gemma4/gemma4_bench
+    // so output tables are visually identical. Backend selector: qquant
+    // (phi3_run_qquant_decode), upstream (raw llama_decode), or both. The
+    // existing --phi3-fused-qquant-rmsnorm-fuse / --phi3-fused-qquant-attn-
+    // parallel knobs are honored on the qquant path.
+    bool bench_mode             = false;
+    int  bench_pp_n             = 64;
+    int  bench_tg_n             = 64;
+    int  bench_reps             = 3;
+    std::string bench_backend   = "both";  // qquant | upstream | both
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
     for (int i = 1; i < argc; i++) {
@@ -310,6 +323,25 @@ int main(int argc, char ** argv) {
                 fused_qquant_load_kv_strict = true;
             } else if (strcmp(argv[i], "--phi3-fused-qquant-a56") == 0) {
                 fused_qquant_a56 = true;
+            } else if (strcmp(argv[i], "--phi3-bench") == 0) {
+                bench_mode = true;
+            } else if (strcmp(argv[i], "--bench-pp") == 0) {
+                if (i + 1 < argc) bench_pp_n = std::stoi(argv[++i]);
+                else { print_usage(argc, argv); return 1; }
+            } else if (strcmp(argv[i], "--bench-tg") == 0) {
+                if (i + 1 < argc) bench_tg_n = std::stoi(argv[++i]);
+                else { print_usage(argc, argv); return 1; }
+            } else if (strcmp(argv[i], "--bench-reps") == 0) {
+                if (i + 1 < argc) bench_reps = std::stoi(argv[++i]);
+                else { print_usage(argc, argv); return 1; }
+            } else if (strcmp(argv[i], "--bench-backend") == 0) {
+                if (i + 1 < argc) {
+                    bench_backend = argv[++i];
+                    if (bench_backend != "qquant" && bench_backend != "upstream" && bench_backend != "both") {
+                        fprintf(stderr, "error: --bench-backend must be one of qquant|upstream|both\n");
+                        return 1;
+                    }
+                } else { print_usage(argc, argv); return 1; }
             } else if (strcmp(argv[i], "--repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (strcmp(argv[i], "--repack-xbox") == 0) {
@@ -452,6 +484,33 @@ int main(int argc, char ** argv) {
         std::string ferr;
         if (!phi3_qmatmul_self_test(raw_model.model, ferr)) {
             fprintf(stderr, "phi3 qmatmul self-test: FAIL: %s\n", ferr.c_str());
+            phi3_unload_raw_model(raw_model);
+            return 1;
+        }
+        phi3_unload_raw_model(raw_model);
+        return 0;
+    }
+
+    // --phi3-bench (llama-bench-style table). Run-and-exit; emits a markdown
+    // table with pp{N}/tg{N} rows for qquant and/or upstream backends.
+    if (bench_mode) {
+        phi3_bench::Params bp;
+        bp.pp_n               = bench_pp_n;
+        bp.tg_n               = bench_tg_n;
+        bp.reps               = bench_reps;
+        bp.n_threads          = fused_qquant_threads > 0
+                                    ? fused_qquant_threads
+                                    : (n_threads_gen > 0 ? n_threads_gen : 1);
+        bp.include_qquant     = (bench_backend == "qquant"   || bench_backend == "both");
+        bp.include_upstream   = (bench_backend == "upstream" || bench_backend == "both");
+        bp.fuse_rmsnorm_quant = fused_qquant_rmsnorm_fuse != 0;
+        bp.attn_parallel      = fused_qquant_attn_parallel != 0;
+        bp.seed               = seed != LLAMA_DEFAULT_SEED ? seed : 1234u;
+
+        std::string berr;
+        const bool ok = phi3_bench::run_bench(raw_model.model, bp, berr);
+        if (!ok) {
+            fprintf(stderr, "phi3 bench: FAIL: %s\n", berr.c_str());
             phi3_unload_raw_model(raw_model);
             return 1;
         }
