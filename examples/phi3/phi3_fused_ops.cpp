@@ -179,10 +179,34 @@ bool phi3_fused_lmhead_argmax(
         }
         pool->cv_work.notify_all();
 
+        // Main-as-worker: compute wid=0's slot on the calling thread using the
+        // same vec_dot inner loop the worker uses. Then tight-spin for the
+        // remaining N-1 helpers. Avoids the N+1 oversubscription that costs us
+        // a whole core on affinity-pinned cpusets.
+        {
+            auto & s = pool->slots[0];
+            const int64_t lo = s.lo;
+            const int64_t hi = s.hi;
+            if (lo < hi && w_traits && w_traits->vec_dot) {
+                float   sb = -std::numeric_limits<float>::infinity();
+                int64_t si = lo;
+                for (int64_t v = lo; v < hi; ++v) {
+                    float ss = 0.0f;
+                    w_traits->vec_dot(n_embd_int, &ss, 0, w_base + (size_t) v * row_bytes, 0, q_hidden_ptr, 0, 1);
+                    if (ss > sb) {
+                        sb = ss;
+                        si = v;
+                    }
+                }
+                s.best_val = sb;
+                s.best_id  = si;
+            }
+        }
+
         // Driver tight-spins on done_count. The ~1 ms argmax burst happens
         // immediately after llama_decode returns, so spinning here keeps the
         // driver core hot and avoids any further wake-up latency.
-        while (pool->done_count.load(std::memory_order_acquire) < N) {
+        while (pool->done_count.load(std::memory_order_acquire) < N - 1) {
             phi3_cpu_relax();
         }
 
@@ -336,9 +360,12 @@ bool phi3_fused_lmhead_pool_init(Phi3LmHeadPool & pool, int n_threads, std::stri
     pool.stop.store(false, std::memory_order_release);
     pool.job_seq.store(0, std::memory_order_release);
     pool.done_count.store(0, std::memory_order_release);
-    pool.workers.reserve(n_threads);
-    for (int i = 0; i < n_threads; ++i) {
-        pool.workers.emplace_back(phi3_lmhead_worker_loop, &pool, i);
+    // Main-as-worker: spawn n_threads-1 helpers with wid in [1, n_threads).
+    // phi3_fused_lmhead_argmax executes wid=0's slot on the calling thread.
+    const int n_helpers = n_threads - 1;
+    pool.workers.reserve(n_helpers);
+    for (int i = 0; i < n_helpers; ++i) {
+        pool.workers.emplace_back(phi3_lmhead_worker_loop, &pool, i + 1);
     }
     pool.initialized = true;
     error.clear();
@@ -597,9 +624,15 @@ bool phi3_matmul_pool_init(Phi3MatmulPool & pool, int n_threads, std::string & e
     pool.stop.store(false, std::memory_order_release);
     pool.job_seq.store(0, std::memory_order_release);
     pool.done_count.store(0, std::memory_order_release);
-    pool.workers.reserve(n_threads);
-    for (int i = 0; i < n_threads; ++i) {
-        pool.workers.emplace_back(phi3_matmul_worker_loop, &pool, i);
+    // Main-as-worker: spawn n_threads-1 helper threads with wid in [1, n_threads).
+    // phi3_matmul_pool_run / phi3_attn_pool_run execute wid=0's shard on the
+    // calling thread, so total compute parallelism is exactly n_threads with no
+    // extra always-spinning driver thread. Matches the contract used by ggml's
+    // threadpool and avoids N+1 oversubscription under affinity-pinned cpusets.
+    const int n_helpers = n_threads - 1;
+    pool.workers.reserve(n_helpers);
+    for (int i = 0; i < n_helpers; ++i) {
+        pool.workers.emplace_back(phi3_matmul_worker_loop, &pool, i + 1);
     }
     pool.initialized = true;
     error.clear();
@@ -646,8 +679,18 @@ void phi3_matmul_pool_run(Phi3MatmulPool * pool, const Phi3MatmulJob & job) {
     }
     pool->cv_work.notify_all();
 
-    // Driver tight-spins on done_count for the short matmul burst.
-    const int target = pool->n_threads;
+    // Main-as-worker: execute wid=0's shard on the calling thread using the
+    // exact same shard math the worker loop uses. Then tight-spin for the
+    // remaining n_threads-1 helpers to publish their done_count.
+    {
+        const int     W   = pool->n_threads;
+        const int     N   = job.N_total;
+        const int     lo0 = 0;
+        const int     hi0 = (int) (((int64_t) 1 * N) / W);
+        phi3_matmul_compute_range(job, lo0, hi0);
+    }
+
+    const int target = pool->n_threads - 1;
     while (pool->done_count.load(std::memory_order_acquire) < target) {
         phi3_cpu_pause();
     }
@@ -671,8 +714,11 @@ void phi3_attn_pool_run(Phi3MatmulPool * pool, const Phi3AttnJob & job) {
     }
     pool->cv_work.notify_all();
 
-    // Driver tight-spins on done_count for the attention burst.
-    const int target = pool->n_threads;
+    // Main-as-worker: compute wid=0's head range on the calling thread, then
+    // tight-spin for the remaining n_threads-1 helpers.
+    phi3_attn_compute_heads(job, /*wid=*/0, /*W=*/pool->n_threads);
+
+    const int target = pool->n_threads - 1;
     while (pool->done_count.load(std::memory_order_acquire) < target) {
         phi3_cpu_pause();
     }

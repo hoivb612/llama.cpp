@@ -49,6 +49,10 @@ struct Phi3LmHeadPool {
         int64_t best_id  = 0;
     };
 
+    // Total degree of parallelism (calling thread + helper workers). The pool
+    // owns n_threads-1 helper threads with wid in [1, n_threads); the calling
+    // thread of phi3_fused_lmhead_argmax acts as worker 0. Matches the Phi3
+    // matmul pool contract.
     int                       n_threads = 0;
     bool                      initialized = false;
 
@@ -189,6 +193,11 @@ enum class Phi3PoolJobKind : int {
 };
 
 struct Phi3MatmulPool {
+    // Total degree of parallelism (calling thread + helper workers). The pool
+    // owns n_threads-1 helper threads with wid in [1, n_threads); the calling
+    // thread acts as worker 0 inside phi3_matmul_pool_run / phi3_attn_pool_run.
+    // This matches the contract used by ggml's threadpool and avoids N+1
+    // oversubscription when the process is pinned to exactly N logical cores.
     int  n_threads   = 0;
     bool initialized = false;
 
@@ -196,12 +205,12 @@ struct Phi3MatmulPool {
     Phi3AttnJob     attn_job;     // populated when job_kind == ATTN
     Phi3PoolJobKind job_kind = Phi3PoolJobKind::MATMUL;
 
-    std::vector<std::thread>          workers;
+    std::vector<std::thread>          workers;   // size = n_threads - 1
     std::mutex                        mtx;
     std::condition_variable           cv_work;
 
     alignas(64) std::atomic<uint64_t> job_seq{0};
-    alignas(64) std::atomic<int>      done_count{0};
+    alignas(64) std::atomic<int>      done_count{0};   // counts wid in [1, n_threads)
     alignas(64) std::atomic<bool>     stop{false};
 
     // Idle backoff thresholds (microseconds) — see spec §4. Phase 1 is tight
@@ -211,10 +220,10 @@ struct Phi3MatmulPool {
     int  spin_phase2_us = 1000;
 };
 
-// Spawn n_threads persistent worker threads. n_threads <= 1 leaves the pool
-// uninitialized (caller falls back to single-thread serial matmul).
-// Safe to call on an already-initialized pool: existing workers are joined
-// and replaced.
+// Spawn n_threads-1 persistent helper threads (the calling thread of pool_run
+// acts as worker 0). n_threads <= 1 leaves the pool uninitialized (caller falls
+// back to single-thread serial matmul). Safe to call on an already-initialized
+// pool: existing workers are joined and replaced.
 bool phi3_matmul_pool_init(Phi3MatmulPool & pool, int n_threads, std::string & error);
 
 // Signal stop, wake spinners, join workers, reset state. Idempotent.
