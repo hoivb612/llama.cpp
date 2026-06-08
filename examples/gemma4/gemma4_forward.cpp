@@ -376,6 +376,95 @@ static bool dispatch_matmul(MatmulCtx * mm,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// G5.1 - parallelised per-head attention worker.
+//
+// Splits the n_new * n_head (t, h) pair space across W workers. Each worker
+// processes a disjoint contiguous range [lo, hi) in row-major order
+// (t-major, h-minor), so a serial run with W=1 enumerates pairs in exactly
+// the same order as the original nested loop -- bit-identical math.
+//
+// Each (t, h) reads shared read-only Q / K_cache / V_cache / pos_all and
+// writes ONLY to attn_ctx[t, h*head_dim : (h+1)*head_dim], so there is no
+// cross-worker data race on the output. The softmax scores buffer is
+// per-call local (one allocation per shard, reused across all pairs the
+// shard owns).
+// ---------------------------------------------------------------------------
+struct AttnJob {
+    int n_new;
+    int n_total;
+    int n_past;
+    int n_head;
+    int n_head_kv;
+    int head_dim;
+    int n_q;
+    int n_kv;
+    int n_swa;
+    bool apply_swa;
+    const int32_t * pos_all;
+    const float *   Q_data;
+    const float *   K_cache;
+    const float *   V_cache;
+    float *         attn_ctx;
+};
+
+static void attn_compute_shard(int wid, int W, void * ud) {
+    const AttnJob & j = *(const AttnJob *) ud;
+    const long long total = (long long) j.n_new * (long long) j.n_head;
+    const int lo = (int) ((long long) wid       * total / W);
+    const int hi = (int) ((long long) (wid + 1) * total / W);
+    if (lo >= hi) return;
+
+    std::vector<float> scores((size_t) j.n_total, 0.0f);
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    for (int idx = lo; idx < hi; ++idx) {
+        const int t = idx / j.n_head;
+        const int h = idx % j.n_head;
+        const int p_t = j.pos_all[j.n_past + t];
+        const int h_kv = h * j.n_head_kv / j.n_head;
+        const float * q_th = j.Q_data + (size_t) t * j.n_q + (size_t) h * j.head_dim;
+
+        float max_s = neg_inf;
+        for (int k = 0; k < j.n_total; ++k) {
+            const int p_k = j.pos_all[k];
+            const bool masked = (p_k > p_t) ||
+                                (j.apply_swa && (p_t - p_k >= j.n_swa));
+            if (masked) {
+                scores[k] = neg_inf;
+                continue;
+            }
+            const float * k_th = j.K_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
+            double s = 0.0;
+            for (int d = 0; d < j.head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
+            const float sf = (float) s;
+            scores[k] = sf;
+            if (sf > max_s) max_s = sf;
+        }
+        double sum = 0.0;
+        for (int k = 0; k < j.n_total; ++k) {
+            if (scores[k] == neg_inf) {
+                scores[k] = 0.0f;
+            } else {
+                scores[k] = std::exp(scores[k] - max_s);
+                sum += (double) scores[k];
+            }
+        }
+        const float inv_sum = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+        for (int k = 0; k < j.n_total; ++k) scores[k] *= inv_sum;
+
+        float * out_th = j.attn_ctx + (size_t) t * j.n_q + (size_t) h * j.head_dim;
+        for (int d = 0; d < j.head_dim; ++d) {
+            double acc = 0.0;
+            for (int k = 0; k < j.n_total; ++k) {
+                const float * v_th = j.V_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
+                acc += (double) scores[k] * (double) v_th[d];
+            }
+            out_th[d] = (float) acc;
+        }
+    }
+}
+
 bool layer_forward_f32_cached(const LayerF32 & L,
                               int n_new, int n_past, int n_swa,
                               const float * hidden_in,
@@ -497,51 +586,35 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- Self-attention over n_total cached positions --------
     // scale = 1.0 (gemma4 hparams.f_attention_scale = 1.0).
     std::vector<float> attn_ctx((size_t) n_q * n_new, 0.0f);
-    std::vector<float> scores((size_t) n_total, 0.0f);
     const bool apply_swa = L.is_swa;
     { prof::Scope _s(&prof::g_acc.lf_attn_ns);
-    for (int t = 0; t < n_new; ++t) {
-        const int p_t = pos_all[n_past + t];
-        for (int h = 0; h < n_head; ++h) {
-            const int h_kv = h * n_head_kv / n_head;
-            const float * q_th = Q.data() + (size_t) t * n_q + (size_t) h * head_dim;
-            float max_s = -std::numeric_limits<float>::infinity();
-            for (int k = 0; k < n_total; ++k) {
-                const int p_k = pos_all[k];
-                const bool masked = (p_k > p_t) ||
-                                    (apply_swa && (p_t - p_k >= n_swa));
-                if (masked) {
-                    scores[k] = -std::numeric_limits<float>::infinity();
-                    continue;
-                }
-                const float * k_th = K_cache + (size_t) k * n_kv + (size_t) h_kv * head_dim;
-                double s = 0.0;
-                for (int d = 0; d < head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
-                const float sf = (float) s;
-                scores[k] = sf;
-                if (sf > max_s) max_s = sf;
-            }
-            double sum = 0.0;
-            for (int k = 0; k < n_total; ++k) {
-                if (scores[k] == -std::numeric_limits<float>::infinity()) {
-                    scores[k] = 0.0f;
-                } else {
-                    scores[k] = std::exp(scores[k] - max_s);
-                    sum += (double) scores[k];
-                }
-            }
-            const float inv_sum = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
-            for (int k = 0; k < n_total; ++k) scores[k] *= inv_sum;
-            float * out_th = attn_ctx.data() + (size_t) t * n_q + (size_t) h * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                double acc = 0.0;
-                for (int k = 0; k < n_total; ++k) {
-                    const float * v_th = V_cache + (size_t) k * n_kv + (size_t) h_kv * head_dim;
-                    acc += (double) scores[k] * (double) v_th[d];
-                }
-                out_th[d] = (float) acc;
-            }
-        }
+    AttnJob job;
+    job.n_new      = n_new;
+    job.n_total    = n_total;
+    job.n_past     = n_past;
+    job.n_head     = n_head;
+    job.n_head_kv  = n_head_kv;
+    job.head_dim   = head_dim;
+    job.n_q        = n_q;
+    job.n_kv       = n_kv;
+    job.n_swa      = n_swa;
+    job.apply_swa  = apply_swa;
+    job.pos_all    = pos_all;
+    job.Q_data     = Q.data();
+    job.K_cache    = K_cache;
+    job.V_cache    = V_cache;
+    job.attn_ctx   = attn_ctx.data();
+    if (mm && get_attn_parallel()) {
+        // G5.1 - dispatch (t, h) pairs across mm.attn_pool. Each worker
+        // gets a disjoint slice of the n_new * n_head job space and writes
+        // to a disjoint slice of attn_ctx; the scores buffer is per-worker
+        // (stack-local inside attn_compute_shard). Bit-identical to the
+        // serial path: same dot-product / softmax / V-accum order per (t,h).
+        attn_pool_run(*mm, &attn_compute_shard, &job);
+    } else {
+        // Serial fallback (also exercised when --gemma4-attn-parallel 0):
+        // wid=0 covers the entire job space exactly like the original loop.
+        attn_compute_shard(0, 1, &job);
     }
     } // close attn scope
 

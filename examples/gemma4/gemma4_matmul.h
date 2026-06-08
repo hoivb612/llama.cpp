@@ -36,6 +36,37 @@ struct GgmlThreadpoolDeleter {
     void operator()(ggml_threadpool * p) const noexcept;
 };
 
+// ---------------------------------------------------------------------------
+// G5.1 - tiny worker pool for parallelising the per-head attention loop in
+// layer_forward_f32_cached. The existing ggml_threadpool inside MatmulCtx is
+// only reachable via ggml_graph_compute, so we add a small purpose-built
+// pool that can dispatch an arbitrary `JobFn(wid, n_workers, user_data)`.
+//
+// Workers park on a condition variable when idle (not busy-spin) so they do
+// not oversubscribe cores while the ggml threadpool is running matmuls.
+// CV wake cost is ~10-20 us per call * 35 layers = ~0.5 ms / decode token,
+// negligible vs the ~4 ms / token attention work being parallelised.
+//
+// Main-as-worker convention (mirrors Phi3MatmulPool, commit 67230341e):
+// pool->n_threads counts the caller as worker 0 plus (n_threads - 1)
+// helpers. attn_pool_run executes wid=0 on the calling thread and waits
+// for n_threads - 1 done counts from the helpers.
+//
+// NOT thread-safe at the run-driver level: at most one in-flight call to
+// attn_pool_run per MatmulCtx (same single-caller invariant the arena /
+// work_buf in this struct already require).
+struct AttnWorkerPool;
+
+// JobFn dispatch signature. Caller passes a function pointer + opaque
+// pointer; pool replicates it across (n_workers - 1) helpers and the
+// caller's own thread. Each invocation receives its worker id (wid in
+// [0, n_workers)) and the total worker count W = pool->n_threads.
+using AttnJobFn = void (*)(int wid, int W, void * user_data);
+
+struct AttnPoolDeleter {
+    void operator()(AttnWorkerPool * p) const noexcept;
+};
+
 struct MatmulCtx {
     // Arena memory used by the per-call ggml_context. Sized once at init
     // and reused (ggml_init resets the bump pointer to the start of this
@@ -52,8 +83,24 @@ struct MatmulCtx {
     // matmul_ctx_init when n_threads > 1.
     std::unique_ptr<ggml_threadpool, GgmlThreadpoolDeleter> pool;
 
+    // G5.1 - persistent attention worker pool. nullptr when n_threads <= 1.
+    // Created in matmul_ctx_init alongside the ggml pool.
+    std::unique_ptr<AttnWorkerPool, AttnPoolDeleter> attn_pool;
+
     int n_threads = 1;
 };
+
+// G5.1 - dispatch fn across n_workers (= mm.n_threads). Caller thread runs
+// fn(0, W, ud) inline; helpers run fn(wid, W, ud) for wid in [1, W).
+// Returns after all helpers report done. If mm.attn_pool is nullptr (single
+// thread fallback or n_threads <= 1), this is a serial call: fn(0, 1, ud).
+void attn_pool_run(MatmulCtx & mm, AttnJobFn fn, void * user_data);
+
+// G5.1 - global setter consumed by gemma4_forward.cpp. Set once from CLI
+// (--gemma4-attn-parallel 0|1) before any decode. Default is ON; pass 0 to
+// fall back to the serial per-head loop for A/B comparison.
+void set_attn_parallel(bool on);
+bool get_attn_parallel();
 
 // Allocate the arena, store the thread count, and (when n_threads > 1)
 // spin up the persistent ggml_threadpool. arena_bytes should be large

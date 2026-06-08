@@ -60,6 +60,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --bench-threads N                  thread count for both backends (default: --threads-gen)\n"
             "    --bench-backend qquant|upstream|both\n"
             "                                       which backends to bench (default both)\n"
+            "    --gemma4-attn-parallel 0|1         dispatch per-head attention across the matmul threadpool (default 1)\n"
             "\n",
         argv[0]);
 }
@@ -113,6 +114,11 @@ int main(int argc, char ** argv) {
     int  bench_reps             = 3;
     int  bench_threads          = 0;       // 0 = inherit from --threads-gen/--threads-prefill
     std::string bench_backend   = "both";  // qquant | upstream | both
+
+    // G5.1 - parallel per-head attention. Default ON for the qquant path.
+    // Pass --gemma4-attn-parallel 0 to fall back to the original serial
+    // per-head loop (used for A/B comparison).
+    int gemma4_attn_parallel    = 1;
 
     for (int i = 1; i < argc; ++i) {
         try {
@@ -230,6 +236,13 @@ int main(int argc, char ** argv) {
                         "error: --bench-backend must be one of qquant|upstream|both\n");
                     return 1;
                 }
+            } else if (std::strcmp(argv[i], "--gemma4-attn-parallel") == 0 && i + 1 < argc) {
+                gemma4_attn_parallel = std::stoi(argv[++i]);
+                if (gemma4_attn_parallel != 0 && gemma4_attn_parallel != 1) {
+                    std::fprintf(stderr,
+                        "error: --gemma4-attn-parallel expects 0 or 1\n");
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -254,6 +267,10 @@ int main(int argc, char ** argv) {
             "error: --gemma4-chat and --gemma4-chat-test are mutually exclusive\n");
         return 1;
     }
+
+    // G5.1 - publish the attn-parallel toggle before any decode path runs.
+    // Read by gemma4::get_attn_parallel() inside layer_forward_f32_cached.
+    gemma4::set_attn_parallel(gemma4_attn_parallel != 0);
 
     // Quiet llama log noise: surface errors only.
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
