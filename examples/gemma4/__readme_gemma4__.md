@@ -793,6 +793,10 @@ CLI flags for --gemma4-bench (run-and-exit)
   --bench-reps N                    Measured repeats per test. Each test
                                     also runs one implicit warmup pass
                                     (always discarded). Default 3.
+  --bench-threads N                 Thread count for both backends. When
+                                    set, overrides the default resolution
+                                    (--threads-gen → --threads-prefill → 4).
+                                    Also sizes the qquant ModelF32::mm pool.
   --bench-backend qquant|upstream|both
                                     Which backends to bench. qquant drives
                                     network_step (the hand path);

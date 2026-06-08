@@ -57,6 +57,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --bench-pp N                       bench prefill size (default 64)\n"
             "    --bench-tg N                       bench gen size (default 64)\n"
             "    --bench-reps N                     measured repeats per test (default 3; warmup is implicit)\n"
+            "    --bench-threads N                  thread count for both backends (default: --threads-gen)\n"
             "    --bench-backend qquant|upstream|both\n"
             "                                       which backends to bench (default both)\n"
             "\n",
@@ -110,6 +111,7 @@ int main(int argc, char ** argv) {
     int  bench_pp_n             = 64;
     int  bench_tg_n             = 64;
     int  bench_reps             = 3;
+    int  bench_threads          = 0;       // 0 = inherit from --threads-gen/--threads-prefill
     std::string bench_backend   = "both";  // qquant | upstream | both
 
     for (int i = 1; i < argc; ++i) {
@@ -219,6 +221,8 @@ int main(int argc, char ** argv) {
                 bench_tg_n = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--bench-reps") == 0 && i + 1 < argc) {
                 bench_reps = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--bench-threads") == 0 && i + 1 < argc) {
+                bench_threads = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--bench-backend") == 0 && i + 1 < argc) {
                 bench_backend = argv[++i];
                 if (bench_backend != "qquant" && bench_backend != "upstream" && bench_backend != "both") {
@@ -477,8 +481,9 @@ int main(int argc, char ** argv) {
         bp.pp_n             = bench_pp_n;
         bp.tg_n             = bench_tg_n;
         bp.reps             = bench_reps;
-        bp.n_threads        = n_threads_gen > 0 ? n_threads_gen
-                              : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        bp.n_threads        = bench_threads > 0 ? bench_threads
+                              : (n_threads_gen > 0 ? n_threads_gen
+                              : (n_threads_prefill > 0 ? n_threads_prefill : 4));
         bp.include_qquant   = (bench_backend == "qquant"   || bench_backend == "both");
         bp.include_upstream = (bench_backend == "upstream" || bench_backend == "both");
         bp.seed             = cli_seed != LLAMA_DEFAULT_SEED ? cli_seed : 1234u;

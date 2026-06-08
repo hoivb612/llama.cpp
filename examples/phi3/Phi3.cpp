@@ -16,7 +16,7 @@
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--phi3-fused-qquant-a56] [--phi3-bench [--bench-pp N] [--bench-tg N] [--bench-reps N] [--bench-backend qquant|upstream|both]] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
+    printf("\n    %s -m Phi-3-mini-4k-instruct.gguf [-p \"where is Paris\"] [-c 4096] [-ngl 99] [-n 256] [-s 1234] [--temp 0.0] [--min-p 0.05] [--threads-prefill 32] [--threads-gen 8] [--threads-gen-auto] [--phi3-fused-lmhead] [--phi3-fused-decode] [--phi3-dump-weights] [--phi3-test-kv] [--phi3-matmul-test] [--phi3-kernel-test] [--phi3-validate-fused] [--phi3-layer-test] [--phi3-full-test] [--phi3-qmatmul-test] [--phi3-fused-f32-debug] [--phi3-fused-f32-n-gen N] [--phi3-fused-qquant-debug] [--phi3-fused-qquant-n-gen N] [--phi3-fused-qquant-threads N] [--phi3-fused-qquant-regress [N]] [--phi3-fused-qquant-rmsnorm-fuse 0|1] [--phi3-fused-qquant-attn-parallel 0|1] [--phi3-fused-qquant-hybrid 0|1] [--phi3-fused-qquant-ab] [--phi3-fused-qquant-ab-ngen N] [--phi3-fused-qquant-ab-ngen-compare N] [--phi3-fused-qquant-profile] [--phi3-fused-qquant-save-kv PATH] [--phi3-fused-qquant-load-kv PATH] [--phi3-fused-qquant-load-kv-strict] [--phi3-fused-qquant-a56] [--phi3-bench [--bench-pp N] [--bench-tg N] [--bench-reps N] [--bench-threads N] [--bench-backend qquant|upstream|both]] [--repack-ggml|--repack-xbox|--repack-xbcg]\n", argv[0]);
     printf("\n");
 }
 
@@ -110,6 +110,7 @@ int main(int argc, char ** argv) {
     int  bench_pp_n             = 64;
     int  bench_tg_n             = 64;
     int  bench_reps             = 3;
+    int  bench_threads          = 0;       // 0 = inherit from --phi3-fused-qquant-threads/--threads-gen
     std::string bench_backend   = "both";  // qquant | upstream | both
     ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
 
@@ -334,6 +335,9 @@ int main(int argc, char ** argv) {
             } else if (strcmp(argv[i], "--bench-reps") == 0) {
                 if (i + 1 < argc) bench_reps = std::stoi(argv[++i]);
                 else { print_usage(argc, argv); return 1; }
+            } else if (strcmp(argv[i], "--bench-threads") == 0) {
+                if (i + 1 < argc) bench_threads = std::stoi(argv[++i]);
+                else { print_usage(argc, argv); return 1; }
             } else if (strcmp(argv[i], "--bench-backend") == 0) {
                 if (i + 1 < argc) {
                     bench_backend = argv[++i];
@@ -498,9 +502,9 @@ int main(int argc, char ** argv) {
         bp.pp_n               = bench_pp_n;
         bp.tg_n               = bench_tg_n;
         bp.reps               = bench_reps;
-        bp.n_threads          = fused_qquant_threads > 0
-                                    ? fused_qquant_threads
-                                    : (n_threads_gen > 0 ? n_threads_gen : 1);
+        bp.n_threads          = bench_threads > 0 ? bench_threads
+                                : (fused_qquant_threads > 0 ? fused_qquant_threads
+                                : (n_threads_gen > 0 ? n_threads_gen : 1));
         bp.include_qquant     = (bench_backend == "qquant"   || bench_backend == "both");
         bp.include_upstream   = (bench_backend == "upstream" || bench_backend == "both");
         bp.fuse_rmsnorm_quant = fused_qquant_rmsnorm_fuse != 0;

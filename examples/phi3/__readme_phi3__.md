@@ -908,6 +908,10 @@ Cached prefill (A5.5/A5.6) — mutually exclusive
   --bench-reps N                   Measured repeats per test (default 3).
                                    One implicit warmup pass per test is
                                    always discarded.
+  --bench-threads N                Thread count for both backends. When
+                                   set, overrides the default resolution
+                                   (--phi3-fused-qquant-threads →
+                                   --threads-gen → 1).
   --bench-backend qquant|upstream|both
                                    Which backends to bench (default both).
                                    qquant honours --phi3-fused-qquant-
