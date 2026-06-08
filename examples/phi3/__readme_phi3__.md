@@ -951,3 +951,12 @@ Quick recipes
   Phi3.exe -m M.gguf --phi3-bench --bench-backend qquant \
            --bench-pp 128 --bench-tg 128 \
            --phi3-fused-qquant-attn-parallel 1 --threads-gen 8
+
+========================================================================
+
+ - Gemma4: --bench-threads > --threads-gen > --threads-prefill > 4
+ - Phi3:   --bench-threads > --phi3-fused-qquant-threads > --threads-gen > 1
+
+ Sub-flags (both binaries): --bench-pp N --bench-tg N --bench-reps N --bench-backend qquant|upstream|both. On Phi-3,--phi3-fused-qquant-rmsnorm-fuse / --phi3-fused-qquant-attn-parallel / --phi3-fused-qquant-threads are honored when picking theqquant configuration.
+
+ 
