@@ -175,18 +175,18 @@ int main(int argc, char **argv) {
         printf("text: '%s'\n\n", text.c_str());
 
         // tokenize with parse_special == false
-        const std::vector<llama_token> res = llama_tokenize(ctx, text, false, false);
+        const std::vector<llama_token> res = common_tokenize(ctx, text, false, false);
         printf("parse_special == false:\n");
         for (const auto & tok : res) {
-            printf("\t%7d ('%s')\n", tok, llama_token_to_piece(ctx, tok).c_str());
+            printf("\t%7d ('%s')\n", tok, common_token_to_piece(ctx, tok).c_str());
         }
         printf("\n");
 
         // tokenize with parse_special == true
-        const std::vector<llama_token> res2 = llama_tokenize(ctx, text, false, true);
+        const std::vector<llama_token> res2 = common_tokenize(ctx, text, false, true);
         printf("parse_special  == true:\n");
         for (const auto & tok : res2) {
-            printf("\t%7d ('%s')\n", tok, llama_token_to_piece(ctx, tok).c_str());
+            printf("\t%7d ('%s')\n", tok, common_token_to_piece(ctx, tok).c_str());
         }
         printf("\n");
 

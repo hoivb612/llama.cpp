@@ -191,7 +191,13 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
         }
     }
 
+#ifdef GGML_B612
+    // B612 renames the exported fp32->fp16 row helper to _org; the unsuffixed
+    // name is a per-DLL dispatched variant and is not in the import library.
+    ggml_fp32_to_fp16_row_org(data_f32.data(), data_f16.data(), ne0*ne1*ne2*ne3);
+#else
     ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), ne0*ne1*ne2*ne3);
+#endif
 
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
