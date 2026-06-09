@@ -21,7 +21,7 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_outputs);
 
 // Get the default ggml_type for a given ftype.
-LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+LLAMA_API enum ggml_type llama_ftype_get_default_type(enum llama_ftype ftype);
 
 struct quantize_state_impl;
 
@@ -58,9 +58,9 @@ LLAMA_API bool llama_quant_tensor_allows_quantization(
 // result_types: caller-allocated array of n_tensors elements, filled with assigned types.
 LLAMA_API void llama_quant_compute_types(
         struct quantize_state_impl * qs,
-        llama_ftype ftype,
+        enum llama_ftype ftype,
         struct ggml_tensor ** tensors,
-        ggml_type * result_types,
+        enum ggml_type * result_types,
         size_t n_tensors);
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
