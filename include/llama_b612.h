@@ -80,6 +80,40 @@ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
 
+//
+// nextn embeddings (hidden state before the final output norm) -- upstream NEXTN MTP draft heads
+//
+
+// Set whether the context outputs nextn embeddings or not
+// If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+// If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
+// LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// Set whether the context outputs the input embeddings of a specific layer
+LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+//
+// model/context data extraction
+//
+
+// returns pointer to the target-model layer indices
+LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
+// returns the number of extracted layers from target model
+LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
 // Phi3 Phase C: skip the lm_head matmul (and logits buffer write) on each decode.
 // When enabled, the standard graph's output tensor (post-final-norm hidden state)
 // is exposed via the embeddings buffer (llama_get_embeddings_ith) and the caller
