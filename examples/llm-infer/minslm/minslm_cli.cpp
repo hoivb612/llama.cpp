@@ -1,13 +1,23 @@
 // minslm_cli - Cross-platform LLM inference benchmark
 // Self-contained: no dependency on llm-infer.h/cpp, Windows headers, or hnswlib.
 // Builds on Linux, WSL2, macOS, and Windows.
-// Links directly against libllama (same as llama-cli).
+// Links against libllama plus libllama-common (for speculative decoding wiring).
 //
 // Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [stream]
 //                   [-d N] [-sm none|layer|row] [--weight-budget MB] [-fa on|off|auto]
+//                   [--spec-type TYPE[,TYPE,...]] [--spec-draft-n-max N]
+//                   [--spec-draft-model PATH]
 
 #include "llama.h"
 #include "ggml-backend.h"
+
+// Speculative decoding wiring from libllama-common. Only the symbols needed
+// for parsing --spec-type, building common_speculative, and running the
+// sample-and-accept loop are used; we keep the existing direct-llama sampler
+// for the non-spec path so default behavior is unchanged.
+#include "common.h"
+#include "sampling.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cassert>
@@ -200,7 +210,38 @@ struct cli_params {
 #else
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 #endif
+
+    // --- Speculative decoding ---
+    // When `spec_types` contains anything other than COMMON_SPECULATIVE_TYPE_NONE
+    // we run the prompt through common_speculative + common_sampler instead of
+    // the default direct-llama sampler chain. draft-* variants additionally
+    // require a draft model via --spec-draft-model.
+    std::vector<enum common_speculative_type> spec_types;
+    int32_t                                   spec_draft_n_max = 3;
+    std::string                               spec_draft_model_path;
 };
+
+// True iff any of `types` is a draft-model-backed speculative type
+// (draft-simple / draft-eagle3 / draft-mtp). ngram-* types are
+// self-speculative and don't need a separate draft model.
+static bool spec_types_need_draft_model(const std::vector<common_speculative_type> & types) {
+    for (auto t : types) {
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True iff `types` contains any non-NONE speculative type.
+static bool spec_types_enabled(const std::vector<common_speculative_type> & types) {
+    for (auto t : types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE) return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -211,6 +252,9 @@ int main(int argc, char ** argv) {
 
     if (argc < 2 || argv[1][0] == '-') {
         printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB|-fa on|off|auto]\n", argv[0]);
+        printf("              [--spec-type TYPE[,TYPE,...]] [--spec-draft-n-max N] [--spec-draft-model PATH]\n");
+        printf("\n  Speculative-decoding types (comma separated): %s\n", common_speculative_all_types_str());
+        printf("    draft-* types require --spec-draft-model; ngram-* types are self-speculative.\n");
         return 1;
     }
 
@@ -258,9 +302,43 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--spec-type") && i + 1 < argc) {
+            const auto names = string_split<std::string>(std::string(argv[++i]), ',');
+            std::vector<common_speculative_type> types;
+            try {
+                types = common_speculative_types_from_names(names);
+            } catch (const std::exception & e) {
+                fprintf(stderr, "Error: --spec-type: %s. Valid types: %s\n",
+                        e.what(), common_speculative_all_types_str());
+                return 1;
+            }
+            p.spec_types.insert(p.spec_types.end(), types.begin(), types.end());
+        }
+        else if (!strcmp(argv[i], "--spec-draft-n-max") && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v < 0) {
+                fprintf(stderr, "Error: --spec-draft-n-max must be >= 0, got %d\n", v);
+                return 1;
+            }
+            p.spec_draft_n_max = v;
+        }
+        else if (!strcmp(argv[i], "--spec-draft-model") && i + 1 < argc) {
+            p.spec_draft_model_path = argv[++i];
+        }
         else {
             fprintf(stderr, "Warning: unknown argument '%s' ignored\n", argv[i]);
         }
+    }
+
+    // Validate the speculative-decoding setup once, before model load.
+    if (spec_types_need_draft_model(p.spec_types) && p.spec_draft_model_path.empty()) {
+        fprintf(stderr, "Error: --spec-type contains a draft-model variant (draft-simple/draft-eagle3/draft-mtp)\n"
+                        "       but --spec-draft-model PATH was not provided.\n");
+        return 1;
+    }
+    if (!p.spec_draft_model_path.empty() && !spec_types_need_draft_model(p.spec_types)) {
+        fprintf(stderr, "Warning: --spec-draft-model is set but --spec-type does not include a draft-model variant; the draft model will not be loaded.\n");
+        p.spec_draft_model_path.clear();
     }
 
     // --- Parse prompt file ---
@@ -346,6 +424,92 @@ int main(int argc, char ** argv) {
            p.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO ? " (runtime-selected)" : "");
     printf("[%s]: system_info: %s\n", __func__, llama_print_system_info());
 
+    // --- Optional speculative-decoding setup ---
+    // The draft model + draft context + common_speculative live for the
+    // lifetime of the program when --spec-type is provided. When no
+    // draft-model variant is selected (spec disabled or pure ngram-* types)
+    // ctx_dft / model_dft stay null.
+    const bool spec_enabled = spec_types_enabled(p.spec_types);
+    llama_model   * model_dft = nullptr;
+    llama_context * ctx_dft   = nullptr;
+    common_speculative * spec = nullptr;
+    common_params spec_cparams; // owns the speculative config that `spec` reads
+
+    if (spec_enabled) {
+        spec_cparams.speculative.types         = p.spec_types;
+        spec_cparams.speculative.draft.n_max   = p.spec_draft_n_max;
+        spec_cparams.speculative.draft.ctx_tgt = ctx;
+
+        if (!p.spec_draft_model_path.empty()) {
+            // Reuse the target-model load knobs that make sense for the draft
+            // model: GPU layers, main GPU, split mode, mmap, direct-IO. We do
+            // NOT propagate the weight-budget envvar -- draft models are
+            // typically small and layer windowing would hurt more than help.
+            llama_model_params dft_mparams = llama_model_default_params();
+            dft_mparams.n_gpu_layers = model_params.n_gpu_layers;
+            dft_mparams.main_gpu     = model_params.main_gpu;
+            dft_mparams.split_mode   = model_params.split_mode;
+            dft_mparams.use_mmap     = model_params.use_mmap;
+            dft_mparams.use_direct_io = model_params.use_direct_io;
+
+            model_dft = llama_model_load_from_file(p.spec_draft_model_path.c_str(), dft_mparams);
+            if (!model_dft) {
+                fprintf(stderr, "Error: failed to load draft model '%s'\n", p.spec_draft_model_path.c_str());
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            llama_context_params dft_cparams = llama_context_default_params();
+            dft_cparams.n_ctx          = p.n_ctx;
+            dft_cparams.n_batch        = p.n_batch;
+            dft_cparams.n_threads      = p.n_threads;
+            dft_cparams.n_threads_batch = p.n_threads;
+            dft_cparams.no_perf        = false;
+            dft_cparams.flash_attn_type = p.flash_attn_type;
+
+            // draft-mtp / eagle3 / gemma4-assistant draft models require the
+            // target context to be wired in via cparams.ctx_other so the draft
+            // graph can reach the target hparams/memory. Mirrors the setup in
+            // tools/server/server-context.cpp.
+            const bool spec_mtp = std::find(p.spec_types.begin(), p.spec_types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != p.spec_types.end();
+            if (spec_mtp) {
+                dft_cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                dft_cparams.n_rs_seq = 0;
+            }
+            dft_cparams.ctx_other = ctx;
+
+            ctx_dft = llama_init_from_model(model_dft, dft_cparams);
+            if (!ctx_dft) {
+                fprintf(stderr, "Error: failed to create draft context\n");
+                llama_model_free(model_dft);
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            spec_cparams.speculative.draft.ctx_dft = ctx_dft;
+        }
+
+        spec = common_speculative_init(spec_cparams.speculative, /*n_seq=*/1);
+        if (!spec) {
+            fprintf(stderr, "Error: common_speculative_init failed\n");
+            if (ctx_dft)   llama_free(ctx_dft);
+            if (model_dft) llama_model_free(model_dft);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        printf("[%s]: speculative decoding enabled (types=%s, n_max=%d%s%s)\n",
+               __func__,
+               common_speculative_type_name_str(p.spec_types).c_str(),
+               p.spec_draft_n_max,
+               p.spec_draft_model_path.empty() ? "" : ", draft=",
+               p.spec_draft_model_path.c_str());
+    }
+
     // NOTE: upstream removed llama_memory_breakdown_print() from the public
     // libllama API (PR #22171, "fit-params: refactor"). The breakdown printer
     // now lives in libcommon as common_memory_breakdown_print(). minslm-cli
@@ -381,9 +545,275 @@ int main(int argc, char ** argv) {
 
         // Clear KV cache for each prompt (no prefix-cache in this version)
         llama_memory_clear(llama_get_memory(ctx), true);
+        if (spec_enabled && ctx_dft) llama_memory_clear(llama_get_memory(ctx_dft), true);
 
         // Tokenize (add_special=false, parse_special=true — same as minslminfer)
         std::vector<llama_token> tokens = tokenize(ctx, full_prompt, false, true);
+
+        // -----------------------------------------------------------------
+        // Speculative-decoding fast-path: when enabled, prefill all-but-last
+        // into both contexts, then run the common_speculative + common_sampler
+        // sample-and-accept loop. Falls through `continue` to the next
+        // prompt so the non-spec code below is bypassed.
+        // -----------------------------------------------------------------
+        if (spec_enabled) {
+            if (tokens.size() < 2) {
+                fprintf(stderr, "Error: speculative decoding requires a prompt of at least 2 tokens\n");
+                goto cleanup;
+            }
+
+            const int n_pref = (int)tokens.size() - 1;
+            const llama_seq_id pref_seq_id = 0;
+
+            int64_t t1 = timer_us();
+            // common_speculative_process requires a fully-populated llama_batch
+            // (n_seq_id/seq_id/pos arrays present). llama_batch_get_one returns
+            // a minimal batch that crashes the spec impl, so build a proper
+            // batch via common_batch_add for the entire prefill.
+            llama_batch pref_batch = llama_batch_init(p.n_batch, 0, 1);
+            for (int i = 0; i < n_pref; i += p.n_batch) {
+                int n_eval = std::min(n_pref - i, p.n_batch);
+                common_batch_clear(pref_batch);
+                for (int k = 0; k < n_eval; ++k) {
+                    common_batch_add(pref_batch, tokens[i + k], i + k, { pref_seq_id }, false);
+                }
+                if (llama_decode(ctx, pref_batch)) {
+                    fprintf(stderr, "Error: llama_decode failed during target prefill (spec)\n");
+                    llama_batch_free(pref_batch);
+                    goto cleanup;
+                }
+                // Drives draft-context prefill internally (decodes dft for
+                // DRAFT_SIMPLE; for MTP it shifts target's NEXTN embeddings
+                // into the impl's pending buffer to seed the next draft).
+                if (!common_speculative_process(spec, pref_batch)) {
+                    fprintf(stderr, "Error: common_speculative_process failed during prefill\n");
+                    llama_batch_free(pref_batch);
+                    goto cleanup;
+                }
+            }
+            llama_batch_free(pref_batch);
+            llama_synchronize(ctx);
+            if (ctx_dft) llama_synchronize(ctx_dft);
+            int64_t t2 = timer_us();
+
+            if (p.verbose >= 2) {
+                float pp_ms = (t2 - t1) / 1000.0f;
+                printf("  prefill: %.1fms (%d tokens, %.1f t/s)\n",
+                       pp_ms, n_pref, n_pref * 1000.0f / pp_ms);
+            }
+
+            // Mirror the direct-llama sampler chain used in the non-spec path.
+            // Field assignments below match the llama_sampler_init_* calls
+            // there so output distributions stay comparable.
+            common_params_sampling sparams;
+            sparams.seed              = 42;
+            sparams.top_k             = 40;
+            sparams.top_p             = 0.9f;
+            sparams.min_p             = 0.0f;
+            sparams.temp              = 0.3f;
+            sparams.penalty_last_n    = 128;
+            sparams.penalty_repeat    = 1.3f;
+            sparams.penalty_freq      = 0.1f;
+            sparams.penalty_present   = 0.1f;
+            sparams.dry_multiplier    = 0.8f;
+            sparams.dry_base          = 1.75f;
+            sparams.dry_allowed_length = 2;
+            sparams.dry_penalty_last_n = 2048;
+            sparams.dry_sequence_breakers = { "\n", ":", "\"", "*" };
+
+            common_sampler * smpl = common_sampler_init(model, sparams);
+            if (!smpl) {
+                fprintf(stderr, "Error: common_sampler_init failed\n");
+                goto cleanup;
+            }
+
+            const llama_seq_id seq_id = 0;
+            llama_tokens prompt_tgt(tokens.begin(), tokens.end() - 1);
+            prompt_tgt.reserve(llama_n_ctx(ctx));
+            llama_token id_last = tokens.back();
+            int         n_past  = n_pref;
+
+            common_speculative_begin(spec, seq_id, prompt_tgt);
+
+            llama_batch  batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+            llama_tokens draft;
+
+            int max_gen = std::min(p.n_len - (int)tokens.size(), 128);
+            if (max_gen < 0) max_gen = 0;
+
+            std::string output;
+            int    n_gen        = 0;
+            int    n_emit       = 0;
+            int    n_drafted    = 0;
+            int    n_accept     = 0;
+            size_t empty_pieces = 0;
+            std::vector<llama_token> empty_ids; empty_ids.reserve(16);
+            std::vector<llama_token> all_ids;   all_ids.reserve((size_t)max_gen);
+
+            int64_t t3 = timer_us();
+            int64_t t_first_tok = 0;
+            bool    stop_brace  = false;
+            bool    stop_eog    = false;
+
+            while (n_gen < max_gen) {
+                // Generate a fresh draft for this round (no carry-over;
+                // we never partial-restore the target context so each round
+                // starts from a clean draft).
+                if (draft.empty()) {
+                    common_speculative_get_draft_params(spec, seq_id) = {
+                        /*.drafting =*/ true,
+                        /*.n_max    =*/ -1,
+                        /*.n_past   =*/ n_past,
+                        /*.id_last  =*/ id_last,
+                        /*.prompt   =*/ &prompt_tgt,
+                        /*.result   =*/ &draft,
+                    };
+                    common_speculative_draft(spec);
+                }
+
+                // Target batch: [id_last, draft[0..N)]
+                common_batch_clear(batch_tgt);
+                common_batch_add(batch_tgt, id_last, n_past, { seq_id }, true);
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(batch_tgt, draft[i], n_past + 1 + (int)i, { seq_id }, true);
+                }
+
+                if (llama_decode(ctx, batch_tgt)) {
+                    fprintf(stderr, "Error: target llama_decode failed during spec round\n");
+                    llama_batch_free(batch_tgt);
+                    common_sampler_free(smpl);
+                    goto cleanup;
+                }
+                // Replaces explicit llama_decode(ctx_dft, batch_tgt): the impl
+                // handles draft-context updates correctly for every spec type
+                // (DRAFT_SIMPLE decodes dft; MTP/EAGLE3 are no-ops here since
+                // they generate from the target's NEXTN embeddings instead).
+                if (!common_speculative_process(spec, batch_tgt)) {
+                    fprintf(stderr, "Error: common_speculative_process failed during spec round\n");
+                    llama_batch_free(batch_tgt);
+                    common_sampler_free(smpl);
+                    goto cleanup;
+                }
+
+                // Sample from the target batch, accepting as many draft
+                // tokens as match the target's choice. ids.size() >= 1 always
+                // (the post-id_last token is always sampled fresh).
+                auto ids = common_sampler_sample_and_accept_n(smpl, ctx, draft);
+
+                common_speculative_accept(spec, seq_id, (uint16_t)(ids.size() - 1));
+
+                // Advance past id_last + accepted drafts. The freshly sampled
+                // token (ids.back()) becomes the next id_last.
+                n_past    += (int)ids.size();
+                n_drafted += (int)draft.size();
+                n_accept  += (int)ids.size() - 1;
+
+                for (size_t i = 0; i < ids.size() && n_gen < max_gen; ++i) {
+                    prompt_tgt.push_back(id_last);
+                    id_last = ids[i];
+
+                    if (llama_vocab_is_eog(vocab, id_last)) {
+                        stop_eog = true;
+                        break;
+                    }
+
+                    if (t_first_tok == 0) t_first_tok = timer_us();
+                    n_emit++;
+
+                    std::string piece = token_to_piece(ctx, id_last);
+                    all_ids.push_back(id_last);
+                    if (piece.empty()) {
+                        ++empty_pieces;
+                        if (empty_ids.size() < 16) empty_ids.push_back(id_last);
+                    }
+                    if (p.streaming) {
+                        printf("%s", piece.c_str());
+                        fflush(stdout);
+                    } else {
+                        output += piece;
+                    }
+
+                    n_gen++;
+
+                    if (piece.find('}') != std::string::npos) {
+                        stop_brace = true;
+                        break;
+                    }
+                }
+
+                if (stop_eog || stop_brace) {
+                    if (p.streaming) printf("\n");
+                    break;
+                }
+
+                draft.clear();
+
+                // Trim any unverified draft tokens past the committed n_past
+                // from both KV caches before the next round.
+                llama_memory_seq_rm(llama_get_memory(ctx),     seq_id, n_past, -1);
+                if (ctx_dft) llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
+            }
+
+            llama_synchronize(ctx);
+            if (ctx_dft) llama_synchronize(ctx_dft);
+            int64_t t4 = timer_us();
+            int64_t tg_us       = t4 - t3;
+            int64_t ttft_us     = t_first_tok > 0 ? (t_first_tok - t3) : 0;
+            int64_t tg_core_us  = t_first_tok > 0 ? (t4 - t_first_tok) : 0;
+            total_tokens_generated += n_gen;
+            total_tokens_emitted   += n_emit;
+            total_tg_us            += tg_us;
+            total_tg_core_us       += tg_core_us;
+            total_ttft_us          += ttft_us;
+
+            llama_batch_free(batch_tgt);
+            common_sampler_free(smpl);
+
+            if (!p.streaming) {
+                if (!output.empty()) {
+                    std::string esc;
+                    esc.reserve(output.size() + 16);
+                    size_t nuls = 0;
+                    size_t ctrl = 0;
+                    for (unsigned char c : output) {
+                        if (c == 0) {
+                            esc += "\\x00";
+                            ++nuls;
+                        } else if (c < 0x20 && c != '\n' && c != '\t' && c != '\r') {
+                            char buf[5];
+                            snprintf(buf, sizeof(buf), "\\x%02X", c);
+                            esc += buf;
+                            ++ctrl;
+                        } else {
+                            esc += (char)c;
+                        }
+                    }
+                    fwrite(esc.data(), 1, esc.size(), stdout);
+                    putchar('\n');
+                    fflush(stdout);
+                    if (p.verbose >= 2 && (nuls || ctrl || empty_pieces)) {
+                        printf("  [output diag: bytes=%zu nuls=%zu other_ctrl=%zu empty_pieces=%zu/%d]\n",
+                               output.size(), nuls, ctrl, empty_pieces, n_gen);
+                    }
+                }
+            }
+
+            if (p.verbose >= 2 && n_gen > 0) {
+                printf("  decode: %.1fms (%d tokens, %.2f t/s)\n",
+                       tg_us / 1000.0f, n_gen, n_gen / (tg_us / 1000000.0f));
+                if (n_emit > 0 && tg_core_us > 0) {
+                    printf("  decode (no-TTFT): %.1fms (%d tokens, %.2f t/s) [TTFT %.1fms]\n",
+                           tg_core_us / 1000.0f, n_emit, n_emit / (tg_core_us / 1000000.0f), ttft_us / 1000.0f);
+                }
+                if (n_drafted > 0) {
+                    printf("  spec:   drafted=%d accepted=%d (%.1f%%)\n",
+                           n_drafted, n_accept, 100.0f * n_accept / n_drafted);
+                }
+            }
+
+            if (p.verbose >= 1) printf("\n");
+            continue;
+        }
 
         // --- Prompt eval (prefill) ---
         int64_t t1 = timer_us();
@@ -597,6 +1027,9 @@ int main(int argc, char ** argv) {
     }
 
 cleanup:
+    if (spec)      common_speculative_free(spec);
+    if (ctx_dft)   llama_free(ctx_dft);
+    if (model_dft) llama_model_free(model_dft);
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
