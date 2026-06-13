@@ -124,7 +124,15 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             cpp += fmt("static const unsigned char asset_%d_data[] = {", i);
-            append_bytes_hex(cpp, bytes);
+            if (bytes.empty()) {
+                // C++ disallows zero-length arrays of a fixed type; emit a
+                // single sentinel byte and report the real (zero) size to
+                // consumers so an empty asset (e.g. an unprovisioned
+                // build.json) still produces valid C++.
+                cpp += "0x00,";
+            } else {
+                append_bytes_hex(cpp, bytes);
+            }
             const auto hash = fnv_hash(bytes.data(), bytes.size());
 
             cpp += fmt("};\nstatic const size_t        asset_%d_size = %zu;\n",
