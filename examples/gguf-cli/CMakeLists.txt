@@ -1,0 +1,6 @@
+set(TARGET gguf-cli)
+add_executable(${TARGET} GGUF-cli.cpp)
+set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME GGUF-cli)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
