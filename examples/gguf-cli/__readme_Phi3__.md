@@ -264,18 +264,45 @@ This is the one and only point where GGUF weight data flows directly into the ac
 
   A layer = attention sublayer then FFN sublayer, each with a residual add.
 
+ h_I_in  = e_I  = [0.2, -0.1, 0.5, 0.0]     ← from token_embd, dequantized
+ h_am_in = e_am = [0.1,  0.3, -0.2, 0.4]
+
+Each token projects Query/Key/Value from its hidden state using the layer's attn_qkv.weight (from GGUF):
+
+ q_I  = Wq · e_I     k_I  = Wk · e_I     v_I  = Wv · e_I
+ q_am = Wq · e_am    k_am = Wk · e_am    v_am = Wv · e_am
+
+So e_I and e_am are consumed right here — they're the raw material the Q/K/V matmuls operate on. Then for "am":
+
+ scores  = [ q_am·k_I , q_am·k_am ] / sqrt(d_head)
+ w       = softmax(scores)
+ attn_am = w[0]·v_I + w[1]·v_am
+ h_am'   = e_am + attn_am          ← residual on top of the embedding
+ h0_am   = h_am' + FFN(norm(h_am'))
+
+e_am appears twice: once as the source of q_am/k_am/v_am, and once as the residual base (e_am + attn_am). Same for e_I. So the embeddings are very much part of layer 0 — I just folded them into the generic h symbols without spelling it out.
+
   (a) Attention — the ONLY place columns interact. Causal:
 
    - Position 0 ("I") may attend to {pos 0} only → it can just look at itself.
    - Position 1 ("am") may attend to {pos 0, pos 1} → it looks at "I" and itself.
 
+  Compute scores for the attention:
+  scores = [ q_am·k_I , q_am·k_am ] / sqrt(d_head)
+  w      = softmax(scores)
+
+ - q_am, k_I, k_am are produced by the learned Wq/Wk (from the GGUF) applied to the actual hidden states.
+ - The two dot products are just real numbers; softmax turns them into a probability distribution that sums to 1.
+ - Whatever those dot products happen to be for this specific model and these specific tokens determines the split. It could be [0.5, 0.5], [0.1, 0.9], etc. 
+   Let's pick [0.4, 0.6] arbitrarily to show the mechanism (a weighted blend), not because the model produces that.
+  
   For "am":
 
    q_am = Wq · h_am
-   scores = [ q_am·k_I ,  q_am·k_am ]      # two numbers
-   w      = softmax(scores) = [0.4, 0.6]   # e.g. 40% weight on "I", 60% on itself
-   attn_am = 0.4·v_I + 0.6·v_am            # a blend of both tokens' values
-   h_am = h_am + attn_am                   # residual: "am" now contains some "I" info
+   scores = [ q_am·k_I ,  q_am·k_am ] / sqrt(d_head)     # two numbers
+   w      = softmax(scores) = [0.4, 0.6]                 # e.g. 40% weight on "I", 60% on itself as example ratio from data
+   attn_am = 0.4·v_I + 0.6·v_am                          # a blend of both tokens' values
+   h_am = h_am + attn_am                                 # residual: "am" now contains some "I" info
 
   For "I": it only sees itself, so attn_I = v_I, h_I = h_I + v_I.
 
@@ -286,7 +313,8 @@ This is the one and only point where GGUF weight data flows directly into the ac
    h_I  = h_I  + FFN(norm(h_I))     # independent
    h_am = h_am + FFN(norm(h_am))    # independent
 
-  Output of layer 0: h0_I = [·], h0_am = [·]. Both become the input columns to layer 1. There is no "the last token from layer 0 flows into layer 1" — both flow.
+  Output of layer 0: h0_I = [· · · · ], h0_am = [· · · ·]. 
+  Both become the input columns to layer 1. There is no "the last token from layer 0 flows into layer 1" — both flow.
 
   ---------------------------------------------------------------------------------------------------------------------------
 
