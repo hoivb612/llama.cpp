@@ -21,6 +21,12 @@ BOOLEAN log_data = FALSE;               // used to turn on data logging
 BOOLEAN show_improve = FALSE;           // used to show improvement data
 
 //
+// Overall accuracy mismatch total.
+//
+
+uint32_t accuracy_mismatch = 0;
+
+//
 // Define vector size.
 //
 
@@ -11618,6 +11624,8 @@ test_dot_q4_0_q8_0_repack (
 
     fprintf(logfile, "number of mismatches %u\n\n", mismatch);
 
+    accuracy_mismatch += mismatch;
+
 exit:
     if (x) {
         zfree(x);
@@ -11768,6 +11776,8 @@ test_dot_q2_k_q8_k_repack (
     }
 
     fprintf(logfile, "number of mismatches %u\n\n", mismatch);
+
+    accuracy_mismatch += mismatch;
 
 exit:
     if (x) {
@@ -11920,6 +11930,8 @@ test_dot_q3_k_q8_k_repack (
 
     fprintf(logfile, "number of mismatches %u\n\n", mismatch);
 
+    accuracy_mismatch += mismatch;
+
 exit:
     if (x) {
         zfree(x);
@@ -12071,6 +12083,8 @@ test_dot_q4_k_q8_k_repack (
 
     fprintf(logfile, "number of mismatches %u\n\n", mismatch);
 
+    accuracy_mismatch += mismatch;
+
 exit:
     if (x) {
         zfree(x);
@@ -12221,6 +12235,8 @@ test_dot_q6_k_q8_k_repack (
     }
 
     fprintf(logfile, "number of mismatches %u\n\n", mismatch);
+
+    accuracy_mismatch += mismatch;
 
 exit:
     if (x) {
@@ -12385,6 +12401,8 @@ test_dot_q8_0_q8_0_repack (
     }
 
     fprintf(logfile, "number of mismatches %u\n\n", mismatch);
+
+    accuracy_mismatch += mismatch;
 
 exit:
     if (x) {
@@ -14992,17 +15010,17 @@ main (
     // Compute the performance of repack vector dot operations.
     //
 
-    vec_dot_q2_k_q8_k_repack(vector_size, 5);
+    vec_dot_q2_k_q8_k_repack(vector_size, 10);
 
-    vec_dot_q3_k_q8_k_repack(vector_size, 5);
+    vec_dot_q3_k_q8_k_repack(vector_size, 10);
 
-    vec_dot_q4_k_q8_k_repack(vector_size, 5);
+    vec_dot_q4_k_q8_k_repack(vector_size, 10);
 
-    vec_dot_q6_k_q8_k_repack(vector_size, 5);
+    vec_dot_q6_k_q8_k_repack(vector_size, 10);
 
-    vec_dot_q4_0_q8_0_repack(vector_size, 5);
+    vec_dot_q4_0_q8_0_repack(vector_size, 10);
 
-    vec_dot_q8_0_q8_0_repack(vector_size, 5);
+    vec_dot_q8_0_q8_0_repack(vector_size, 10);
 
     //
     // Compute the performance of combinied quantize/vector dot operations.
@@ -15037,33 +15055,56 @@ main (
             int64_t best_time_second = improve_table[j].best_time_second;
             char * type_second = improve_table[j].type_second;
             int64_t iter = improve_table[j].iter;
-    
-            best_time_second = max(1, best_time_second);
-            float multiple = (float)best_time_first / (float)best_time_second;
-            fprintf(logfile, "%s %s is %5.2f x speed of %s\n",
-                    text,
-                    type_second,
-                    multiple,
-                    type_first);
 
-            if (show_improve) {
-                printf("%s %s is %5.2f x speed of %s\n",
-                       text,
-                       type_second,
-                       multiple,
-                       type_first);
+            best_time_first = max(1, best_time_first);
+            best_time_second = max(1, best_time_second);
+
+            float time_first = (float)best_time_first;
+            float time_second = (float)best_time_second;
+
+            if (best_time_first >= best_time_second) {
+                float speed_up = (time_first - time_second) * 100.f / time_first;
+                fprintf(logfile, "%s %s is %5.2f%% faster than %s\n",
+                        text,
+                        type_second,
+                        speed_up,
+                        type_first);
+    
+                if (show_improve) {
+                    printf("%s %s is %5.2f%% faster than %s\n",
+                           text,
+                           type_second,
+                           speed_up,
+                           type_first);
+                }
+
+            } else {
+                float speed_up = (time_second - time_first) * 100.f / time_second;
+                fprintf(logfile, "%s %s is %5.2f%% faster than %s\n",
+                        text,
+                        type_first,
+                        speed_up,
+                        type_second);
+    
+                if (show_improve) {
+                    printf("%s %s is %5.2f%% faster than %s\n",
+                           text,
+                           type_first,
+                           speed_up,
+                           type_second);
+                }
             }
         
             fprintf(logfile, "  loop iterations %zd\n", iter);
-            fprintf(logfile, "  best %s time %zdns\n", type_first, best_time_first);
-            fprintf(logfile, "    time per iteration %6.2fus\n", (float)best_time_first * 1000. / (float)(iter));
+            fprintf(logfile, "  best %s total time %zdus\n", type_first, best_time_first);
+            fprintf(logfile, "    time per iteration %6.2fns\n", (float)best_time_first * 1000. / (float)(iter));
 
-            fprintf(logfile, "  best %s time %zdns\n", type_second, best_time_second);
-            fprintf(logfile, "    time per iteration %6.2fus\n\n", (float)best_time_second * 1000. / (float)(iter));
-    
+            fprintf(logfile, "  best %s total time %zdus\n", type_second, best_time_second);
+            fprintf(logfile, "    time per iteration %6.2fns\n\n", (float)best_time_second * 1000. / (float)(iter));
         }
     }
 
+    fprintf(logfile, "total accuracy mismatches %u\n", accuracy_mismatch);
     fprintf(logfile, "xrand count %d\n", xrand_count);
 
 exit:

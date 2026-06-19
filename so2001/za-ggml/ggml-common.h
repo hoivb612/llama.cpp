@@ -210,12 +210,14 @@ typedef struct {
     int8_t qs[QK8_0 * 4];  // quants for 4 q8_0 blocks
 } block_q8_0x4;
 static_assert(sizeof(block_q8_0x4) == 4 * sizeof(ggml_half) + QK8_0 * 4, "wrong q8_0x4 block size/padding");
+static_assert(sizeof(block_q8_0x4) == 4 * sizeof(block_q8_0), "block_q8_0x4 not 4 * block_q8_0");
 
 typedef struct {
     ggml_half d[8];        // deltas for 8 q4_0 blocks
     uint8_t qs[QK4_0 * 4]; // nibbles / quants for 8 q4_0 blocks
 } block_q4_0x8;
 static_assert(sizeof(block_q4_0x8) == 8 * sizeof(ggml_half) + QK4_0 * 4, "wrong q4_0x8 block size/padding");
+static_assert(sizeof(block_q4_0x8) == 8 * sizeof(block_q4_0), "block_q4_0x8 not 8 * block_q4_0");
 
 //
 // Super-block quantization structures

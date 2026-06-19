@@ -204,10 +204,10 @@ make_q2_k_repack_quant (
         // Repack the 8-bit quant values into the q2_k_repack quant block.
         //
 
-        __m512i q2bytes = _mm512_loadu_si512((const __m512i*)&qs_out[0]);
-        const __m512i q2bytes_0 = _mm512_loadu_si512((const __m512i*)&qs_out[64]);
-        const __m512i q2bytes_1 = _mm512_loadu_si512((const __m512i*)&qs_out[128]);
-        const __m512i q2bytes_2 = _mm512_loadu_si512((const __m512i*)&qs_out[192]);
+        __m512i q2bytes = _mm512_loadu_si512(&qs_out[0]);
+        const __m512i q2bytes_0 = _mm512_loadu_si512(&qs_out[64]);
+        const __m512i q2bytes_1 = _mm512_loadu_si512(&qs_out[128]);
+        const __m512i q2bytes_2 = _mm512_loadu_si512(&qs_out[192]);
 
         q2bytes = _mm512_or_si512(q2bytes, _mm512_slli_epi16(q2bytes_0, 2));
         q2bytes = _mm512_or_si512(q2bytes, _mm512_slli_epi16(q2bytes_1, 4));
@@ -322,10 +322,10 @@ make_q3_k_repack_quant (
         //      dot product.
         //
 
-        const __m512i q3bytes_0 = _mm512_loadu_si512((const __m512i*)&qs_out[0]);
-        const __m512i q3bytes_1 = _mm512_loadu_si512((const __m512i*)&qs_out[64]);
-        const __m512i q3bytes_2 = _mm512_loadu_si512((const __m512i*)&qs_out[128]);
-        const __m512i q3bytes_3 = _mm512_loadu_si512((const __m512i*)&qs_out[192]);
+        const __m512i q3bytes_0 = _mm512_loadu_si512(&qs_out[0]);
+        const __m512i q3bytes_1 = _mm512_loadu_si512(&qs_out[64]);
+        const __m512i q3bytes_2 = _mm512_loadu_si512(&qs_out[128]);
+        const __m512i q3bytes_3 = _mm512_loadu_si512(&qs_out[192]);
 
         //
         // Isolate low bits.
@@ -872,6 +872,31 @@ make_q4_k_q8_k_repack_quant (
     }
 }
 
+//
+// xx_vec_dot_... implementation note.
+//
+// The purpose of the xx_vec_dot functions is to compute the dot product of a set
+// of columns against a set of rows. Below is both the old implementation of these
+// functions along with a new implementation that unrolls the columns such that a
+// row of data is computed against multiple columns of data at a time. This allows
+// the row data to be unpacked once and used against the 4 columns of data thus
+// reducing the execution time. The typical improvement is around 25%.
+//
+// The algorithm computes groups of 4 columns until all such groups have been consumed
+// and then computes the remaining single columns.
+//
+// The arguments to each of the functions are the same where:
+//
+//  unit32_t n     - The number of weight elements in each row/column (quant encoded).
+//  float * s_base - A pointer to an array that receives the dot product of column/row pairs.
+//  size_t nr_nb1  - The stride in bytes between dot product groups (sizeof(float) * nrows).
+//  block_qx_..._repack * x_base - a pointer to the base of the repacked row data quants.
+//  size_t bx      - unused
+//  block_q8_..._repack * y_base - a pointer to the base of the repacked column data quants.
+//  size_t ncols   - the number of columns of data.
+//  uint32_t nrows - the number of rows of data.
+//
+
 //#define ORIGINAL_VERSION 1
 
 #if ORIGINAL_VERSION
@@ -904,7 +929,7 @@ xx_vec_dot_q4_0_q8_0_x8 (
     for (uint64_t l = 0; l < ncols; l += 1) {
 
         //
-        // Iterate throught the specified number of rows
+        // Iterate through the specified number of rows
         //
 
         const block_q4_0_repack * x = vx;
@@ -912,7 +937,7 @@ xx_vec_dot_q4_0_q8_0_x8 (
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
@@ -935,7 +960,7 @@ xx_vec_dot_q4_0_q8_0_x8 (
         
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
                     const __m256i tmp1 = _mm256_loadu_si256((const __m256i *)&x[i].qs[j * QK4_0 + 0]);
-                    __m512i qy = _mm512_loadu_si512((const __m512i *)&y[i].qs[j * QK8_0 * 2 + 0]);
+                    __m512i qy = _mm512_loadu_si512(&y[i].qs[j * QK8_0 * 2 + 0]);
         
                     const __m256i tmp2 = _mm256_srli_epi16(tmp1, 4);
                     __m512i qx = _mm512_inserti32x8(_mm512_castsi256_si512(tmp1), tmp2, 1);
@@ -943,14 +968,14 @@ xx_vec_dot_q4_0_q8_0_x8 (
         
                     //
                     // Multiply unsigned scaled q4 quant values by signed q8 quant
-                    // values and acculate the results.
+                    // values and accumulate the results.
                     //
         
                     sumi = _mm512_dpbusd_epi32(sumi, qx, qy);
         
                     //
                     // Multiply the unsigned bias quant values by the signed q8 quant
-                    // values and acculate the results.
+                    // values and accumulate the results.
                     //
         
                     bias = _mm512_dpbusd_epi32(bias, offset, qy);
@@ -984,21 +1009,6 @@ xx_vec_dot_q4_0_q8_0_x8 (
 
 #else
 
-//
-// Batch-optimized Q4_0 x Q8_0 vec_dot for prompt prefill (ncols >= 4).
-//
-// Key optimization: processes 4 activation columns per weight load, reducing
-// weight memory traffic by ~4x.
-//
-// Q4_0 difference from K-quants: d is a VECTOR of 8 fp16 values (one per
-// sub-block), not a single scalar. SHARED: weight d[8] loaded once.
-// PER-COLUMN: activation d[8] loaded, element-wise multiply with weight d.
-//
-// Register budget (AVX-512, 32 zmm):
-//   4 x acc (zmm) + 4 x sumi (zmm) + 4 xx bias (zmm) +
-//   1 x qx (zmm) + 1 x qy (zmm) + offset + m4 x 15 zmm
-//
-
 void
 xx_vec_dot_q4_0_q8_0_x8 (
     uint32_t n,
@@ -1018,27 +1028,32 @@ xx_vec_dot_q4_0_q8_0_x8 (
     const __m512i offset = _mm512_set1_epi8(8);
     const __m512i m4 = _mm512_set1_epi8(0xf);
 
+    //
+    // Iterate through the specified number of columns.
+    //
+
     const uint64_t ncols4 = ncols & ~3ULL;
     uint64_t l = 0;
 
     //
     // Phase 1: Process 4 activation columns at a time.
     //
-    // For each weight row + super-block, load weight qs and d once,
-    // unpack nibbles once, then dpbusd against 4 activation columns.
-    //
 
     for (; l < ncols4; l += 4) {
 
-        const block_q8_0_repack * y0 = y_base + (l + 0) * nb;
-        const block_q8_0_repack * y1 = y_base + (l + 1) * nb;
-        const block_q8_0_repack * y2 = y_base + (l + 2) * nb;
-        const block_q8_0_repack * y3 = y_base + (l + 3) * nb;
+        const block_q8_0_repack * y0 = y_base + (l * nb);
+        const block_q8_0_repack * y1 = y0 + nb;
+        const block_q8_0_repack * y2 = y1 + nb;
+        const block_q8_0_repack * y3 = y2 + nb;
 
-        float * s0 = (float *)((char *)s_base + (l + 0) * nr_nb1);
-        float * s1 = (float *)((char *)s_base + (l + 1) * nr_nb1);
-        float * s2 = (float *)((char *)s_base + (l + 2) * nr_nb1);
-        float * s3 = (float *)((char *)s_base + (l + 3) * nr_nb1);
+        float * s0 = (float *)((char *)s_base + (l * nr_nb1));
+        float * s1 = (float *)((char *)s0 + nr_nb1);
+        float * s2 = (float *)((char *)s1 + nr_nb1);
+        float * s3 = (float *)((char *)s2 + nr_nb1);
+
+        //
+        // Iterate through the specified number of rows.
+        //
 
         const block_q4_0_repack * x = x_base;
 
@@ -1049,11 +1064,11 @@ xx_vec_dot_q4_0_q8_0_x8 (
             __m512 acc2 = _mm512_setzero_ps();
             __m512 acc3 = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            // Iterate through the quant blocks 4 columns at a time.
+            //
 
-                //
-                // Per-column integer accumulators.
-                //
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 __m512i sumi0 = _mm512_setzero_si512();
                 __m512i sumi1 = _mm512_setzero_si512();
@@ -1066,14 +1081,23 @@ xx_vec_dot_q4_0_q8_0_x8 (
                 __m512i bias3 = _mm512_setzero_si512();
 
                 //
-                // SHARED: Load weight q4 data once per sub-block, unpack nibbles,
-                // then dpbusd against 4 activation columns.
+                // Compute the integer product of the q4 and q8 quants against 4
+                // columns and accumulate the integer results.
                 //
 
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
 
                     //
-                    // SHARED: unpack weight nibbles.
+                    // Load the column data first.
+                    //
+
+                    const __m512i qy0 = _mm512_loadu_si512(&y0[i].qs[j * QK8_0 * 2]);
+                    const __m512i qy1 = _mm512_loadu_si512(&y1[i].qs[j * QK8_0 * 2]);
+                    const __m512i qy2 = _mm512_loadu_si512(&y2[i].qs[j * QK8_0 * 2]);
+                    const __m512i qy3 = _mm512_loadu_si512(&y3[i].qs[j * QK8_0 * 2]);
+
+                    //
+                    // Load weight nibbles once.
                     //
 
                     const __m256i tmp1 = _mm256_loadu_si256((const __m256i *)&x[i].qs[j * QK4_0 + 0]);
@@ -1082,35 +1106,31 @@ xx_vec_dot_q4_0_q8_0_x8 (
                     qx = _mm512_and_si512(m4, qx);
 
                     //
-                    // Per-column: load q8 and dpbusd against shared qx.
+                    // Dot product against 4 activation columns.
                     //
 
-                    const __m512i qy0 = _mm512_loadu_si512((const __m512i *)&y0[i].qs[j * QK8_0 * 2]);
                     sumi0 = _mm512_dpbusd_epi32(sumi0, qx, qy0);
                     bias0 = _mm512_dpbusd_epi32(bias0, offset, qy0);
 
-                    const __m512i qy1 = _mm512_loadu_si512((const __m512i *)&y1[i].qs[j * QK8_0 * 2]);
                     sumi1 = _mm512_dpbusd_epi32(sumi1, qx, qy1);
                     bias1 = _mm512_dpbusd_epi32(bias1, offset, qy1);
 
-                    const __m512i qy2 = _mm512_loadu_si512((const __m512i *)&y2[i].qs[j * QK8_0 * 2]);
                     sumi2 = _mm512_dpbusd_epi32(sumi2, qx, qy2);
                     bias2 = _mm512_dpbusd_epi32(bias2, offset, qy2);
 
-                    const __m512i qy3 = _mm512_loadu_si512((const __m512i *)&y3[i].qs[j * QK8_0 * 2]);
                     sumi3 = _mm512_dpbusd_epi32(sumi3, qx, qy3);
                     bias3 = _mm512_dpbusd_epi32(bias3, offset, qy3);
                 }
 
                 //
-                // SHARED: Load weight d[8] (fp16 - fp32) once.
+                // Load weight d[8] (fp16 - fp32) once.
                 //
 
                 const __m128h xd = _mm_loadu_ph(x[i].d);
                 __m256 x_fp32 = _mm256_cvtph_ps(xd);
 
                 //
-                // Per-column: subtract bias, build per-column scale vector, FMA.
+                // Subtract bias, build per-column scale vector, FMA.
                 //
 
 #define Q40_COL_FMA(col, y_ptr, sumi_v, bias_v, acc_v) \
@@ -1133,7 +1153,7 @@ xx_vec_dot_q4_0_q8_0_x8 (
             }
 
             //
-            // Reduce and store results for each of the 4 columns.
+            // Reduce and store results for 4 columns.
             //
 
 #define REDUCE_Q40_CP(acc, dst) \
@@ -1166,26 +1186,40 @@ xx_vec_dot_q4_0_q8_0_x8 (
 
     for (; l < ncols; l += 1) {
 
+        //
+        // Iterate through the specified number of rows.
+        //
+
         const block_q4_0_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            // Iterate through the quant blocks.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
 
-                const __m128h xd = _mm_loadu_ph(x[i].d);
                 const __m128h yd = _mm_loadu_ph(y_rem[i].d);
+                const __m128h xd = _mm_loadu_ph(x[i].d);
                 const __m256 scale = _mm256_mul_ps(_mm256_cvtph_ps(xd),
                                                    _mm256_cvtph_ps(yd));
+
                 __m512 d = _mm512_castps256_ps512(scale);
                 d = _mm512_insertf32x8(d, scale, 1);
 
+                //
+                // Compute the integer product of the q4 and q8 quants and accumulate the
+                // integer results.
+                //
+
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
+                    __m512i qy = _mm512_loadu_si512(&y_rem[i].qs[j * QK8_0 * 2 + 0]);
                     const __m256i tmp1 = _mm256_loadu_si256((const __m256i *)&x[i].qs[j * QK4_0 + 0]);
-                    __m512i qy = _mm512_loadu_si512((const __m512i *)&y_rem[i].qs[j * QK8_0 * 2 + 0]);
 
                     const __m256i tmp2 = _mm256_srli_epi16(tmp1, 4);
                     __m512i qx = _mm512_inserti32x8(_mm512_castsi256_si512(tmp1), tmp2, 1);
@@ -1195,9 +1229,17 @@ xx_vec_dot_q4_0_q8_0_x8 (
                     bias = _mm512_dpbusd_epi32(bias, offset, qy);
                 }
 
+                //
+                // Subtract out the bias value and accumulate the FMA value.
+                //
+
                 sumi = _mm512_sub_epi32(sumi, bias);
                 acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(sumi), acc);
             }
+
+            //
+            // Reduce and store the result.
+            //
 
             const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                              _mm512_extractf32x8_ps(acc, 1));
@@ -1257,7 +1299,7 @@ xx_vec_dot_q2_k_q8_k_x8 (
             __m512 acc = _mm512_setzero_ps();
             __m256 mins_acc = _mm256_setzero_ps();
         
-            for (uint64_t i = 0; i < nb; ++i) {
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
                 const float dmin = y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -1266,7 +1308,7 @@ xx_vec_dot_q2_k_q8_k_x8 (
                 const int8_t * q8 = y[i].qs;
         
                 const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x[i].scales);
-                __m512i q2bits = _mm512_loadu_si512((const __m512i*)q2);
+                __m512i q2bits = _mm512_loadu_si512(q2);
         
                 const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
                 const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
@@ -1280,7 +1322,7 @@ xx_vec_dot_q2_k_q8_k_x8 (
                 // integer results.
                 //
         
-                for (uint64_t j = 0; j < QK_K / 64; ++j) {
+                for (uint64_t j = 0; j < QK_K / 64; j += 1) {
                     const __m512i q8v = _mm512_loadu_si512(q8 + (j * 64));
                     const __m512i q2v = _mm512_and_si512(q2bits, m3);
                     q2bits = _mm512_srli_epi16(q2bits, 2);
@@ -1331,11 +1373,11 @@ xx_vec_dot_q2_k_q8_k_x8 (
 void
 xx_vec_dot_q2_k_q8_k_x8 (
     uint32_t n,
-    float * s,
+    float * s_base,
     size_t nr_nb1,
-    const block_q2_K_repack * vx,
+    const block_q2_K_repack * x_base,
     size_t bx,
-    const block_q8_K_repack * vy,
+    const block_q8_K_repack * y_base,
     size_t ncols,
     uint32_t nrows
     )
@@ -1351,9 +1393,6 @@ xx_vec_dot_q2_k_q8_k_x8 (
     // Iterate through the specified number of columns.
     //
 
-    const block_q8_K_repack * y_base = vy;
-    float * s_base = s;
-
     const uint64_t ncols4 = ncols & ~3ULL;
     uint64_t l = 0;
 
@@ -1363,21 +1402,21 @@ xx_vec_dot_q2_k_q8_k_x8 (
 
     for (; l < ncols4; l += 4) {
 
-        const block_q8_K_repack * y0 = y_base + (l + 0) * nb;
-        const block_q8_K_repack * y1 = y_base + (l + 1) * nb;
-        const block_q8_K_repack * y2 = y_base + (l + 2) * nb;
-        const block_q8_K_repack * y3 = y_base + (l + 3) * nb;
+        const block_q8_K_repack * y0 = y_base + (l * nb);
+        const block_q8_K_repack * y1 = y0 + nb;
+        const block_q8_K_repack * y2 = y1 + nb;
+        const block_q8_K_repack * y3 = y2 + nb;
 
-        float * s0 = (float *)((char *)s_base + (l + 0) * nr_nb1);
-        float * s1 = (float *)((char *)s_base + (l + 1) * nr_nb1);
-        float * s2 = (float *)((char *)s_base + (l + 2) * nr_nb1);
-        float * s3 = (float *)((char *)s_base + (l + 3) * nr_nb1);
+        float * s0 = (float *)((char *)s_base + (l * nr_nb1));
+        float * s1 = (float *)((char *)s0 + nr_nb1);
+        float * s2 = (float *)((char *)s1 + nr_nb1);
+        float * s3 = (float *)((char *)s2 + nr_nb1);
 
         //
         // Iterate through the specified number of rows.
         //
 
-        const block_q2_K_repack * x = vx;
+        const block_q2_K_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
 
@@ -1395,7 +1434,7 @@ xx_vec_dot_q2_k_q8_k_x8 (
             // Iterate through the quant blocks 4 columns at a time.
             //
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 __m512i sumi0 = _mm512_setzero_si512();
                 __m512i sumi1 = _mm512_setzero_si512();
@@ -1407,9 +1446,9 @@ xx_vec_dot_q2_k_q8_k_x8 (
                 // columns and accumulate the integer results.
                 //
         
-                __m512i q2bits = _mm512_loadu_si512((const __m512i*)x[i].qs);
+                __m512i q2bits = _mm512_loadu_si512(x[i].qs);
 
-                for (uint64_t j = 0; j < QK_K / 64; ++j) {
+                for (uint64_t j = 0; j < QK_K / 64; j += 1) {
                     const __m512i q2v = _mm512_and_si512(q2bits, m3);
                     q2bits = _mm512_srli_epi16(q2bits, 2);
 
@@ -1522,8 +1561,8 @@ xx_vec_dot_q2_k_q8_k_x8 (
     // Phase 2: Process remaining columns one at a time (original path).
     //
 
-    const block_q8_K_repack * y_rem = y_base + l * nb;
-    float * s_rem = (float *)((char *)s_base + l * nr_nb1);
+    const block_q8_K_repack * y_rem = y_base + (l * nb);
+    float * s_rem = (float *)((char *)s_base + (l * nr_nb1));
 
     for (; l < ncols; l += 1) {
 
@@ -1531,19 +1570,23 @@ xx_vec_dot_q2_k_q8_k_x8 (
         // Iterate through the specified number of rows.
         //
 
-        const block_q2_K_repack * x = vx;
+        const block_q2_K_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
             __m256 mins_acc = _mm256_setzero_ps();
-        
-            for (uint64_t i = 0; i < nb; ++i) {
+
+            //
+            // Iterate through the quant blocks.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y_rem[i].d * GGML_FP16_TO_FP32(x[i].d);
                 const float dmin = y_rem[i].d * GGML_FP16_TO_FP32(x[i].dmin);
         
                 const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x[i].scales);
-                __m512i q2bits = _mm512_loadu_si512((const __m512i*)x[i].qs);
+                __m512i q2bits = _mm512_loadu_si512(x[i].qs);
         
                 const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
                 const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
@@ -1557,7 +1600,7 @@ xx_vec_dot_q2_k_q8_k_x8 (
                 // integer results.
                 //
         
-                for (uint64_t j = 0; j < QK_K / 64; ++j) {
+                for (uint64_t j = 0; j < QK_K / 64; j += 1) {
                     const __m512i q8v = _mm512_loadu_si512(&y_rem[i].qs[j * 64]);
                     const __m512i q2v = _mm512_and_si512(q2bits, m3);
                     q2bits = _mm512_srli_epi16(q2bits, 2);
@@ -1583,7 +1626,11 @@ xx_vec_dot_q2_k_q8_k_x8 (
                 const __m256i prod = _mm256_madd_epi16(mins, bsums);
                 mins_acc = _mm256_fmadd_ps(_mm256_set1_ps(dmin), _mm256_cvtepi32_ps(prod), mins_acc);
             }
-        
+
+            //
+            // Reduce and store the result.
+            //
+
             __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                        _mm512_extractf32x8_ps(acc, 1));
         
@@ -1649,8 +1696,8 @@ xx_vec_dot_q3_k_q8_k_x8 (
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
-        
-            for (uint64_t i = 0; i < nb; ++i) {
+
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         
@@ -1687,7 +1734,7 @@ xx_vec_dot_q3_k_q8_k_x8 (
                 __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
         
-                __m512i q3bytes = _mm512_loadu_si512((const __m512i*)q3);
+                __m512i q3bytes = _mm512_loadu_si512(q3);
         
                 for (uint64_t j = 0; j < QK_K / 64; j += 1) {
         
@@ -1787,27 +1834,27 @@ xx_vec_dot_q3_k_q8_k_x8 (
     const __m512i zero512 = _mm512_setzero_si512();
 
     //
-    // Iterate through the specified number of columns and rows.
+    // Iterate through the specified number of columns.
     //
 
     const uint64_t ncols4 = ncols & ~3ULL;
     uint64_t l = 0;
 
     //
-    // Phase 1: Process 4 columns at a time.
+    // Phase 1: Process 4 activation columns at a time.
     //
 
     for (; l < ncols4; l += 4) {
 
-        const block_q8_K_repack * y0 = y_base + (l + 0) * nb;
-        const block_q8_K_repack * y1 = y_base + (l + 1) * nb;
-        const block_q8_K_repack * y2 = y_base + (l + 2) * nb;
-        const block_q8_K_repack * y3 = y_base + (l + 3) * nb;
+        const block_q8_K_repack * y0 = y_base + (l * nb);
+        const block_q8_K_repack * y1 = y0 + nb;
+        const block_q8_K_repack * y2 = y1 + nb;
+        const block_q8_K_repack * y3 = y2 + nb;
 
-        float * s0 = (float *)((char *)s_base + (l + 0) * nr_nb1);
-        float * s1 = (float *)((char *)s_base + (l + 1) * nr_nb1);
-        float * s2 = (float *)((char *)s_base + (l + 2) * nr_nb1);
-        float * s3 = (float *)((char *)s_base + (l + 3) * nr_nb1);
+        float * s0 = (float *)((char *)s_base + (l * nr_nb1));
+        float * s1 = (float *)((char *)s0 + nr_nb1);
+        float * s2 = (float *)((char *)s1 + nr_nb1);
+        float * s3 = (float *)((char *)s2 + nr_nb1);
 
         //
         // Iterate through the specified number of rows.
@@ -1823,10 +1870,10 @@ xx_vec_dot_q3_k_q8_k_x8 (
             __m512 acc3 = _mm512_setzero_ps();
 
             //
-            // Iterate through the quant blocks.
+            // Iterate through the quant blocks 4 columns at a time.
             //
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 __m512i sumi0 = _mm512_setzero_si512();
                 __m512i sumi1 = _mm512_setzero_si512();
@@ -1837,6 +1884,28 @@ xx_vec_dot_q3_k_q8_k_x8 (
                 __m512i bias1 = _mm512_setzero_si512();
                 __m512i bias2 = _mm512_setzero_si512();
                 __m512i bias3 = _mm512_setzero_si512();
+
+                //
+                // Set up scales. There are 16 scales packed in 6-bit format.
+                //
+
+                uint64_t scales_h = *((uint64_t *)(x[i].scales));
+                uint64_t scales_l = scales_h & kmask2;
+                scales_h = (scales_h >> 4) & kmask2;
+
+                uint64_t high_2bits = *((uint32_t *)(x[i].scales + 8));
+
+                scales_h |= ((high_2bits >> 2) & kmask1) << 32;
+                scales_h |= (high_2bits & kmask1);
+
+                scales_l |= ((high_2bits << 2) & kmask1) << 32;
+                scales_l |= ((high_2bits << 4) & kmask1);
+
+                __m128i scales8 = _mm_insert_epi64(zero128, scales_l, 0);
+                scales8 = _mm_insert_epi64(scales8, scales_h, 1);
+
+                scales8 = _mm_sub_epi8(scales8, m32);
+                const __m512i scales = _mm512_cvtepi8_epi32(scales8);
 
                 //
                 // Compute the integer product of the q3 and q8 quants and accumulate the
@@ -1891,28 +1960,6 @@ xx_vec_dot_q3_k_q8_k_x8 (
                 }
         
                 //
-                // Set up scales. There are 16 scales packed in 6-bit format.
-                //
-
-                uint64_t scales_h = *((uint64_t *)(x[i].scales));
-                uint64_t scales_l = scales_h & kmask2;
-                scales_h = (scales_h >> 4) & kmask2;
-
-                uint64_t high_2bits = *((uint32_t *)(x[i].scales + 8));
-
-                scales_h |= ((high_2bits >> 2) & kmask1) << 32;
-                scales_h |= (high_2bits & kmask1);
-
-                scales_l |= ((high_2bits << 2) & kmask1) << 32;
-                scales_l |= ((high_2bits << 4) & kmask1);
-
-                __m128i scales8 = _mm_insert_epi64(zero128, scales_l, 0);
-                scales8 = _mm_insert_epi64(scales8, scales_h, 1);
-
-                scales8 = _mm_sub_epi8(scales8, m32);
-                const __m512i scales = _mm512_cvtepi8_epi32(scales8);
-
-                //
                 // Subtract the bias values from the sum and scale the result
                 // sum values.
                 //
@@ -1951,7 +1998,7 @@ xx_vec_dot_q3_k_q8_k_x8 (
             }
 
             //
-            // Reduce and store results.
+            // Reduce and store results for 4 columns.
             //
 
 #define REDUCE_Q3K(acc, dst) \
@@ -1992,13 +2039,17 @@ xx_vec_dot_q3_k_q8_k_x8 (
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
-        
-            for (uint64_t i = 0; i < nb; ++i) {
+
+            //
+            // Iterate through the quant blocks.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y_rem[i].d * GGML_FP16_TO_FP32(x[i].d);
         
                 //
-                // Set up scales. There are 16 scales packed in 6-bit format.
+                // There are 16 scale values packed in 6-bit format.
                 //
 
                 uint64_t scales_h = *((uint64_t *)(x[i].scales));
@@ -2080,7 +2131,11 @@ xx_vec_dot_q3_k_q8_k_x8 (
                 sumi = _mm512_mullo_epi32(sumi, scales);
                 acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
             }
-        
+
+            //
+            // Reduce and store the result.
+            //
+
             __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                        _mm512_extractf32x8_ps(acc, 1));
         
@@ -2136,7 +2191,7 @@ xx_vec_dot_q4_k_q8_k_x8 (
     for (uint64_t l = 0; l < ncols; l += 1) {
 
         //
-        // Iterate throught the specified number of rows
+        // Iterate through the specified number of rows
         //
 
         const block_q4_K_repack * x = vx;
@@ -2144,8 +2199,8 @@ xx_vec_dot_q4_k_q8_k_x8 (
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
             __m128 mins_acc = _mm_setzero_ps();
-        
-            for (uint64_t i = 0; i < nb; ++i) {
+
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
                 const float dmin = y[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -2184,7 +2239,7 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 // integer results.
                 //
         
-                for (uint64_t j = 0; j < QK_K / 64; ++j) {
+                for (uint64_t j = 0; j < QK_K / 64; j += 1) {
                     const __m256i q4bits = _mm256_loadu_si256((const __m256i*)(q4 + (j * 32)));
                     const __m512i q8v = _mm512_loadu_si512(q8 + (j * 64));
         
@@ -2238,31 +2293,14 @@ xx_vec_dot_q4_k_q8_k_x8 (
 
 #else
 
-//
-// Drop-in replacement with identical signature. Two-phase approach:
-//
-// How it works: For each weight row + super-block:
-//
-// 1. Load & decode weight q4 data + 6-bit scales/mins once
-// 2. dpbusd the same q4 vector against 4 different q8 activation columns
-// 3. Apply shared scale vector to all 4 integer accumulators
-// 4. Per-column: FMA with column-specific d values, accumulate mins
-//
-// Why faster for batch >= 4:
-//
-//  - 4x reduction in weight memory traffic (the bottleneck)
-//  - Scale/min extraction amortized across 4 columns
-//  - ~12 zmm registers used - no spill pressure
-//
-
 void
 xx_vec_dot_q4_k_q8_k_x8 (
     uint32_t n,
-    float * s,
+    float * s_base,
     size_t nr_nb1,
-    const block_q4_K_repack * vx,
+    const block_q4_K_repack * x_base,
     size_t bx,
-    const block_q8_K_repack * vy,
+    const block_q8_K_repack * y_base,
     size_t ncols,
     uint32_t nrows
     )
@@ -2280,8 +2318,9 @@ xx_vec_dot_q4_k_q8_k_x8 (
 
     uint64_t utmp[2];
 
-    const block_q8_K_repack * y_base = vy;
-    float * s_base = s;
+    //
+    // Iterate through the specified number of columns.
+    //
 
     const uint64_t ncols4 = ncols & ~3ULL;
     uint64_t l = 0;
@@ -2289,24 +2328,24 @@ xx_vec_dot_q4_k_q8_k_x8 (
     //
     // Phase 1: Process 4 activation columns at a time.
     //
-    // For each weight row, load weight super-blocks once and dot-product
-    // against 4 activation columns simultaneously. This amortizes weight
-    // memory traffic across 4 columns.
-    //
 
     for (; l < ncols4; l += 4) {
 
-        const block_q8_K_repack * y0 = y_base + (l + 0) * nb;
-        const block_q8_K_repack * y1 = y_base + (l + 1) * nb;
-        const block_q8_K_repack * y2 = y_base + (l + 2) * nb;
-        const block_q8_K_repack * y3 = y_base + (l + 3) * nb;
+        const block_q8_K_repack * y0 = y_base + (l * nb);
+        const block_q8_K_repack * y1 = y0 + nb;
+        const block_q8_K_repack * y2 = y1 + nb;
+        const block_q8_K_repack * y3 = y2 + nb;
 
-        float * s0 = (float *)((char *)s_base + (l + 0) * nr_nb1);
-        float * s1 = (float *)((char *)s_base + (l + 1) * nr_nb1);
-        float * s2 = (float *)((char *)s_base + (l + 2) * nr_nb1);
-        float * s3 = (float *)((char *)s_base + (l + 3) * nr_nb1);
+        float * s0 = (float *)((char *)s_base + (l * nr_nb1));
+        float * s1 = (float *)((char *)s0 + nr_nb1);
+        float * s2 = (float *)((char *)s1 + nr_nb1);
+        float * s3 = (float *)((char *)s2 + nr_nb1);
 
-        const block_q4_K_repack * x = vx;
+        //
+        // Iterate through the specified number of rows.
+        //
+
+        const block_q4_K_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
 
@@ -2320,11 +2359,14 @@ xx_vec_dot_q4_k_q8_k_x8 (
             __m128 mins_acc2 = _mm_setzero_ps();
             __m128 mins_acc3 = _mm_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            // Iterate through the quant blocks 4 columns at a time.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 //
-                // SHARED: extract weight d/dmin and decode 6-bit scales/mins.
-                // Done once per super-block, reused across all 4 columns.
+                // Extract weight d/dmin and decode 6-bit scales/mins.
                 //
 
                 const float x_d = GGML_FP16_TO_FP32(x[i].d);
@@ -2343,11 +2385,9 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 __m512i scale = _mm512_cvtepi8_epi32(scales8);
                 scale = _mm512_inserti64x4(scale, _mm512_castsi512_si256(scale), 1);
 
-                const uint8_t * q4 = x[i].qs;
-
                 //
-                // SHARED: Load weight q4 data once per sub-block iteration,
-                // then dpbusd against 4 activation columns.
+                // Load weight q4 data once per sub-block iteration, then dpbusd against 4
+                // activation columns.
                 //
 
                 __m512i sumi0 = _mm512_setzero_si512();
@@ -2355,13 +2395,22 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 __m512i sumi2 = _mm512_setzero_si512();
                 __m512i sumi3 = _mm512_setzero_si512();
 
-                for (uint64_t j = 0; j < QK_K / 64; ++j) {
+                for (uint64_t j = 0; j < QK_K / 64; j += 1) {
+
+                    //
+                    // Load the column data first.
+                    //
+
+                    const __m512i q8v0 = _mm512_loadu_si512(&y0[i].qs[j * 64]);
+                    const __m512i q8v1 = _mm512_loadu_si512(&y1[i].qs[j * 64]);
+                    const __m512i q8v2 = _mm512_loadu_si512(&y2[i].qs[j * 64]);
+                    const __m512i q8v3 = _mm512_loadu_si512(&y3[i].qs[j * 64]);
 
                     //
                     // Load weight nibbles once
                     //
 
-                    const __m256i q4bits = _mm256_loadu_si256((const __m256i*)(q4 + (j * 32)));
+                    const __m256i q4bits = _mm256_loadu_si256((const __m256i*)&x[i].qs[j * 32]);
 
                     __m512i q4v = _mm512_castsi256_si512(q4bits);
                     q4v = _mm512_inserti32x8(q4v, _mm256_srli_epi16(q4bits, 4), 1);
@@ -2371,14 +2420,14 @@ xx_vec_dot_q4_k_q8_k_x8 (
                     // Dot product against 4 activation columns
                     //
 
-                    sumi0 = _mm512_dpbusd_epi32(sumi0, q4v, _mm512_loadu_si512(y0[i].qs + (j * 64)));
-                    sumi1 = _mm512_dpbusd_epi32(sumi1, q4v, _mm512_loadu_si512(y1[i].qs + (j * 64)));
-                    sumi2 = _mm512_dpbusd_epi32(sumi2, q4v, _mm512_loadu_si512(y2[i].qs + (j * 64)));
-                    sumi3 = _mm512_dpbusd_epi32(sumi3, q4v, _mm512_loadu_si512(y3[i].qs + (j * 64)));
+                    sumi0 = _mm512_dpbusd_epi32(sumi0, q4v, q8v0);
+                    sumi1 = _mm512_dpbusd_epi32(sumi1, q4v, q8v1);
+                    sumi2 = _mm512_dpbusd_epi32(sumi2, q4v, q8v2);
+                    sumi3 = _mm512_dpbusd_epi32(sumi3, q4v, q8v3);
                 }
 
                 //
-                // SHARED: Apply scale vector to all 4 column accumulators.
+                // Apply scale vector to all 4 column accumulators.
                 //
 
                 sumi0 = _mm512_mullo_epi32(sumi0, scale);
@@ -2387,7 +2436,7 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 sumi3 = _mm512_mullo_epi32(sumi3, scale);
 
                 //
-                // Per-column: multiply by d-scale and FMA into float accumulators.
+                // Multiply by d-scale and FMA into float accumulators.
                 //
 
                 const float d0 = y0[i].d * x_d;
@@ -2401,7 +2450,7 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 acc3 = _mm512_fmadd_ps(_mm512_set1_ps(d3), _mm512_cvtepi32_ps(sumi3), acc3);
 
                 //
-                // SHARED mins extraction, per-column bsums.
+                // Compute dmin value.
                 //
 
                 const __m128i mins = _mm_cvtepi8_epi16(mins8);
@@ -2411,10 +2460,15 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 const float dmin2 = y2[i].d * x_dmin;
                 const float dmin3 = y3[i].d * x_dmin;
 
-                const __m128i prod0 = _mm_madd_epi16(mins, _mm_loadu_si128((const __m128i *)y0[i].bsums));
-                const __m128i prod1 = _mm_madd_epi16(mins, _mm_loadu_si128((const __m128i *)y1[i].bsums));
-                const __m128i prod2 = _mm_madd_epi16(mins, _mm_loadu_si128((const __m128i *)y2[i].bsums));
-                const __m128i prod3 = _mm_madd_epi16(mins, _mm_loadu_si128((const __m128i *)y3[i].bsums));
+                const __m128i bsums0 = _mm_loadu_si128((const __m128i *)y0[i].bsums);
+                const __m128i bsums1 = _mm_loadu_si128((const __m128i *)y1[i].bsums);
+                const __m128i bsums2 = _mm_loadu_si128((const __m128i *)y2[i].bsums);
+                const __m128i bsums3 = _mm_loadu_si128((const __m128i *)y3[i].bsums);
+
+                const __m128i prod0 = _mm_madd_epi16(mins, bsums0);
+                const __m128i prod1 = _mm_madd_epi16(mins, bsums1);
+                const __m128i prod2 = _mm_madd_epi16(mins, bsums2);
+                const __m128i prod3 = _mm_madd_epi16(mins, bsums3);
 
                 mins_acc0 = _mm_fmadd_ps(_mm_set1_ps(dmin0), _mm_cvtepi32_ps(prod0), mins_acc0);
                 mins_acc1 = _mm_fmadd_ps(_mm_set1_ps(dmin1), _mm_cvtepi32_ps(prod1), mins_acc1);
@@ -2423,7 +2477,7 @@ xx_vec_dot_q4_k_q8_k_x8 (
             }
 
             //
-            // Horizontal reduction: 512 -> 256 -> 128, subtract mins, hadd to scalar.
+            // Reduce and store results for 4 columns.
             //
 
 #define REDUCE_CP(acc_v, mins_v, dest, idx) \
@@ -2452,18 +2506,26 @@ xx_vec_dot_q4_k_q8_k_x8 (
     // Phase 2: Process remaining columns one at a time (original path).
     //
 
-    const block_q8_K_repack * y_rem = y_base + l * nb;
-    float * s_rem = (float *)((char *)s_base + l * nr_nb1);
+    const block_q8_K_repack * y_rem = y_base + (l * nb);
+    float * s_rem = (float *)((char *)s_base + (l * nr_nb1));
 
     for (; l < ncols; l += 1) {
 
-        const block_q4_K_repack * x = vx;
+        //
+        // Iterate through the specified number of rows.
+        //
+
+        const block_q4_K_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
             __m128 mins_acc = _mm_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            //  Iterate through the quant blocks.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 const float d = y_rem[i].d * GGML_FP16_TO_FP32(x[i].d);
                 const float dmin = y_rem[i].d * GGML_FP16_TO_FP32(x[i].dmin);
@@ -2474,9 +2536,6 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 utmp[0] = (uint64_t)((vscales[2] & kmask2) | ((vscales[0] & kmask4) >> 2)) << 32;
                 utmp[0] |= (uint64_t)(vscales[0] & kmask1);
 
-                const uint8_t * q4 = x[i].qs;
-                const int8_t  * q8 = y_rem[i].qs;
-
                 const __m128i scales8 = _mm_insert_epi64(zero128, utmp[0], 0);
                 const __m128i mins8 = _mm_insert_epi64(zero128, utmp[1], 0);
 
@@ -2485,9 +2544,9 @@ xx_vec_dot_q4_k_q8_k_x8 (
 
                 __m512i sumi = _mm512_setzero_si512();
 
-                for (uint64_t j = 0; j < QK_K / 64; ++j) {
-                    const __m256i q4bits = _mm256_loadu_si256((const __m256i*)(q4 + (j * 32)));
-                    const __m512i q8v = _mm512_loadu_si512(q8 + (j * 64));
+                for (uint64_t j = 0; j < QK_K / 64; j += 1) {
+                    const __m512i q8v = _mm512_loadu_si512(&y_rem[i].qs[j * 64]);
+                    const __m256i q4bits = _mm256_loadu_si256((const __m256i*)&x[i].qs[j * 32]);
 
                     __m512i q4v = _mm512_castsi256_si512(q4bits);
                     q4v = _mm512_inserti32x8(q4v, _mm256_srli_epi16(q4bits, 4), 1);
@@ -2504,6 +2563,10 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 const __m128i prod = _mm_madd_epi16(mins, q8s);
                 mins_acc = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), mins_acc);
             }
+
+            //
+            // Reduce and store result.
+            //
 
             const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                              _mm512_extractf32x8_ps(acc, 1));
@@ -2565,7 +2628,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
         
@@ -2586,7 +2649,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 //      merge with the first set of 4-bits.
                 //
 
-                __m512i q2bits = _mm512_loadu_si512((const __m512i*)q2);
+                __m512i q2bits = _mm512_loadu_si512(q2);
                 q2bits = _mm512_rol_epi32(q2bits, 4);
 
                 //
@@ -2594,13 +2657,13 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 // and perform dot product.
                 //
 
-                for (uint64_t j = 0; j < QK_K / 128; ++j) {
+                for (uint64_t j = 0; j < QK_K / 128; j += 1) {
 
                     //
                     // Load 64 nibble packed 4-bit quant values - 128 4-bit values.
                     //
 
-                    __m512i q4bits = _mm512_loadu_si512((const __m512i*)(q4 + (j * 64)));
+                    __m512i q4bits = _mm512_loadu_si512(q4 + (j * 64));
 
                     //
                     // Merge the low 4-bits and current high 2-bits of the 6-bit quant
@@ -2712,11 +2775,11 @@ xx_vec_dot_q6_k_q8_k_x8 (
 void
 xx_vec_dot_q6_k_q8_k_x8 (
     uint32_t n,
-    float * s,
+    float * s_base,
     size_t nr_nb1,
-    const block_q6_K_repack * vx,
+    const block_q6_K_repack * x_base,
     size_t bx,
-    const block_q8_K_repack * vy,
+    const block_q8_K_repack * y_base,
     size_t ncols,
     uint32_t nrows
     )
@@ -2729,8 +2792,9 @@ xx_vec_dot_q6_k_q8_k_x8 (
     const __m512i m2 = _mm512_set1_epi8(0x30);
     const __m512i m32s = _mm512_set1_epi8(32);
 
-    const block_q8_K_repack * y_base = vy;
-    float * s_base = s;
+    //
+    // Iterate through the specified number of columns.
+    //
 
     const uint64_t ncols4 = ncols & ~3ULL;
     uint64_t l = 0;
@@ -2741,21 +2805,21 @@ xx_vec_dot_q6_k_q8_k_x8 (
 
     for (; l < ncols4; l += 4) {
 
-        const block_q8_K_repack * y0 = y_base + (l + 0) * nb;
-        const block_q8_K_repack * y1 = y_base + (l + 1) * nb;
-        const block_q8_K_repack * y2 = y_base + (l + 2) * nb;
-        const block_q8_K_repack * y3 = y_base + (l + 3) * nb;
+        const block_q8_K_repack * y0 = y_base + (l * nb);
+        const block_q8_K_repack * y1 = y0 + nb;
+        const block_q8_K_repack * y2 = y1 + nb;
+        const block_q8_K_repack * y3 = y2 + nb;
 
-        float * s0 = (float *)((char *)s_base + (l + 0) * nr_nb1);
-        float * s1 = (float *)((char *)s_base + (l + 1) * nr_nb1);
-        float * s2 = (float *)((char *)s_base + (l + 2) * nr_nb1);
-        float * s3 = (float *)((char *)s_base + (l + 3) * nr_nb1);
+        float * s0 = (float *)((char *)s_base + (l * nr_nb1));
+        float * s1 = (float *)((char *)s0 + nr_nb1);
+        float * s2 = (float *)((char *)s1 + nr_nb1);
+        float * s3 = (float *)((char *)s2 + nr_nb1);
 
         //
         // Iterate through the specified number of rows.
         //
 
-        const block_q6_K_repack * x = vx;
+        const block_q6_K_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
 
@@ -2764,7 +2828,11 @@ xx_vec_dot_q6_k_q8_k_x8 (
             __m512 acc2 = _mm512_setzero_ps();
             __m512 acc3 = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            // Iterate through the quant blocks 4 columns at a time.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
 
                 //
                 // Per-column integer accumulators.
@@ -2786,7 +2854,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 // N.B. This lines up the first set of high 2-bits in the proper position.
                 //
 
-                __m512i q2bits = _mm512_loadu_si512((const __m512i*)&x[i].qh[0]);
+                __m512i q2bits = _mm512_loadu_si512(&x[i].qh[0]);
                 q2bits = _mm512_rol_epi32(q2bits, 6);
 
                 //
@@ -2797,11 +2865,20 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 for (uint64_t j = 0; j < QK_K / 128; j += 1) {
 
                     //
+                    // Load the first set of 4 column activations.
+                    //
+
+                    const __m512i q8_0 = _mm512_loadu_si512(&y0[i].qs[j * 128 + 0]);
+                    const __m512i q8_1 = _mm512_loadu_si512(&y1[i].qs[j * 128 + 0]);
+                    const __m512i q8_2 = _mm512_loadu_si512(&y2[i].qs[j * 128 + 0]);
+                    const __m512i q8_3 = _mm512_loadu_si512(&y3[i].qs[j * 128 + 0]);
+
+                    //
                     // Load 64 nibble packed 4-bit quant values - 128 4-bit values
                     // and shift the next high 2-bits into place.
                     //
 
-                    __m512i q4bits = _mm512_loadu_si512((const __m512i*)(&x[i].ql[j * 64]));
+                    __m512i q4bits = _mm512_loadu_si512(&x[i].ql[j * 64]);
                     q2bits = _mm512_ror_epi32(q2bits, 2);
 
                     //
@@ -2812,6 +2889,31 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q4bits1 = _mm512_and_si512(q4bits, m4);
                     const __m512i q2bits1 = _mm512_and_si512(q2bits, m2);
                     const __m512i q6_0 = _mm512_or_si512(q2bits1, q4bits1);
+
+                    //
+                    // Dpbusd against shared q6_0.
+                    //
+
+                    sumi0 = _mm512_dpbusd_epi32(sumi0, q6_0, q8_0);
+                    bias0 = _mm512_dpbusd_epi32(bias0, m32s, q8_0);
+
+                    sumi1 = _mm512_dpbusd_epi32(sumi1, q6_0, q8_1);
+                    bias1 = _mm512_dpbusd_epi32(bias1, m32s, q8_1);
+
+                    sumi2 = _mm512_dpbusd_epi32(sumi2, q6_0, q8_2);
+                    bias2 = _mm512_dpbusd_epi32(bias2, m32s, q8_2);
+
+                    sumi3 = _mm512_dpbusd_epi32(sumi3, q6_0, q8_3);
+                    bias3 = _mm512_dpbusd_epi32(bias3, m32s, q8_3);
+
+                    //
+                    // Load the next 4 column activations.
+                    //
+
+                    const __m512i q8_4 = _mm512_loadu_si512(&y0[i].qs[j * 128 + 64]);
+                    const __m512i q8_5 = _mm512_loadu_si512(&y1[i].qs[j * 128 + 64]);
+                    const __m512i q8_6 = _mm512_loadu_si512(&y2[i].qs[j * 128 + 64]);
+                    const __m512i q8_7 = _mm512_loadu_si512(&y3[i].qs[j * 128 + 64]);
 
                     //
                     // Shift the next nibble into place and shift next high 2-bits into
@@ -2831,54 +2933,34 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q6_1 = _mm512_or_si512(q2bits2, q4bits2);
 
                     //
-                    // Per-column: load q8-x and dpbusd against shared q6_0.
+                    // Dpbusd against shared q6_1.
                     //
 
-                    const __m512i q8_0 = _mm512_loadu_si512((const __m512i *)&y0[i].qs[j * 128 + 0]);
-                    sumi0 = _mm512_dpbusd_epi32(sumi0, q6_0, q8_0);
-                    bias0 = _mm512_dpbusd_epi32(bias0, m32s, q8_0);
-
-                    const __m512i q8_1 = _mm512_loadu_si512((const __m512i *)&y1[i].qs[j * 128 + 0]);
-                    sumi1 = _mm512_dpbusd_epi32(sumi1, q6_0, q8_1);
-                    bias1 = _mm512_dpbusd_epi32(bias1, m32s, q8_1);
-
-                    const __m512i q8_2 = _mm512_loadu_si512((const __m512i *)&y2[i].qs[j * 128 + 0]);
-                    sumi2 = _mm512_dpbusd_epi32(sumi2, q6_0, q8_2);
-                    bias2 = _mm512_dpbusd_epi32(bias2, m32s, q8_2);
-
-                    const __m512i q8_3 = _mm512_loadu_si512((const __m512i *)&y3[i].qs[j * 128 + 0]);
-                    sumi3 = _mm512_dpbusd_epi32(sumi3, q6_0, q8_3);
-                    bias3 = _mm512_dpbusd_epi32(bias3, m32s, q8_3);
-
-                    //
-                    // Per-column: load q8-x and dpbusd against shared q6_1.
-                    //
-
-                    const __m512i q8_4 = _mm512_loadu_si512((const __m512i *)&y0[i].qs[j * 128 + 64]);
                     sumi0 = _mm512_dpbusd_epi32(sumi0, q6_1, q8_4);
                     bias0 = _mm512_dpbusd_epi32(bias0, m32s, q8_4);
 
-                    const __m512i q8_5 = _mm512_loadu_si512((const __m512i *)&y1[i].qs[j * 128 + 64]);
                     sumi1 = _mm512_dpbusd_epi32(sumi1, q6_1, q8_5);
                     bias1 = _mm512_dpbusd_epi32(bias1, m32s, q8_5);
 
-                    const __m512i q8_6 = _mm512_loadu_si512((const __m512i *)&y2[i].qs[j * 128 + 64]);
                     sumi2 = _mm512_dpbusd_epi32(sumi2, q6_1, q8_6);
                     bias2 = _mm512_dpbusd_epi32(bias2, m32s, q8_6);
 
-                    const __m512i q8_7 = _mm512_loadu_si512((const __m512i *)&y3[i].qs[j * 128 + 64]);
                     sumi3 = _mm512_dpbusd_epi32(sumi3, q6_1, q8_7);
                     bias3 = _mm512_dpbusd_epi32(bias3, m32s, q8_7);
                 }
 
                 //
-                // Shared: load weight d[8] (fp16 -> fp32) and scales.
+                // Load weight d[8] (fp16 -> fp32) and scales.
                 //
 
                 const float xd = GGML_FP16_TO_FP32(x[i].d);
 
                 const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
                 const __m512i scales = _mm512_cvtepi8_epi32(scales8);
+
+                //
+                // Subtract bias, multiply by scale, FMA.
+                //
 
 #define Q6K_COL_FMA(col, y_ptr, sumi_v, bias_v, acc_v) \
                 do { \
@@ -2900,7 +2982,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
             }
 
             //
-            // Reduce and store results for each of the 4 columns.
+            // Reduce and store results for 4 columns.
             //
 
 #define REDUCE_Q6K_CP(acc, dst) \
@@ -2928,8 +3010,8 @@ xx_vec_dot_q6_k_q8_k_x8 (
     // Phase 2: Process remaining columns one at a time (0-3 columns).
     //
 
-    const block_q8_K_repack * y_rem = y_base + l * nb;;
-    float * s_rem = (float *)((char *)s_base + l * nr_nb1);
+    const block_q8_K_repack * y_rem = y_base + (l * nb);
+    float * s_rem = (float *)((char *)s_base + (l * nr_nb1));
 
     for (; l < ncols; l += 1) {
 
@@ -2937,12 +3019,16 @@ xx_vec_dot_q6_k_q8_k_x8 (
         // Iterate through the specified number of rows.
         //
 
-        const block_q6_K_repack * x = vx;
+        const block_q6_K_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            // Iterate through the quant blocks.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 const float d = y_rem[i].d * GGML_FP16_TO_FP32(x[i].d);
         
@@ -2958,7 +3044,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 // N.B. This lines up the first set of 2-bits in the proper position.
                 //
 
-                __m512i q2bits = _mm512_loadu_si512((const __m512i*)&x[i].qh[0]);
+                __m512i q2bits = _mm512_loadu_si512(&x[i].qh[0]);
                 q2bits = _mm512_rol_epi32(q2bits, 6);
 
                 //
@@ -2973,7 +3059,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     // and shift the next high 2-bits into place.
                     //
 
-                    __m512i q4bits = _mm512_loadu_si512((const __m512i*)(&x[i].ql[j * 64]));
+                    __m512i q4bits = _mm512_loadu_si512(&x[i].ql[j * 64]);
                     q2bits = _mm512_ror_epi32(q2bits, 2);
 
                     //
@@ -3030,6 +3116,10 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
             }
 
+            //
+            // Reduce and store result.
+            //
+
             __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                        _mm512_extractf32x8_ps(acc, 1));
 
@@ -3042,7 +3132,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
             x += nb;
         }
 
-        s = (float *)((char *)s_rem + nr_nb1);
+        s_rem = (float *)((char *)s_rem + nr_nb1);
         y_rem += nb;
     }
 }
@@ -3078,7 +3168,7 @@ xx_vec_dot_q8_0_q8_0_x8 (
     for (uint64_t l = 0; l < ncols; l += 1) {
 
         //
-        // Iterate throught the specified number of rows.
+        // Iterate through the specified number of rows.
         //
 
         const block_q8_0_repack * x = vx;
@@ -3086,7 +3176,7 @@ xx_vec_dot_q8_0_q8_0_x8 (
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 __m512i sumi = _mm512_setzero_si512();
         
@@ -3107,8 +3197,8 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 //
         
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
-                    const __m512i qx = _mm512_loadu_si512((const __m512i *)&x[i].qs[j * QK8_0 * 2 + 0]);
-                    const __m512i qy = _mm512_loadu_si512((const __m512i *)&y[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qx = _mm512_loadu_si512(&x[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qy = _mm512_loadu_si512(&y[i].qs[j * QK8_0 * 2 + 0]);
     
                     //
                     // Compute the absolute value of qx and generate a mask of the corresponding
@@ -3164,11 +3254,11 @@ xx_vec_dot_q8_0_q8_0_x8 (
 void
 xx_vec_dot_q8_0_q8_0_x8 (
     uint32_t n,
-    float * s,
+    float * s_base,
     size_t nr_nb1,
-    const block_q8_0_repack * vx,
+    const block_q8_0_repack * x_base,
     size_t bx,
-    const block_q8_0_repack * vy,
+    const block_q8_0_repack * y_base,
     size_t ncols,
     uint32_t nrows
     )
@@ -3183,9 +3273,6 @@ xx_vec_dot_q8_0_q8_0_x8 (
     // Iterate through the specified number of columns.
     //
 
-    const block_q8_0_repack * y_base = vy;
-    float * s_base = s;
-
     const uint64_t ncols4 = ncols & ~3ULL;
     uint64_t l = 0;
 
@@ -3195,23 +3282,32 @@ xx_vec_dot_q8_0_q8_0_x8 (
 
     for (; l < ncols4; l += 4) {
 
-        const block_q8_0_repack * y0 = y_base + (l + 0) * nb;
-        const block_q8_0_repack * y1 = y_base + (l + 1) * nb;
-        const block_q8_0_repack * y2 = y_base + (l + 2) * nb;
-        const block_q8_0_repack * y3 = y_base + (l + 3) * nb;
+        const block_q8_0_repack * y0 = y_base + (l * nb);
+        const block_q8_0_repack * y1 = y0 + nb;
+        const block_q8_0_repack * y2 = y1 + nb;
+        const block_q8_0_repack * y3 = y2 + nb;
 
-        float * s0 = (float *)((char *)s_base + (l + 0) * nr_nb1);
-        float * s1 = (float *)((char *)s_base + (l + 1) * nr_nb1);
-        float * s2 = (float *)((char *)s_base + (l + 2) * nr_nb1);
-        float * s3 = (float *)((char *)s_base + (l + 3) * nr_nb1);
+        float * s0 = (float *)((char *)s_base + (l * nr_nb1));
+        float * s1 = (float *)((char *)s0 + nr_nb1);
+        float * s2 = (float *)((char *)s1 + nr_nb1);
+        float * s3 = (float *)((char *)s2 + nr_nb1);
 
-        const block_q8_0_repack * x = vx;
+        //
+        // Iterate through the specified number of rows.
+        //
+
+        const block_q8_0_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
+
             __m512 acc0 = _mm512_setzero_ps();
             __m512 acc1 = _mm512_setzero_ps();
             __m512 acc2 = _mm512_setzero_ps();
             __m512 acc3 = _mm512_setzero_ps();
+
+            //
+            // Iterate through the quant blocks 4 columns at a time.
+            //
 
             for (uint64_t i = 0; i < nb; i += 1) {
 
@@ -3229,13 +3325,22 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 //
         
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
-    
+
+                    //
+                    // Load the column data first.
+                    //
+
+                    const __m512i qy0 = _mm512_loadu_si512(&y0[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qy1 = _mm512_loadu_si512(&y1[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qy2 = _mm512_loadu_si512(&y2[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qy3 = _mm512_loadu_si512(&y3[i].qs[j * QK8_0 * 2 + 0]);
+
                     //
                     // Compute the absolute value of the row and generate a mask of the
                     // corresponding values of qx that are negative.
                     //
     
-                    const __m512i qx = _mm512_loadu_si512((const __m512i *)&x[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qx = _mm512_loadu_si512(&x[i].qs[j * QK8_0 * 2 + 0]);
                     const __m512i ax = _mm512_abs_epi8(qx);
                     const __mmask64 is_negative_qx = _mm512_movepi8_mask(qx);
     
@@ -3244,16 +3349,9 @@ xx_vec_dot_q8_0_q8_0_x8 (
                     // in the corresponding byte of qx.
                     //
     
-                    const __m512i qy0 = _mm512_loadu_si512((const __m512i *)&y0[i].qs[j * QK8_0 * 2 + 0]);
                     const __m512i sy0 = _mm512_mask_sub_epi8(qy0, is_negative_qx, zero512, qy0);
-    
-                    const __m512i qy1 = _mm512_loadu_si512((const __m512i *)&y1[i].qs[j * QK8_0 * 2 + 0]);
                     const __m512i sy1 = _mm512_mask_sub_epi8(qy1, is_negative_qx, zero512, qy1);
-
-                    const __m512i qy2 = _mm512_loadu_si512((const __m512i *)&y2[i].qs[j * QK8_0 * 2 + 0]);
                     const __m512i sy2 = _mm512_mask_sub_epi8(qy2, is_negative_qx, zero512, qy2);
-
-                    const __m512i qy3 = _mm512_loadu_si512((const __m512i *)&y3[i].qs[j * QK8_0 * 2 + 0]);
                     const __m512i sy3 = _mm512_mask_sub_epi8(qy3, is_negative_qx, zero512, qy3);
 
                     //
@@ -3276,7 +3374,7 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 const __m256 x_fp32 = _mm256_cvtph_ps(xd);
 
                 //
-                // Per-column: build per-column scale vector, FMA.
+                // Build per-column scale vector, FMA.
                 //
 
 #define Q80_COL_FMA(col, y_ptr, sumi_v, acc_v) \
@@ -3298,7 +3396,7 @@ xx_vec_dot_q8_0_q8_0_x8 (
             }
 
             //
-            // Reduce and store results for each of the 4 columns.
+            // Reduce and store results for 4 columns.
             //
 
 #define REDUCE_Q80_CP(acc, dst) \
@@ -3326,21 +3424,25 @@ xx_vec_dot_q8_0_q8_0_x8 (
     // Phase 2: Process remaining columns one at a time (0-3 columns).
     //
 
-    const block_q8_0_repack * y_rem = y_base + l * nb;
-    float * s_rem = (float *)((char *)s_base + l * nr_nb1);
+    const block_q8_0_repack * y_rem = y_base + (l * nb);
+    float * s_rem = (float *)((char *)s_base + (l * nr_nb1));
 
     for (; l < ncols; l += 1) {
 
         //
-        // Iterate throught the remaining rows.
+        // Iterate through the remaining rows.
         //
 
-        const block_q8_0_repack * x = vx;
+        const block_q8_0_repack * x = x_base;
 
         for (uint64_t k = 0; k < nrows; k += 1) {
             __m512 acc = _mm512_setzero_ps();
 
-            for (uint64_t i = 0; i < nb; ++i) {
+            //
+            // Iterate through the quant blocks.
+            //
+
+            for (uint64_t i = 0; i < nb; i += 1) {
         
                 __m512i sumi = _mm512_setzero_si512();
         
@@ -3348,8 +3450,8 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 // Compute combined scale for the an entire quant block.
                 //
         
-                const __m128h xd = _mm_loadu_ph(x[i].d);
                 const __m128h yd = _mm_loadu_ph(y_rem[i].d);
+                const __m128h xd = _mm_loadu_ph(x[i].d);
                 const __m256 scale = _mm256_mul_ps(_mm256_cvtph_ps(xd),
                                                    _mm256_cvtph_ps(yd));
         
@@ -3361,8 +3463,8 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 //
         
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
-                    const __m512i qx = _mm512_loadu_si512((const __m512i *)&x[i].qs[j * QK8_0 * 2 + 0]);
-                    const __m512i qy = _mm512_loadu_si512((const __m512i *)&y_rem[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qy = _mm512_loadu_si512(&y_rem[i].qs[j * QK8_0 * 2 + 0]);
+                    const __m512i qx = _mm512_loadu_si512(&x[i].qs[j * QK8_0 * 2 + 0]);
     
                     //
                     // Compute the absolute value of qx and generate a mask of the corresponding
@@ -3394,7 +3496,11 @@ xx_vec_dot_q8_0_q8_0_x8 (
         
                 acc = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(sumi), acc);
             }
-        
+
+            //
+            // Reduce and store result.
+            //
+
             const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                              _mm512_extractf32x8_ps(acc, 1));
         

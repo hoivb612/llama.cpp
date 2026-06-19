@@ -95,6 +95,16 @@ inline ggml_bf16_t ggml_compute_fp32_to_bf16(float s) {
 
 #endif
 
+#define USE_HW_FP_CONVERT
+
+#if defined(USE_HW_FP_CONVERT)
+
+#define GGML_FP16_TO_FP32(x) GGML_COMPUTE_FP16_TO_FP32(x)
+#define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
+
+#else
+
+//
 // precomputed f32 table for f16 (256 KB)
 // defined in ggml.c, initialized in ggml_init()
 
@@ -107,8 +117,9 @@ inline float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 }
 
 #define GGML_FP16_TO_FP32(x) ggml_lookup_fp16_to_fp32(x)
-
 #define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
+
+#endif // defined(USE_HW_FP_CONVERT)
 
 #define GGML_HASHTABLE_FULL ((size_t)-1)
 #define GGML_HASHTABLE_ALREADY_EXISTS ((size_t)-2)

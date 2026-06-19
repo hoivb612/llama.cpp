@@ -237,8 +237,12 @@ DECLSPEC_CACHEALIGN ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 // precomputed quick gelu table for f16 (128 KB)
 DECLSPEC_CACHEALIGN ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 
+#if !defined(USE_HW_FP_CONVERT)
+
 // precomputed f32 table for f16 (256 KB) (ggml-impl.h)
 DECLSPEC_CACHEALIGN float ggml_table_f32_f16[1 << 16];
+
+#endif // !defined(USE_HW_FP_CONVERT)
 
 GGML_CALL const char * ggml_status_to_string(enum ggml_status status) {
     switch (status) {
@@ -5028,7 +5032,7 @@ int32_t vec_dot_type_counts[GGML_TYPE_COUNT] = {0};
 int32_t vec_dot_src0_counts[GGML_TYPE_COUNT] = {0};
 int64_t vec_dot_src0_time[GGML_TYPE_COUNT] = {0};
 
-#define ROW_SIZE_BUCKETS 16385
+#define ROW_SIZE_BUCKETS 16385          // 16kb
 
 typedef struct {
     int32_t total_count;
@@ -5036,6 +5040,17 @@ typedef struct {
 } guant_type_info;
 
 DECLSPEC_CACHEALIGN guant_type_info quant_type_row_size[GGML_TYPE_COUNT] = {0};
+
+#define VEC_DOT_BUCKETS 16385           // 16kb
+#define VEC_DOT_BUCKET_SIZE (1ull << 13) // 8kb
+
+typedef struct {
+    int32_t total_count;
+    int32_t counts[VEC_DOT_BUCKETS];
+    int64_t total_size;
+} quant_vec_dot_info;
+
+DECLSPEC_CACHEALIGN quant_vec_dot_info quant_vec_dot_size[GGML_TYPE_COUNT] = {0};
 
 //
 // Spin wait statistics.
@@ -5283,7 +5298,7 @@ print_tensor_op_perf_data (
     }
 
     //
-    // Scan through all the quant types looking for types that have a non-zero
+    // Scan through all the quant type row sizes looking for types that have a non-zero
     // total count.
     //
 
@@ -5292,7 +5307,7 @@ print_tensor_op_perf_data (
             printf("vector row size count histogram for quant type %s\n\n",
                    ggml_type_name(i));
 
-            printf("  Size   Count    %%\n\n");
+            printf("  Size   Count     %%\n\n");
         
             total_count = quant_type_row_size[i].total_count;
             total_percent = 0;
@@ -5303,15 +5318,55 @@ print_tensor_op_perf_data (
                     percent = (float)quant_type_row_size[i].counts[j] * 100.f / (float)total_count;
                     total_percent += percent;
                     weighted_rowsize += (j + 1) * quant_type_row_size[i].counts[j];
-                    printf("%6zd  %6d  %5.2f\n",
+                    printf("%6zd  %6d  %6.2f\n",
                            j + 1,
                            quant_type_row_size[i].counts[j],
                            percent);
                 }
             }
         
-            printf("\n      %8d %5.2f\n\n", total_count, total_percent);
+            printf("\n      %8d  %6.2f\n\n", total_count, total_percent);
             printf("Average row size %zd\n\n", weighted_rowsize / total_count);
+        }
+    }
+
+    //
+    // Scan through all the quant vec_dot sizes looking for types that have a non-zero
+    // total count.
+    //
+
+    for (int64_t i = 0; i < ARRAYSIZE(quant_vec_dot_size); i += 1) {
+        if (quant_vec_dot_size[i].total_count) {
+            printf("vec_dot (row-size * nr0 + col-size * nr1) histogram for quant type %s\n\n",
+                   ggml_type_name(i));
+
+            printf("     row*col    Count     %%\n\n");
+        
+            total_count = quant_vec_dot_size[i].total_count;
+            total_percent = 0;
+            int64_t weighted_vecsize = 0;
+
+            for (int64_t j = 0; j < ARRAYSIZE(quant_vec_dot_size[i].counts); j += 1) {
+                if (quant_vec_dot_size[i].counts[j]) {
+                    int64_t bucket_size = (j + 1) * VEC_DOT_BUCKET_SIZE;
+                    percent = (float)quant_vec_dot_size[i].counts[j] * 100.f / (float)total_count;
+                    total_percent += percent;
+                    weighted_vecsize += bucket_size * quant_vec_dot_size[i].counts[j];
+                    printf(" %11zd  %7d  %6.2f\n",
+                           bucket_size,
+                           quant_vec_dot_size[i].counts[j],
+                           percent);
+                }
+            }
+        
+            printf("\n%12zd %8d  %6.2f\n\n",
+                   quant_vec_dot_size[i].total_size,
+                   total_count,
+                   total_percent);
+
+            printf("Average vec size %zd\n", weighted_vecsize / total_count);
+            int64_t cache_blocks = quant_vec_dot_size[i].total_size / 64ll;
+            printf("Total cache blocks consumed %zd\n\n", cache_blocks);
         }
     }
 
@@ -5846,7 +5901,17 @@ void ggml_init_tables(void)
             uint16_t u16;
             ggml_fp16_t fp16;
         } u = {i};
+
+#if defined(USE_HW_FP_CONVERT)
+
+        float f = GGML_COMPUTE_FP16_TO_FP32(u.fp16);
+
+#else
+
         float f = ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(u.fp16);
+
+#endif // defined(USE_HW_FP_CONVERT)
+
         ggml_table_gelu_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_f32(f));
         ggml_table_gelu_quick_f16[i] = GGML_FP32_TO_FP16(ggml_gelu_quick_f32(f));
     }
@@ -15071,7 +15136,9 @@ void ggml_compute_forward_mul_mat(
            nr1);
 */
 
-    // distribute the thread work across the inner or outer loop
+    //
+    // Distribute the thread work across the inner (rows) or outer (columns) loop.
+    //
 
     int64_t ir010;
     int64_t ir011;
@@ -15079,9 +15146,24 @@ void ggml_compute_forward_mul_mat(
     int64_t ir111;
     int64_t src0_rpc = 0;
 
-//    if (nr0 >= nr1) {
-//    if ((nr0 >= nth) || (nr1 < nth)) {
-    if ((nr0 >= nr1) && ((nr0 >= nth) || (nr1 < nth))) {
+    //
+    //  If the vector dot type is repack and the number of rows is greater than or
+    //     equal to the number of threads and the number of columns is greater than
+    //     or equal to 4, then distribute across rows.
+    //  
+    //  N.B. The factor 4 is the number of times the repack algoritms are unrolled
+    //       based on the number of columns.
+    //
+    //  else if the number of rows is greater than or equal to the number of columns
+    //      and, the number of rows is greater than or equal to the number of threads
+    //      or the number of columns is less than the number of threads, then distribute
+    //      across rows.
+    //
+    //  else distribute across columns.
+    //
+
+    if ((ggml_is_multirow(vec_dot_type) && (nr0 >= nth) && (nr1 >= 4)) ||
+        ((nr0 >= nr1) && ((nr0 >= nth) || (nr1 < nth)))) {
 
 #ifdef GGML_TENSOR_OP_PERF
 
@@ -15100,6 +15182,7 @@ void ggml_compute_forward_mul_mat(
 
     } else {
 //        printf("nr0 %zd, nr1 %zd\n", nr0, nr1);
+
         ir010 = 0;
         ir011 = nr0;
         src0_rpc = nr0;
@@ -15176,6 +15259,11 @@ void ggml_compute_forward_mul_mat(
 #ifdef GGML_TENSOR_OP_PERF
 
     if (!ith) {
+
+        //
+        // Update quant type row size statistics.
+        //
+
         uint64_t bucket_index = src0_row_size;
 
         if (bucket_index > ARRAYSIZE(quant_type_row_size[src0_type].counts)) {
@@ -15185,6 +15273,25 @@ void ggml_compute_forward_mul_mat(
 
         quant_type_row_size[src0_type].total_count += 1;
         quant_type_row_size[src0_type].counts[bucket_index - 1] += 1;
+
+        //
+        // Update quant vec_dot size statistics.
+        //
+
+        int64_t vec_dot_size = (src0_row_size * nr0) + (row_size * nr1);
+
+        bucket_index = (vec_dot_size + VEC_DOT_BUCKET_SIZE - 1) / VEC_DOT_BUCKET_SIZE;
+        if (bucket_index > ARRAYSIZE(quant_vec_dot_size[src0_type].counts)) {
+            bucket_index = ARRAYSIZE(quant_vec_dot_size[src0_type].counts);
+        }
+
+        quant_vec_dot_size[src0_type].total_count += 1;
+        quant_vec_dot_size[src0_type].counts[bucket_index - 1] += 1;
+        quant_vec_dot_size[src0_type].total_size += vec_dot_size;
+
+        //
+        // Update block factor statistics.
+        //
 
         uint64_t blk_index = blck0_factor;
 
