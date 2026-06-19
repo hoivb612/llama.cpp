@@ -199,6 +199,7 @@ struct cli_params {
     bool    force_cpu    = false;
     bool    no_mmap      = false;
     bool    direct_io    = true;
+    bool    repack_xbcg  = false;  // b612 callgraph repack path (GGML_TENSOR_REPACK_MODE_XBCG)
     // Flash Attention default. On the GDKX/Xbox build the non-FA path
     // (separate QK matmul + softmax + attn*V) currently outperforms the FA
     // shader for prompt processing on RDNA2, so we default to OFF there.
@@ -251,7 +252,7 @@ int main(int argc, char ** argv) {
     cli_params p;
 
     if (argc < 2 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB|-fa on|off|auto]\n", argv[0]);
+        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB|-fa on|off|auto|repack-xbcg]\n", argv[0]);
         printf("              [--spec-type TYPE[,TYPE,...]] [--spec-draft-n-max N] [--spec-draft-model PATH]\n");
         printf("\n  Speculative-decoding types (comma separated): %s\n", common_speculative_all_types_str());
         printf("    draft-* types require --spec-draft-model; ngram-* types are self-speculative.\n");
@@ -282,6 +283,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "stream")) { p.streaming = true; }
         else if (!strcmp(argv[i], "cpu"))    { p.force_cpu = true; }
         else if (!strcmp(argv[i], "--no-mmap") || !strcmp(argv[i], "-nm")) { p.no_mmap = true; }
+        else if (!strcmp(argv[i], "repack-xbcg")) { p.repack_xbcg = true; }
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) { p.main_gpu = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-sm") && i + 1 < argc) {
             i++;
@@ -356,6 +358,11 @@ int main(int argc, char ** argv) {
     // --- Initialize llama backend ---
     llama_backend_init();
     // ggml_backend_load_all();
+
+    if (p.repack_xbcg) {
+        llama_set_tensor_repack_mode(GGML_TENSOR_REPACK_MODE_XBCG);
+        printf("[%s]: tensor repack mode = XBCG (callgraph)\n", __func__);
+    }
 
 #if !defined(_GAMING_XBOX)
     // Quiet mode unless verbose
