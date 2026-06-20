@@ -13,26 +13,53 @@
 //   - Driver code-section sizes (admin)
 //   - JSON output for scripting (--json)
 //
-// Windows-only. Runs without admin (best-effort) and lights up additional
-// breakdowns when elevated.
+// Cross-platform: on Windows it uses Win32 / NtQuerySystemInformation / SCM;
+// on Linux it reads /proc and (best-effort) systemd. Runs without privilege
+// (best-effort) and lights up additional breakdowns when elevated / root.
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
 #include <winternl.h>
 #include <winsvc.h>
+#else
+#include <unistd.h>
+#include <dirent.h>
+#include <strings.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+// --- Windows-type shims (Linux/macOS) ------------------------------------
+// wxemem's data structs and printers are written in Windows vocabulary
+// (DWORD pids, SERVICE_* type bits). Provide minimal stand-ins so the
+// platform-neutral code compiles unchanged; the POSIX collectors below fill
+// the same structs from /proc and systemd.
+typedef uint32_t DWORD;
+#ifndef SERVICE_KERNEL_DRIVER
+#define SERVICE_KERNEL_DRIVER       0x00000001u
+#endif
+#ifndef SERVICE_FILE_SYSTEM_DRIVER
+#define SERVICE_FILE_SYSTEM_DRIVER  0x00000002u
+#endif
+#ifndef _stricmp
+#define _stricmp strcasecmp
+#endif
+#endif // !_WIN32
+
 // --- NtQuerySystemInformation glue ---------------------------------------
 // These are declared in winternl.h but the relevant SYSTEM_INFORMATION_CLASS
 // values and structs are not. They are stable Microsoft-internal APIs used by
 // Task Manager / Process Explorer / Sysinternals tools.
+#if defined(_WIN32)
 
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0)
@@ -125,10 +152,11 @@ struct RTL_PROCESS_MODULES {
     RTL_PROCESS_MODULE_INFORMATION Modules[1];
 };
 }  // extern "C"
+#endif // _WIN32
 
 // --- helpers --------------------------------------------------------------
 
-static std::string g_program = "wxemem";
+[[maybe_unused]] static std::string g_program = "wxemem";
 
 static std::string format_bytes(uint64_t bytes, int width = 0) {
     static const char * units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -147,12 +175,13 @@ static std::string format_bytes(uint64_t bytes, int width = 0) {
     return buf;
 }
 
-static std::string format_mib(uint64_t bytes) {
+[[maybe_unused]] static std::string format_mib(uint64_t bytes) {
     char buf[64];
     snprintf(buf, sizeof(buf), "%.1f MB", (double)bytes / (1024.0 * 1024.0));
     return buf;
 }
 
+#if defined(_WIN32)
 static bool is_running_as_admin() {
     BOOL  is_admin = FALSE;
     PSID  admins_sid = nullptr;
@@ -167,7 +196,13 @@ static bool is_running_as_admin() {
     }
     return is_admin != FALSE;
 }
+#else
+static bool is_running_as_admin() {
+    return geteuid() == 0;
+}
+#endif
 
+#if defined(_WIN32)
 static std::string ws_to_utf8(const wchar_t * w) {
     if (!w || !*w) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
@@ -176,6 +211,7 @@ static std::string ws_to_utf8(const wchar_t * w) {
     WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
     return s;
 }
+#endif
 
 static std::string json_escape(const std::string & s) {
     std::string out;
@@ -317,6 +353,8 @@ static std::string hotpatch_original(const std::string & driver) {
 }
 
 // --- collectors -----------------------------------------------------------
+
+#if defined(_WIN32)
 
 static PhysicalMem collect_physical() {
     PhysicalMem p{};
@@ -618,6 +656,291 @@ static std::vector<PageFile> collect_pagefiles() {
     return out;
 }
 
+#else // ===================== POSIX / Linux collectors =====================
+
+// Read an entire (small) /proc file into `out`. Returns false on failure.
+static bool read_proc_file(const char * path, std::string & out) {
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    out.clear();
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    fclose(f);
+    return true;
+}
+
+// Parse a "Key: <number> kB" line (as in /proc/meminfo and /proc/<pid>/status)
+// from `text`, returning the value in BYTES. Returns 0 if the key is absent.
+// The match is anchored at the start of a line and requires the key to be
+// immediately followed by ':'.
+static uint64_t proc_kb(const std::string & text, const char * key) {
+    const size_t klen = strlen(key);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        if (text.compare(pos, klen, key) == 0 &&
+            pos + klen < text.size() && text[pos + klen] == ':') {
+            const char * p = text.c_str() + pos + klen + 1;
+            char * end = nullptr;
+            unsigned long long v = strtoull(p, &end, 10);
+            return (uint64_t)v * 1024ull; // these fields are reported in kB
+        }
+        pos = eol + 1;
+    }
+    return 0;
+}
+
+static PhysicalMem collect_physical() {
+    PhysicalMem p{};
+    std::string mi;
+    if (!read_proc_file("/proc/meminfo", mi)) return p;
+
+    p.total     = proc_kb(mi, "MemTotal");
+    p.available = proc_kb(mi, "MemAvailable");
+    if (p.available == 0) { // pre-3.14 kernels: approximate
+        p.available = proc_kb(mi, "MemFree") + proc_kb(mi, "Cached") + proc_kb(mi, "Buffers");
+    }
+    p.used            = p.total > p.available ? p.total - p.available : 0;
+    p.memory_load_pct = p.total ? (uint32_t)((p.used * 100) / p.total) : 0;
+    p.commit_total    = proc_kb(mi, "Committed_AS");
+    p.commit_limit    = proc_kb(mi, "CommitLimit");
+
+    const uint64_t swap_total = proc_kb(mi, "SwapTotal");
+    const uint64_t swap_free  = proc_kb(mi, "SwapFree");
+    p.total_virtual  = 0; // no system-wide virtual-address total on Linux
+    p.avail_virtual  = 0;
+    p.total_pagefile = p.total     + swap_total; // physical + swap backing
+    p.avail_pagefile = p.available + swap_free;
+    return p;
+}
+
+static KernelMem collect_kernel() {
+    KernelMem k{};
+    std::string mi;
+    if (!read_proc_file("/proc/meminfo", mi)) return k;
+
+    // Map Windows pool vocabulary onto Linux slab accounting:
+    //   paged pool     ~ reclaimable slab (SReclaimable)
+    //   non-paged pool ~ unreclaimable slab + kernel stacks + page tables
+    //   system cache   ~ page cache (Cached + Buffers)
+    k.paged_pool          = proc_kb(mi, "SReclaimable");
+    k.paged_pool_avail    = 0; // not exposed by Linux
+    k.resident_paged_pool = k.paged_pool;
+    k.non_paged_pool      = proc_kb(mi, "SUnreclaim")
+                          + proc_kb(mi, "KernelStack")
+                          + proc_kb(mi, "PageTables");
+    k.driver_code         = 0; // see /proc/modules in the drivers section
+    k.system_code         = 0; // Linux doesn't expose resident kernel-text size
+    k.system_cache        = proc_kb(mi, "Cached") + proc_kb(mi, "Buffers");
+    k.commit_total        = proc_kb(mi, "Committed_AS");
+    k.commit_limit        = proc_kb(mi, "CommitLimit");
+    k.available           = (k.paged_pool || k.non_paged_pool || k.system_cache);
+    return k;
+}
+
+static MemList collect_memlist() {
+    MemList m{};
+    std::string mi;
+    if (!read_proc_file("/proc/meminfo", mi)) return m;
+
+    m.free_bytes     = proc_kb(mi, "MemFree");
+    m.zero_bytes     = 0; // Linux has no separate zeroed-page list
+    m.modified_bytes = proc_kb(mi, "Dirty") + proc_kb(mi, "Writeback");
+    // "Standby" (clean, reclaimable cache) ~ file-backed LRU pages.
+    m.standby_bytes  = proc_kb(mi, "Active(file)") + proc_kb(mi, "Inactive(file)");
+    m.available      = true;
+    return m;
+}
+
+static std::vector<ProcInfo> collect_processes() {
+    std::vector<ProcInfo> out;
+    DIR * d = opendir("/proc");
+    if (!d) return out;
+
+    struct dirent * ent;
+    while ((ent = readdir(d)) != nullptr) {
+        const char * nm = ent->d_name;
+        if (nm[0] < '0' || nm[0] > '9') continue; // only numeric (PID) dirs
+        char * endp = nullptr;
+        long pid = strtol(nm, &endp, 10);
+        if (endp == nm || *endp != '\0' || pid <= 0) continue;
+
+        char path[64];
+        std::string status;
+        snprintf(path, sizeof(path), "/proc/%ld/status", pid);
+        if (!read_proc_file(path, status)) continue; // process already gone
+
+        ProcInfo pi{};
+        pi.pid = (DWORD)pid;
+
+        std::string comm;
+        snprintf(path, sizeof(path), "/proc/%ld/comm", pid);
+        if (read_proc_file(path, comm) && !comm.empty()) {
+            if (comm.back() == '\n') comm.pop_back();
+            pi.name = comm;
+        } else {
+            pi.name = "<unknown>";
+        }
+
+        pi.ws       = proc_kb(status, "VmRSS");  // working set ~ resident set
+        pi.peak_ws  = proc_kb(status, "VmHWM");  // peak resident set
+        pi.pagefile = proc_kb(status, "VmSwap"); // pages actually swapped out
+
+        // Private resident: prefer smaps_rollup (own/root only); else RssAnon.
+        uint64_t priv = 0;
+        std::string rollup;
+        snprintf(path, sizeof(path), "/proc/%ld/smaps_rollup", pid);
+        if (read_proc_file(path, rollup)) {
+            priv = proc_kb(rollup, "Private_Clean") + proc_kb(rollup, "Private_Dirty");
+        }
+        if (priv == 0) priv = proc_kb(status, "RssAnon");
+        pi.private_bytes = priv;
+
+        out.push_back(std::move(pi));
+    }
+    closedir(d);
+    return out;
+}
+
+// Map systemd's UnitFileState onto wxemem's Windows-flavoured start kinds.
+static ServiceStartKind systemd_start_kind(const std::string & ufs) {
+    if (ufs == "enabled" || ufs == "enabled-runtime")          return ServiceStartKind::Auto;
+    if (ufs == "static" || ufs == "indirect" ||
+        ufs == "generated" || ufs == "alias")                  return ServiceStartKind::Demand;
+    if (ufs == "disabled" || ufs == "masked" ||
+        ufs == "masked-runtime" || ufs == "bad")               return ServiceStartKind::Disabled;
+    return ServiceStartKind::Unknown;
+}
+
+// Best-effort systemd inventory. Requires the `systemctl` CLI; if it is absent
+// (e.g. minimal containers, WSL without systemd) this returns empty and the
+// services section is simply omitted.
+static std::vector<ServiceInfo> collect_services() {
+    std::vector<ServiceInfo> out;
+
+    FILE * lf = popen("systemctl list-units --type=service --state=running "
+                      "--no-legend --no-pager --plain 2>/dev/null", "r");
+    if (!lf) return out;
+    std::vector<std::string> names;
+    char lb[1024];
+    while (fgets(lb, sizeof(lb), lf)) {
+        char unit[512];
+        if (sscanf(lb, "%511s", unit) == 1 && strstr(unit, ".service")) {
+            names.push_back(unit);
+        }
+    }
+    pclose(lf);
+    if (names.empty()) return out;
+
+    // Batch all property queries into a single systemctl invocation.
+    std::string cmd = "systemctl show -p Id -p MainPID -p UnitFileState --no-pager";
+    for (const auto & n : names) { cmd += " '"; cmd += n; cmd += "'"; }
+    cmd += " 2>/dev/null";
+    FILE * sf = popen(cmd.c_str(), "r");
+    if (!sf) return out;
+
+    // `systemctl show` prints key=value lines; unit blocks are separated by a
+    // blank line.
+    ServiceInfo cur{};
+    bool have = false;
+    auto flush = [&]() {
+        if (have && !cur.name.empty()) {
+            cur.service_type  = 0; // user-mode; kernel modules are in drivers
+            cur.current_state = 0;
+            out.push_back(cur);
+        }
+        cur = ServiceInfo{};
+        have = false;
+    };
+    while (fgets(lb, sizeof(lb), sf)) {
+        std::string line(lb);
+        if (!line.empty() && line.back() == '\n') line.pop_back();
+        if (line.empty()) { flush(); continue; }
+        have = true;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "Id") {
+            cur.name = val;
+            cur.display_name = val;
+        } else if (key == "MainPID") {
+            cur.pid = (DWORD)strtoul(val.c_str(), nullptr, 10);
+        } else if (key == "UnitFileState") {
+            cur.start_kind = systemd_start_kind(val);
+        }
+    }
+    flush();
+    pclose(sf);
+    return out;
+}
+
+static std::vector<DriverInfo> collect_drivers() {
+    std::vector<DriverInfo> out;
+    std::string mods;
+    if (!read_proc_file("/proc/modules", mods)) return out;
+
+    // Each line: name size refcount deps state address
+    // `size` is in bytes; `address` is 0 unless reading as root.
+    size_t pos = 0;
+    while (pos < mods.size()) {
+        size_t eol = mods.find('\n', pos);
+        if (eol == std::string::npos) eol = mods.size();
+        std::string line = mods.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.empty()) continue;
+
+        char namebuf[256];
+        unsigned long long size = 0;
+        if (sscanf(line.c_str(), "%255s %llu", namebuf, &size) == 2) {
+            DriverInfo di{};
+            di.name       = namebuf;
+            di.image_size = (uint64_t)size;
+            size_t hx = line.rfind("0x");
+            di.image_base = (hx != std::string::npos)
+                              ? (uintptr_t)strtoull(line.c_str() + hx, nullptr, 16) : 0;
+            out.push_back(std::move(di));
+        }
+    }
+    return out;
+}
+
+static std::vector<PageFile> collect_pagefiles() {
+    std::vector<PageFile> out;
+    std::string sw;
+    if (!read_proc_file("/proc/swaps", sw)) return out;
+
+    // Skip the header line, then: Filename Type Size Used Priority
+    // (Size/Used are in 1024-byte units.)
+    size_t pos = sw.find('\n');
+    if (pos == std::string::npos) return out;
+    pos += 1;
+    while (pos < sw.size()) {
+        size_t eol = sw.find('\n', pos);
+        if (eol == std::string::npos) eol = sw.size();
+        std::string line = sw.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.empty()) continue;
+
+        char fnbuf[512]; char typebuf[64];
+        unsigned long long size_kb = 0, used_kb = 0; long prio = 0;
+        if (sscanf(line.c_str(), "%511s %63s %llu %llu %ld",
+                   fnbuf, typebuf, &size_kb, &used_kb, &prio) >= 4) {
+            PageFile pf;
+            pf.path        = fnbuf;
+            pf.total_bytes = (uint64_t)size_kb * 1024ull;
+            pf.used_bytes  = (uint64_t)used_kb * 1024ull;
+            pf.peak_bytes  = 0; // Linux doesn't track peak swap usage
+            out.push_back(std::move(pf));
+        }
+    }
+    return out;
+}
+
+#endif // _WIN32 / POSIX collectors
+
 // --- formatting -----------------------------------------------------------
 
 struct Options {
@@ -641,7 +964,11 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
     auto line = []{ printf("--------------------------------------------------------------------------------\n"); };
 
     if (!opts.processes_only) {
+#if defined(_WIN32)
         printf("WXEmem -- Windows memory snapshot\n");
+#else
+        printf("WXEmem -- Linux memory snapshot\n");
+#endif
         line();
         printf(" Physical RAM\n");
         printf("   %-22s %12s\n",                 "Total:",     format_bytes(p.total,     12).c_str());
@@ -980,7 +1307,11 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
     }
 
     if (!admin) {
+#if defined(_WIN32)
         printf(" Tip: re-run elevated (admin) for full kernel pool + driver image breakdown\n");
+#else
+        printf(" Tip: re-run as root (sudo) for per-process private memory + driver addresses\n");
+#endif
     }
 }
 
@@ -1135,7 +1466,11 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
 
 static void print_usage() {
     fprintf(stderr,
+#if defined(_WIN32)
         "WXEmem — Windows memory inspector\n"
+#else
+        "WXEmem — Linux memory inspector\n"
+#endif
         "Usage: wxemem [options]\n"
         "\n"
         "Options:\n"
