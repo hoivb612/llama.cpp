@@ -43,6 +43,7 @@
 
 /tags
 /.build/
+/so2001/build*
 /build*
 /release
 /debug
