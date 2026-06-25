@@ -606,6 +606,14 @@ int64_t mul_mat_repack_early_time_us = 0;
 int mul_mat_repack_early_count = 0;
 int compute_op_counts[GGML_OP_COUNT] = {0};
 int64_t compute_op_time[GGML_OP_COUNT] = {0};
+// Phase split for GGML_OP_MUL_MAT: a matmul whose src1 has more than one column
+// (src1->ne[1] > 1) is a batched/prefill matmul; a single-column matmul
+// (src1->ne[1] == 1) is a single-token decode matmul. These let the perf table
+// show how much MUL_MAT time/ops belong to each phase.
+int     mul_mat_prefill_count = 0;
+int64_t mul_mat_prefill_time  = 0;
+int     mul_mat_decode_count  = 0;
+int64_t mul_mat_decode_time   = 0;
 int openMP_compute_runs = 0;
 
 #define GGML_TENSOR_NODE_COUNT 4096
@@ -664,6 +672,21 @@ void ggml_cpu_print_tensor_op_perf() {
                    percent,
                    (double)(compute_op_time[i]) / (double)compute_op_counts[i],
                    ggml_op_name(i));
+            // Break MUL_MAT down into batched (prefill) vs single-token (decode).
+            if (i == GGML_OP_MUL_MAT && (mul_mat_prefill_count || mul_mat_decode_count)) {
+                printf("%8d %8.2f  %5.2f   %8.2f GGML_OP_%s [prefill]\n",
+                       mul_mat_prefill_count,
+                       (double)(mul_mat_prefill_time) / (1000. * 1000.),
+                       (double)mul_mat_prefill_time * 100.f / (double)total_time,
+                       mul_mat_prefill_count ? (double)(mul_mat_prefill_time) / (double)mul_mat_prefill_count : 0.,
+                       ggml_op_name(i));
+                printf("%8d %8.2f  %5.2f   %8.2f GGML_OP_%s [decode ]\n",
+                       mul_mat_decode_count,
+                       (double)(mul_mat_decode_time) / (1000. * 1000.),
+                       (double)mul_mat_decode_time * 100.f / (double)total_time,
+                       mul_mat_decode_count ? (double)(mul_mat_decode_time) / (double)mul_mat_decode_count : 0.,
+                       ggml_op_name(i));
+            }
         }
     }
 
@@ -3557,6 +3580,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 // printf("=================================================\n");
                 const struct ggml_tensor * src0 = node->src[0];
                 const enum ggml_type src0_type = src0->type;
+                // Phase split: batched (prefill) vs single-token (decode).
+                if (node->src[1]->ne[1] > 1) {
+                    mul_mat_prefill_count += 1;
+                    mul_mat_prefill_time  += tensor_t0;
+                } else {
+                    mul_mat_decode_count += 1;
+                    mul_mat_decode_time  += tensor_t0;
+                }
                 vec_dot_type_times[type_traits_cpu[src0_type].vec_dot_type] += tensor_t0;
                 quant_type_info *quant_type_info_data = &(quant_type_row_size[src0_type]);
                 uint64_t bucket_index = ggml_row_size(src0_type, src0->ne[0] /* ne00 */);
