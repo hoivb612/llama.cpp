@@ -414,6 +414,10 @@ ggml_compute_tsc_frequency (
     return;
 }
 
+uint64_t ggml_read_tsc_freq(void) {
+    return tsc_freq;
+}
+
 void ggml_time_init(void) {
     if (!timer_freq) {
         LARGE_INTEGER t;

@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2024 Arm Ltd.
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "ggml-impl.h"
@@ -606,6 +605,12 @@ make_q6_k_repack_quant (
         __m512i qs2 = _mm512_or_si512(qs2_0, qs2_1);
         qs2 = _mm512_or_si512(qs2, qs2_2);
         qs2 = _mm512_or_si512(qs2, qs2_3);
+
+        //
+        // Position the first 2-bits for direct use in the vec dot repack function.
+        //
+
+        qs2 = _mm512_rol_epi32(qs2, 4);
         _mm512_storeu_si512((__m512i *)&out->qh[0], qs2);
 
         out += 1;
@@ -1875,16 +1880,6 @@ xx_vec_dot_q3_k_q8_k_x8 (
 
             for (uint64_t i = 0; i < nb; i += 1) {
 
-                __m512i sumi0 = _mm512_setzero_si512();
-                __m512i sumi1 = _mm512_setzero_si512();
-                __m512i sumi2 = _mm512_setzero_si512();
-                __m512i sumi3 = _mm512_setzero_si512();
-
-                __m512i bias0 = _mm512_setzero_si512();
-                __m512i bias1 = _mm512_setzero_si512();
-                __m512i bias2 = _mm512_setzero_si512();
-                __m512i bias3 = _mm512_setzero_si512();
-
                 //
                 // Set up scales. There are 16 scales packed in 6-bit format.
                 //
@@ -1914,8 +1909,27 @@ xx_vec_dot_q3_k_q8_k_x8 (
 
                 __m512i q3bytes = _mm512_loadu_si512(x[i].qs);
         
+                __m512i sumi0 = _mm512_setzero_si512();
+                __m512i sumi1 = _mm512_setzero_si512();
+                __m512i sumi2 = _mm512_setzero_si512();
+                __m512i sumi3 = _mm512_setzero_si512();
+
+                __m512i bias0 = _mm512_setzero_si512();
+                __m512i bias1 = _mm512_setzero_si512();
+                __m512i bias2 = _mm512_setzero_si512();
+                __m512i bias3 = _mm512_setzero_si512();
+
                 for (uint64_t j = 0; j < QK_K / 64; j += 1) {
-        
+
+                    //
+                    // Load the column data first.
+                    //
+
+                    const __m512i q8v0 = _mm512_loadu_si512(&y0[i].qs[j * 64]);
+                    const __m512i q8v1 = _mm512_loadu_si512(&y1[i].qs[j * 64]);
+                    const __m512i q8v2 = _mm512_loadu_si512(&y2[i].qs[j * 64]);
+                    const __m512i q8v3 = _mm512_loadu_si512(&y3[i].qs[j * 64]);
+
                     //
                     // Isolate the low 2-bits of the q3 values and move to the next value.
                     //
@@ -1942,26 +1956,21 @@ xx_vec_dot_q3_k_q8_k_x8 (
                     // and accumulate the results.
                     //
 
-                    const __m512i q8v0 = _mm512_loadu_si512(&y0[i].qs[j * 64]);
                     sumi0 = _mm512_dpbusd_epi32(sumi0, q3lv, q8v0);
                     bias0 = _mm512_dpbusd_epi32(bias0, q3hv, q8v0);
 
-                    const __m512i q8v1 = _mm512_loadu_si512(&y1[i].qs[j * 64]);
                     sumi1 = _mm512_dpbusd_epi32(sumi1, q3lv, q8v1);
                     bias1 = _mm512_dpbusd_epi32(bias1, q3hv, q8v1);
 
-                    const __m512i q8v2 = _mm512_loadu_si512(&y2[i].qs[j * 64]);
                     sumi2 = _mm512_dpbusd_epi32(sumi2, q3lv, q8v2);
                     bias2 = _mm512_dpbusd_epi32(bias2, q3hv, q8v2);
 
-                    const __m512i q8v3 = _mm512_loadu_si512(&y3[i].qs[j * 64]);
                     sumi3 = _mm512_dpbusd_epi32(sumi3, q3lv, q8v3);
                     bias3 = _mm512_dpbusd_epi32(bias3, q3hv, q8v3);
                 }
-        
+
                 //
-                // Subtract the bias values from the sum and scale the result
-                // sum values.
+                // Subtract out the bias from the sum and scale the sum values.
                 //
 
                 sumi0 = _mm512_sub_epi32(sumi0, bias0);
@@ -2075,10 +2084,10 @@ xx_vec_dot_q3_k_q8_k_x8 (
                 // integer results.
                 //
         
+                __m512i q3bytes = _mm512_loadu_si512(x[i].qs);
+        
                 __m512i bias = _mm512_setzero_si512();
                 __m512i sumi = _mm512_setzero_si512();
-        
-                __m512i q3bytes = _mm512_loadu_si512(x[i].qs);
         
                 for (uint64_t j = 0; j < QK_K / 64; j += 1) {
         
@@ -2380,7 +2389,7 @@ xx_vec_dot_q4_k_q8_k_x8 (
                 utmp[0] |= (uint64_t)(vscales[0] & kmask1);
 
                 const __m128i scales8 = _mm_insert_epi64(zero128, utmp[0], 0);
-                const __m128i mins8   = _mm_insert_epi64(zero128, utmp[1], 0);
+                const __m128i mins8 = _mm_insert_epi64(zero128, utmp[1], 0);
 
                 __m512i scale = _mm512_cvtepi8_epi32(scales8);
                 scale = _mm512_inserti64x4(scale, _mm512_castsi512_si256(scale), 1);
@@ -2643,14 +2652,12 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 __m512i sumi = _mm512_setzero_si512();
 
                 //
-                // Load the high 2-bits and rotate the bits left by 4 - 256 2-bit values.
+                // Load 256 2-bit high values.
                 //
-                // N.B. This lines up the first set of 2-bits in the proper position to
-                //      merge with the first set of 4-bits.
+                // N.B. The high 2-bits are preshifted for direct use.
                 //
 
                 __m512i q2bits = _mm512_loadu_si512(q2);
-                q2bits = _mm512_rol_epi32(q2bits, 4);
 
                 //
                 // Unpack the 6-bit quant values into unsigned 8-bit quant values
@@ -2835,8 +2842,12 @@ xx_vec_dot_q6_k_q8_k_x8 (
             for (uint64_t i = 0; i < nb; i += 1) {
 
                 //
-                // Per-column integer accumulators.
+                // Load 256 2-bit high values.
                 //
+                // N.B. The high 2-bits are preshifted for direct use.
+                //
+
+                __m512i q2bits = _mm512_loadu_si512(&x[i].qh[0]);
 
                 __m512i sumi0 = _mm512_setzero_si512();
                 __m512i sumi1 = _mm512_setzero_si512();
@@ -2847,15 +2858,6 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 __m512i bias1 = _mm512_setzero_si512();
                 __m512i bias2 = _mm512_setzero_si512();
                 __m512i bias3 = _mm512_setzero_si512();
-
-                //
-                // Load the high 2-bits and rotate the bits left by 6 - 256 2-bit values.
-                //
-                // N.B. This lines up the first set of high 2-bits in the proper position.
-                //
-
-                __m512i q2bits = _mm512_loadu_si512(&x[i].qh[0]);
-                q2bits = _mm512_rol_epi32(q2bits, 6);
 
                 //
                 // Unpack the 6-bit quant values into unsigned 8-bit quant values
@@ -2874,16 +2876,14 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q8_3 = _mm512_loadu_si512(&y3[i].qs[j * 128 + 0]);
 
                     //
-                    // Load 64 nibble packed 4-bit quant values - 128 4-bit values
-                    // and shift the next high 2-bits into place.
+                    // Load 64 nibble packed 4-bit quant values - 128 4-bit values.
                     //
 
                     __m512i q4bits = _mm512_loadu_si512(&x[i].ql[j * 64]);
-                    q2bits = _mm512_ror_epi32(q2bits, 2);
 
                     //
-                    // Merge the low 4-bits and high 2-bits of the 6-bit quant values
-                    // into unsigned 6-bit quant value.
+                    // Merge the low 4-bits and high 2-bits into unsigned 6-bit quant
+                    // values.
                     //
         
                     const __m512i q4bits1 = _mm512_and_si512(q4bits, m4);
@@ -2891,7 +2891,10 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q6_0 = _mm512_or_si512(q2bits1, q4bits1);
 
                     //
-                    // Dpbusd against shared q6_0.
+                    // Multiply the unsigned q6 quant values by the signed q8 quant
+                    // values and accumulate the results. Also multiply the unsigned
+                    // bias values by the signed q8 quant values, and accumulate the
+                    // results.
                     //
 
                     sumi0 = _mm512_dpbusd_epi32(sumi0, q6_0, q8_0);
@@ -2924,8 +2927,8 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     q2bits = _mm512_ror_epi32(q2bits, 2);
 
                     //
-                    // Merge the high 4-bits and high 2-bits of the 6-bit quant value
-                    // into unsigned 6-bit quant values.
+                    // Merge the high 4-bits and high 2-bits into unsigned 6-bit quant
+                    // values.
                     //
 
                     const __m512i q4bits2 = _mm512_and_si512(q4bits, m4);
@@ -2933,8 +2936,17 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q6_1 = _mm512_or_si512(q2bits2, q4bits2);
 
                     //
-                    // Dpbusd against shared q6_1.
+                    // Shift the next set of high 2-bits into place.
                     //
+
+                    q2bits = _mm512_ror_epi32(q2bits, 2);
+
+                    //
+                    // Multiply the unsigned q6 quant values by the signed q8 quant
+                    // values and accumulate the results. Also multiply the unsigned
+                    // bias values by the signed q8 quant values, and accumulate the
+                    // results.
+                    // 
 
                     sumi0 = _mm512_dpbusd_epi32(sumi0, q6_1, q8_4);
                     bias0 = _mm512_dpbusd_epi32(bias0, m32s, q8_4);
@@ -3035,17 +3047,16 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
                 const __m512i scales = _mm512_cvtepi8_epi32(scales8);
         
-                __m512i bias = _mm512_setzero_si512();
-                __m512i sumi = _mm512_setzero_si512();
-
                 //
-                // Load the high 2-bits and rotate the bits left by 6 - 256 2-bit values.
+                // Load 256 2-bit high values.
                 //
-                // N.B. This lines up the first set of 2-bits in the proper position.
+                // N.B. The high 2-bits are preshifted for direct use.
                 //
 
                 __m512i q2bits = _mm512_loadu_si512(&x[i].qh[0]);
-                q2bits = _mm512_rol_epi32(q2bits, 6);
+
+                __m512i bias = _mm512_setzero_si512();
+                __m512i sumi = _mm512_setzero_si512();
 
                 //
                 // Unpack the 6-bit quant values into unsigned 8-bit quant values
@@ -3055,16 +3066,20 @@ xx_vec_dot_q6_k_q8_k_x8 (
                 for (uint64_t j = 0; j < QK_K / 128; j += 1) {
 
                     //
-                    // Load 64 nibble packed 4-bit quant values - 128 4-bit values
-                    // and shift the next high 2-bits into place.
+                    // Load column activation value.
+                    //
+
+                    const __m512i q8_0 = _mm512_loadu_si512(&y_rem[i].qs[j * 128 + 0]);
+
+                    //
+                    // Load 64 nibble packed 4-bit quant values - 128 4-bit values.
                     //
 
                     __m512i q4bits = _mm512_loadu_si512(&x[i].ql[j * 64]);
-                    q2bits = _mm512_ror_epi32(q2bits, 2);
 
                     //
-                    // Merge the low 4-bits and high 2-bits of the 6-bit quant values
-                    // into unsigned 6-bit quant values.
+                    // Merge the low 4-bits and high 2-bits into unsigned 6-bit quant
+                    // values.
                     //
         
                     const __m512i q4bits1 = _mm512_and_si512(q4bits, m4);
@@ -3072,12 +3087,20 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q6_0 = _mm512_or_si512(q2bits1, q4bits1);
 
                     //
-                    // Load 8-bit quant values - 64 8-bit values and dpbusd against q6_0.
+                    // Multiply the unsigned q6 quant values by the signed q8 quant
+                    // values and accumulate the results. Also multiply the unsigned
+                    // bias values by the signed q8 quant values, and accumulate the
+                    // results.
                     //
 
-                    const __m512i q8_0 = _mm512_loadu_si512(&y_rem[i].qs[j * 128 + 0]);
                     sumi = _mm512_dpbusd_epi32(sumi, q6_0, q8_0);
                     bias = _mm512_dpbusd_epi32(bias, m32s, q8_0);
+
+                    //
+                    // Load column activation value.
+                    //
+
+                    const __m512i q8_1 = _mm512_loadu_si512(&y_rem[i].qs[j * 128 + 64]);
 
                     //
                     // Shift the next nibble into place and shift next high 2-bits into
@@ -3097,10 +3120,18 @@ xx_vec_dot_q6_k_q8_k_x8 (
                     const __m512i q6_1 = _mm512_or_si512(q2bits2, q4bits2);
 
                     //
-                    // Load 8-bit quant values - 64 8-bit values and dpbusd against q6_1.
+                    // Shift the next set of high 2-bits into place.
                     //
 
-                    const __m512i q8_1 = _mm512_loadu_si512(&y_rem[i].qs[j * 128 + 64]);
+                    q2bits = _mm512_ror_epi32(q2bits, 2);
+
+                    //
+                    // Multiply the unsigned q6 quant values by the signed q8 quant
+                    // values and accumulate the results. Also multiply the unsigned
+                    // bias values by the signed q8 quant values, and accumulate the
+                    // results.
+                    //
+
                     sumi = _mm512_dpbusd_epi32(sumi, q6_1, q8_1);
                     bias = _mm512_dpbusd_epi32(bias, m32s, q8_1);
                 }
@@ -3312,18 +3343,14 @@ xx_vec_dot_q8_0_q8_0_x8 (
             for (uint64_t i = 0; i < nb; i += 1) {
 
                 //
-                // Per-column integer accumulators.
+                // Compute the dot product and accumulate.
                 //
-
+        
                 __m512i sumi0 = _mm512_setzero_si512();
                 __m512i sumi1 = _mm512_setzero_si512();
                 __m512i sumi2 = _mm512_setzero_si512();
                 __m512i sumi3 = _mm512_setzero_si512();
 
-                //
-                // Compute the dot product and accumulate.
-                //
-        
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
 
                     //
@@ -3444,8 +3471,6 @@ xx_vec_dot_q8_0_q8_0_x8 (
 
             for (uint64_t i = 0; i < nb; i += 1) {
         
-                __m512i sumi = _mm512_setzero_si512();
-        
                 //
                 // Compute combined scale for the an entire quant block.
                 //
@@ -3462,6 +3487,8 @@ xx_vec_dot_q8_0_q8_0_x8 (
                 // Compute the dot product and accumulate.
                 //
         
+                __m512i sumi = _mm512_setzero_si512();
+
                 for (uint64_t j = 0; j < (QK_K / (QK8_0 * 2)); j += 1) {
                     const __m512i qy = _mm512_loadu_si512(&y_rem[i].qs[j * QK8_0 * 2 + 0]);
                     const __m512i qx = _mm512_loadu_si512(&x[i].qs[j * QK8_0 * 2 + 0]);
