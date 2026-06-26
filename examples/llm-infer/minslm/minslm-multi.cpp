@@ -238,7 +238,7 @@ int main(int argc, char** argv) {
     int64_t t0 = timer_us();
 
     if (argc == 1 || argv[1][0] == '-') {
-        printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [paffin] [stream] [verbose] [repack-xbox | repack-ggml] [--weight-budget MB]\n", argv[0]);
+        printf("usage: %s arg_MODEL_PATH arg_#_threads arg_CUSTOM_PROMPT_file [pfc] [paffin] [ccx-affin] [stream] [verbose] [repack-xbox | repack-ggml] [--weight-budget MB]\n", argv[0]);
         return 1;
     }
 
@@ -276,6 +276,9 @@ int main(int argc, char** argv) {
 
         } else if (!strcmp(argv[4], "paffin")) {
             params.process_affinity = true;
+
+        } else if (!strcmp(argv[4], "ccx-affin")) {
+            _putenv_s("GGML_B612_CCX_SPREAD", "1");
 
         } else if (!strcmp(argv[4], "pfc")) {
             params.pfc_mode = true;

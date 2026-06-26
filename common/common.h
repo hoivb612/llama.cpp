@@ -467,6 +467,8 @@ struct common_params {
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
+    bool ccx_affin = false; // pin one worker thread per CCX to spread memory bandwidth (GGML_B612_CCX_SPREAD)
+
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
@@ -709,6 +711,11 @@ struct common_params {
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
+
+// Enable per-CCX worker pinning by setting the GGML_B612_CCX_SPREAD env var,
+// which the ggml-cpu backend reads to spread worker threads across CCXs.
+// No-op when enable is false. Safe to call on any platform.
+void common_ccx_affinity_init(bool enable);
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -371,6 +372,18 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+}
+
+void common_ccx_affinity_init(bool enable) {
+    if (!enable) {
+        return;
+    }
+    // Bridge to the ggml-cpu CCX-spread mechanism, which is gated on this env var.
+#if defined(_WIN32)
+    _putenv_s("GGML_B612_CCX_SPREAD", "1");
+#else
+    setenv("GGML_B612_CCX_SPREAD", "1", 1);
+#endif
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {
