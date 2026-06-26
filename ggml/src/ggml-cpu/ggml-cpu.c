@@ -3145,6 +3145,116 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
 #endif
 
+// ---------------------------------------------------------------------------
+// B612 group-aware CCX-spread affinity (opt-in via env GGML_B612_CCX_SPREAD=1)
+//
+// On large chiplet CPUs (e.g. 96-core, 12 CCXs across 3 processor groups) decode
+// is fabric-bandwidth-bound: aggregate read bandwidth scales with the number of
+// distinct CCXs / memory links engaged, NOT with L3 locality. The Windows OS
+// scheduler does not deterministically spread worker threads one-per-CCX, and
+// SetProcessAffinityMask / SetThreadAffinityMask are capped to a single processor
+// group (64 LPs) -> they can only reach a subset of CCXs. Only SetThreadGroupAffinity
+// can cross processor groups.
+//
+// This routine pins worker `ith` to a distinct CCX, interleaving processor groups,
+// so consecutive workers engage different fabric links. It is a no-op unless the
+// GGML_B612_CCX_SPREAD environment variable is set to a non-zero value, and a no-op
+// on non-Windows or pre-Win7 SDKs.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32) && defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0601)
+
+typedef struct {
+    WORD      group;
+    KAFFINITY mask;
+    int       base_lp;   // lowest LP index (within group) belonging to this CCX
+    int       n_cores;   // physical cores in this CCX (LPs / 2 for SMT)
+} ggml_b612_ccx_t;
+
+static ggml_b612_ccx_t g_b612_ccx[64];
+static int             g_b612_nccx      = 0;
+static int             g_b612_ccx_ready = 0;   // 0 = uninit, 1 = enabled+built, -1 = disabled/failed
+static volatile LONG   g_b612_ccx_lock  = 0;
+
+static void ggml_b612_build_ccx_map(void) {
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    if (len == 0) { return; }
+    BYTE * buf = (BYTE *) malloc(len);
+    if (!buf) { return; }
+    if (!GetLogicalProcessorInformationEx(RelationCache, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *) buf, &len)) {
+        free(buf);
+        return;
+    }
+    BYTE * p = buf;
+    while (p < buf + len) {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX * info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *) p;
+        if (info->Relationship == RelationCache && info->Cache.Level == 3 && g_b612_nccx < 64) {
+            GROUP_AFFINITY   ga = info->Cache.GroupMask;
+            ggml_b612_ccx_t * c = &g_b612_ccx[g_b612_nccx++];
+            int base = -1, n_lp = 0;
+            c->group = ga.Group;
+            c->mask  = ga.Mask;
+            for (int b = 0; b < 64; b++) {
+                if (ga.Mask & (1ull << b)) {
+                    if (base < 0) { base = b; }
+                    n_lp++;
+                }
+            }
+            c->base_lp = (base < 0) ? 0 : base;
+            c->n_cores = (n_lp / 2 > 0) ? (n_lp / 2) : 1;
+        }
+        p += info->Size;
+    }
+    free(buf);
+}
+
+static void ggml_b612_pin_ccx_spread(int ith) {
+    if (g_b612_ccx_ready == 0) {
+        while (InterlockedCompareExchange(&g_b612_ccx_lock, 1, 0) != 0) { /* spin */ }
+        if (g_b612_ccx_ready == 0) {
+            const char * env = getenv("GGML_B612_CCX_SPREAD");
+            if (env && env[0] && env[0] != '0') {
+                ggml_b612_build_ccx_map();
+                g_b612_ccx_ready = (g_b612_nccx > 0) ? 1 : -1;
+                if (g_b612_ccx_ready == 1) {
+                    fprintf(stderr, "ggml: B612 CCX-spread affinity enabled (%d CCXs)\n", g_b612_nccx);
+                }
+            } else {
+                g_b612_ccx_ready = -1;
+            }
+        }
+        InterlockedExchange(&g_b612_ccx_lock, 0);
+    }
+
+    if (g_b612_ccx_ready != 1 || g_b612_nccx <= 0) {
+        return;
+    }
+
+    int               ci   = ith % g_b612_nccx;       // distinct CCX per worker, interleaving groups
+    int               core = ith / g_b612_nccx;        // stack onto next core once nthr > nccx
+    ggml_b612_ccx_t * c    = &g_b612_ccx[ci];
+    int               lp   = c->base_lp + 2 * (core % c->n_cores);  // primary thread of each physical core
+
+    GROUP_AFFINITY ga;
+    ZeroMemory(&ga, sizeof(ga));
+    ga.Group = c->group;
+    ga.Mask  = 1ull << lp;
+
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, NULL)) {
+        static volatile LONG warned = 0;
+        if (InterlockedCompareExchange(&warned, 1, 0) == 0) {
+            fprintf(stderr, "warn: ggml B612 CCX-spread SetThreadGroupAffinity (g=%u mask=0x%llx) failed err=%lu\n",
+                    (unsigned) ga.Group, (unsigned long long) ga.Mask, (unsigned long) GetLastError());
+        }
+    }
+}
+
+#else
+
+static void ggml_b612_pin_ccx_spread(int ith) { UNUSED(ith); }
+
+#endif // _WIN32 CCX-spread
+
 static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
         if (mask[i]) { return true; }
@@ -3522,6 +3632,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     set_numa_thread_affinity(state->ith);
 #endif
+
+    // Opt-in (GGML_B612_CCX_SPREAD=1) group-aware CCX-spread pinning: pin each worker
+    // to a distinct CCX across all processor groups to maximize engaged fabric links.
+    // No-op unless the env var is set; no-op on non-Windows. See ggml_b612_pin_ccx_spread.
+    ggml_b612_pin_ccx_spread(state->ith);
 
     struct ggml_compute_params params = {
         /*.ith        =*/ state->ith,
