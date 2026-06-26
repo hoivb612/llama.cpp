@@ -20,3 +20,30 @@ if (MSVC)
         NOMINMAX
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# Standalone Windows OS utilities (CPU topology + memory-bandwidth probes).
+# These are self-contained Win32 diagnostics used to investigate NUMA / CCX
+# behaviour (see topo.c and bwtest.c headers). Windows-only.
+#   topo   - dumps LP -> core -> CCX(L3) -> NUMA topology
+#   bwtest - measures aggregate read bandwidth vs thread placement
+# ---------------------------------------------------------------------------
+if (WIN32)
+    add_executable(topo topo.c)
+    install(TARGETS topo RUNTIME)
+    target_compile_definitions(topo PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+
+    add_executable(bwtest bwtest.c)
+    install(TARGETS bwtest RUNTIME)
+    target_compile_definitions(bwtest PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+endif()
