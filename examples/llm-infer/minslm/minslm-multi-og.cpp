@@ -17,7 +17,7 @@
 // Usage:
 //   minslminfer-multi-og MODEL_PATH #_threads SCRIPT_file [template_file] [options...]
 //
-// Options: verbose|v1|v2  pfc  paffin  stream  cpu  add-special  parse-special
+// Options: verbose|v1|v2  pfc  paffin  ccx-affin  stream  cpu  add-special  parse-special
 //
 // The optional template=FILE uses CUSTOM_TEMPLATE_PROMPT / CUSTOM_TURN_TEMPLATE
 // sections (same as minslm-multi) to supply model-specific chat formatting.
@@ -828,7 +828,7 @@ int main(int argc, char** argv) {
         printf("    PROMPT\n");
         printf("    /context | /rewind [N] | quit()\n");
         printf("\n");
-        printf("  Options: verbose|v1|v2  pfc  paffin  stream  cpu\n");
+        printf("  Options: verbose|v1|v2  pfc  paffin  ccx-affin  stream  cpu\n");
         printf("           add-special  parse-special  template=<file>\n");
         printf("           -d N (GPU device index)  -sm none|layer|row\n");
         printf("           --weight-budget MB (layer windowing budget)\n");
@@ -871,6 +871,8 @@ int main(int argc, char** argv) {
             params.verbose = 2;
         } else if (arg == "paffin") {
             params.process_affinity = true;
+        } else if (arg == "ccx-affin") {
+            _putenv_s("GGML_B612_CCX_SPREAD", "1");
         } else if (arg == "pfc") {
             params.pfc_mode = true;
         } else if (arg == "stream") {

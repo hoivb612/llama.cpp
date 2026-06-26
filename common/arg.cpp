@@ -2308,6 +2308,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NUMA"));
     add_opt(common_arg(
+        {"--ccx-affin"},
+        "pin one worker thread per CCX to spread memory bandwidth across CCX/fabric links\n"
+        "(improves decode throughput on multi-CCX AMD CPUs; sets GGML_B612_CCX_SPREAD)",
+        [](common_params & params) {
+            params.ccx_affin = true;
+            common_ccx_affinity_init(true);
+        }
+    ).set_env("LLAMA_ARG_CCX_AFFIN"));
+    add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

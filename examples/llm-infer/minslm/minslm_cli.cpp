@@ -3,7 +3,7 @@
 // Builds on Linux, WSL2, macOS, and Windows.
 // Links against libllama plus libllama-common (for speculative decoding wiring).
 //
-// Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [stream]
+// Usage: minslm_cli MODEL_PATH N_THREADS CUSTOM_PROMPT_FILE [v1|v2] [cpu] [ccx-affin] [stream]
 //                   [-d N] [-sm none|layer|row] [--weight-budget MB] [-fa on|off|auto]
 //                   [--spec-type TYPE[,TYPE,...]] [--spec-draft-n-max N]
 //                   [--spec-draft-model PATH]
@@ -252,7 +252,7 @@ int main(int argc, char ** argv) {
     cli_params p;
 
     if (argc < 2 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|-d N|-sm none|layer|row|--weight-budget MB|-fa on|off|auto|repack-xbcg]\n", argv[0]);
+        printf("usage: %s MODEL_PATH [N_THREADS] [PROMPT_FILE] [v1|v2|stream|cpu|ccx-affin|-d N|-sm none|layer|row|--weight-budget MB|-fa on|off|auto|repack-xbcg]\n", argv[0]);
         printf("              [--spec-type TYPE[,TYPE,...]] [--spec-draft-n-max N] [--spec-draft-model PATH]\n");
         printf("\n  Speculative-decoding types (comma separated): %s\n", common_speculative_all_types_str());
         printf("    draft-* types require --spec-draft-model; ngram-* types are self-speculative.\n");
@@ -282,6 +282,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "verbose")){ p.verbose = 1; }
         else if (!strcmp(argv[i], "stream")) { p.streaming = true; }
         else if (!strcmp(argv[i], "cpu"))    { p.force_cpu = true; }
+        else if (!strcmp(argv[i], "ccx-affin")) { common_ccx_affinity_init(true); }
         else if (!strcmp(argv[i], "--no-mmap") || !strcmp(argv[i], "-nm")) { p.no_mmap = true; }
         else if (!strcmp(argv[i], "repack-xbcg")) { p.repack_xbcg = true; }
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) { p.main_gpu = atoi(argv[++i]); }
