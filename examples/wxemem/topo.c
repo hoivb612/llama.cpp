@@ -74,11 +74,91 @@ static void walk(LOGICAL_PROCESSOR_RELATIONSHIP rel, const char *title) {
     free(buf);
 }
 
+static int popcount64(KAFFINITY m) {
+    int n = 0;
+    for (int b = 0; b < 64; b++) if (m & (1ull << b)) n++;
+    return n;
+}
+
+static void print_summary(void) {
+    DWORD len = 0;
+    BYTE *p;
+
+    // L3 cache domains == CCXs; record LPs (threads) sharing each L3.
+    int ccx_threads[256];
+    int nccx = 0;
+    BYTE *buf = get_info(RelationCache, &len);
+    if (buf) {
+        p = buf;
+        while (p < buf + len) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)p;
+            if (info->Relationship == RelationCache && info->Cache.Level == 3 && nccx < 256) {
+                ccx_threads[nccx++] = popcount64(info->Cache.GroupMask.Mask);
+            }
+            p += info->Size;
+        }
+        free(buf);
+    }
+
+    // physical cores (one RelationProcessorCore entry each)
+    int ncores = 0;
+    buf = get_info(RelationProcessorCore, &len);
+    if (buf) {
+        p = buf;
+        while (p < buf + len) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)p;
+            if (info->Relationship == RelationProcessorCore) ncores++;
+            p += info->Size;
+        }
+        free(buf);
+    }
+
+    // NUMA nodes
+    int nnuma = 0;
+    buf = get_info(RelationNumaNode, &len);
+    if (buf) {
+        p = buf;
+        while (p < buf + len) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)p;
+            if (info->Relationship == RelationNumaNode) nnuma++;
+            p += info->Size;
+        }
+        free(buf);
+    }
+
+    int ngroups = (int)GetActiveProcessorGroupCount();
+    int nlp     = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+
+    printf("=== SUMMARY ===\n");
+    if (nccx > 0) {
+        int uniform = 1;
+        for (int i = 1; i < nccx; i++) if (ccx_threads[i] != ccx_threads[0]) { uniform = 0; break; }
+        if (uniform) {
+            int t = ccx_threads[0];
+            printf("  %d CCX(s) x %d cores (%d threads) each  [cores assume SMT pairs]\n",
+                   nccx, t / 2, t);
+        } else {
+            printf("  %d CCX(s), mixed sizes:\n", nccx);
+            for (int i = 0; i < nccx; i++)
+                printf("    CCX %2d: %d cores (%d threads)\n", i, ccx_threads[i] / 2, ccx_threads[i]);
+        }
+    } else {
+        printf("  no L3/CCX topology found\n");
+    }
+    printf("  %d physical cores, %d logical processors\n", ncores, nlp);
+    printf("  %d processor group(s), %d NUMA node(s)\n", ngroups, nnuma);
+    if (nccx > 0)
+        printf("  one-thread-per-CCX spread: ccxrun -c 1 <cmd>  (= -n %d on this box)\n", nccx);
+    printf("\n");
+}
+
 int main(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     printf("ActiveProcessorGroups=%u, total logical=%lu\n\n",
            GetActiveProcessorGroupCount(), GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+
+    print_summary();
 
     walk(RelationGroup, "PROCESSOR GROUPS");
     walk(RelationProcessorCore, "PHYSICAL CORES (each = 1 core, mask shows its SMT LPs)");
