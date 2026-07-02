@@ -276,40 +276,27 @@
 #define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
 
 //
-// GGML errors are always fatal.
+// GGML asserts attempt to break into the debugger. If continued they are fatal.
+//
+// N.B. The nature of GGML prevents asserts from being turned off due to the fact
+//      that there is inadequate code to actually deal with the assert condition.
 //
 
-#define GGML_ERROR(x) \
+#define GGML_ASSERT(x) \
     do { \
         if (!(x)) { \
             fflush(stdout); \
             fprintf(stderr, "GGML_ASSERT: %s:%d: %s\n", __FILE__, __LINE__, #x); \
-            ggml_print_backtrace(); \
+            __debugbreak(); \
             abort(); \
         } \
     } while (0)
 
 //
-// Unreachable code execution is always a fatal error.
+// Unreachable code execution always asserts.
 //
 
-#define GGML_UNREACHABLE() GGML_ERROR(!"statement should not be reached")
-
-//
-// If enabled asserts are always fatal.
-//
-// N.B. NDEBUG is used by the C/C++ runtime asserts.
-//
-
-//#define ENABLE_ASSERTS 1
-
-#ifdef ENABLE_ASSERTS
-//#undef NDEBUG
-#define GGML_ASSERT(x) GGML_ERROR(x)
-#else
-#define NDEBUG 1 
-#define GGML_ASSERT(x)
-#endif // ENABLE_ASSERTS
+#define GGML_UNREACHABLE() GGML_ASSERT(!"statement should not be reached")
 
 //
 // Tensor and tensor op perf data collection.

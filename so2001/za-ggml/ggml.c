@@ -968,8 +968,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
 
     [GGML_TYPE_Q8_0_x8] = {
         .type_name                = "q8_0_x8",
-        .blck_size                = QK8_0 * 8,
-        .type_size                = sizeof(block_q8_0_repack),
+        .blck_size                = QK8_0,
+        .type_size                = sizeof(block_q8_0),
         .is_quantized             = true,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q8_0_q8_0_x8,
         .vec_dot_type             = GGML_TYPE_Q8_0_Q8_0_x8,
@@ -977,8 +977,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q8_0_Q8_0_x8] = {
         .type_name                = "q8_0_q8_0_x8",
-        .blck_size                = QK8_0 * 8,
-        .type_size                = sizeof(block_q8_0_repack),
+        .blck_size                = QK8_0,
+        .type_size                = sizeof(block_q8_0),
         .is_quantized             = true,
         .to_float                 = NULL,
         .from_float               = (ggml_from_float_t)quantize_row_q8_0_x8,
@@ -1099,8 +1099,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
 
     [GGML_TYPE_Q4_0_x8] = {
         .type_name                = "q4_0_x8",
-        .blck_size                = QK4_0 * 8,
-        .type_size                = sizeof(block_q4_0_repack),
+        .blck_size                = QK4_0,
+        .type_size                = sizeof(block_q4_0),
         .is_quantized             = true,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_0_q8_0_x8,
         .vec_dot_type             = GGML_TYPE_Q4_0_Q8_0_x8,
@@ -1108,8 +1108,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q4_0_Q8_0_x8] = {
         .type_name                = "q4_0_q8_0_x8",
-        .blck_size                = QK8_0 * 8,
-        .type_size                = sizeof(block_q8_0_repack),
+        .blck_size                = QK8_0,
+        .type_size                = sizeof(block_q8_0),
         .is_quantized             = true,
         .from_float               = (ggml_from_float_t)quantize_row_q8_0_x8,
         .vec_dot                  = (ggml_vec_dot_t)xx_vec_dot_q4_0_q8_0_x8,
@@ -14732,7 +14732,6 @@ void ggml_compute_forward_mul_mat(
     enum ggml_type src0_type = src0->type;
     const enum ggml_type src1_type = src1->type;
 
-
     const int ith = params->ith;
     const int nth = params->nth;
 
@@ -22112,6 +22111,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     for (int j = 0; j < n_threads; j += 1) {
         workers[j].ith = j;
         workers[j].shared = &state_shared;
+        workers[j].thrd = NULL;
     }
 
 #ifdef GGML_TENSOR_OP_PERF
@@ -22128,9 +22128,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef __clang__
 
-        printf("omp is not supported with clang\n");
-
-        state_shared.status = GGML_STATUS_ABORTED;
+        GGML_ASSERT(!"omp is not supported with clang");
 
 #else
 
@@ -24434,6 +24432,17 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
     int alignment_idx = gguf_find_key(ctx, "general.alignment");
     if (alignment_idx != -1) {
         ctx->alignment = gguf_get_val_u32(ctx, alignment_idx);
+    }
+
+    //
+    // The alignment must be nonzero and a power of two.
+    //
+
+    if ((ctx->alignment == 0) || ((ctx->alignment & (ctx->alignment - 1)) != 0)) {
+        fprintf(stderr, "alignment must be nonzero and a power of two %u\n", ctx->alignment);
+        fclose(file);
+        gguf_free(ctx);
+        return NULL;
     }
 
     // we require the data section to be aligned, so take into account any padding

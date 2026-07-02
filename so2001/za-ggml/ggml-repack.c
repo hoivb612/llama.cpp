@@ -877,6 +877,46 @@ make_q4_k_q8_k_repack_quant (
     }
 }
 
+inline
+float
+xx_vec_reduce_x4 (
+    __m128 sum
+    )
+
+{
+    __m128 shuf = _mm_movehdup_ps(sum);
+    __m128 sums = _mm_add_ps(sum, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
+}
+
+inline
+float
+xx_vec_reduce_x8 (
+    __m256 res
+    )
+
+{
+    const __m128 sum = _mm_add_ps(_mm256_castps256_ps128(res),
+                                  _mm256_extractf128_ps(res, 1));
+
+    return xx_vec_reduce_x4(sum);
+}
+
+inline
+float
+xx_vec_reduce_x16 (
+    __m512 acc
+    )
+
+{
+    const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
+                                     _mm512_extractf32x8_ps(acc, 1));
+
+    return xx_vec_reduce_x8(res);
+}
+
 //
 // xx_vec_dot_... implementation note.
 //
@@ -1161,22 +1201,10 @@ xx_vec_dot_q4_0_q8_0_x8 (
             // Reduce and store results for 4 columns.
             //
 
-#define REDUCE_Q40_CP(acc, dst) \
-            do { \
-                const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc), \
-                                                 _mm512_extractf32x8_ps(acc, 1)); \
-                const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res), \
-                                             _mm256_extractf128_ps(res, 1)); \
-                const __m128 t1 = _mm_hadd_ps(t0, t0); \
-                dst[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1)); \
-            } while (0)
-
-            REDUCE_Q40_CP(acc0, s0);
-            REDUCE_Q40_CP(acc1, s1);
-            REDUCE_Q40_CP(acc2, s2);
-            REDUCE_Q40_CP(acc3, s3);
-
-#undef REDUCE_Q40_CP
+            s0[k] = xx_vec_reduce_x16(acc0);
+            s1[k] = xx_vec_reduce_x16(acc1);
+            s2[k] = xx_vec_reduce_x16(acc2);
+            s3[k] = xx_vec_reduce_x16(acc3);
 
             x += nb;
         }
@@ -1246,14 +1274,7 @@ xx_vec_dot_q4_0_q8_0_x8 (
             // Reduce and store the result.
             //
 
-            const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
-                                             _mm512_extractf32x8_ps(acc, 1));
-
-            const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
-                                          _mm256_extractf128_ps(res, 1));
-
-            const __m128 t1 = _mm_hadd_ps(t0, t0);
-            s_rem[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+            s_rem[k] = xx_vec_reduce_x16(acc);
 
             x += nb;
         }
@@ -1542,13 +1563,10 @@ xx_vec_dot_q2_k_q8_k_x8 (
 
 #define REDUCE_Q2K_MINS(acc, mins_acc, dst) \
             do { \
-                __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc), \
-                                           _mm512_extractf32x8_ps(acc, 1)); \
-                res = _mm256_sub_ps(res, mins_acc); \
-                __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res), \
-                                       _mm256_extractf128_ps(res, 1)); \
-                const __m128 t1 = _mm_hadd_ps(t0, t0); \
-                dst[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1)); \
+                const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc), \
+                                                 _mm512_extractf32x8_ps(acc, 1)); \
+                const __m256 sum = _mm256_sub_ps(res, mins_acc); \
+                dst[k] = xx_vec_reduce_x8(sum); \
             } while (0);
 
             REDUCE_Q2K_MINS(acc0, mins_acc0, s0);
@@ -1636,16 +1654,11 @@ xx_vec_dot_q2_k_q8_k_x8 (
             // Reduce and store the result.
             //
 
-            __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
-                                       _mm512_extractf32x8_ps(acc, 1));
+            const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
+                                             _mm512_extractf32x8_ps(acc, 1));
         
-            res = _mm256_sub_ps(res, mins_acc);
-        
-            __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
-                                   _mm256_extractf128_ps(res, 1));
-        
-            const __m128 t1 = _mm_hadd_ps(t0, t0);
-            s_rem[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+            const __m256 sum = _mm256_sub_ps(res, mins_acc);
+            s_rem[k] = xx_vec_reduce_x8(sum);
 
             x += nb;
         }
@@ -2010,22 +2023,10 @@ xx_vec_dot_q3_k_q8_k_x8 (
             // Reduce and store results for 4 columns.
             //
 
-#define REDUCE_Q3K(acc, dst) \
-            do { \
-                __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc), \
-                                           _mm512_extractf32x8_ps(acc, 1)); \
-                __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res), \
-                                       _mm256_extractf128_ps(res, 1)); \
-                const __m128 t1 = _mm_hadd_ps(t0, t0); \
-                dst[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1)); \
-            } while (0);
-
-            REDUCE_Q3K(acc0, s0);
-            REDUCE_Q3K(acc1, s1);
-            REDUCE_Q3K(acc2, s2);
-            REDUCE_Q3K(acc3, s3);
-
-#undef REDUCE_Q3K
+            s0[k] = xx_vec_reduce_x16(acc0);
+            s1[k] = xx_vec_reduce_x16(acc1);
+            s2[k] = xx_vec_reduce_x16(acc2);
+            s3[k] = xx_vec_reduce_x16(acc3);
 
             x += nb;
         }
@@ -2145,14 +2146,7 @@ xx_vec_dot_q3_k_q8_k_x8 (
             // Reduce and store the result.
             //
 
-            __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
-                                       _mm512_extractf32x8_ps(acc, 1));
-        
-            __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
-                                   _mm256_extractf128_ps(res, 1));
-        
-            const __m128 t1 = _mm_hadd_ps(t0, t0);
-            s_rem[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+            s_rem[k] = xx_vec_reduce_x16(acc);
 
             x += nb;
         }
@@ -2489,21 +2483,20 @@ xx_vec_dot_q4_k_q8_k_x8 (
             // Reduce and store results for 4 columns.
             //
 
-#define REDUCE_CP(acc_v, mins_v, dest, idx) \
+#define REDUCE_CP(acc_v, mins_v, dst) \
             { \
                 const __m256 _res = _mm256_add_ps(_mm512_castps512_ps256(acc_v), \
                                                    _mm512_extractf32x8_ps(acc_v, 1)); \
-                __m128 _t0 = _mm_add_ps(_mm256_castps256_ps128(_res), \
-                                         _mm256_extractf128_ps(_res, 1)); \
-                _t0 = _mm_sub_ps(_t0, mins_v); \
-                const __m128 _t1 = _mm_hadd_ps(_t0, _t0); \
-                dest[idx] = _mm_cvtss_f32(_mm_hadd_ps(_t1, _t1)); \
+                const __m128 sum0 = _mm_add_ps(_mm256_castps256_ps128(_res), \
+                                               _mm256_extractf128_ps(_res, 1)); \
+                const __m128 sum1 = _mm_sub_ps(sum0, mins_v); \
+                dst[k] = xx_vec_reduce_x4(sum1); \
             }
 
-            REDUCE_CP(acc0, mins_acc0, s0, k);
-            REDUCE_CP(acc1, mins_acc1, s1, k);
-            REDUCE_CP(acc2, mins_acc2, s2, k);
-            REDUCE_CP(acc3, mins_acc3, s3, k);
+            REDUCE_CP(acc0, mins_acc0, s0);
+            REDUCE_CP(acc1, mins_acc1, s1);
+            REDUCE_CP(acc2, mins_acc2, s2);
+            REDUCE_CP(acc3, mins_acc3, s3);
 
 #undef REDUCE_CP
 
@@ -2580,13 +2573,11 @@ xx_vec_dot_q4_k_q8_k_x8 (
             const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
                                              _mm512_extractf32x8_ps(acc, 1));
 
-            __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
-                                   _mm256_extractf128_ps(res, 1));
+            const __m128 sum0 = _mm_add_ps(_mm256_castps256_ps128(res),
+                                           _mm256_extractf128_ps(res, 1));
 
-            t0 = _mm_sub_ps(t0, mins_acc);
-
-            const __m128 t1 = _mm_hadd_ps(t0, t0);
-            s_rem[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+            const __m128 sum1 = _mm_sub_ps(sum0, mins_acc);
+            s_rem[k] = xx_vec_reduce_x4(sum1);
 
             x += nb;
         }
@@ -2997,22 +2988,10 @@ xx_vec_dot_q6_k_q8_k_x8 (
             // Reduce and store results for 4 columns.
             //
 
-#define REDUCE_Q6K_CP(acc, dst) \
-            do { \
-                const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc), \
-                                                 _mm512_extractf32x8_ps(acc, 1)); \
-                const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res), \
-                                             _mm256_extractf128_ps(res, 1)); \
-                const __m128 t1 = _mm_hadd_ps(t0, t0); \
-                dst[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1)); \
-            } while (0)
-
-            REDUCE_Q6K_CP(acc0, s0);
-            REDUCE_Q6K_CP(acc1, s1);
-            REDUCE_Q6K_CP(acc2, s2);
-            REDUCE_Q6K_CP(acc3, s3);
-
-#undef REDUCE_Q6K_CP
+            s0[k] = xx_vec_reduce_x16(acc0);
+            s1[k] = xx_vec_reduce_x16(acc1);
+            s2[k] = xx_vec_reduce_x16(acc2);
+            s3[k] = xx_vec_reduce_x16(acc3);
 
             x += nb;
         }
@@ -3151,14 +3130,7 @@ xx_vec_dot_q6_k_q8_k_x8 (
             // Reduce and store result.
             //
 
-            __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
-                                       _mm512_extractf32x8_ps(acc, 1));
-
-            __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
-                                   _mm256_extractf128_ps(res, 1));
-
-            const __m128 t1 = _mm_hadd_ps(t0, t0);
-            s_rem[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+            s_rem[k] = xx_vec_reduce_x16(acc);
 
             x += nb;
         }
@@ -3426,22 +3398,10 @@ xx_vec_dot_q8_0_q8_0_x8 (
             // Reduce and store results for 4 columns.
             //
 
-#define REDUCE_Q80_CP(acc, dst) \
-            do { \
-                const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc), \
-                                                 _mm512_extractf32x8_ps(acc, 1)); \
-                const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res), \
-                                             _mm256_extractf128_ps(res, 1)); \
-                const __m128 t1 = _mm_hadd_ps(t0, t0); \
-                dst[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1)); \
-            } while (0)
-
-            REDUCE_Q80_CP(acc0, s0);
-            REDUCE_Q80_CP(acc1, s1);
-            REDUCE_Q80_CP(acc2, s2);
-            REDUCE_Q80_CP(acc3, s3);
-
-#undef REDUCE_Q80_CP
+            s0[k] = xx_vec_reduce_x16(acc0);
+            s1[k] = xx_vec_reduce_x16(acc1);
+            s2[k] = xx_vec_reduce_x16(acc2);
+            s3[k] = xx_vec_reduce_x16(acc3);
 
             x += nb;
         }
@@ -3528,14 +3488,7 @@ xx_vec_dot_q8_0_q8_0_x8 (
             // Reduce and store result.
             //
 
-            const __m256 res = _mm256_add_ps(_mm512_castps512_ps256(acc),
-                                             _mm512_extractf32x8_ps(acc, 1));
-        
-            const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(res),
-                                         _mm256_extractf128_ps(res, 1));
-        
-            const __m128 t1 = _mm_hadd_ps(t0, t0);
-            s_rem[k] = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+            s_rem[k] = xx_vec_reduce_x16(acc);
     
             x += nb;
         }
@@ -3795,11 +3748,15 @@ ggml_repack_tensor (
     case TENSOR_REPACKING_MODE_XBCG:
 
         //
-        // Check if the tensor is contiguous and the number of elements is 0 mod QK_K.
+        // Check if the tensor is a matrix, is contiguous, and the number of elements
+        // is 0 mod QK_K.
+        //
+        // N.B. A matrix only has two dimensions.
         //
 
         uint64_t ne = tensor->ne[0];
-        if (!ggml_is_contiguous(tensor) || ((ne % QK_K) != 0)) {
+        if (!ggml_is_matrix(tensor) || !ggml_is_contiguous(tensor) || ((ne % QK_K) != 0)) {
+            printf("Attempted repack rejected\n");
             break;
         }
 

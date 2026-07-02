@@ -9401,7 +9401,7 @@ static int iq1_find_best_neighbour2(const uint16_t * restrict neighbours, const 
             for (int j = 0; j < 8; ++j) {
                 float w = weight[j];
                 float q = xg[(grid_i[j] - 1)/2];
-                float diff = scale*q - xval[i];
+                float diff = scale*q - xval[j];
                 d2 += w*diff*diff;
             }
             if (d2 < best_score) {
