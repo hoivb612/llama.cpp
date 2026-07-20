@@ -377,6 +377,222 @@ bool run_chat_loop(const llama_model * model, const Weights & w,
     return true;
 }
 
+bool run_chat_script(const llama_model * model, const Weights & w,
+                     const std::vector<ScriptItem> & items,
+                     const std::string & system_prompt,
+                     const ChatParams & params,
+                     std::string & error) {
+    if (params.chat_ctx <= 0) { error = "run_chat_script: chat_ctx<=0"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    (void) resolve_chat_template(model);
+
+    const int n_threads = params.n_threads > 0 ? params.n_threads : 1;
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+
+    NetworkState st;
+    if (!network_state_reserve(st, mf, params.chat_ctx, error)) return false;
+
+    SamplerCtx sc;
+    if (!sampler_init(sc, n_vocab, params, error)) return false;
+
+    std::vector<int32_t> kv_tokens;
+    auto cleanup = [&]() { sampler_free(sc); };
+
+    std::vector<std::pair<std::string, std::string>> transcript;  // (user, answer)
+    int turn_index = 0;
+
+    for (const ScriptItem & it : items) {
+        if (it.kind == ScriptItem::QUIT) {
+            std::fprintf(stderr, "\n[gemma4 -cpf: quit()]\n");
+            break;
+        }
+        if (it.kind == ScriptItem::CONTEXT) {
+            std::fprintf(stderr,
+                "\n[gemma4 -cpf /context: %d turns, n_past=%d / cap=%d]\n",
+                (int) transcript.size(), st.n_past, st.cap_seq);
+            for (size_t i = 0; i < transcript.size(); ++i) {
+                std::fprintf(stderr, "  [%zu] U: %s\n       A: %s\n",
+                             i, transcript[i].first.c_str(),
+                             transcript[i].second.c_str());
+            }
+            continue;
+        }
+        if (it.kind == ScriptItem::REWIND) {
+            std::fprintf(stderr,
+                "\n[gemma4 -cpf /rewind %d: KV rewind not supported in -cpf; "
+                "continuing without dropping turns]\n", it.n);
+            continue;
+        }
+
+        // ---- USER turn ----
+        std::string user_text = it.text;
+        if (turn_index == 0 && !system_prompt.empty()) {
+            // Gemma has no system role: fold the system prompt into turn 1.
+            user_text = system_prompt + "\n\n" + user_text;
+        }
+
+        std::fprintf(stderr, "\n>>> %s\n", it.text.c_str());
+        std::string terr, response;
+        double prefill_ms = 0, gen_ms = 0;
+        int    n_prompt = 0, n_gen = 0;
+        const bool first = (turn_index == 0);
+        const bool ok = run_one_turn(mf, vocab, n_vocab, st, sc, params,
+                                     kv_tokens, user_text, first,
+                                     prefill_ms, gen_ms, n_prompt, n_gen,
+                                     response, terr);
+        if (!ok) { error = terr; cleanup(); return false; }
+
+        const double gen_tps = (gen_ms > 0.0 && n_gen > 0) ? (1000.0 * n_gen) / gen_ms : 0.0;
+        const double pre_tps = (prefill_ms > 0.0 && n_prompt > 0) ? (1000.0 * n_prompt) / prefill_ms : 0.0;
+        std::fprintf(stderr,
+            "[gemma4 -cpf turn %d: prompt_tok=%d gen_tok=%d  "
+            "prefill %.1f ms (%.1f t/s)  gen %.1f ms (%.1f t/s)  "
+            "n_past=%d / cap=%d]\n",
+            turn_index, n_prompt, n_gen,
+            prefill_ms, pre_tps, gen_ms, gen_tps,
+            st.n_past, st.cap_seq);
+
+        transcript.emplace_back(it.text, response);
+        ++turn_index;
+    }
+
+    cleanup();
+    error.clear();
+    return true;
+}
+
+bool run_template_prompts(const llama_model * model, const Weights & w,
+                          const std::string & tmpl,
+                          const std::vector<std::string> & prompts,
+                          const ChatParams & params,
+                          std::string & error) {
+    if (params.chat_ctx <= 0) { error = "run_template_prompts: chat_ctx<=0"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    (void) resolve_chat_template(model);
+
+    const int n_threads = params.n_threads > 0 ? params.n_threads : 1;
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+
+    NetworkState st;
+    if (!network_state_reserve(st, mf, params.chat_ctx, error)) return false;
+
+    SamplerCtx sc;
+    if (!sampler_init(sc, n_vocab, params, error)) return false;
+    auto cleanup = [&]() { sampler_free(sc); };
+
+    // Gemma ends a turn with <end_of_turn>, but some GGUFs don't flag it via
+    // llama_vocab_is_eog / llama_vocab_eot, so generation would run past the
+    // answer. Resolve the id (API first, then a one-time piece scan) and treat
+    // it as an extra stop token.
+    llama_token eot_id = llama_vocab_eot(vocab);
+    if (eot_id < 0) {
+        for (int id = 0; id < n_vocab; ++id) {
+            if (token_piece(vocab, id) == "<end_of_turn>") { eot_id = id; break; }
+        }
+    }
+
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+
+    auto trim = [](std::string s) -> std::string {
+        const size_t a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return std::string();
+        const size_t b = s.find_last_not_of(" \t\r\n");
+        return s.substr(a, b - a + 1);
+    };
+
+    for (size_t pi = 0; pi < prompts.size(); ++pi) {
+        // minslm-cli parity: strip surrounding quotes, then trim.
+        std::string user_msg = prompts[pi];
+        user_msg.erase(std::remove(user_msg.begin(), user_msg.end(), '"'), user_msg.end());
+        user_msg = trim(user_msg);
+        if (user_msg.empty()) continue;
+
+        // Substitute {message} in the template.
+        std::string full_prompt = trim(tmpl);
+        const size_t pos = full_prompt.find("{message}");
+        if (pos != std::string::npos) full_prompt.replace(pos, 9, user_msg);
+
+        // Fresh KV per prompt (each prompt is independent, like minslm-cli).
+        st.n_past = 0;
+        st.pos_all.clear();
+
+        std::vector<int32_t> toks;
+        if (!tokenize_to(vocab, full_prompt.data(), (int) full_prompt.size(),
+                         /*add_special=*/false, /*parse_special=*/true, toks)) {
+            error = "run_template_prompts: tokenize failed"; cleanup(); return false;
+        }
+        if (toks.empty()) continue;
+        if ((int) toks.size() + 1 > st.cap_seq) {
+            std::fprintf(stderr,
+                "[gemma4 -cpf: prompt %zu is %zu tokens > cap %d; skipping "
+                "(raise --gemma4-chat-ctx)]\n", pi + 1, toks.size(), st.cap_seq);
+            continue;
+        }
+
+        std::fprintf(stderr, "\n> [%zu/%zu] %s\n", pi + 1, prompts.size(), user_msg.c_str());
+
+        const auto t_pre0 = std::chrono::steady_clock::now();
+        if (!network_step(st, mf, (int) toks.size(), toks.data(),
+                          /*last_token_only=*/true, logits.data(), error)) {
+            cleanup(); return false;
+        }
+        const double prefill_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_pre0).count();
+
+        int n_gen = 0;
+        std::string response;   // accumulated for turn-marker antiprompt
+        llama_token tok = sample_token(sc, logits.data(), n_vocab);
+        const auto t_gen0 = std::chrono::steady_clock::now();
+        while (true) {
+            if (llama_vocab_is_eog(vocab, tok) || (eot_id >= 0 && tok == eot_id)) break;
+            response += token_piece(vocab, tok);
+            ++n_gen;
+            // Turn-marker antiprompt: in this GGUF <end_of_turn> /
+            // <start_of_turn> are emitted as multi-token text (not atomic
+            // special tokens), so we detect them in the concatenated text and
+            // stop the turn there -- same effect as minslm-cli's stop heuristic.
+            size_t cut = response.find("<end_of_turn>");
+            if (cut == std::string::npos) cut = response.find("<start_of_turn>");
+            if (cut != std::string::npos) { response.resize(cut); break; }
+            if (params.n_predict >= 0 && n_gen >= params.n_predict) break;
+            if (st.n_past + 1 + 1 > st.cap_seq) break;
+            int32_t feed = tok;
+            if (!network_step(st, mf, 1, &feed, /*last_token_only=*/true,
+                              logits.data(), error)) { cleanup(); return false; }
+            tok = sample_token(sc, logits.data(), n_vocab);
+        }
+        const double gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gen0).count();
+
+        // Trim trailing whitespace and print the cleaned answer.
+        while (!response.empty() &&
+               (response.back() == '\n' || response.back() == '\r' ||
+                response.back() == ' '  || response.back() == '\t')) {
+            response.pop_back();
+        }
+        std::printf("%s\n", response.c_str());
+        std::fflush(stdout);
+
+        const double gen_tps = (gen_ms > 0.0 && n_gen > 0) ? (1000.0 * n_gen) / gen_ms : 0.0;
+        const double pre_tps = (prefill_ms > 0.0 && !toks.empty()) ? (1000.0 * toks.size()) / prefill_ms : 0.0;
+        std::fprintf(stderr,
+            "[gemma4 -cpf prompt %zu/%zu: prompt_tok=%zu gen_tok=%d  "
+            "prefill %.1f ms (%.1f t/s)  gen %.1f ms (%.1f t/s)]\n",
+            pi + 1, prompts.size(), toks.size(), n_gen,
+            prefill_ms, pre_tps, gen_ms, gen_tps);
+    }
+
+    cleanup();
+    error.clear();
+    return true;
+}
+
 // ----------------------------------------------------------------------
 // Scripted multi-turn determinism test.
 //

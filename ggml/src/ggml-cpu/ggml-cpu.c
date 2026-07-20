@@ -3677,6 +3677,20 @@ static void ggml_b612_pin_ccx_spread(int ith) {
     ggml_b612_ccx_t * c    = &g_b612_ccx[ci];
     int               lp   = c->base_lp + 2 * (core % c->n_cores);  // primary thread of each physical core
 
+    // Pin at most once per worker thread. SetThreadGroupAffinity is sticky, so
+    // re-issuing it on every graph compute is pure overhead. This matters for
+    // callers that dispatch many small graphs per token (e.g. the gemma4 hand
+    // path issues ~270 ggml_graph_compute calls/token); without this guard the
+    // per-graph syscall + re-pin thrash regressed both prefill and decode.
+    // The persistent threadpool keeps a fixed ith per OS thread, so the target
+    // (group, lp) is invariant for a given thread; guard on it to also handle
+    // the rare case of a thread being reused with a different ith.
+    static __declspec(thread) int  t_pinned_lp    = -1;
+    static __declspec(thread) WORD t_pinned_group = 0xFFFF;
+    if (t_pinned_lp == lp && t_pinned_group == c->group) {
+        return;
+    }
+
     GROUP_AFFINITY ga;
     ZeroMemory(&ga, sizeof(ga));
     ga.Group = c->group;
@@ -3688,6 +3702,9 @@ static void ggml_b612_pin_ccx_spread(int ith) {
             fprintf(stderr, "warn: ggml B612 CCX-spread SetThreadGroupAffinity (g=%u mask=0x%llx) failed err=%lu\n",
                     (unsigned) ga.Group, (unsigned long long) ga.Mask, (unsigned long) GetLastError());
         }
+    } else {
+        t_pinned_lp    = lp;
+        t_pinned_group = c->group;
     }
 }
 
@@ -3696,6 +3713,12 @@ static void ggml_b612_pin_ccx_spread(int ith) {
 static void ggml_b612_pin_ccx_spread(int ith) { UNUSED(ith); }
 
 #endif // _WIN32 CCX-spread
+
+// Public wrapper so auxiliary worker pools outside the ggml graph can share the
+// same CCX-spread placement as the internal threadpool workers.
+void ggml_b612_ccx_pin_self(int ith) {
+    ggml_b612_pin_ccx_spread(ith);
+}
 
 static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {

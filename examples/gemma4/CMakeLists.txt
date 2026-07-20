@@ -6,6 +6,8 @@ add_executable(${TARGET}
     gemma4_weights.cpp
     gemma4_kernels.cpp
     gemma4_matmul.cpp
+    gemma4_moe.cpp
+    gemma4_expert_store.cpp
     gemma4_kvcache.cpp
     gemma4_chat.cpp
     gemma4_bench.cpp

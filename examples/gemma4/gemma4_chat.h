@@ -45,6 +45,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace gemma4 {
 
@@ -73,6 +74,41 @@ bool run_chat_loop(const llama_model * model, const Weights & w,
                    const std::string & single_prompt,
                    const ChatParams & params,
                    std::string & error);
+
+// One item of a custom-prompt-file (cpf) script.
+struct ScriptItem {
+    enum Kind { USER, CONTEXT, REWIND, QUIT } kind = USER;
+    std::string text;   // USER: the user message
+    int         n = 0;  // REWIND: number of turns to drop
+};
+
+// Run a scripted multi-turn chat on the hand path (same custom-prompt-file
+// format as minslm-cli / cpf_gem4mm: SYSTEM block + PROMPT/T: blocks with
+// /context, /rewind N and quit() meta commands). `system_prompt` (may be
+// empty) is folded into the first user turn, since Gemma has no system role.
+// Each user turn's answer streams to stdout; a per-turn profile line goes to
+// stderr. Lets us run real prompts end-to-end and judge whether the hand
+// path's numerical drift actually degrades answers.
+//
+// Returns true when the script completes (or hits quit()); false with
+// `error` set on any fatal per-turn failure.
+bool run_chat_script(const llama_model * model, const Weights & w,
+                     const std::vector<ScriptItem> & items,
+                     const std::string & system_prompt,
+                     const ChatParams & params,
+                     std::string & error);
+
+// Run a template-substitution prompt file (CUSTOM_TEMPLATE_PROMPT +
+// CUSTOM_PROMPT list, same format as minslm-cli / minslm-multi). `tmpl`
+// contains the full chat markup and a {message} placeholder; each entry in
+// `prompts` is substituted for {message} and run INDEPENDENTLY (fresh KV),
+// tokenized raw (add_special=false, parse_special=true). Each generation
+// streams to stdout with a per-prompt profile line on stderr.
+bool run_template_prompts(const llama_model * model, const Weights & w,
+                          const std::string & tmpl,
+                          const std::vector<std::string> & prompts,
+                          const ChatParams & params,
+                          std::string & error);
 
 // Scripted multi-turn determinism test for the chat loop.
 //

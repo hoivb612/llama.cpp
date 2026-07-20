@@ -1,6 +1,8 @@
 #include "gemma4_forward.h"
 #include "gemma4_kernels.h"
 #include "gemma4_kvcache.h"
+#include "gemma4_moe.h"
+#include "gemma4_expert_store.h"
 #include "gemma4_weights.h"
 
 #include "ggml.h"
@@ -259,7 +261,7 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
     out.il        = il;
     out.n_embd    = w_global.n_embd;
     out.n_head    = w_global.n_head;
-    out.n_head_kv = w_global.n_head_kv;
+    out.n_head_kv = L.n_head_kv;
     out.head_dim  = L.head_dim;
     out.n_ff      = L.n_ff;
     out.n_embd_per_layer = w_global.n_embd_per_layer;
@@ -282,7 +284,11 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
     if (!copy_f32(L.post_attn_norm, out.post_attn_norm, error)) return false;
     if (!copy_f32(L.ffn_norm,       out.ffn_norm,       error)) return false;
     if (!copy_f32(L.post_ffw_norm,  out.post_ffw_norm,  error)) return false;
-    if (!copy_f32(L.post_norm,      out.post_norm,      error)) return false;
+    // post_norm is a per-layer-embedding (PLE) tensor; absent on the 26B-A4B
+    // MoE variant (no PLE). Optional -- only consumed by the guarded PLE block.
+    if (L.post_norm) {
+        if (!copy_f32(L.post_norm,  out.post_norm,      error)) return false;
+    }
 
     // Tensor pointers are ALWAYS populated -- the qquant path needs them
     // even when the F32 vectors are skipped. Shared-KV layers also
@@ -296,6 +302,26 @@ bool dequant_layer(const llama_model * model, const Weights & w_global,
     out.ffn_down_t = L.ffn_down;
     out.inp_gate_t = L.inp_gate;
     out.proj_t     = L.proj;
+
+    // MoE tensor pointers (populated for both dequant modes; the network
+    // path reads them directly, the F32 self-test path ignores them since
+    // it only exercises dense layers).
+    out.is_moe_layer  = L.is_moe_layer;
+    if (L.is_moe_layer) {
+        out.n_ff_exp      = w_global.n_ff_exp;
+        out.n_expert      = w_global.n_expert;
+        out.n_expert_used = w_global.n_expert_used;
+        out.moe_gate_inp     = L.ffn_gate_inp;
+        out.moe_gate_inp_s   = L.ffn_gate_inp_s;
+        out.moe_pre_norm_2   = L.ffn_pre_norm_2;
+        out.moe_post_norm_1  = L.ffn_post_norm_1;
+        out.moe_post_norm_2  = L.ffn_post_norm_2;
+        out.moe_gate_up_exps = L.ffn_gate_up_exps;
+        out.moe_gate_exps    = L.ffn_gate_exps;
+        out.moe_up_exps      = L.ffn_up_exps;
+        out.moe_down_exps    = L.ffn_down_exps;
+        out.moe_down_exps_s  = L.ffn_down_exps_s;
+    }
 
     if (dequant_to_f32) {
         if (!dequant_f32(L.wq,       out.wq,       error)) return false;
@@ -639,40 +665,73 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     }
     }
 
-    // -------- ffn_norm --------
-    std::vector<float> ff_in((size_t) n_embd * n_new, 0.0f);
-    { prof::Scope _s(&prof::g_acc.lf_ffn_norm_ns);
-    for (int t = 0; t < n_new; ++t) {
-        rmsnorm_mul_f32(ff_in.data() + (size_t) t * n_embd,
-                        attn_out2.data() + (size_t) t * n_embd,
-                        L.ffn_norm.data(), n_embd, eps);
-    }
-    }
-
-    // -------- gate, up, gelu(gate)*up --------
-    std::vector<float> gate((size_t) n_ff * n_new, 0.0f);
-    std::vector<float> up  ((size_t) n_ff * n_new, 0.0f);
-    { prof::Scope _s(&prof::g_acc.lf_gate_ns);
-    if (!dispatch_matmul(mm, L.ffn_gate_t, L.ffn_gate.empty() ? nullptr : L.ffn_gate.data(),
-                         ff_in.data(), gate.data(), n_embd, n_ff, n_new,
-                         "ffn_gate", error)) return false;
-    }
-    { prof::Scope _s(&prof::g_acc.lf_up_ns);
-    if (!dispatch_matmul(mm, L.ffn_up_t, L.ffn_up.empty() ? nullptr : L.ffn_up.data(),
-                         ff_in.data(), up.data(), n_embd, n_ff, n_new,
-                         "ffn_up", error)) return false;
-    }
-    { prof::Scope _s(&prof::g_acc.lf_gelu_mul_ns);
-    gelu_f32(gate.data(), gate.data(), n_ff * n_new);
-    for (size_t i = 0; i < (size_t) n_ff * n_new; ++i) gate[i] *= up[i];
-    }
-
-    // -------- ffn_down --------
+    // -------- FFN (dense) or MoE block --------
+    // Both produce ff_out [n_embd, n_new] = the pre-post_ffw_norm FFN result
+    // (dense: ffn_down output; MoE: cur_mlp + cur_moe). The shared
+    // post_ffw_norm + residual block below then finishes the layer.
     std::vector<float> ff_out((size_t) n_embd * n_new, 0.0f);
-    { prof::Scope _s(&prof::g_acc.lf_ffn_down_ns);
-    if (!dispatch_matmul(mm, L.ffn_down_t, L.ffn_down.empty() ? nullptr : L.ffn_down.data(),
-                         gate.data(), ff_out.data(), n_ff, n_embd, n_new,
-                         "ffn_down", error)) return false;
+
+    if (L.is_moe_layer) {
+        if (!mm) { error = "layer_forward_f32_cached: MoE layer requires MatmulCtx"; return false; }
+        MoeInputs in;
+        in.n_embd        = n_embd;
+        in.n_ff          = n_ff;
+        in.n_ff_exp      = L.n_ff_exp;
+        in.n_expert      = L.n_expert;
+        in.n_expert_used = L.n_expert_used;
+        in.ffn_norm         = L.ffn_norm.data();
+        in.ffn_gate         = L.ffn_gate_t;
+        in.ffn_up           = L.ffn_up_t;
+        in.ffn_down         = L.ffn_down_t;
+        in.ffn_post_norm_1  = L.moe_post_norm_1;
+        in.ffn_pre_norm_2   = L.moe_pre_norm_2;
+        in.ffn_post_norm_2  = L.moe_post_norm_2;
+        in.ffn_gate_inp     = L.moe_gate_inp;
+        in.ffn_gate_inp_s   = L.moe_gate_inp_s;
+        in.ffn_gate_up_exps = L.moe_gate_up_exps;
+        in.ffn_gate_exps    = L.moe_gate_exps;
+        in.ffn_up_exps      = L.moe_up_exps;
+        in.ffn_down_exps    = L.moe_down_exps;
+        in.ffn_down_exps_s  = L.moe_down_exps_s;
+        prof::Scope _s(&prof::g_acc.lf_gate_ns);
+        if (!moe_ffn(*mm, in, attn_out2.data(), ff_out.data(), n_new, eps, error)) {
+            return false;
+        }
+    } else {
+        // -------- ffn_norm --------
+        std::vector<float> ff_in((size_t) n_embd * n_new, 0.0f);
+        { prof::Scope _s(&prof::g_acc.lf_ffn_norm_ns);
+        for (int t = 0; t < n_new; ++t) {
+            rmsnorm_mul_f32(ff_in.data() + (size_t) t * n_embd,
+                            attn_out2.data() + (size_t) t * n_embd,
+                            L.ffn_norm.data(), n_embd, eps);
+        }
+        }
+
+        // -------- gate, up, gelu(gate)*up --------
+        std::vector<float> gate((size_t) n_ff * n_new, 0.0f);
+        std::vector<float> up  ((size_t) n_ff * n_new, 0.0f);
+        { prof::Scope _s(&prof::g_acc.lf_gate_ns);
+        if (!dispatch_matmul(mm, L.ffn_gate_t, L.ffn_gate.empty() ? nullptr : L.ffn_gate.data(),
+                             ff_in.data(), gate.data(), n_embd, n_ff, n_new,
+                             "ffn_gate", error)) return false;
+        }
+        { prof::Scope _s(&prof::g_acc.lf_up_ns);
+        if (!dispatch_matmul(mm, L.ffn_up_t, L.ffn_up.empty() ? nullptr : L.ffn_up.data(),
+                             ff_in.data(), up.data(), n_embd, n_ff, n_new,
+                             "ffn_up", error)) return false;
+        }
+        { prof::Scope _s(&prof::g_acc.lf_gelu_mul_ns);
+        gelu_f32(gate.data(), gate.data(), n_ff * n_new);
+        for (size_t i = 0; i < (size_t) n_ff * n_new; ++i) gate[i] *= up[i];
+        }
+
+        // -------- ffn_down --------
+        { prof::Scope _s(&prof::g_acc.lf_ffn_down_ns);
+        if (!dispatch_matmul(mm, L.ffn_down_t, L.ffn_down.empty() ? nullptr : L.ffn_down.data(),
+                             gate.data(), ff_out.data(), n_ff, n_embd, n_new,
+                             "ffn_down", error)) return false;
+        }
     }
 
     // -------- post_ffw_norm + residual2 --------
@@ -689,7 +748,11 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     }
 
     // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
-    { prof::Scope _s(&prof::g_acc.lf_ple_ns);
+    // Only present when the model has per-layer embeddings (E2B/E4B). The
+    // 26B-A4B MoE variant has no PLE (n_epl == 0, inp_gate/proj absent), so
+    // this whole block is skipped and pe_in flows straight to out_scale.
+    if (n_epl > 0 && L.inp_gate_t) {
+    prof::Scope _s(&prof::g_acc.lf_ple_ns);
     std::vector<float> ple_a((size_t) n_epl * n_new, 0.0f);
     if (!dispatch_matmul(mm, L.inp_gate_t, L.inp_gate.empty() ? nullptr : L.inp_gate.data(),
                          pe_in.data(), ple_a.data(), n_embd, n_epl, n_new,
@@ -1206,6 +1269,18 @@ bool network_forward_f32(const ModelF32 & m,
 
 namespace {
 
+// Canonical label for the active hand-forward mode, so logs match the terms
+// we use when discussing results:
+//   "hand(streaming)" -- hand path with an installed+ready ExpertStore
+//                        (MoE experts pread from a byte-capped LRU pool)
+//   "hand(resident)"  -- hand path reading experts directly from the mmap
+//                        (default; also used for dense models with no store)
+// The reference engine (llama_decode) is always labelled "upstream".
+const char * hand_path_label() {
+    const ExpertStore * s = get_expert_store();
+    return (s && s->ready()) ? "hand(streaming)" : "hand(resident)";
+}
+
 // Helper: run upstream llama_decode on prompt_tokens and return the
 // last-position logits as a std::vector.
 bool upstream_last_token_logits(const llama_model * model,
@@ -1298,7 +1373,8 @@ bool network_self_test(const llama_model * model, const Weights & w,
     }
     const double ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "gemma4 network_self_test: hand path took %.1f ms (single batch, last-token logits)\n", ms);
+    std::fprintf(stderr, "gemma4 network_self_test: %s took %.1f ms (single batch, last-token logits)\n",
+                 hand_path_label(), ms);
 
     // -------- Metrics --------
     const int k = 10;
@@ -1350,12 +1426,12 @@ bool network_self_test(const llama_model * model, const Weights & w,
         return std::string(buf, buf + n);
     };
 
-    std::fprintf(stderr, "gemma4 network_self_test results:\n");
-    std::fprintf(stderr, "  hand top-1     = %d (%s)\n", top1_h, piece(top1_h).c_str());
-    std::fprintf(stderr, "  upstream top-1 = %d (%s)\n", top1_u, piece(top1_u).c_str());
+    std::fprintf(stderr, "gemma4 network_self_test results (%s vs upstream):\n", hand_path_label());
+    std::fprintf(stderr, "  %-15s top-1 = %d (%s)\n", hand_path_label(), top1_h, piece(top1_h).c_str());
+    std::fprintf(stderr, "  %-15s top-1 = %d (%s)\n", "upstream", top1_u, piece(top1_u).c_str());
     std::fprintf(stderr, "  match top-1    = %s\n", top1_h == top1_u ? "YES" : "NO");
-    std::fprintf(stderr, "  upstream top-1 rank in hand = %d (of %d)\n",
-                 rank_top1_u_in_hand, n_vocab);
+    std::fprintf(stderr, "  upstream top-1 rank in %s = %d (of %d)\n",
+                 hand_path_label(), rank_top1_u_in_hand, n_vocab);
     std::fprintf(stderr, "  top-5  overlap = %d/5\n", o5);
     std::fprintf(stderr, "  top-10 overlap = %d/10\n", o10);
     std::fprintf(stderr, "  max_abs  = %.4e\n", max_abs);
@@ -1363,11 +1439,11 @@ bool network_self_test(const llama_model * model, const Weights & w,
     std::fprintf(stderr, "  RMS      = %.4e\n", rms);
     std::fprintf(stderr, "  cos_sim  = %.6f\n", cos_sim);
 
-    std::fprintf(stderr, "  upstream top-10:");
+    std::fprintf(stderr, "  %-15s top-10:", "upstream");
     for (int i = 0; i < 10; ++i)
         std::fprintf(stderr, " %d(%.2f)", top_u[i], (double) upstream_logits[top_u[i]]);
     std::fprintf(stderr, "\n");
-    std::fprintf(stderr, "  hand     top-10:");
+    std::fprintf(stderr, "  %-15s top-10:", hand_path_label());
     for (int i = 0; i < 10; ++i)
         std::fprintf(stderr, " %d(%.2f)", top_h[i], (double) hand_logits[top_h[i]]);
     std::fprintf(stderr, "\n");
@@ -1407,6 +1483,17 @@ bool network_step(NetworkState & s, const ModelF32 & m,
                   const int32_t * token_ids,
                   bool last_token_only,
                   float * logits_out,
+                  std::string & error) {
+    return network_step(s, m, n_new, token_ids, last_token_only,
+                        logits_out, /*out_argmax=*/nullptr, error);
+}
+
+bool network_step(NetworkState & s, const ModelF32 & m,
+                  int n_new,
+                  const int32_t * token_ids,
+                  bool last_token_only,
+                  float * logits_out,
+                  int32_t * out_argmax,
                   std::string & error) {
     if (n_new <= 0) { error = "network_step: n_new<=0"; return false; }
     if (s.cap_seq <= 0) { error = "network_step: state not reserved"; return false; }
@@ -1450,8 +1537,12 @@ bool network_step(NetworkState & s, const ModelF32 & m,
     }
 
     // ---- 2. PLE preprocessing on the n_new new tokens ----
+    // Skipped entirely on models without per-layer embeddings (26B-A4B MoE:
+    // n_epl == 0). per_layer_final stays empty; the per-layer slice pointer
+    // is unused because layer_forward_f32_cached guards the PLE block.
     std::vector<float> per_layer_final;
-    { prof::Scope _s(&prof::g_acc.ple_ns);
+    if (n_epl > 0) {
+    prof::Scope _s(&prof::g_acc.ple_ns);
     if (!compute_per_layer_inputs(m, n_new, token_ids, inpL.data(),
                                   per_layer_final, error)) return false;
     }
@@ -1519,6 +1610,23 @@ bool network_step(NetworkState & s, const ModelF32 & m,
     // (inpL layout is [n_embd, n_new] with n_embd innermost).
     const int t_start = last_token_only ? n_new - 1 : 0;
     const int t_count = last_token_only ? 1 : n_new;
+
+    // G6.2 - fused greedy lm_head + argmax fast path. Only when the caller
+    // wants a single greedy token (out_argmax set, last_token_only) and the
+    // fused path is enabled. Computes the argmax directly over the (tied)
+    // output embedding, skipping the full [n_vocab] logit materialization and
+    // the monotonic softcap. No logits are produced in this path.
+    if (out_argmax && last_token_only && gemma4::get_lmhead_fused()) {
+        prof::Scope _s(&prof::g_acc.lm_head_ns);
+        const float * hidden_slice = inpL.data() + (size_t) t_start * n_embd;
+        if (!gemma4::lmhead_argmax_qf32(m.mm, m.tok_embd_quant, hidden_slice,
+                                        n_embd, n_vocab, *out_argmax, error)) {
+            return false;
+        }
+        s.n_past += n_new;
+        return true;
+    }
+
     { prof::Scope _s(&prof::g_acc.lm_head_ns);
     const float * hidden_slice = inpL.data() + (size_t) t_start * n_embd;
     if (!matmul_qf32(m.mm, m.tok_embd_quant, hidden_slice, logits_out,
@@ -1537,6 +1645,13 @@ bool network_step(NetworkState & s, const ModelF32 & m,
             logits_out[i] = cap * std::tanh(logits_out[i] * inv);
         }
     }
+    }
+
+    // Convenience argmax over the last token's (softcapped) logits for callers
+    // that requested a greedy token but did not take the fused path above.
+    if (out_argmax) {
+        const float * last = logits_out + (size_t) (t_count - 1) * n_vocab;
+        *out_argmax = (int32_t) (std::max_element(last, last + n_vocab) - last);
     }
 
     s.n_past += n_new;
@@ -1574,18 +1689,19 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
     std::vector<int32_t> hand_gen;
     hand_gen.reserve(n_gen);
     std::vector<float> logits((size_t) n_vocab, 0.0f);
+    int32_t next_tok = 0;
     const auto t0 = std::chrono::steady_clock::now();
     if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
-                      /*last_token_only=*/true, logits.data(), error)) {
+                      /*last_token_only=*/true, logits.data(), &next_tok, error)) {
         return false;
     }
-    int next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+    int next = next_tok;
     hand_gen.push_back(next);
     for (int g = 1; g < n_gen; ++g) {
         int32_t tok = next;
         if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
-                          logits.data(), error)) return false;
-        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+                          logits.data(), &next_tok, error)) return false;
+        next = next_tok;
         hand_gen.push_back(next);
     }
     const double hand_ms = std::chrono::duration<double, std::milli>(
@@ -1650,19 +1766,19 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
         up_text   += piece(up_gen[g]);
     }
 
-    std::fprintf(stderr, "gemma4 network_gen_self_test results:\n");
-    std::fprintf(stderr, "  hand path took     %.1f ms (prefill %d + %d gen tokens)\n",
-                 hand_ms, n_prompt, n_gen);
-    std::fprintf(stderr, "  upstream path took %.1f ms\n", up_ms);
+    std::fprintf(stderr, "gemma4 network_gen_self_test results (%s vs upstream):\n", hand_path_label());
+    std::fprintf(stderr, "  %-15s took %.1f ms (prefill %d + %d gen tokens)\n",
+                 hand_path_label(), hand_ms, n_prompt, n_gen);
+    std::fprintf(stderr, "  %-15s took %.1f ms\n", "upstream", up_ms);
     std::fprintf(stderr, "  match              %d/%d tokens\n", matched, n_gen);
     if (first_diverge >= 0) {
-        std::fprintf(stderr, "  first divergence at gen step %d: hand=%d(%s) up=%d(%s)\n",
-                     first_diverge,
+        std::fprintf(stderr, "  first divergence at gen step %d: %s=%d(%s) upstream=%d(%s)\n",
+                     first_diverge, hand_path_label(),
                      hand_gen[first_diverge], piece(hand_gen[first_diverge]).c_str(),
                      up_gen[first_diverge],   piece(up_gen[first_diverge]).c_str());
     }
-    std::fprintf(stderr, "  hand text     : \"%s\"\n", hand_text.c_str());
-    std::fprintf(stderr, "  upstream text : \"%s\"\n", up_text.c_str());
+    std::fprintf(stderr, "  %-15s text : \"%s\"\n", hand_path_label(), hand_text.c_str());
+    std::fprintf(stderr, "  %-15s text : \"%s\"\n", "upstream", up_text.c_str());
 
     if (matched != n_gen) {
         std::ostringstream ss;
@@ -1670,6 +1786,148 @@ bool network_gen_self_test(const llama_model * model, const Weights & w,
         error = ss.str();
         return false;
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Teacher-forced drift diagnostic
+// ---------------------------------------------------------------------
+//
+// Unlike network_gen_self_test (which lets each path pick its own greedy
+// tokens and so compares apples-to-oranges the moment they diverge), this
+// harness feeds BOTH the hand path and upstream the *same* token every step
+// -- upstream's greedy choice -- and reports per-step logits agreement
+// (cos_sim, max_abs, top-1 match). Identical inputs at every step isolate the
+// hand forward's pure numerical drift from token-path divergence, and expose
+// how that drift accumulates through the KV cache across decode steps.
+bool network_drift_self_test(const llama_model * model, const Weights & w,
+                             const std::string & prompt, int n_gen,
+                             int n_threads, std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_drift_self_test: n_gen<=0"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_drift_self_test: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr,
+        "gemma4 network_drift_self_test: prompt=\"%s\" -> %d tokens, n_gen=%d (teacher-forced)\n",
+        prompt.c_str(), n_prompt, n_gen);
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_gen + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    const int n_ctx = n_prompt + n_gen + 32;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "network_drift_self_test: llama_init_from_model failed"; return false; }
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    std::vector<float> hand_logits((size_t) n_vocab, 0.0f);
+
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+
+    // Compare hand vs upstream logits: cos_sim, max_abs, and each side's top-1.
+    auto compare = [&](const float * up, const float * hand,
+                       double & cos, double & maxabs, int & th, int & tu) {
+        double dot = 0.0, hh = 0.0, uu = 0.0, mx = 0.0;
+        int bh = 0, bu = 0;
+        for (int v = 0; v < n_vocab; ++v) {
+            const double h = (double) hand[v], u = (double) up[v];
+            dot += h * u; hh += h * h; uu += u * u;
+            const double d = std::fabs(h - u);
+            if (d > mx) mx = d;
+            if (hand[v] > hand[bh]) bh = v;
+            if (up[v]   > up[bu])   bu = v;
+        }
+        cos = dot / (std::sqrt(hh) * std::sqrt(uu) + 1e-30);
+        maxabs = mx; th = bh; tu = bu;
+    };
+
+    std::fprintf(stderr,
+        "  step |   cos_sim  |  max_abs  | %-15s top-1 | upstream top-1 | flip\n",
+        hand_path_label());
+
+    int    first_flip   = -1;
+    double min_cos       = 1.0;
+    int    flips         = 0;
+
+    auto emit = [&](int step, double cos, double maxabs, int th, int tu) {
+        if (cos < min_cos) min_cos = cos;
+        const bool flip = (th != tu);
+        if (flip) { ++flips; if (first_flip < 0) first_flip = step; }
+        std::fprintf(stderr, "  %4d | %.8f | %.3e | %6d (%-6s) | %6d (%-6s) | %s\n",
+                     step, cos, maxabs,
+                     th, piece(th).c_str(), tu, piece(tu).c_str(),
+                     flip ? "FLIP" : "");
+    };
+
+    // ---- Step 0: prefill both paths on the prompt ----
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, hand_logits.data(), error)) {
+        llama_free(ctx); return false;
+    }
+    {
+        llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
+        if (llama_decode(ctx, batch) != 0) {
+            error = "network_drift_self_test: prompt llama_decode failed";
+            llama_free(ctx); return false;
+        }
+    }
+    const float * up = llama_get_logits_ith(ctx, n_prompt - 1);
+    if (!up) { error = "network_drift_self_test: get_logits_ith null"; llama_free(ctx); return false; }
+
+    double cos, maxabs; int th, tu;
+    compare(up, hand_logits.data(), cos, maxabs, th, tu);
+    emit(0, cos, maxabs, th, tu);
+    int teacher = tu;   // feed upstream's greedy choice to both next step
+
+    // ---- Decode loop: feed the SAME teacher token to both paths ----
+    for (int g = 1; g < n_gen; ++g) {
+        int32_t tok = teacher;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          hand_logits.data(), error)) { llama_free(ctx); return false; }
+        llama_batch one = llama_batch_get_one(&tok, 1);
+        if (llama_decode(ctx, one) != 0) {
+            error = "network_drift_self_test: gen llama_decode failed";
+            llama_free(ctx); return false;
+        }
+        const float * up2 = llama_get_logits_ith(ctx, -1);
+        if (!up2) { error = "network_drift_self_test: get_logits_ith(-1) null"; llama_free(ctx); return false; }
+
+        compare(up2, hand_logits.data(), cos, maxabs, th, tu);
+        emit(g, cos, maxabs, th, tu);
+        teacher = tu;
+    }
+    llama_free(ctx);
+
+    std::fprintf(stderr, "gemma4 network_drift_self_test summary (%s vs upstream, teacher-forced):\n",
+                 hand_path_label());
+    std::fprintf(stderr, "  min cos_sim        = %.8f\n", min_cos);
+    std::fprintf(stderr, "  top-1 flips        = %d/%d steps\n", flips, n_gen);
+    if (first_flip >= 0)
+        std::fprintf(stderr, "  first top-1 flip   = step %d\n", first_flip);
+    else
+        std::fprintf(stderr, "  first top-1 flip   = (none; every step top-1 agrees)\n");
+
     return true;
 }
 
@@ -1892,8 +2150,8 @@ bool network_profile(const llama_model * model, const Weights & w,
     if (n_prompt < 0) { error = "network_profile: tokenize failed"; return false; }
     prompt_tokens.resize(n_prompt);
 
-    std::fprintf(stderr, "gemma4 network_profile: prompt=\"%s\" -> %d tokens, n_decode=%d\n",
-                 prompt.c_str(), n_prompt, n_decode);
+    std::fprintf(stderr, "gemma4 network_profile: prompt=\"%s\" -> %d tokens, n_decode=%d (%s, hand-only)\n",
+                 prompt.c_str(), n_prompt, n_decode, hand_path_label());
 
     ModelF32 mf;
     if (!dequant_model(model, w, mf, error, n_threads)) return false;
@@ -1905,15 +2163,22 @@ bool network_profile(const llama_model * model, const Weights & w,
     std::vector<float> logits((size_t) n_vocab, 0.0f);
 
     // ---- Prefill (n_prompt tokens) ----
+    ExpertStore * store = get_expert_store();
     profile_reset();
     profile_set_enabled(true);
+    const auto t_pre0 = std::chrono::steady_clock::now();
     if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
                       /*last_token_only=*/true, logits.data(), error)) {
         profile_set_enabled(false);
         return false;
     }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_pre0).count();
     profile_set_enabled(false);
     profile_print("prefill", 1, n_prompt);
+    std::fprintf(stderr, "  prefill: %.1f ms (%d tokens, %.1f t/s)\n",
+                 prefill_ms, n_prompt, n_prompt * 1000.0 / prefill_ms);
+    if (store) { store->drain(); store->log_stats("prefill"); store->reset_stats(); }
 
     if (n_decode <= 0) return true;
 
@@ -1921,16 +2186,24 @@ bool network_profile(const llama_model * model, const Weights & w,
     int32_t next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
     profile_reset();
     profile_set_enabled(true);
+    const auto t_dec0 = std::chrono::steady_clock::now();
     for (int g = 0; g < n_decode; ++g) {
+        int32_t nxt = next;
         if (!network_step(st, mf, 1, &next, /*last_token_only=*/true,
-                          logits.data(), error)) {
+                          logits.data(), &nxt, error)) {
             profile_set_enabled(false);
             return false;
         }
-        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        next = nxt;
     }
+    const double decode_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_dec0).count();
     profile_set_enabled(false);
     profile_print("decode", n_decode, n_decode);
+    std::fprintf(stderr, "  decode: %.1f ms (%d tokens, %.2f t/s, %.2f ms/token)\n",
+                 decode_ms, n_decode, n_decode * 1000.0 / decode_ms,
+                 decode_ms / n_decode);
+    if (store) { store->drain(); store->log_stats("decode"); }
     return true;
 }
 

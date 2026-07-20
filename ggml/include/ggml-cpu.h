@@ -124,6 +124,15 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // B612 CCX-spread affinity: pin the CALLING thread as logical worker `ith`
+    // to a distinct CCX (one-per-core-complex, interleaving processor groups),
+    // matching the placement used for the internal ggml threadpool workers.
+    // No-op unless env GGML_B612_CCX_SPREAD is set (and Windows). Idempotent
+    // per thread (sticky affinity is only issued once). Exposed so auxiliary
+    // worker pools outside the ggml graph (e.g. gemma4's attention pool) can
+    // share the same CCX placement instead of floating onto pinned cores.
+    GGML_BACKEND_API void ggml_b612_ccx_pin_self(int ith);
+
     //
     // CPU backend
     //

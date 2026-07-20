@@ -98,6 +98,28 @@ struct LayerF32 {
     // layer (does NOT call wk/wv). Forward-pass storage of K/V at the
     // owning layer is the caller's responsibility (see network_forward_f32).
     int kv_reuse_il = -1;
+
+    // ---- MoE (Gemma-4 26B-A4B). Populated only when is_moe_layer == true. ----
+    // On a MoE layer the dense ffn_gate/ffn_up/ffn_down (+ ffn_norm vector)
+    // above act as the shared "always-on" expert; the routed experts live in
+    // the *_exps tensors below. layer_forward_f32_cached dispatches to
+    // moe_ffn (gemma4_moe.cpp) instead of the dense FFN. All pointers are
+    // non-owning views into the source llama_model (require -ngl 0).
+    bool is_moe_layer  = false;
+    int  n_ff_exp      = 0;   // per-expert FFN width (e.g. 704)
+    int  n_expert      = 0;   // e.g. 128
+    int  n_expert_used = 0;   // e.g. 8
+
+    const ggml_tensor * moe_gate_inp     = nullptr;  // router [n_embd, n_expert]
+    const ggml_tensor * moe_gate_inp_s   = nullptr;  // [n_embd] F32
+    const ggml_tensor * moe_pre_norm_2   = nullptr;  // [n_embd] F32
+    const ggml_tensor * moe_post_norm_1  = nullptr;  // [n_embd] F32
+    const ggml_tensor * moe_post_norm_2  = nullptr;  // [n_embd] F32
+    const ggml_tensor * moe_gate_up_exps = nullptr;  // merged (one of merged/separate)
+    const ggml_tensor * moe_gate_exps    = nullptr;
+    const ggml_tensor * moe_up_exps      = nullptr;
+    const ggml_tensor * moe_down_exps    = nullptr;
+    const ggml_tensor * moe_down_exps_s  = nullptr;  // [n_expert] F32 (nullable)
 };
 
 // Dequantize layer `il` of the model into LayerF32. Reads w_global for
@@ -314,12 +336,38 @@ bool network_step(NetworkState & s, const ModelF32 & m,
                   float * logits_out,
                   std::string & error);
 
+// Overload with an optional greedy-argmax output. When out_argmax != nullptr
+// AND last_token_only AND the fused lm_head path is enabled
+// (gemma4::get_lmhead_fused()), the final lm_head step computes the argmax
+// token directly (fused per-vocab-row vec_dot, softcap skipped) and writes it
+// to *out_argmax WITHOUT materializing the full logit vector -- logits_out may
+// be nullptr in that case. Otherwise it falls back to the full-logits path and,
+// if out_argmax != nullptr, sets *out_argmax = argmax(logits) for convenience.
+// GREEDY ONLY: callers that sample from the softcapped distribution must pass
+// out_argmax == nullptr and read logits_out.
+bool network_step(NetworkState & s, const ModelF32 & m,
+                  int n_new,
+                  const int32_t * token_ids,
+                  bool last_token_only,
+                  float * logits_out,
+                  int32_t * out_argmax,
+                  std::string & error);
+
 // Self-test: run greedy generation for n_gen tokens with both the hand
 // path (network_step) and upstream (llama_decode + argmax), and compare
 // the generated token sequences. PASS if all n_gen tokens match.
 bool network_gen_self_test(const llama_model * model, const Weights & w,
                            const std::string & prompt, int n_gen,
                            int n_threads, std::string & error);
+
+// Teacher-forced drift diagnostic: feed BOTH the hand path and upstream the
+// same token (upstream's greedy choice) every step, and report per-step
+// logits agreement (cos_sim, max_abs, top-1). Isolates the hand forward's
+// numerical drift from token-path divergence and shows how it accumulates
+// through the KV cache. Always PASS (diagnostic only).
+bool network_drift_self_test(const llama_model * model, const Weights & w,
+                             const std::string & prompt, int n_gen,
+                             int n_threads, std::string & error);
 
 // G4.3 -- Cached prefill: hand-only gen driver that piggybacks on
 // network_gen_self_test's structure but writes the post-prefill

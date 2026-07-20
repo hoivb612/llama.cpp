@@ -20,14 +20,118 @@
 #include "gemma4_forward.h"
 #include "gemma4_kernels.h"
 #include "gemma4_loader.h"
+#include "gemma4_moe.h"
+#include "gemma4_expert_store.h"
 #include "gemma4_weights.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <string>
 #include <vector>
+
+// Parse a custom-prompt-file (cpf) script (SYSTEM block + PROMPT/T: blocks,
+// same format as minslm-cli / cpf_gem4mm). Fills `system_prompt` and `items`.
+// Recognizes meta commands quit(), /context, /rewind N inside PROMPT blocks.
+static bool parse_cpf_script(const std::string & path,
+                             std::string & system_prompt,
+                             std::vector<gemma4::ScriptItem> & items) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    auto trim = [](const std::string & s) -> std::string {
+        const size_t a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return std::string();
+        const size_t b = s.find_last_not_of(" \t\r\n");
+        return s.substr(a, b - a + 1);
+    };
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(f, line)) lines.push_back(line);
+
+    size_t i = 0;
+    while (i < lines.size()) {
+        const std::string t = trim(lines[i]);
+        if (t == "SYSTEM") {
+            ++i;
+            std::string sys;
+            while (i < lines.size()) {
+                const std::string tt = trim(lines[i]);
+                if (tt == "SYSTEM" || tt == "PROMPT") break;
+                if (!tt.empty()) { if (!sys.empty()) sys += "\n"; sys += tt; }
+                ++i;
+            }
+            system_prompt = sys;
+        } else if (t == "PROMPT") {
+            ++i;
+            std::vector<std::string> blk;
+            while (i < lines.size()) {
+                const std::string tt = trim(lines[i]);
+                if (tt == "SYSTEM" || tt == "PROMPT") break;
+                if (!tt.empty()) blk.push_back(tt);
+                ++i;
+            }
+            if (blk.empty()) continue;
+
+            // Prefer a "T:" line; else use the first non-empty content line.
+            std::string content = blk.front();
+            for (const std::string & bl : blk) {
+                if (bl.size() >= 2 && (bl[0] == 'T' || bl[0] == 't') && bl[1] == ':') {
+                    content = bl; break;
+                }
+            }
+
+            gemma4::ScriptItem item;
+            if (content == "quit()") {
+                item.kind = gemma4::ScriptItem::QUIT;
+            } else if (content.rfind("/context", 0) == 0) {
+                item.kind = gemma4::ScriptItem::CONTEXT;
+            } else if (content.rfind("/rewind", 0) == 0) {
+                item.kind = gemma4::ScriptItem::REWIND;
+                const std::string rest = trim(content.substr(7));
+                item.n = rest.empty() ? 1 : std::atoi(rest.c_str());
+            } else {
+                item.kind = gemma4::ScriptItem::USER;
+                if (content.size() >= 2 && (content[0] == 'T' || content[0] == 't') && content[1] == ':')
+                    item.text = trim(content.substr(2));
+                else
+                    item.text = content;
+            }
+            items.push_back(std::move(item));
+        } else {
+            ++i;
+        }
+    }
+    return true;
+}
+
+// Parse a template-substitution prompt file (CUSTOM_TEMPLATE_PROMPT +
+// CUSTOM_PROMPT sections, same format as minslm-cli / minslm-multi). Fills
+// `tmpl` (with the {message} placeholder) and `prompts`. Returns false only
+// if the file can't be opened; an empty result means the file is not in this
+// format (caller falls back to the SYSTEM/PROMPT parser).
+static bool parse_cpf_template(const std::string & path,
+                              std::string & tmpl,
+                              std::vector<std::string> & prompts) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    std::string line;
+    bool in_template = false;
+    bool in_prompts  = false;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "CUSTOM_TEMPLATE_PROMPT") { in_template = true;  in_prompts = false; continue; }
+        if (line == "CUSTOM_PROMPT")          { in_prompts  = true;  in_template = false; continue; }
+        if (line == "END_SECTION")            { in_template = false; in_prompts  = false; continue; }
+        if (in_template)      tmpl += line + '\n';
+        else if (in_prompts)  prompts.push_back(line);
+    }
+    return true;
+}
 
 static void print_usage(int /*argc*/, char ** argv) {
     std::printf(
@@ -37,10 +141,14 @@ static void print_usage(int /*argc*/, char ** argv) {
         "  Hand-coded F32 self-tests (custom forward path):\n"
         "    --gemma4-dump-weights              resolve+print tensor schema\n"
         "    --gemma4-kernel-test               run kernel unit-tests (no model needed)\n"
+        "    --gemma4-moe-view-test [IL] [NC]   MoE per-expert view alignment self-test (default IL=0 NC=4)\n"
         "    --gemma4-layer-test [IL]           hand vs ggml oracle for layer IL (default 0)\n"
         "    --gemma4-layer-test-ntok N         tokens for layer-test (default 8)\n"
         "    --gemma4-network-test [PROMPT]     hand vs upstream last-token logits\n"
         "    --gemma4-network-gen [PROMPT] [N]  greedy decode hand vs upstream (N tokens)\n"
+        "    --gemma4-network-drift [PROMPT] [N]  teacher-forced per-step drift diagnostic (hand vs upstream)\n"
+        "    --gemma4-moe-budget MiB            P1: hard-cap MoE expert RAM, stream rest via pread (0=all-resident)\n"
+        "    --gemma4-moe-prefetch 0|1          P2: overlap expert preads with compute via a worker (default 1)\n"
         "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
         "                                       per-stage timing for prefill + N_DECODE decode steps\n"
         "    --gemma4-save-kv PATH [PROMPT] [N] prefill, save KV state to PATH, continue greedy gen N tokens\n"
@@ -49,6 +157,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --gemma4-chat                      run hand-path chat (interactive if no -p, else single turn)\n"
             "    --gemma4-chat-test                 scripted multi-turn determinism test (greedy)\n"
             "    --gemma4-chat-ctx N                NetworkState capacity for chat (default 4096)\n"
+            "    -cpf FILE                          run a custom-prompt-file script (hand-path multi-turn chat)\n"
             "    --temp F                           sampling temperature (default 0.0 = greedy)\n"
             "    --min-p F                          min-p sampler cutoff (default 0.05; ignored when --temp 0)\n"
             "    --seed N                           sampler seed (default LLAMA_DEFAULT_SEED)\n"
@@ -62,6 +171,9 @@ static void print_usage(int /*argc*/, char ** argv) {
             "                                       which backends to bench (default both)\n"
             "    --gemma4-attn-parallel 0|1         dispatch per-head attention across the matmul threadpool (default 1)\n"
             "    --gemma4-matmul-cache 0|1          cache per-shape mul_mat graphs across decode calls (default 1)\n"
+            "    --gemma4-moe-fused 0|1             fuse resident MoE experts via ggml_mul_mat_id (default 1)\n"
+            "    --gemma4-lmhead-fused 0|1          fuse greedy lm_head+argmax, skip softcap (default 1)\n"
+            "    --gemma4-ccx-affin                 pin ggml workers one-per-CCX for decode bandwidth (96-core box)\n"
             "\n",
         argv[0]);
 }
@@ -76,6 +188,9 @@ int main(int argc, char ** argv) {
     int  n_threads_gen      = 0;
     bool dump_weights       = false;  // G3.1: resolve + print schema, skip decode
     bool kernel_test        = false;  // G3.2: run kernel self-tests, skip everything else
+    bool moe_view_test      = false;  // MoE P0: per-expert view alignment self-test
+    int  moe_view_il        = 0;      // layer for --gemma4-moe-view-test
+    int  moe_view_ncols     = 4;      // activation columns for --gemma4-moe-view-test
     bool layer_test         = false;  // G3.3: hand-coded layer vs ggml oracle
     int  layer_test_il      = 0;
     int  layer_test_ntok    = 8;
@@ -84,6 +199,9 @@ int main(int argc, char ** argv) {
     bool network_gen_test   = false;  // G3.4b: greedy decode with KV cache vs upstream
     std::string network_gen_prompt  = "The capital of France is";
     int  network_gen_n      = 32;
+    bool network_drift_test = false;  // teacher-forced per-step drift diagnostic
+    std::string network_drift_prompt = "The capital of France is";
+    int  network_drift_n    = 32;
     bool network_profile    = false;  // profile prefill + N decode steps
     std::string profile_prompt = "The capital of France is";
     int  profile_n_decode   = 4;
@@ -93,10 +211,13 @@ int main(int argc, char ** argv) {
     bool        load_kv_strict = false;// --gemma4-load-kv-strict
     std::string cached_prompt = "The capital of France is";
     int         cached_n_gen  = 32;
+    int         moe_budget_mib = 0;    // --gemma4-moe-budget MiB (0 = all-resident)
+    int         moe_prefetch   = 1;    // --gemma4-moe-prefetch 0|1 (overlap I/O with compute)
     // G4.4: chat loop with sampling
     bool        chat_mode    = false;  // --gemma4-chat
     bool        chat_test    = false;  // --gemma4-chat-test
     int         chat_ctx     = 4096;   // --gemma4-chat-ctx N
+    std::string cpf_path;              // -cpf FILE : custom-prompt-file script
     float       cli_temp     = 0.0f;   // --temp F  (0 = greedy)
     float       cli_min_p    = 0.05f;  // --min-p F
     uint32_t    cli_seed     = LLAMA_DEFAULT_SEED;  // --seed N
@@ -125,6 +246,19 @@ int main(int argc, char ** argv) {
     // back to the per-call build path (regression guard / A/B comparison).
     int gemma4_matmul_cache     = 1;
 
+    // G6.1 - fused resident MoE via ggml_mul_mat_id. Default ON; pass 0 to
+    // fall back to the per-expert GEMV loop (regression guard / A/B).
+    int gemma4_moe_fused        = 1;
+
+    // G6.2 - fused greedy lm_head+argmax (softcap-skipped). Default ON; pass
+    // 0 to fall back to the full-logits matmul + softcap + max_element (A/B).
+    int gemma4_lmhead_fused     = 1;
+
+    // G6.3 - CCX-spread decode affinity (bandwidth). Off by default; pass
+    // --gemma4-ccx-affin to pin ggml workers one-per-CCX (bridges to the
+    // GGML_B612_CCX_SPREAD ggml-cpu hook, same as minslm-cli's "ccx-affin").
+    bool gemma4_ccx_affin       = false;
+
     for (int i = 1; i < argc; ++i) {
         try {
             if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -145,6 +279,15 @@ int main(int argc, char ** argv) {
                 dump_weights = true;
             } else if (std::strcmp(argv[i], "--gemma4-kernel-test") == 0) {
                 kernel_test = true;
+            } else if (std::strcmp(argv[i], "--gemma4-moe-view-test") == 0) {
+                moe_view_test = true;
+                // Optional next-args: layer index, then n_cols.
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    moe_view_il = std::stoi(argv[++i]);
+                }
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    moe_view_ncols = std::stoi(argv[++i]);
+                }
             } else if (std::strcmp(argv[i], "--gemma4-layer-test") == 0) {
                 layer_test = true;
                 // Optional next-arg: layer index. Default 0.
@@ -169,6 +312,19 @@ int main(int argc, char ** argv) {
                     (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
                     network_gen_n = std::stoi(argv[++i]);
                 }
+            } else if (std::strcmp(argv[i], "--gemma4-network-drift") == 0) {
+                network_drift_test = true;
+                if (i + 1 < argc && argv[i+1][0] != '-') {
+                    network_drift_prompt = argv[++i];
+                }
+                if (i + 1 < argc && argv[i+1][0] != '-' &&
+                    (argv[i+1][0] >= '0' && argv[i+1][0] <= '9')) {
+                    network_drift_n = std::stoi(argv[++i]);
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-moe-budget") == 0 && i + 1 < argc) {
+                moe_budget_mib = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-moe-prefetch") == 0 && i + 1 < argc) {
+                moe_prefetch = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-network-profile") == 0) {
                 network_profile = true;
                 if (i + 1 < argc && argv[i+1][0] != '-') {
@@ -208,6 +364,8 @@ int main(int argc, char ** argv) {
                 chat_test = true;
             } else if (std::strcmp(argv[i], "--gemma4-chat-ctx") == 0 && i + 1 < argc) {
                 chat_ctx = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "-cpf") == 0 && i + 1 < argc) {
+                cpf_path = argv[++i];
             } else if (std::strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
                 cli_temp = std::stof(argv[++i]);
             } else if (std::strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
@@ -255,6 +413,22 @@ int main(int argc, char ** argv) {
                         "error: --gemma4-matmul-cache expects 0 or 1\n");
                     return 1;
                 }
+            } else if (std::strcmp(argv[i], "--gemma4-moe-fused") == 0 && i + 1 < argc) {
+                gemma4_moe_fused = std::stoi(argv[++i]);
+                if (gemma4_moe_fused != 0 && gemma4_moe_fused != 1) {
+                    std::fprintf(stderr,
+                        "error: --gemma4-moe-fused expects 0 or 1\n");
+                    return 1;
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-lmhead-fused") == 0 && i + 1 < argc) {
+                gemma4_lmhead_fused = std::stoi(argv[++i]);
+                if (gemma4_lmhead_fused != 0 && gemma4_lmhead_fused != 1) {
+                    std::fprintf(stderr,
+                        "error: --gemma4-lmhead-fused expects 0 or 1\n");
+                    return 1;
+                }
+            } else if (std::strcmp(argv[i], "--gemma4-ccx-affin") == 0) {
+                gemma4_ccx_affin = true;
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
                 print_usage(argc, argv);
                 return 0;
@@ -287,6 +461,25 @@ int main(int argc, char ** argv) {
     // G5.2 - publish the matmul cache toggle before any matmul runs.
     // Read by gemma4::get_matmul_cache() inside matmul_qf32.
     gemma4::set_matmul_cache(gemma4_matmul_cache != 0);
+
+    // G6.1 - publish the fused-MoE toggle before any MoE forward runs.
+    // Read by gemma4::get_moe_fused() inside moe_ffn.
+    gemma4::set_moe_fused(gemma4_moe_fused != 0);
+
+    // G6.2 - publish the fused lm_head+argmax toggle before any decode runs.
+    // Read by gemma4::get_lmhead_fused() inside network_step (greedy paths).
+    gemma4::set_lmhead_fused(gemma4_lmhead_fused != 0);
+
+    // G6.3 - bridge --gemma4-ccx-affin to the ggml-cpu CCX-spread hook. Must
+    // be set before the first ggml_graph_compute (getenv is read once). Same
+    // mechanism as minslm-cli's common_ccx_affinity_init(true).
+    if (gemma4_ccx_affin) {
+#if defined(_WIN32)
+        _putenv_s("GGML_B612_CCX_SPREAD", "1");
+#else
+        setenv("GGML_B612_CCX_SPREAD", "1", 1);
+#endif
+    }
 
     // Quiet llama log noise: surface errors only.
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
@@ -393,6 +586,33 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // ---------- MoE P0: --gemma4-moe-view-test [IL] [NC] ----------
+    // Validate the per-expert 2D view primitive (matmul_expert_qf32) against
+    // a contiguous single-expert copy on a MoE layer. Requires -ngl 0 so the
+    // expert weight data is host accessible.
+    if (moe_view_test) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+        const bool ok = gemma4::moe_expert_view_selftest(raw.model, w, moe_view_il,
+                                                         moe_view_ncols, n_threads, terr);
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 moe_expert_view_selftest: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 moe_expert_view_selftest: PASS (il=%d n_cols=%d)\n",
+                     moe_view_il, moe_view_ncols);
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
     // ---------- G3.3: --gemma4-layer-test [IL] [--gemma4-layer-test-ntok N] ----
     // Run hand-coded single-layer F32 forward vs ggml-graph oracle on the
     // specified layer; both consume dequantized F32 weights so the only
@@ -432,8 +652,28 @@ int main(int argc, char ** argv) {
         }
         std::string terr;
         const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+
+        // P1: optional pread hard-cap expert streaming.
+        gemma4::ExpertStore estore;
+        if (moe_budget_mib > 0 && w.is_moe) {
+            std::string serr;
+            const size_t budget = (size_t) moe_budget_mib * 1024ull * 1024ull;
+            if (!estore.init(raw.model, model_path, w, budget, serr)) {
+                std::fprintf(stderr, "gemma4 ExpertStore init FAIL: %s\n", serr.c_str());
+                gemma4_unload_raw_model(raw);
+                return 1;
+            }
+            gemma4::set_expert_store(&estore);
+            estore.set_prefetch(moe_prefetch != 0);
+        }
+
         const bool ok = gemma4::network_self_test(raw.model, w, network_test_prompt,
                                                   n_threads, terr);
+        if (gemma4::get_expert_store()) {
+            estore.drain();
+            estore.log_stats("network-test");
+            gemma4::set_expert_store(nullptr);
+        }
         if (!ok) {
             std::fprintf(stderr, "gemma4 network_self_test: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);
@@ -457,16 +697,82 @@ int main(int argc, char ** argv) {
         }
         std::string terr;
         const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+
+        // P1: optional pread hard-cap expert streaming.
+        gemma4::ExpertStore estore;
+        if (moe_budget_mib > 0 && w.is_moe) {
+            std::string serr;
+            const size_t budget = (size_t) moe_budget_mib * 1024ull * 1024ull;
+            if (!estore.init(raw.model, model_path, w, budget, serr)) {
+                std::fprintf(stderr, "gemma4 ExpertStore init FAIL: %s\n", serr.c_str());
+                gemma4_unload_raw_model(raw);
+                return 1;
+            }
+            gemma4::set_expert_store(&estore);
+            estore.set_prefetch(moe_prefetch != 0);
+        }
+
         const bool ok = gemma4::network_gen_self_test(raw.model, w,
                                                       network_gen_prompt,
                                                       network_gen_n,
                                                       n_threads, terr);
+        if (gemma4::get_expert_store()) {
+            estore.drain();
+            estore.log_stats("network-gen");
+            gemma4::set_expert_store(nullptr);
+        }
         if (!ok) {
             std::fprintf(stderr, "gemma4 network_gen_self_test: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);
             return 1;
         }
         std::fprintf(stderr, "gemma4 network_gen_self_test: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- Drift diagnostic: --gemma4-network-drift [PROMPT] [N] ------
+    // Teacher-forced: feed both paths upstream's greedy token each step and
+    // report per-step logits agreement to localize numerical drift.
+    if (network_drift_test) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::string terr;
+        const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+
+        gemma4::ExpertStore estore;
+        if (moe_budget_mib > 0 && w.is_moe) {
+            std::string serr;
+            const size_t budget = (size_t) moe_budget_mib * 1024ull * 1024ull;
+            if (!estore.init(raw.model, model_path, w, budget, serr)) {
+                std::fprintf(stderr, "gemma4 ExpertStore init FAIL: %s\n", serr.c_str());
+                gemma4_unload_raw_model(raw);
+                return 1;
+            }
+            gemma4::set_expert_store(&estore);
+            estore.set_prefetch(moe_prefetch != 0);
+        }
+
+        const bool ok = gemma4::network_drift_self_test(raw.model, w,
+                                                        network_drift_prompt,
+                                                        network_drift_n,
+                                                        n_threads, terr);
+        if (gemma4::get_expert_store()) {
+            estore.drain();
+            estore.log_stats("network-drift");
+            gemma4::set_expert_store(nullptr);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 network_drift_self_test: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        std::fprintf(stderr, "gemma4 network_drift_self_test: DONE\n");
         gemma4_unload_raw_model(raw);
         return 0;
     }
@@ -484,8 +790,24 @@ int main(int argc, char ** argv) {
         }
         std::string terr;
         const int n_threads = n_threads_prefill > 0 ? n_threads_prefill : 4;
+
+        // P2: optional pread hard-cap expert streaming.
+        gemma4::ExpertStore estore;
+        if (moe_budget_mib > 0 && w.is_moe) {
+            std::string serr;
+            const size_t budget = (size_t) moe_budget_mib * 1024ull * 1024ull;
+            if (!estore.init(raw.model, model_path, w, budget, serr)) {
+                std::fprintf(stderr, "gemma4 ExpertStore init FAIL: %s\n", serr.c_str());
+                gemma4_unload_raw_model(raw);
+                return 1;
+            }
+            gemma4::set_expert_store(&estore);
+            estore.set_prefetch(moe_prefetch != 0);
+        }
+
         const bool ok = gemma4::network_profile(raw.model, w, profile_prompt,
                                                 profile_n_decode, n_threads, terr);
+        gemma4::set_expert_store(nullptr);
         if (!ok) {
             std::fprintf(stderr, "gemma4 network_profile: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);
@@ -612,6 +934,92 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::fprintf(stderr, "gemma4 chat_self_test: PASS\n");
+        gemma4_unload_raw_model(raw);
+        return 0;
+    }
+
+    // ---------- -cpf FILE: custom-prompt-file script -----
+    // Runs a SYSTEM + PROMPT/T: script through the hand-path multi-turn
+    // chat so we can watch real end-to-end answers (and judge whether the
+    // hand path's numerical drift actually degrades output). Honors
+    // --gemma4-moe-budget / --gemma4-moe-prefetch for MoE streaming.
+    if (!cpf_path.empty()) {
+        gemma4::Weights w;
+        std::string werr;
+        if (!gemma4::resolve(raw.model, w, werr)) {
+            std::fprintf(stderr, "gemma4: weights resolve FAIL: %s\n", werr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+
+        std::string system_prompt;
+        std::vector<gemma4::ScriptItem> items;
+        std::string tmpl;
+        std::vector<std::string> tprompts;
+
+        // Auto-detect format: CUSTOM_TEMPLATE_PROMPT/CUSTOM_PROMPT (minslm-cli
+        // style, {message} substitution, independent turns) vs SYSTEM/PROMPT/T:
+        // (accumulating multi-turn chat).
+        if (!parse_cpf_template(cpf_path, tmpl, tprompts)) {
+            std::fprintf(stderr, "gemma4 -cpf: failed to open script file '%s'\n", cpf_path.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
+        const bool template_format = (!tmpl.empty() || !tprompts.empty());
+        if (!template_format) {
+            if (!parse_cpf_script(cpf_path, system_prompt, items)) {
+                std::fprintf(stderr, "gemma4 -cpf: failed to open script file '%s'\n", cpf_path.c_str());
+                gemma4_unload_raw_model(raw);
+                return 1;
+            }
+        }
+
+        if (template_format) {
+            std::fprintf(stderr, "gemma4 -cpf: script='%s' format=template, %zu prompts\n",
+                         cpf_path.c_str(), tprompts.size());
+        } else {
+            std::fprintf(stderr, "gemma4 -cpf: script='%s' format=system/prompt, system=%zu chars, %zu items\n",
+                         cpf_path.c_str(), system_prompt.size(), items.size());
+        }
+
+        // Optional MoE expert streaming (P1/P2).
+        gemma4::ExpertStore estore;
+        if (moe_budget_mib > 0 && w.is_moe) {
+            std::string serr;
+            const size_t budget = (size_t) moe_budget_mib * 1024ull * 1024ull;
+            if (!estore.init(raw.model, model_path, w, budget, serr)) {
+                std::fprintf(stderr, "gemma4 ExpertStore init FAIL: %s\n", serr.c_str());
+                gemma4_unload_raw_model(raw);
+                return 1;
+            }
+            gemma4::set_expert_store(&estore);
+            estore.set_prefetch(moe_prefetch != 0);
+        }
+
+        gemma4::ChatParams cp;
+        cp.temp      = cli_temp;
+        cp.min_p     = cli_min_p;
+        cp.seed      = cli_seed;
+        cp.n_predict = n_predict;
+        cp.chat_ctx  = chat_ctx;
+        cp.n_threads = n_threads_gen > 0 ? n_threads_gen
+                       : (n_threads_prefill > 0 ? n_threads_prefill : 4);
+        cp.stream    = true;
+
+        std::string terr;
+        const bool ok = template_format
+            ? gemma4::run_template_prompts(raw.model, w, tmpl, tprompts, cp, terr)
+            : gemma4::run_chat_script(raw.model, w, items, system_prompt, cp, terr);
+        if (gemma4::get_expert_store()) {
+            estore.drain();
+            estore.log_stats("cpf");
+            gemma4::set_expert_store(nullptr);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "gemma4 -cpf: FAIL: %s\n", terr.c_str());
+            gemma4_unload_raw_model(raw);
+            return 1;
+        }
         gemma4_unload_raw_model(raw);
         return 0;
     }

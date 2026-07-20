@@ -66,6 +66,12 @@ std::string blk_name(int il, const char * leaf) {
     return buf;
 }
 
+std::string blk_scale_name(int il, const char * leaf) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "blk.%d.%s.scale", il, leaf);
+    return buf;
+}
+
 bool check_f32_1d(const ggml_tensor * t, int64_t n, const char * what, std::string & error) {
     if (t->type != GGML_TYPE_F32) {
         std::ostringstream oss;
@@ -91,6 +97,18 @@ bool check_mat2d(const ggml_tensor * t, int64_t d0, int64_t d1, const char * wha
         oss << "gemma4::resolve: " << what << " has shape [" << t->ne[0] << ","
             << t->ne[1] << "," << t->ne[2] << "," << t->ne[3]
             << "], expected [" << d0 << "," << d1 << ",1,1]";
+        error = oss.str();
+        return false;
+    }
+    return true;
+}
+
+bool check_mat3d(const ggml_tensor * t, int64_t d0, int64_t d1, int64_t d2, const char * what, std::string & error) {
+    if (t->ne[0] != d0 || t->ne[1] != d1 || t->ne[2] != d2 || t->ne[3] != 1) {
+        std::ostringstream oss;
+        oss << "gemma4::resolve: " << what << " has shape [" << t->ne[0] << ","
+            << t->ne[1] << "," << t->ne[2] << "," << t->ne[3]
+            << "], expected [" << d0 << "," << d1 << "," << d2 << ",1]";
         error = oss.str();
         return false;
     }
@@ -144,11 +162,18 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
         return false;
     }
 
-    if (detect_moe(model, out.n_layer)) {
-        error = "gemma4::resolve: MoE variant detected (ffn_gate_inp present); "
-                "this G3 path supports dense E2B/E4B only -- use the baseline "
-                "(upstream llama_decode) path for MoE models";
-        return false;
+    out.is_moe = detect_moe(model, out.n_layer);
+    if (out.is_moe) {
+        out.n_expert      = get_meta_i32(model, "gemma4.expert_count",               0);
+        out.n_expert_used = get_meta_i32(model, "gemma4.expert_used_count",          0);
+        out.n_ff_exp      = get_meta_i32(model, "gemma4.expert_feed_forward_length", 0);
+        if (out.n_expert <= 0 || out.n_expert_used <= 0 || out.n_expert_used > out.n_expert) {
+            std::ostringstream oss;
+            oss << "gemma4::resolve: invalid MoE hparams (n_expert=" << out.n_expert
+                << " n_expert_used=" << out.n_expert_used << ")";
+            error = oss.str();
+            return false;
+        }
     }
 
     out.n_swa             = get_meta_i32(model, "gemma4.attention.sliding_window", 0);
@@ -202,46 +227,54 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
     if (!out.output_norm) return false;
     if (!check_f32_1d(out.output_norm, out.n_embd, "output_norm.weight", error)) return false;
 
-    // Per-layer embedding globals.
-    out.per_layer_tok_embd   = require_tensor(model, "per_layer_token_embd.weight",  error);
-    if (!out.per_layer_tok_embd) return false;
-    out.per_layer_model_proj = require_tensor(model, "per_layer_model_proj.weight",  error);
-    if (!out.per_layer_model_proj) return false;
-    out.per_layer_proj_norm  = require_tensor(model, "per_layer_proj_norm.weight",   error);
-    if (!out.per_layer_proj_norm) return false;
+    // Per-layer embedding globals (Gemma PLE). Present on E2B/E4B, absent on the
+    // 26B-A4B MoE variant (embedding_length_per_layer_input == 0). When
+    // per_layer_token_embd is absent, n_embd_per_layer stays 0 and the whole PLE
+    // path (globals + per-layer inp_gate/proj) is skipped.
+    out.per_layer_tok_embd = try_tensor(model, "per_layer_token_embd.weight");
+    if (out.per_layer_tok_embd) {
+        out.per_layer_model_proj = require_tensor(model, "per_layer_model_proj.weight",  error);
+        if (!out.per_layer_model_proj) return false;
+        out.per_layer_proj_norm  = require_tensor(model, "per_layer_proj_norm.weight",   error);
+        if (!out.per_layer_proj_norm) return false;
 
-    // n_embd_per_layer is recoverable from per_layer_token_embd shape:
-    // per_layer_token_embd.weight has shape [n_embd_per_layer * n_layer, n_vocab].
-    if (out.per_layer_tok_embd->ne[1] != out.n_vocab) {
-        std::ostringstream oss;
-        oss << "gemma4::resolve: per_layer_token_embd.weight ne[1]="
-            << out.per_layer_tok_embd->ne[1] << " != n_vocab=" << out.n_vocab;
-        error = oss.str();
-        return false;
-    }
-    if (out.per_layer_tok_embd->ne[0] % out.n_layer != 0) {
-        std::ostringstream oss;
-        oss << "gemma4::resolve: per_layer_token_embd.weight ne[0]="
-            << out.per_layer_tok_embd->ne[0] << " not divisible by n_layer="
-            << out.n_layer;
-        error = oss.str();
-        return false;
-    }
-    out.n_embd_per_layer = (int) (out.per_layer_tok_embd->ne[0] / out.n_layer);
+        // n_embd_per_layer is recoverable from per_layer_token_embd shape:
+        // per_layer_token_embd.weight has shape [n_embd_per_layer * n_layer, n_vocab].
+        if (out.per_layer_tok_embd->ne[1] != out.n_vocab) {
+            std::ostringstream oss;
+            oss << "gemma4::resolve: per_layer_token_embd.weight ne[1]="
+                << out.per_layer_tok_embd->ne[1] << " != n_vocab=" << out.n_vocab;
+            error = oss.str();
+            return false;
+        }
+        if (out.per_layer_tok_embd->ne[0] % out.n_layer != 0) {
+            std::ostringstream oss;
+            oss << "gemma4::resolve: per_layer_token_embd.weight ne[0]="
+                << out.per_layer_tok_embd->ne[0] << " not divisible by n_layer="
+                << out.n_layer;
+            error = oss.str();
+            return false;
+        }
+        out.n_embd_per_layer = (int) (out.per_layer_tok_embd->ne[0] / out.n_layer);
 
-    // Validate the other per-layer-embedding globals against the derived dim.
-    if (out.per_layer_model_proj->ne[0] != out.n_embd ||
-        out.per_layer_model_proj->ne[1] != (int64_t) out.n_embd_per_layer * out.n_layer) {
-        std::ostringstream oss;
-        oss << "gemma4::resolve: per_layer_model_proj shape ["
-            << out.per_layer_model_proj->ne[0] << ","
-            << out.per_layer_model_proj->ne[1] << "] != expected ["
-            << out.n_embd << "," << out.n_embd_per_layer * out.n_layer << "]";
-        error = oss.str();
-        return false;
+        // Validate the other per-layer-embedding globals against the derived dim.
+        if (out.per_layer_model_proj->ne[0] != out.n_embd ||
+            out.per_layer_model_proj->ne[1] != (int64_t) out.n_embd_per_layer * out.n_layer) {
+            std::ostringstream oss;
+            oss << "gemma4::resolve: per_layer_model_proj shape ["
+                << out.per_layer_model_proj->ne[0] << ","
+                << out.per_layer_model_proj->ne[1] << "] != expected ["
+                << out.n_embd << "," << out.n_embd_per_layer * out.n_layer << "]";
+            error = oss.str();
+            return false;
+        }
+        if (!check_f32_1d(out.per_layer_proj_norm, out.n_embd_per_layer,
+                          "per_layer_proj_norm.weight", error)) return false;
+    } else {
+        out.n_embd_per_layer     = 0;
+        out.per_layer_model_proj = nullptr;
+        out.per_layer_proj_norm  = nullptr;
     }
-    if (!check_f32_1d(out.per_layer_proj_norm, out.n_embd_per_layer,
-                      "per_layer_proj_norm.weight", error)) return false;
 
     // rope_freqs is a single global in our dense Gemma-4 GGUFs (stored once).
     out.rope_freqs = try_tensor(model, "rope_freqs.weight");
@@ -278,14 +311,16 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
         L.attn_k_norm      = require_tensor(model, s_attn_k_norm,      error); if (!L.attn_k_norm)      return false;
         L.wo               = require_tensor(model, s_attn_output,      error); if (!L.wo)               return false;
         L.post_attn_norm   = require_tensor(model, s_post_attn_norm,   error); if (!L.post_attn_norm)   return false;
-        L.post_norm        = require_tensor(model, s_post_norm,        error); if (!L.post_norm)        return false;
+        L.post_norm        = try_tensor    (model, s_post_norm.c_str());        // optional (dense E2B/E4B only; absent on MoE)
         L.ffn_norm         = require_tensor(model, s_ffn_norm,         error); if (!L.ffn_norm)         return false;
         L.ffn_gate         = require_tensor(model, s_ffn_gate,         error); if (!L.ffn_gate)         return false;
         L.ffn_up           = require_tensor(model, s_ffn_up,           error); if (!L.ffn_up)           return false;
         L.ffn_down         = require_tensor(model, s_ffn_down,         error); if (!L.ffn_down)         return false;
         L.post_ffw_norm    = require_tensor(model, s_post_ffw_norm,    error); if (!L.post_ffw_norm)    return false;
-        L.inp_gate         = require_tensor(model, s_inp_gate,         error); if (!L.inp_gate)         return false;
-        L.proj             = require_tensor(model, s_proj,             error); if (!L.proj)             return false;
+        L.inp_gate         = (out.n_embd_per_layer > 0) ? require_tensor(model, s_inp_gate, error) : nullptr;
+        if (out.n_embd_per_layer > 0 && !L.inp_gate) return false;
+        L.proj             = (out.n_embd_per_layer > 0) ? require_tensor(model, s_proj, error) : nullptr;
+        if (out.n_embd_per_layer > 0 && !L.proj) return false;
         L.layer_output_scale = try_tensor(model, s_layer_out_scale.c_str());   // optional
 
         L.has_kv     = (L.wk != nullptr);
@@ -323,9 +358,18 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
         }
 
         // attn_k / attn_v / norms must match the derived head_dim.
-        if (!check_mat2d(L.wk, out.n_embd, (int64_t) out.n_head_kv * L.head_dim,
-                         s_attn_k.c_str(), error)) return false;
-        if (L.wv && !check_mat2d(L.wv, out.n_embd, (int64_t) out.n_head_kv * L.head_dim,
+        // n_head_kv is derived per-layer from attn_k (Gemma-4 26B-A4B varies it:
+        // SWA layers use 8 KV heads, full-attention layers use 2).
+        if (L.wk->ne[0] != out.n_embd || L.wk->ne[1] % L.head_dim != 0) {
+            std::ostringstream oss;
+            oss << "gemma4::resolve: " << s_attn_k << " shape [" << L.wk->ne[0] << ","
+                << L.wk->ne[1] << "] incompatible with n_embd=" << out.n_embd
+                << " head_dim=" << L.head_dim;
+            error = oss.str();
+            return false;
+        }
+        L.n_head_kv = (int) (L.wk->ne[1] / L.head_dim);
+        if (L.wv && !check_mat2d(L.wv, out.n_embd, (int64_t) L.n_head_kv * L.head_dim,
                                  s_attn_v.c_str(), error)) return false;
         if (!check_f32_1d(L.attn_q_norm, L.head_dim, s_attn_q_norm.c_str(), error)) return false;
         if (!check_f32_1d(L.attn_k_norm, L.head_dim, s_attn_k_norm.c_str(), error)) return false;
@@ -334,7 +378,7 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
 
         if (!check_f32_1d(L.attn_norm,      out.n_embd, s_attn_norm.c_str(),      error)) return false;
         if (!check_f32_1d(L.post_attn_norm, out.n_embd, s_post_attn_norm.c_str(), error)) return false;
-        if (!check_f32_1d(L.post_norm,      out.n_embd, s_post_norm.c_str(),      error)) return false;
+        if (L.post_norm && !check_f32_1d(L.post_norm, out.n_embd, s_post_norm.c_str(), error)) return false;
         if (!check_f32_1d(L.ffn_norm,       out.n_embd, s_ffn_norm.c_str(),       error)) return false;
         if (!check_f32_1d(L.post_ffw_norm,  out.n_embd, s_post_ffw_norm.c_str(),  error)) return false;
 
@@ -351,8 +395,10 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
         if (!check_mat2d(L.ffn_up,   out.n_embd, L.n_ff,    s_ffn_up.c_str(),   error)) return false;
         if (!check_mat2d(L.ffn_down, L.n_ff,    out.n_embd, s_ffn_down.c_str(), error)) return false;
 
-        if (!check_mat2d(L.inp_gate, out.n_embd, out.n_embd_per_layer, s_inp_gate.c_str(), error)) return false;
-        if (!check_mat2d(L.proj,     out.n_embd_per_layer, out.n_embd, s_proj.c_str(),     error)) return false;
+        if (out.n_embd_per_layer > 0) {
+            if (!check_mat2d(L.inp_gate, out.n_embd, out.n_embd_per_layer, s_inp_gate.c_str(), error)) return false;
+            if (!check_mat2d(L.proj,     out.n_embd_per_layer, out.n_embd, s_proj.c_str(),     error)) return false;
+        }
 
         if (L.layer_output_scale) {
             if (L.layer_output_scale->type != GGML_TYPE_F32 ||
@@ -364,6 +410,57 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
                 error = oss.str();
                 return false;
             }
+        }
+
+        // ---- MoE tensors (26B-A4B). A layer is MoE iff ffn_gate_inp is present.
+        // The dense ffn_gate/ffn_up/ffn_down resolved above act as the shared
+        // expert on these layers. ----
+        L.ffn_gate_inp = try_tensor(model, blk_name(il, "ffn_gate_inp").c_str());
+        L.is_moe_layer = (L.ffn_gate_inp != nullptr);
+        if (L.is_moe_layer) {
+            const std::string s_gate_inp_s  = blk_scale_name(il, "ffn_gate_inp");
+            const std::string s_pre_norm_2  = blk_name(il, "pre_ffw_norm_2");
+            const std::string s_post_norm_1 = blk_name(il, "post_ffw_norm_1");
+            const std::string s_post_norm_2 = blk_name(il, "post_ffw_norm_2");
+            const std::string s_down_exps   = blk_name(il, "ffn_down_exps");
+
+            L.ffn_gate_inp_s  = require_tensor(model, s_gate_inp_s,  error); if (!L.ffn_gate_inp_s)  return false;
+            L.ffn_pre_norm_2  = require_tensor(model, s_pre_norm_2,  error); if (!L.ffn_pre_norm_2)  return false;
+            L.ffn_post_norm_1 = require_tensor(model, s_post_norm_1, error); if (!L.ffn_post_norm_1) return false;
+            L.ffn_post_norm_2 = require_tensor(model, s_post_norm_2, error); if (!L.ffn_post_norm_2) return false;
+
+            if (!check_mat2d(L.ffn_gate_inp, out.n_embd, out.n_expert,
+                             blk_name(il, "ffn_gate_inp").c_str(), error)) return false;
+            if (!check_f32_1d(L.ffn_gate_inp_s,  out.n_embd, s_gate_inp_s.c_str(),  error)) return false;
+            if (!check_f32_1d(L.ffn_pre_norm_2,  out.n_embd, s_pre_norm_2.c_str(),  error)) return false;
+            if (!check_f32_1d(L.ffn_post_norm_1, out.n_embd, s_post_norm_1.c_str(), error)) return false;
+            if (!check_f32_1d(L.ffn_post_norm_2, out.n_embd, s_post_norm_2.c_str(), error)) return false;
+
+            // Experts: merged gate_up (as in the shipped GGUF) or separate gate/up.
+            L.ffn_gate_up_exps = try_tensor(model, blk_name(il, "ffn_gate_up_exps").c_str());
+            if (L.ffn_gate_up_exps) {
+                if (!check_mat3d(L.ffn_gate_up_exps, out.n_embd, (int64_t) out.n_ff_exp * 2, out.n_expert,
+                                 blk_name(il, "ffn_gate_up_exps").c_str(), error)) return false;
+                L.ffn_gate_up_exps_s = try_tensor(model, blk_scale_name(il, "ffn_gate_up_exps").c_str()); // optional
+                if (L.ffn_gate_up_exps_s &&
+                    !check_f32_1d(L.ffn_gate_up_exps_s, out.n_expert,
+                                  blk_scale_name(il, "ffn_gate_up_exps").c_str(), error)) return false;
+            } else {
+                L.ffn_gate_exps = require_tensor(model, blk_name(il, "ffn_gate_exps"), error); if (!L.ffn_gate_exps) return false;
+                L.ffn_up_exps   = require_tensor(model, blk_name(il, "ffn_up_exps"),   error); if (!L.ffn_up_exps)   return false;
+                if (!check_mat3d(L.ffn_gate_exps, out.n_embd, out.n_ff_exp, out.n_expert,
+                                 blk_name(il, "ffn_gate_exps").c_str(), error)) return false;
+                if (!check_mat3d(L.ffn_up_exps,   out.n_embd, out.n_ff_exp, out.n_expert,
+                                 blk_name(il, "ffn_up_exps").c_str(), error)) return false;
+            }
+
+            L.ffn_down_exps = require_tensor(model, s_down_exps, error); if (!L.ffn_down_exps) return false;
+            if (!check_mat3d(L.ffn_down_exps, out.n_ff_exp, out.n_embd, out.n_expert,
+                             s_down_exps.c_str(), error)) return false;
+            L.ffn_down_exps_s = try_tensor(model, blk_scale_name(il, "ffn_down_exps").c_str()); // optional
+            if (L.ffn_down_exps_s &&
+                !check_f32_1d(L.ffn_down_exps_s, out.n_expert,
+                              blk_scale_name(il, "ffn_down_exps").c_str(), error)) return false;
         }
     }
 
@@ -407,6 +504,8 @@ bool resolve(const llama_model * model, Weights & out, std::string & error) {
 // ---------------------------------------------------------------------
 
 void dump(const Weights & w) {
+    auto tn = [](const ggml_tensor * t) { return t ? ggml_type_name(t->type) : "absent"; };
+
     std::fprintf(stderr,
         "gemma4 weights: n_layer=%d n_embd=%d n_head=%d n_head_kv=%d "
         "n_vocab=%d n_embd_per_layer=%d swa=%d rope_dim=%d rope_base=%.0f rope_base_swa=%.0f "
@@ -417,18 +516,25 @@ void dump(const Weights & w) {
         (double) w.final_logit_softcap, (int) w.output_tied_to_embd,
         w.rope_freqs ? "present" : "absent");
 
+    if (w.is_moe) {
+        std::fprintf(stderr,
+            "  MoE: n_expert=%d n_expert_used=%d n_ff_exp=%d\n",
+            w.n_expert, w.n_expert_used, w.n_ff_exp);
+    }
+
     // Per-layer summary -- group consecutive identical rows for brevity.
     int run_start = 0;
     auto layer_sig = [&](int il) {
         const auto & L = w.layers[il];
-        char buf[160];
+        char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "swa=%d head_dim=%d n_ff=%d has_v=%d has_scale=%d wq=%s wk=%s wo=%s ffn_gate=%s ffn_down=%s",
-            (int) L.is_swa, L.head_dim, L.n_ff,
+            "swa=%d moe=%d head_dim=%d n_head_kv=%d n_ff=%d has_v=%d has_scale=%d wq=%s wk=%s wo=%s ffn_gate=%s ffn_down=%s gate_up_exps=%s down_exps=%s",
+            (int) L.is_swa, (int) L.is_moe_layer, L.head_dim, L.n_head_kv, L.n_ff,
             (int) L.has_v_proj, (int) (L.layer_output_scale != nullptr),
             ggml_type_name(L.wq->type), ggml_type_name(L.wk->type),
             ggml_type_name(L.wo->type),
-            ggml_type_name(L.ffn_gate->type), ggml_type_name(L.ffn_down->type));
+            ggml_type_name(L.ffn_gate->type), ggml_type_name(L.ffn_down->type),
+            tn(L.ffn_gate_up_exps), tn(L.ffn_down_exps));
         return std::string(buf);
     };
 
@@ -445,12 +551,8 @@ void dump(const Weights & w) {
     std::fprintf(stderr,
         "  globals: tok_embd=%s output=%s output_norm=%s per_layer_tok_embd=%s "
         "per_layer_model_proj=%s per_layer_proj_norm=%s\n",
-        ggml_type_name(w.tok_embd->type),
-        ggml_type_name(w.output->type),
-        ggml_type_name(w.output_norm->type),
-        ggml_type_name(w.per_layer_tok_embd->type),
-        ggml_type_name(w.per_layer_model_proj->type),
-        ggml_type_name(w.per_layer_proj_norm->type));
+        tn(w.tok_embd), tn(w.output), tn(w.output_norm),
+        tn(w.per_layer_tok_embd), tn(w.per_layer_model_proj), tn(w.per_layer_proj_norm));
 }
 
 } // namespace gemma4
