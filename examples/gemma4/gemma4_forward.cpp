@@ -1094,6 +1094,7 @@ bool dequant_model(const llama_model * model, const Weights & w,
 
     out.tok_embd_quant           = w.tok_embd;
     out.per_layer_tok_embd_quant = w.per_layer_tok_embd;
+    out.per_layer_model_proj_quant = w.per_layer_model_proj;
 
     // Dequant every layer. layer_forward_f32 needs LayerF32.freq_factors
     // pointing at OUR freq_factors_data (so the original model could in
@@ -1185,13 +1186,24 @@ static bool compute_per_layer_inputs(const ModelF32 & m,
     }
 
     // 1. per_layer_proj = (per_layer_model_proj @ inpL) / sqrt(n_embd)
-    //    per_layer_model_proj: [n_embd, n_epl * n_layer]   (dequantized)
+    //    per_layer_model_proj: [n_embd, n_epl * n_layer]
     //    inpL:                 [n_embd, n_tokens]
     //    out:                  [n_epl * n_layer, n_tokens]
+    // Upstream projects through the quantized weight (ggml_mul_mat on the
+    // Q-typed per_layer_model_proj); route this M=n_epl*n_layer projection
+    // (the second-largest matmul after lm_head) through the same SIMD +
+    // threaded qquant shim instead of the scalar double-accumulate
+    // matmul_f32. Bit-closer to upstream and ~10x faster. Falls back to the
+    // F32 path when the quant tensor / shim is unavailable (e.g. tests).
     const int M = n_epl * n_layer;
     std::vector<float> proj_out((size_t) M * n_tokens, 0.0f);
-    matmul_f32(m.per_layer_model_proj.data(), inpL, proj_out.data(),
-               n_embd, M, n_tokens);
+    if (m.per_layer_model_proj_quant) {
+        if (!matmul_qf32(m.mm, m.per_layer_model_proj_quant, inpL, proj_out.data(),
+                         n_embd, M, n_tokens, error)) return false;
+    } else {
+        matmul_f32(m.per_layer_model_proj.data(), inpL, proj_out.data(),
+                   n_embd, M, n_tokens);
+    }
     const float inv_sqrt_nembd = 1.0f / std::sqrt((float) n_embd);
     for (auto & v : proj_out) v *= inv_sqrt_nembd;
 

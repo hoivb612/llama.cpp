@@ -233,6 +233,7 @@ struct ModelF32 {
     // tok_embd is the embedding matrix; also used as the tied lm_head.
     const ggml_tensor * tok_embd_quant            = nullptr; // [n_embd, n_vocab]
     const ggml_tensor * per_layer_tok_embd_quant  = nullptr; // F32 [n_embd_per_layer * n_layer, n_vocab]
+    const ggml_tensor * per_layer_model_proj_quant = nullptr; // [n_embd, n_embd_per_layer * n_layer] (quant)
 
     // Persistent matmul shim used by the qquant network path. Initialised
     // in dequant_model; sized once to comfortably hold the largest single

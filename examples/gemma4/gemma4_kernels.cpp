@@ -45,21 +45,42 @@ void rmsnorm_per_head_f32(float * dst, const float * src, const float * w,
     }
 }
 
+// Bit-match ggml-cpu's geglu path (GGML_GELU_FP16 is defined in
+// ggml/src/ggml-cpu/vec.h). Upstream evaluates gelu through a 64K F16 lookup
+// table with +-10 saturation:
+//   x <= -10  -> 0
+//   x >=  10  -> x                (gelu saturates to identity; geglu then
+//                                  does x*g directly)
+//   else      -> F16_to_F32( F16_of_gelu_tanh( F16_to_F32( F16_of(x) ) ) )
+// The table stores F32_TO_FP16(gelu_ref(FP16_TO_F32(index))), so the input is
+// rounded to F16 before the tanh formula and the result is rounded to F16
+// after. Replicating this round-trip is required to match the oracle across
+// the many gelu sites (shared MLP + 8 experts per layer x 30 layers) where a
+// direct-F32 gelu accumulates drift.
+//
+// Precompute the same 65536-entry table ggml keeps (indexed by the F16 bits of
+// the input) so the hot path is a single F16 convert + table load instead of a
+// per-element tanh() libm call and two F16 round-trips. The stored value is the
+// already-F32-decoded table entry (F16_to_F32 folded in) so the lookup is a
+// plain array read. Bit-identical to the previous scalar formula above.
+static const float * gelu_f16_table() {
+    static const std::vector<float> table = [] {
+        const float kSqrt2OverPi = 0.79788456080286535587989211986876f;
+        const float kC = 0.044715f;
+        std::vector<float> t((size_t) 1 << 16);
+        for (int i = 0; i < (1 << 16); ++i) {
+            const float xr    = ggml_fp16_to_fp32((ggml_fp16_t) i);
+            const float inner = kSqrt2OverPi * xr * (1.0f + kC * xr * xr);
+            const float g     = 0.5f * xr * (1.0f + std::tanh(inner));
+            t[(size_t) i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(g));
+        }
+        return t;
+    }();
+    return table.data();
+}
+
 void gelu_f32(float * dst, const float * src, int n) {
-    // Bit-match ggml-cpu's geglu path (GGML_GELU_FP16 is defined in
-    // ggml/src/ggml-cpu/vec.h). Upstream evaluates gelu through a 64K
-    // F16 lookup table with +-10 saturation:
-    //   x <= -10  -> 0
-    //   x >=  10  -> x                (gelu saturates to identity;
-    //                                  geglu then does x*g directly)
-    //   else      -> F16_to_F32( F16_of_gelu_tanh( F16_to_F32( F16_of(x) ) ) )
-    // The table stores F32_TO_FP16(gelu_ref(FP16_TO_F32(index))), so the
-    // input is rounded to F16 before the tanh formula and the result is
-    // rounded to F16 after. Replicating this round-trip is required to
-    // match the oracle across the many gelu sites (shared MLP + 8 experts
-    // per layer x 30 layers) where a direct-F32 gelu accumulates drift.
-    const float kSqrt2OverPi = 0.79788456080286535587989211986876f;
-    const float kC = 0.044715f;
+    const float * tbl = gelu_f16_table();
     for (int i = 0; i < n; ++i) {
         const float x = src[i];
         if (x <= -10.0f) {
@@ -67,10 +88,7 @@ void gelu_f32(float * dst, const float * src, int n) {
         } else if (x >= 10.0f) {
             dst[i] = x;
         } else {
-            const float xr    = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
-            const float inner = kSqrt2OverPi * xr * (1.0f + kC * xr * xr);
-            const float g     = 0.5f * xr * (1.0f + std::tanh(inner));
-            dst[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(g));
+            dst[i] = tbl[(uint16_t) ggml_fp32_to_fp16(x)];
         }
     }
 }
