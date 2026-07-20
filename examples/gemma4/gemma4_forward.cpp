@@ -436,12 +436,18 @@ struct AttnJob {
 
 static void attn_compute_shard(int wid, int W, void * ud) {
     const AttnJob & j = *(const AttnJob *) ud;
+    // Reuse ggml's SIMD F32 dot for Q.K (same helper ggml_mul_mat would use),
+    // matching upstream's F32 attention accumulation instead of a scalar
+    // double-precision loop.
+    const struct ggml_type_traits_cpu * f32tr = ggml_get_type_traits_cpu(GGML_TYPE_F32);
+    const ggml_vec_dot_t f32_dot = f32tr ? f32tr->vec_dot : nullptr;
     const long long total = (long long) j.n_new * (long long) j.n_head;
     const int lo = (int) ((long long) wid       * total / W);
     const int hi = (int) ((long long) (wid + 1) * total / W);
     if (lo >= hi) return;
 
     std::vector<float> scores((size_t) j.n_total, 0.0f);
+    std::vector<double> vacc((size_t) j.head_dim, 0.0);
     const float neg_inf = -std::numeric_limits<float>::infinity();
 
     for (int idx = lo; idx < hi; ++idx) {
@@ -461,9 +467,14 @@ static void attn_compute_shard(int wid, int W, void * ud) {
                 continue;
             }
             const float * k_th = j.K_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
-            double s = 0.0;
-            for (int d = 0; d < j.head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
-            const float sf = (float) s;
+            float sf;
+            if (f32_dot) {
+                f32_dot(j.head_dim, &sf, 0, k_th, 0, q_th, 0, 1);
+            } else {
+                double s = 0.0;
+                for (int d = 0; d < j.head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
+                sf = (float) s;
+            }
             scores[k] = sf;
             if (sf > max_s) max_s = sf;
         }
@@ -479,15 +490,22 @@ static void attn_compute_shard(int wid, int W, void * ud) {
         const float inv_sum = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
         for (int k = 0; k < j.n_total; ++k) scores[k] *= inv_sum;
 
+        // out[d] = sum_k scores[k] * V[k][d]. Accumulate with k outermost so
+        // the inner d-loop walks V[k] contiguously (cache-friendly, and the
+        // compiler auto-vectorizes the fma), instead of the transposed layout
+        // that strided V by n_kv on every element. The per-d double accumulator
+        // keeps the summation bit-identical to the original transposed loop
+        // (same ascending-k order per output element). Masked positions have
+        // scores[k] == 0 (set exactly in the softmax pass) so they are skipped.
         float * out_th = j.attn_ctx + (size_t) t * j.n_q + (size_t) h * j.head_dim;
-        for (int d = 0; d < j.head_dim; ++d) {
-            double acc = 0.0;
-            for (int k = 0; k < j.n_total; ++k) {
-                const float * v_th = j.V_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
-                acc += (double) scores[k] * (double) v_th[d];
-            }
-            out_th[d] = (float) acc;
+        std::fill(vacc.begin(), vacc.end(), 0.0);
+        for (int k = 0; k < j.n_total; ++k) {
+            const float sc = scores[k];
+            if (sc == 0.0f) continue;
+            const float * v_th = j.V_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
+            for (int d = 0; d < j.head_dim; ++d) vacc[d] += (double) sc * (double) v_th[d];
         }
+        for (int d = 0; d < j.head_dim; ++d) out_th[d] = (float) vacc[d];
     }
 }
 
