@@ -1881,7 +1881,8 @@ bool network_step(NetworkState & s, const ModelF32 & m,
         // when n_past == 0 (the fused path assumes a fresh prefill). Reuse
         // layers and decode fall through to the hand path unchanged.
         const bool use_fused = get_prefill_fused() && n_new > 1 &&
-                               s.n_past == 0 && !reuse && m.mm.pool;
+                               s.n_past == 0 && !reuse && m.mm.pool &&
+                               !L.is_moe_layer;
         if (use_fused) {
             if (!layer_forward_fused_prefill(m.mm, L, n_new, m.n_swa,
                                              inpL.data(), s.pos_all.data(), slice,

@@ -1216,3 +1216,12 @@ measured: prefill stayed within run-to-run noise (+-2 t/s) across chunk sizes
 per-graph ggml_init/build/free overhead is cheap and the matmul+op compute is
 identical regardless of layers-per-graph, so multi-layer fusion was dropped -
 the single-layer fused path already captures the entire available win.
+
+G7 fix - fused prefill must NOT run on MoE layers. The fused per-layer prefill
+graph hardcodes the DENSE FFN (+PLE); it does not emit the MoE shared-MLP +
+router + experts path. When fused was made the default, 26B-A4B (all-MoE
+layers) prefill silently ran shared-MLP-only and skipped the experts,
+producing garbage ("로, 1, 2, 3, 4, 5" vs the correct " {100, 500, ...").
+Fixed by adding `&& !L.is_moe_layer` to the network_step fused guard so MoE
+layers always take the hand path. Verified: E2B dense 24/24 (fused on),
+26B fused-on now byte-identical to fused-off. Dense models are unaffected.
