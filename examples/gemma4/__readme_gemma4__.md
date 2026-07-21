@@ -1225,3 +1225,31 @@ producing garbage ("로, 1, 2, 3, 4, 5" vs the correct " {100, 500, ...").
 Fixed by adding `&& !L.is_moe_layer` to the network_step fused guard so MoE
 layers always take the hand path. Verified: E2B dense 24/24 (fused on),
 26B fused-on now byte-identical to fused-off. Dense models are unaffected.
+
+P2b - multi-worker prefetch (--gemma4-moe-prefetch-threads N, default 2)
+
+The P2 background prefetch used a SINGLE I/O worker, so in the tight-budget
+(I/O-bound) streaming regime the consumer GEMV raced ahead and blocked on
+in-flight reads (high `waits`). Profiling 26B-A4B showed the streaming path is
+I/O-bound only BELOW ~4 GiB budget; at/above 4 GiB it already matches the
+all-resident compute ceiling (streaming == resident == 11.3 t/s on UMA), and
+the fused mul_mat_id resident path gives no extra decode headroom there. So the
+lever that matters for the memory-saving regime is raising read bandwidth, not
+compute batching.
+
+ExpertStore::set_prefetch(on, n_workers) now spawns N worker threads on the
+same queue. pread / ReadFile-with-OVERLAPPED-offset are thread-safe for
+concurrent positioned reads on one handle, and the existing mtx_ + claimed_
+logic already serializes all pool mutations and prevents duplicate reads, so
+worker_loop needed ZERO logic changes - each key is still popped once and read
+with the lock released, now concurrently. Data path is provably unchanged:
+fetches / bytes_read / prefetch_reads are byte-identical across worker counts,
+and hand output is bit-identical (workers only affect I/O timing).
+
+Results (26B-A4B Q4_K, budget 1024 MiB, 24 decode tok, ccx-affin):
+  UMA 395:      1w 6.06  2w 8.31 (+37%)  4w 8.41 (+39%, sweet spot)  8w 8.10
+  TR 7995WX:    1w 4.98  2w 6.52 (+31%, sweet spot)  4w 6.51  8w 6.26
+Prefill also gains (~+30% on UMA, 4.3 -> 5.6 t/s) since prefill streams too.
+Past the sweet spot, N I/O workers contend with the N gen-compute threads
+(16-core UMA: 8 gen + 8 io saturates), so throughput dips even as `waits`
+keeps falling. Neutral in the compute-bound regime (4 GiB: 10.11 -> 10.16).

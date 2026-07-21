@@ -149,6 +149,7 @@ static void print_usage(int /*argc*/, char ** argv) {
         "    --gemma4-network-drift [PROMPT] [N]  teacher-forced per-step drift diagnostic (hand vs upstream)\n"
         "    --gemma4-moe-budget MiB            P1: hard-cap MoE expert RAM, stream rest via pread (0=all-resident)\n"
         "    --gemma4-moe-prefetch 0|1          P2: overlap expert preads with compute via a worker (default 1)\n"
+        "    --gemma4-moe-prefetch-threads N    P2: number of concurrent prefetch I/O workers (default 2)\n"
         "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
         "                                       per-stage timing for prefill + N_DECODE decode steps\n"
         "    --gemma4-save-kv PATH [PROMPT] [N] prefill, save KV state to PATH, continue greedy gen N tokens\n"
@@ -214,6 +215,7 @@ int main(int argc, char ** argv) {
     int         cached_n_gen  = 32;
     int         moe_budget_mib = 0;    // --gemma4-moe-budget MiB (0 = all-resident)
     int         moe_prefetch   = 1;    // --gemma4-moe-prefetch 0|1 (overlap I/O with compute)
+    int         moe_prefetch_threads = 2; // --gemma4-moe-prefetch-threads N (concurrent I/O workers)
     // G4.4: chat loop with sampling
     bool        chat_mode    = false;  // --gemma4-chat
     bool        chat_test    = false;  // --gemma4-chat-test
@@ -331,6 +333,8 @@ int main(int argc, char ** argv) {
                 moe_budget_mib = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-moe-prefetch") == 0 && i + 1 < argc) {
                 moe_prefetch = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-moe-prefetch-threads") == 0 && i + 1 < argc) {
+                moe_prefetch_threads = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-network-profile") == 0) {
                 network_profile = true;
                 if (i + 1 < argc && argv[i+1][0] != '-') {
@@ -681,7 +685,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             gemma4::set_expert_store(&estore);
-            estore.set_prefetch(moe_prefetch != 0);
+            estore.set_prefetch(moe_prefetch != 0, moe_prefetch_threads);
         }
 
         const bool ok = gemma4::network_self_test(raw.model, w, network_test_prompt,
@@ -726,7 +730,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             gemma4::set_expert_store(&estore);
-            estore.set_prefetch(moe_prefetch != 0);
+            estore.set_prefetch(moe_prefetch != 0, moe_prefetch_threads);
         }
 
         const bool ok = gemma4::network_gen_self_test(raw.model, w,
@@ -772,7 +776,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             gemma4::set_expert_store(&estore);
-            estore.set_prefetch(moe_prefetch != 0);
+            estore.set_prefetch(moe_prefetch != 0, moe_prefetch_threads);
         }
 
         const bool ok = gemma4::network_drift_self_test(raw.model, w,
@@ -819,7 +823,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             gemma4::set_expert_store(&estore);
-            estore.set_prefetch(moe_prefetch != 0);
+            estore.set_prefetch(moe_prefetch != 0, moe_prefetch_threads);
         }
 
         const bool ok = gemma4::network_profile(raw.model, w, profile_prompt,
@@ -1010,7 +1014,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             gemma4::set_expert_store(&estore);
-            estore.set_prefetch(moe_prefetch != 0);
+            estore.set_prefetch(moe_prefetch != 0, moe_prefetch_threads);
         }
 
         gemma4::ChatParams cp;

@@ -104,11 +104,15 @@ public:
     // Geometry lookup (for the streaming matmul: type + dims).
     const ExpertTensorRec * rec(const ggml_tensor * W3d) const;
 
-    // Enable/disable the background prefetch worker. Turning it on starts a
-    // single I/O thread; turning it off (or destruction) stops and joins it.
-    // Safe to call once after init(); no-op if the state is unchanged.
-    void set_prefetch(bool on);
+    // Enable/disable the background prefetch worker(s). Turning it on starts
+    // n_workers I/O threads (>=1); turning it off (or destruction) stops and
+    // joins them. Safe to call once after init(); no-op if the state is
+    // unchanged. Multiple workers issue concurrent positioned reads (pread /
+    // ReadFile-with-offset are thread-safe on the shared handle) to raise
+    // effective read bandwidth in the I/O-bound (tight-budget) regime.
+    void set_prefetch(bool on, int n_workers = 1);
     bool prefetch_enabled() const { return prefetch_on_; }
+    int  prefetch_workers() const { return n_workers_; }
 
     // Asynchronously warm the given (tensor, expert) blocks into the pool in
     // list order (which should be usage order for best overlap). No-op when
@@ -165,6 +169,8 @@ private:
     void * insert_locked(const ggml_tensor * t, int e, void * buf, size_t bytes);
 
     // Background worker entry point (present only while prefetch is on).
+    // Multiple worker threads may run this concurrently; all pool mutations
+    // are serialized by mtx_ while the read_at() itself runs lock-free.
     void worker_loop();
 
     std::unordered_map<const ggml_tensor *, ExpertTensorRec> recs_;
@@ -186,7 +192,8 @@ private:
     std::mutex               mtx_;
     std::condition_variable  cv_worker_; // wakes the worker when work arrives
     std::condition_variable  cv_done_;   // wakes fetch() when a read completes
-    std::thread              worker_;
+    std::vector<std::thread> workers_;    // background I/O thread pool
+    int                      n_workers_ = 1; // count of active worker threads
     std::deque<Key>          queue_;      // pending prefetch requests (FIFO)
     std::unordered_set<Key, KeyHash> claimed_; // queued or in-flight keys
     bool                     prefetch_on_ = false;

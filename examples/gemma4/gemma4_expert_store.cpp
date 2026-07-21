@@ -319,16 +319,21 @@ const void * ExpertStore::fetch(const ggml_tensor * W3d, int expert, std::string
     return buf;
 }
 
-void ExpertStore::set_prefetch(bool on) {
+void ExpertStore::set_prefetch(bool on, int n_workers) {
     if (on == prefetch_on_) return;
     if (on) {
         if (!handle_valid_) return; // nothing to prefetch from
+        const int nw = std::max(1, n_workers);
         {
             std::lock_guard<std::mutex> lock(mtx_);
             stop_ = false;
             prefetch_on_ = true;
+            n_workers_   = nw;
         }
-        worker_ = std::thread(&ExpertStore::worker_loop, this);
+        workers_.reserve((size_t) nw);
+        for (int i = 0; i < nw; ++i) {
+            workers_.emplace_back(&ExpertStore::worker_loop, this);
+        }
     } else {
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -337,7 +342,11 @@ void ExpertStore::set_prefetch(bool on) {
             queue_.clear();
         }
         cv_worker_.notify_all();
-        if (worker_.joinable()) worker_.join();
+        for (std::thread & t : workers_) {
+            if (t.joinable()) t.join();
+        }
+        workers_.clear();
+        n_workers_ = 1;
         // Any keys still marked claimed but never serviced are now free.
         std::lock_guard<std::mutex> lock(mtx_);
         claimed_.clear();
@@ -428,7 +437,7 @@ void ExpertStore::log_stats(const char * tag) const {
     std::fprintf(stderr,
         "gemma4 ExpertStore[%s]: fetches=%llu hits=%llu misses=%llu (hit rate %.1f%%) "
         "prefetch_reads=%llu waits=%llu evictions=%llu bytes_read=%.1f MiB "
-        "peak_resident=%.1f MiB budget=%.1f MiB prefetch=%s\n",
+        "peak_resident=%.1f MiB budget=%.1f MiB prefetch=%s(%dw)\n",
         tag ? tag : "",
         (unsigned long long) stats_.fetches,
         (unsigned long long) stats_.hits,
@@ -440,7 +449,8 @@ void ExpertStore::log_stats(const char * tag) const {
         stats_.bytes_read / (1024.0 * 1024.0),
         stats_.peak_bytes / (1024.0 * 1024.0),
         budget_ / (1024.0 * 1024.0),
-        prefetch_on_ ? "on" : "off");
+        prefetch_on_ ? "on" : "off",
+        prefetch_on_ ? n_workers_ : 0);
 }
 
 } // namespace gemma4
