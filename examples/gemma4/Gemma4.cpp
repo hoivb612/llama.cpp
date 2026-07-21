@@ -173,6 +173,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --gemma4-matmul-cache 0|1          cache per-shape mul_mat graphs across decode calls (default 1)\n"
             "    --gemma4-moe-fused 0|1             fuse resident MoE experts via ggml_mul_mat_id (default 1)\n"
             "    --gemma4-lmhead-fused 0|1          fuse greedy lm_head+argmax, skip softcap (default 1)\n"
+            "    --gemma4-prefill-fused 0|1         fuse per-layer prefill into one ggml graph (default 0)\n"
             "    --gemma4-ccx-affin                 pin ggml workers one-per-CCX for decode bandwidth (96-core box)\n"
             "\n",
         argv[0]);
@@ -253,6 +254,11 @@ int main(int argc, char ** argv) {
     // G6.2 - fused greedy lm_head+argmax (softcap-skipped). Default ON; pass
     // 0 to fall back to the full-logits matmul + softcap + max_element (A/B).
     int gemma4_lmhead_fused     = 1;
+
+    // G7 (prototype) - fused per-layer prefill graph. Off by default; pass
+    // --gemma4-prefill-fused 1 to build one ggml graph per layer for the
+    // prefill (n_new > 1) path instead of the hand scalar kernels (A/B).
+    int gemma4_prefill_fused    = 0;
 
     // G6.3 - CCX-spread decode affinity (bandwidth). Off by default; pass
     // --gemma4-ccx-affin to pin ggml workers one-per-CCX (bridges to the
@@ -427,6 +433,13 @@ int main(int argc, char ** argv) {
                         "error: --gemma4-lmhead-fused expects 0 or 1\n");
                     return 1;
                 }
+            } else if (std::strcmp(argv[i], "--gemma4-prefill-fused") == 0 && i + 1 < argc) {
+                gemma4_prefill_fused = std::stoi(argv[++i]);
+                if (gemma4_prefill_fused != 0 && gemma4_prefill_fused != 1) {
+                    std::fprintf(stderr,
+                        "error: --gemma4-prefill-fused expects 0 or 1\n");
+                    return 1;
+                }
             } else if (std::strcmp(argv[i], "--gemma4-ccx-affin") == 0) {
                 gemma4_ccx_affin = true;
             } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
@@ -469,6 +482,10 @@ int main(int argc, char ** argv) {
     // G6.2 - publish the fused lm_head+argmax toggle before any decode runs.
     // Read by gemma4::get_lmhead_fused() inside network_step (greedy paths).
     gemma4::set_lmhead_fused(gemma4_lmhead_fused != 0);
+
+    // G7 - publish the fused-prefill toggle before any prefill runs.
+    // Read by gemma4::get_prefill_fused() inside network_step.
+    gemma4::set_prefill_fused(gemma4_prefill_fused != 0);
 
     // G6.3 - bridge --gemma4-ccx-affin to the ggml-cpu CCX-spread hook. Must
     // be set before the first ggml_graph_compute (getenv is read once). Same

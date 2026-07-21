@@ -745,6 +745,8 @@ Bottom line: the decode gap vs minslm is essentially closed on the dense model �
 
 ==========================================================
 
+Findings — the prefill gap is not repack, and not dispatch overhead
+
 ┌────────────────────────────────────────────────┬──────────┬───────┐
 │ Component                                      │ Time     │ Share │
 ├────────────────────────────────────────────────┼──────────┼───────┤
@@ -1065,3 +1067,40 @@ Notes
  Sub-flags (both binaries): --bench-pp N --bench-tg N --bench-reps N --bench-backend qquant|upstream|both. On Phi-3,--phi3-fused-qquant-rmsnorm-fuse / --phi3-fused-qquant-attn-parallel / --phi3-fused-qquant-threads are honored when picking theqquant configuration.
 
 
+
+==========================================================
+
+G7 (prototype) - fused per-layer prefill graph (--gemma4-prefill-fused 0|1)
+
+Prefill option #2: collapse the ~7 scalar hand-kernels + separate matmul
+dispatches per layer into ONE ggml graph per layer, built from the QUANTIZED
+weight handles (L.wq_t .. L.proj_t) as cross-context leaves and run
+multithreaded on the persistent mm.pool. This turns ~245 ggml_graph_compute
+dispatches per prefill into ~35, and lets ggml multithread every op (rms_norm,
+rope, gelu, mul, add, softmax) instead of the single-thread scalar path.
+
+layer_forward_fused_prefill() (gemma4_forward.cpp) mirrors the correctness
+oracle oracle_layer_forward_f32() exactly, but:
+  * quantized weights instead of F32 dequant (no big-weight F32 copies);
+  * multithreaded on mm.pool (ggml_graph_plan / ggml_graph_compute), not 1 thread;
+  * persistent reused arena (no 1 GiB malloc/free per layer);
+  * SWA-aware causal mask when L.is_swa (window = model n_swa);
+  * persists roped-K / rms-normed-V into the external K_cache / V_cache so the
+    subsequent hand DECODE path reads them (layout matches: [head_dim,
+    n_head_kv, n_tokens] == cache row t*n_kv + h*head_dim + d).
+
+Engaged only for prefill (n_new > 1, n_past == 0, non-reuse layers, pool set);
+decode and KV-reuse layers stay on the hand path unchanged. Default OFF.
+
+Numbers (Threadripper 7995WX dev box, E2B Q4_K_M, 8 threads, -cpf 555-tok):
+  fused OFF : prefill ~90-98 t/s
+  fused ON  : prefill ~106-112 t/s   (approx +10%)
+  decode    : unchanged (hand path)
+
+Correctness:
+  --gemma4-network-gen "1, 2, 3, 4," 24 : 24/24 match (fused on and off)
+  -cpf 18-prompt run : JSON answers byte-coherent with the known-good output
+  The lone 15/16 on "...France..." is a tie-break at gen step 13 deep in the
+  degenerate <turn|>/<eos> collapse tail (first real token " Paris." matches);
+  expected ULP-level drift - fused uses F32 ggml reductions (upstream-like)
+  vs the hand path's double accumulators.

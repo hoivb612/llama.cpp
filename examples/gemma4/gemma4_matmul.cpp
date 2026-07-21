@@ -199,6 +199,15 @@ bool get_lmhead_fused() {
     return g_lmhead_fused.load(std::memory_order_relaxed);
 }
 
+static std::atomic<bool> g_prefill_fused{false};
+
+void set_prefill_fused(bool on) {
+    g_prefill_fused.store(on, std::memory_order_relaxed);
+}
+bool get_prefill_fused() {
+    return g_prefill_fused.load(std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 
 bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,

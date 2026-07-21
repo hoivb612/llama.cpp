@@ -1077,6 +1077,225 @@ bool oracle_layer_forward_f32(const LayerF32 & L,
     return true;
 }
 
+// =====================================================================
+// G7 (prototype) - fused per-layer prefill graph.
+//
+// Same ggml graph as oracle_layer_forward_f32, but:
+//   * consumes the QUANTIZED weight handles (L.wq_t etc.) as graph leaves
+//     (cross-context references into the model loader's ggml context, exactly
+//     as matmul_qf32 does) -- no F32 dequant of the big matmul weights;
+//   * runs multithreaded on the persistent mm.pool (ggml_graph_plan +
+//     ggml_graph_compute) instead of a single thread;
+//   * reuses a persistent arena across calls (no 1 GiB malloc/free per layer);
+//   * applies an SWA-aware causal mask when L.is_swa (window = n_swa_model);
+//   * persists the roped/normed K and rms-normed V into the external
+//     K_cache / V_cache so the subsequent hand decode path reads them.
+//
+// Prefill only: n_past is assumed 0 (network_step calls this only when
+// n_new > 1 and the layer does not reuse another layer's KV). The output
+// hidden state matches the hand path's layer output modulo SIMD-reduction
+// order (F32 ggml reductions vs the hand path's double accumulators), which
+// is the same numerical relationship the oracle already validates.
+// =====================================================================
+bool layer_forward_fused_prefill(MatmulCtx & mm,
+                                 const LayerF32 & L,
+                                 int n_tokens,
+                                 int n_swa_model,
+                                 const float * hidden_in,
+                                 const int32_t * pos,
+                                 const float * per_layer_input,
+                                 float * hidden_out,
+                                 float * K_cache,
+                                 float * V_cache,
+                                 std::string & error) {
+    if (n_tokens <= 0) { error = "fused_prefill: n_tokens<=0"; return false; }
+    if (!K_cache || !V_cache) { error = "fused_prefill: null KV cache"; return false; }
+    const int n_embd    = L.n_embd;
+    const int n_head    = L.n_head;
+    const int n_head_kv = L.n_head_kv;
+    const int head_dim  = L.head_dim;
+    const int n_ff      = L.n_ff;
+    const int n_epl     = L.n_embd_per_layer;
+    const int n_q       = n_head * head_dim;
+    const int n_kv      = n_head_kv * head_dim;
+    const float eps     = L.rms_eps;
+
+    // Persistent arena reused across calls. Grow to fit the largest layer/
+    // prompt seen so far. Dominant buffers: FFN gate/up/mid (n_ff*n_tokens)
+    // and the attention scores (n_tokens*n_tokens*n_head). Generous 8x/3x
+    // multipliers + slack cover every intermediate + ggml tensor overhead.
+    static std::vector<uint8_t> arena;
+    const size_t big = std::max<size_t>(n_ff, std::max<size_t>(n_q, n_embd));
+    const size_t need =
+        (size_t) 8 * big * n_tokens * sizeof(float) +
+        (size_t) 3 * (size_t) n_tokens * n_tokens * n_head * sizeof(float) +
+        (size_t) 8 * (size_t) (n_kv + n_epl) * n_tokens * sizeof(float) +
+        ((size_t) 64 << 20);
+    if (arena.size() < need) arena.assign(need, 0);
+
+    ggml_init_params ip{ arena.size(), arena.data(), /*no_alloc=*/false };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) { error = "fused_prefill: ggml_init failed"; return false; }
+
+    // Inputs.
+    ggml_tensor * t_x  = new_f32_2d(gctx, n_embd, n_tokens, hidden_in);
+    ggml_tensor * t_pl = (n_epl > 0)
+                       ? new_f32_2d(gctx, n_epl, n_tokens, per_layer_input)
+                       : nullptr;
+    ggml_tensor * t_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_tokens);
+    std::memcpy(t_pos->data, pos, (size_t) n_tokens * sizeof(int32_t));
+
+    // Small F32 norm weights (always resident).
+    ggml_tensor * t_attn_norm      = new_f32_1d(gctx, n_embd,   L.attn_norm.data());
+    ggml_tensor * t_attn_q_norm    = new_f32_1d(gctx, head_dim, L.attn_q_norm.data());
+    ggml_tensor * t_attn_k_norm    = new_f32_1d(gctx, head_dim, L.attn_k_norm.data());
+    ggml_tensor * t_post_attn_norm = new_f32_1d(gctx, n_embd,   L.post_attn_norm.data());
+    ggml_tensor * t_ffn_norm       = new_f32_1d(gctx, n_embd,   L.ffn_norm.data());
+    ggml_tensor * t_post_ffw_norm  = new_f32_1d(gctx, n_embd,   L.post_ffw_norm.data());
+    ggml_tensor * t_post_norm      = (n_epl > 0)
+                                   ? new_f32_1d(gctx, n_embd, L.post_norm.data())
+                                   : nullptr;
+
+    ggml_tensor * t_freq_factors = nullptr;
+    if (L.freq_factors) {
+        t_freq_factors = new_f32_1d(gctx, L.rope_dim / 2, L.freq_factors);
+    }
+
+    // Quantized weight leaves (cross-context references into model loader ctx).
+    auto W = [](const ggml_tensor * t) { return const_cast<ggml_tensor *>(t); };
+
+    // SWA-aware causal mask: mask[k, t] = 0 if attended else -INF.
+    // masked = (pos[k] > pos[t]) || (is_swa && pos[t]-pos[k] >= n_swa).
+    ggml_tensor * t_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    {
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        float * m = (float *) t_mask->data;
+        for (int t = 0; t < n_tokens; ++t) {
+            const int p_t = pos[t];
+            for (int k = 0; k < n_tokens; ++k) {
+                const int p_k = pos[k];
+                const bool masked = (p_k > p_t) ||
+                    (L.is_swa && (p_t - p_k >= n_swa_model));
+                m[(size_t) t * n_tokens + k] = masked ? neg_inf : 0.0f;
+            }
+        }
+    }
+
+    // ---- graph (mirrors oracle_layer_forward_f32) ----
+    ggml_tensor * norm1 = ggml_rms_norm(gctx, t_x, eps);
+    norm1 = ggml_mul(gctx, norm1, t_attn_norm);
+
+    ggml_tensor * Q = ggml_mul_mat(gctx, W(L.wq_t), norm1);
+    Q = ggml_reshape_3d(gctx, Q, head_dim, n_head, n_tokens);
+    Q = ggml_rms_norm(gctx, Q, eps);
+    Q = ggml_mul(gctx, Q, t_attn_q_norm);
+    Q = ggml_rope_ext(gctx, Q, t_pos, t_freq_factors, L.rope_dim,
+                      GGML_ROPE_TYPE_NEOX, 0, L.rope_base,
+                      1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    ggml_tensor * Kc = ggml_mul_mat(gctx, W(L.wk_t), norm1);
+    Kc = ggml_reshape_3d(gctx, Kc, head_dim, n_head_kv, n_tokens);
+
+    ggml_tensor * Vc;
+    if (L.wv_t) {
+        Vc = ggml_mul_mat(gctx, W(L.wv_t), norm1);
+        Vc = ggml_reshape_3d(gctx, Vc, head_dim, n_head_kv, n_tokens);
+    } else {
+        Vc = Kc;
+    }
+
+    Kc = ggml_rms_norm(gctx, Kc, eps);
+    Kc = ggml_mul(gctx, Kc, t_attn_k_norm);
+    Vc = ggml_rms_norm(gctx, Vc, eps);   // gemma4 V: rms_norm WITHOUT weight
+
+    Kc = ggml_rope_ext(gctx, Kc, t_pos, t_freq_factors, L.rope_dim,
+                       GGML_ROPE_TYPE_NEOX, 0, L.rope_base,
+                       1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    // Kc / Vc are now exactly the per-token cache rows we must persist.
+    ggml_tensor * Kc_final = Kc;
+    ggml_tensor * Vc_final = Vc;
+
+    ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q,  0, 2, 1, 3));
+    ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, Kc, 0, 2, 1, 3));
+    ggml_tensor * Vp = ggml_cont(gctx, ggml_permute(gctx, Vc, 0, 2, 1, 3));
+
+    ggml_tensor * kq = ggml_mul_mat(gctx, Kp, Qp);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    kq = ggml_soft_max_ext(gctx, kq, t_mask, 1.0f, 0.0f);
+
+    ggml_tensor * Vt  = ggml_cont(gctx, ggml_transpose(gctx, Vp));
+    ggml_tensor * kqv = ggml_mul_mat(gctx, Vt, kq);
+    kqv = ggml_cont(gctx, ggml_permute(gctx, kqv, 0, 2, 1, 3));
+    ggml_tensor * attn_ctx_t = ggml_reshape_2d(gctx, kqv, n_q, n_tokens);
+
+    ggml_tensor * attn_out = ggml_mul_mat(gctx, W(L.wo_t), attn_ctx_t);
+    ggml_tensor * post_attn = ggml_rms_norm(gctx, attn_out, eps);
+    post_attn = ggml_mul(gctx, post_attn, t_post_attn_norm);
+    ggml_tensor * attn_out2 = ggml_add(gctx, post_attn, t_x);
+
+    ggml_tensor * ff_in = ggml_rms_norm(gctx, attn_out2, eps);
+    ff_in = ggml_mul(gctx, ff_in, t_ffn_norm);
+    ggml_tensor * gate = ggml_mul_mat(gctx, W(L.ffn_gate_t), ff_in);
+    ggml_tensor * up   = ggml_mul_mat(gctx, W(L.ffn_up_t),   ff_in);
+    gate = ggml_gelu(gctx, gate);
+    ggml_tensor * mid  = ggml_mul(gctx, gate, up);
+    ggml_tensor * ff_out = ggml_mul_mat(gctx, W(L.ffn_down_t), mid);
+
+    ggml_tensor * post_ffw = ggml_rms_norm(gctx, ff_out, eps);
+    post_ffw = ggml_mul(gctx, post_ffw, t_post_ffw_norm);
+    ggml_tensor * cur = ggml_add(gctx, post_ffw, attn_out2);
+
+    // PLE merge (skipped when n_epl == 0, e.g. MoE variant).
+    if (n_epl > 0) {
+        ggml_tensor * ple = ggml_mul_mat(gctx, W(L.inp_gate_t), cur);
+        ple = ggml_gelu(gctx, ple);
+        ple = ggml_mul(gctx, ple, t_pl);
+        ple = ggml_mul_mat(gctx, W(L.proj_t), ple);
+        ple = ggml_rms_norm(gctx, ple, eps);
+        ple = ggml_mul(gctx, ple, t_post_norm);
+        cur = ggml_add(gctx, cur, ple);
+    }
+
+    if (L.has_layer_output_scale) {
+        cur = ggml_scale(gctx, cur, L.layer_output_scale);
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, 1024, false);
+    ggml_build_forward_expand(gf, cur);
+    // Ensure the roped K / normed V are materialized (they already feed cur
+    // through attention, but expand explicitly so a future graph reorder
+    // cannot drop them before we memcpy).
+    ggml_build_forward_expand(gf, Kc_final);
+    ggml_build_forward_expand(gf, Vc_final);
+
+    ggml_status status;
+    if (mm.pool) {
+        ggml_cplan cplan = ggml_graph_plan(gf, mm.n_threads, mm.pool.get());
+        if (cplan.work_size > mm.work_buf.size()) {
+            mm.work_buf.assign(cplan.work_size, 0);
+        }
+        cplan.work_data = mm.work_buf.empty() ? nullptr : mm.work_buf.data();
+        status = ggml_graph_compute(gf, &cplan);
+    } else {
+        status = ggml_graph_compute_with_ctx(gctx, gf, mm.n_threads);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        error = "fused_prefill: graph compute failed";
+        ggml_free(gctx);
+        return false;
+    }
+
+    // Persist K/V (n_past==0 => cache offset 0). Layout of Kc_final/Vc_final
+    // is [head_dim, n_head_kv, n_tokens] => linear index t*n_kv + h*head_dim + d,
+    // exactly the hand cache row layout.
+    std::memcpy(K_cache, Kc_final->data, (size_t) n_tokens * n_kv * sizeof(float));
+    std::memcpy(V_cache, Vc_final->data, (size_t) n_tokens * n_kv * sizeof(float));
+    std::memcpy(hidden_out, cur->data, (size_t) n_embd * n_tokens * sizeof(float));
+    ggml_free(gctx);
+    return true;
+}
+
 // ---------------------------------------------------------------------
 // Self-test
 // ---------------------------------------------------------------------
@@ -1657,6 +1876,23 @@ bool network_step(NetworkState & s, const ModelF32 & m,
             reuse = true;
         }
 
+        // G7 (prototype) - fused per-layer prefill graph. Only for the prefill
+        // case (n_new > 1) on the qquant path (mm set), non-reuse layers, and
+        // when n_past == 0 (the fused path assumes a fresh prefill). Reuse
+        // layers and decode fall through to the hand path unchanged.
+        const bool use_fused = get_prefill_fused() && n_new > 1 &&
+                               s.n_past == 0 && !reuse && m.mm.pool;
+        if (use_fused) {
+            if (!layer_forward_fused_prefill(m.mm, L, n_new, m.n_swa,
+                                             inpL.data(), s.pos_all.data(), slice,
+                                             hidden_out.data(),
+                                             K_buf, V_buf, error)) {
+                std::ostringstream ss;
+                ss << "network_step: layer " << il << " (fused): " << error;
+                error = ss.str();
+                return false;
+            }
+        } else
         if (!layer_forward_f32_cached(L, n_new, s.n_past, m.n_swa,
                                       inpL.data(), s.pos_all.data(), slice,
                                       hidden_out.data(),
