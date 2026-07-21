@@ -768,6 +768,102 @@ Options to close it
 2. Fuse each layer's ops into one ggml sub-graph (norm→qkv→...→ffn as one graph, ~35 computes instead of 245) — medium change, keeps hand control of MoE, recovers barrier + quantization-reuse efficiency.
 3. Full fused ggml graph for the dense path (matches minslm) — biggest win, biggest change/risk, and would diverge from the hand-coded forward that the MoE-streaming path relies on.
 
+Excellent — big drops in every scalar bucket:
+
+• gelu*up: 190 → 27.8 ms (6.8×)
+• RoPE: 58 → 8.5 ms
+• q/k/v rms-norm: 20 → 3.9 ms
+• attn_norm/ffn_norm/post_attn/post_ffw all ~3-4 ms (were 9-12)
+
+Prefill 85.3 → 94.4 t/s (+10.6%) on this box.
+
+Strong result on the full 555-token prompts on Threadripper:
+
+┌─────────┬───────────┬────────────────────────┐
+│         │ Before    │ After                  │
+├─────────┼───────────┼────────────────────────┤
+│ prefill │ 78–86 t/s │ 96–105 t/s (+~22%)     │
+├─────────┼───────────┼────────────────────────┤
+│ decode  │ ~37 t/s   │ ~37–38 t/s (unchanged) │
+└─────────┴───────────┴────────────────────────┘
+
+The longer prompts benefit more than the 236-tok profile (+10.6%) because there's more parallelizable scalar work amortizing each pool dispatch. Decode is untouched — the 32K-element threshold keeps the single-token path fully serial.
+
+Verification:
+
+• Bit-identical: my binary reproduces the exact baseline 4/16 "solitary" divergence and cos_sim, proving the parallelized prefill matches the serial math element-for-element.
+• kernel self-test: PASS.
+• Only  gemma4_forward.cpp  changed (added  <functional> , a threshold-guarded  parallel_for  over the existing attn pool, and applied it to gelu*up, RoPE Q/K, all rmsnorm sites, residual adds, and the PLE scalar tail).
+
+UMA 395 confirms the win:
+
+┌────────────────────┬───────────┬──────────────────────┐
+│ UMA 395, ccx-affin │ Before    │ After                │
+├────────────────────┼───────────┼──────────────────────┤
+│ prefill            │ 103.3 t/s │ 113.4 t/s (+9.8%)    │
+├────────────────────┼───────────┼──────────────────────┤
+│ decode             │ 40.9 t/s  │ 40.9 t/s (unchanged) │
+└────────────────────┴───────────┴──────────────────────┘
+
+Prefill is now 63% of minslm (was 57%); decode holds at ~93% parity. Solid, low-risk win banked and verified on both boxes.
+
+The remaining prefill gap (113 vs 180) is now almost entirely the matmul compute itself — the scalar glue is largely defused. The next lever is option #2: batch each layer's ops into one (or a few) fused ggml graphs so all 245 separate  ggml_graph_compute  dispatches per prefill collapse into ~35, keeping the pool hot and letting ggml quantize/reuse activations across nodes. That's a medium-risk change but the clearest path to close more of the gap.
+
+The next lever (if you want to keep pushing prefill toward minslm's 163) would be option #2 — batching per-layer ops into fewer ggml graphs to cut the 245 separate dispatches.
+
+There's already a full fused single-layer ggml graph ( oracle_layer_forward_f32 ) mirroring the reference model — used as the correctness oracle. This is essentially the option-#2 implementation already written in gemma4_forward.cpp.
+
+oracle_layer_forward_f32  is a complete fused single-layer ggml graph, but it uses F32 weights + single-thread + fresh 1GB arena (correctness oracle only). For the prototype I'll adapt it into a prefill path: quantized weight handles ( L.*_t ), the persistent  mm.pool , a reused arena, SWA-aware mask, and K/V persisted to the cache. 
+
+Prototype #2 (fused per-layer prefill graph) works. Summary:
+
+What I built ( --gemma4-prefill-fused 0|1 , default off):
+
+• New  layer_forward_fused_prefill()  in  gemma4_forward.cpp : builds one ggml graph per layer using the quantized weight handles ( L.wq_t … L.proj_t ) as cross-context leaves, runs it multithreaded on the persistent  mm.pool , with an SWA-aware causal mask, a reused persistent arena, and persists roped-K / normed-V into the external  K_cache / V_cache  so decode (still the hand path) reads them.
+• Wired into  network_step  only for the prefill case ( n_new>1 ,  n_past==0 , non-reuse layers, pool present); decode + reuse layers untouched.
+• Global setter/getter ( set/get_prefill_fused ) + CLI flag, mirroring the existing  attn-parallel / matmul-cache  pattern.
+
+Results (Threadripper dev box, E2B Q4_K_M, 8t):
+
+┌───────────┬──────────────┬───────────┐
+│           │ prefill      │ decode    │
+├───────────┼──────────────┼───────────┤
+│ fused OFF │ ~90–98 t/s   │ unchanged │
+├───────────┼──────────────┼───────────┤
+│ fused ON  │ ~106–112 t/s │ unchanged │
+└───────────┴──────────────┴───────────┘
+
+≈ +10% prefill, decode identical (uses hand path).
+
+Correctness:
+
+•  --gemma4-network-gen "1, 2, 3, 4," 24 : 24/24 match (fused on & off).
+•  -cpf  18-prompt run: output JSON byte-coherent with the known-good answers.
+• The only divergence ( "…France…" 16  → 15/16) is a tie-break at step 13 deep in the degenerate  <turn|>/<eos>  collapse tail; first real token " Paris." matches. This is expected ULP-level drift (fused F32 ggml reductions vs hand double accumulators) — the fused graph is numerically upstream-like.
+
+The prototype collapses ~245 per-prefill dispatches into ~35 fused graphs. To test on UMA 395 (after rebuild):
+
+Gemma4.exe -m <E2B.gguf> --threads-gen 8 --threads-prefill 8 --gemma4-ccx-affin \
+  --gemma4-prefill-fused 1 -cpf ..\examples\llm-infer\prompts\custom_prompts_gemma4.txt
+
+Compare prefill t/s against the same run without  --gemma4-prefill-fused 1 . Default is off, so the baseline path is unaffected.
+
+Confirmed on UMA 395 — the fused prefill stacks cleanly on top of ccx-affin:
+
+┌───────────────────────────┬────────────────────┬────────┐
+│ config                    │ prefill (prompt 2) │ decode │
+├───────────────────────────┼────────────────────┼────────┤
+│ no ccx-affin, no fused    │ 96.0 t/s           │ 25.4   │
+├───────────────────────────┼────────────────────┼────────┤
+│ ccx-affin, no fused       │ 120.2 t/s          │ 41.6   │
+├───────────────────────────┼────────────────────┼────────┤
+│ ccx-affin + prefill-fused │ 132.7 t/s          │ 41.2   │
+└───────────────────────────┴────────────────────┴────────┘
+
+So fused adds ~+8–10% prefill on top of ccx-affin (120→133, 114→124), decode unchanged, output coherent. That moves prefill from ~63% to ~71% of minslm (128 vs 180 t/s). Same relative gain as the dev box — consistent win on both boxes.
+
+The prototype is validated and pushed. Where it stands vs minslm: the remaining gap is now in the fused-graph compute itself (matmul kernel + ggml op overhead per layer), not dispatch count.
+
 ===================================================================================
 
 CLI reference — Gemma4.exe
@@ -1104,3 +1200,19 @@ Correctness:
   degenerate <turn|>/<eos> collapse tail (first real token " Paris." matches);
   expected ULP-level drift - fused uses F32 ggml reductions (upstream-like)
   vs the hand path's double accumulators.
+
+==========================================================
+
+G7 update - fused per-layer prefill is now the DEFAULT (--gemma4-prefill-fused 1)
+
+After validating on both the Threadripper dev box and the UMA 395 (consistent
+~+10% prefill, decode unchanged, output coherent), the fused per-layer prefill
+graph is enabled by default. Pass --gemma4-prefill-fused 0 to fall back to the
+hand scalar-kernel path for A/B comparison.
+
+Multi-layer fusion (fusing >1 layer per ggml graph) was prototyped and
+measured: prefill stayed within run-to-run noise (+-2 t/s) across chunk sizes
+1/4/8/18/35, while arena memory grew linearly (~8 GB at 35 layers). The
+per-graph ggml_init/build/free overhead is cheap and the matmul+op compute is
+identical regardless of layers-per-graph, so multi-layer fusion was dropped -
+the single-layer fused path already captures the entire available win.

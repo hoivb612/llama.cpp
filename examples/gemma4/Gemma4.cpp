@@ -173,7 +173,7 @@ static void print_usage(int /*argc*/, char ** argv) {
             "    --gemma4-matmul-cache 0|1          cache per-shape mul_mat graphs across decode calls (default 1)\n"
             "    --gemma4-moe-fused 0|1             fuse resident MoE experts via ggml_mul_mat_id (default 1)\n"
             "    --gemma4-lmhead-fused 0|1          fuse greedy lm_head+argmax, skip softcap (default 1)\n"
-            "    --gemma4-prefill-fused 0|1         fuse per-layer prefill into one ggml graph (default 0)\n"
+            "    --gemma4-prefill-fused 0|1         fuse per-layer prefill into one ggml graph (default 1)\n"
             "    --gemma4-ccx-affin                 pin ggml workers one-per-CCX for decode bandwidth (96-core box)\n"
             "\n",
         argv[0]);
@@ -255,10 +255,10 @@ int main(int argc, char ** argv) {
     // 0 to fall back to the full-logits matmul + softcap + max_element (A/B).
     int gemma4_lmhead_fused     = 1;
 
-    // G7 (prototype) - fused per-layer prefill graph. Off by default; pass
-    // --gemma4-prefill-fused 1 to build one ggml graph per layer for the
-    // prefill (n_new > 1) path instead of the hand scalar kernels (A/B).
-    int gemma4_prefill_fused    = 0;
+    // G7 - fused per-layer prefill graph. Default ON; pass
+    // --gemma4-prefill-fused 0 to fall back to the hand scalar kernels for the
+    // prefill (n_new > 1) path (regression guard / A/B comparison).
+    int gemma4_prefill_fused    = 1;
 
     // G6.3 - CCX-spread decode affinity (bandwidth). Off by default; pass
     // --gemma4-ccx-affin to pin ggml workers one-per-CCX (bridges to the

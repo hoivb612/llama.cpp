@@ -199,7 +199,7 @@ bool get_lmhead_fused() {
     return g_lmhead_fused.load(std::memory_order_relaxed);
 }
 
-static std::atomic<bool> g_prefill_fused{false};
+static std::atomic<bool> g_prefill_fused{true};
 
 void set_prefill_fused(bool on) {
     g_prefill_fused.store(on, std::memory_order_relaxed);

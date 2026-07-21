@@ -240,12 +240,12 @@ bool get_moe_fused();
 void set_lmhead_fused(bool on);
 bool get_lmhead_fused();
 
-// G7 (prototype) - global setter for the fused per-layer prefill graph. When
-// ON, the prefill (n_new > 1) path builds ONE ggml graph per layer (quantized
-// weights, run multithreaded on mm.pool) instead of the ~7-per-layer scalar
-// hand kernels + separate matmul dispatches. Collapses the per-layer dispatch
-// count and lets ggml multithread every op. Decode (n_new == 1) always uses
-// the hand path. Default OFF; set via --gemma4-prefill-fused 0|1 for A/B.
+// G7 - global setter for the fused per-layer prefill graph. When ON, the
+// prefill (n_new > 1) path builds ONE ggml graph per layer (quantized weights,
+// run multithreaded on mm.pool) instead of the per-op scalar hand kernels +
+// separate matmul dispatches, letting ggml multithread every op. Decode
+// (n_new == 1) always uses the hand path. Default ON; set via
+// --gemma4-prefill-fused 0 to fall back for A/B comparison.
 void set_prefill_fused(bool on);
 bool get_prefill_fused();
 
