@@ -1253,3 +1253,27 @@ Prefill also gains (~+30% on UMA, 4.3 -> 5.6 t/s) since prefill streams too.
 Past the sweet spot, N I/O workers contend with the N gen-compute threads
 (16-core UMA: 8 gen + 8 io saturates), so throughput dips even as `waits`
 keeps falling. Neutral in the compute-bound regime (4 GiB: 10.11 -> 10.16).
+
+P2c - effective streaming bandwidth instrumentation (io_bw)
+
+ExpertStoreStats now tracks read_ns: wall-ns summed across every read_at()
+call (I/O busy thread-time). log_stats reports io_read (total thread-ms in
+I/O) and io_bw = bytes_read / read_ns in GiB/s/stream -- the effective
+PER-STREAM read bandwidth. Aggregate wall-clock bandwidth ~= io_bw times the
+number of overlapping workers.
+
+This quantifies the streaming I/O path directly. Dev box (TR7995WX, warm
+page cache), 26B-A4B, budget 1024, decode:
+  1w io_bw 3.12 GiB/s (agg 3.1)   2w 2.46 (agg 4.9)   4w 1.35 (agg 5.4)
+Per-stream BW falls as workers rise because they contend for the same
+memory-copy bandwidth; aggregate saturates ~5 GiB/s, which is why decode t/s
+plateaus past 2 workers.
+
+CAVEAT - warm page cache masks storage speed. On big-RAM boxes the whole
+model fits the OS page cache after warm-up, so read_at() is a kernel memcpy,
+not a device read: io_bw reports RAM-copy speed (~3 GiB/s/stream here), NOT
+disk/NVMe speed. To measure actual storage (and see NVMe gains) the reads
+must miss the cache: either drop the OS standby/page cache between runs
+(cold run) or use an uncached read path (FILE_FLAG_NO_BUFFERING with
+sector-aligned rounding). The io_bw metric is what makes those comparisons
+visible once the cache is bypassed.

@@ -62,6 +62,7 @@ struct ExpertStoreStats {
     uint64_t fetches      = 0;  // hits + misses
     uint64_t prefetch_reads = 0; // blocks read by the background worker
     uint64_t waits          = 0; // fetches that blocked on an in-flight worker read
+    uint64_t read_ns        = 0; // wall-ns summed across all read_at() calls (I/O busy thread-time)
 };
 
 // Hard-capped, LRU expert block cache backed by positioned file reads.

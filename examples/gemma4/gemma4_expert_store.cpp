@@ -6,6 +6,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -298,11 +299,17 @@ const void * ExpertStore::fetch(const ggml_tensor * W3d, int expert, std::string
     lock.unlock();
     void * buf = aligned_alloc_bytes(bytes);
     if (!buf) { error = "ExpertStore::fetch: allocation failed"; return nullptr; }
-    if (!read_at(off, buf, bytes, error)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool rok = read_at(off, buf, bytes, error);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (!rok) {
         aligned_free_bytes(buf);
         return nullptr;
     }
+    const uint64_t dt_ns =
+        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     lock.lock();
+    stats_.read_ns += dt_ns;
 
     // Another thread (worker) may have raced this key in while we read; if so,
     // drop our copy and use the resident one.
@@ -397,8 +404,14 @@ void ExpertStore::worker_loop() {
 
         lock.unlock();
         void * buf = aligned_alloc_bytes(bytes);
+        const auto t0 = std::chrono::steady_clock::now();
         const bool ok = buf && read_at(off, buf, bytes, werr);
+        const auto t1 = std::chrono::steady_clock::now();
+        const uint64_t dt_ns = buf
+            ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()
+            : 0;
         lock.lock();
+        if (dt_ns) stats_.read_ns += dt_ns;
 
         if (!ok) {
             // Drop the request; a later fetch() will read it synchronously and
@@ -434,10 +447,21 @@ const ExpertTensorRec * ExpertStore::rec(const ggml_tensor * W3d) const {
 void ExpertStore::log_stats(const char * tag) const {
     const double hr = stats_.fetches
         ? (100.0 * (double) stats_.hits / (double) stats_.fetches) : 0.0;
+    // Effective per-stream read bandwidth: total bytes / total time spent
+    // inside read_at() (summed across all worker threads). This reflects the
+    // raw storage/page-cache speed per I/O stream and is storage-sensitive
+    // (warm page cache >> cold NVMe > SATA SSD > HDD); aggregate wall-clock
+    // bandwidth is roughly this times the number of overlapping workers.
+    const double io_ms   = stats_.read_ns / 1.0e6;
+    const double io_bw   = stats_.read_ns
+        ? ((double) stats_.bytes_read * 1.0e9)
+          / ((double) stats_.read_ns * 1024.0 * 1024.0 * 1024.0)
+        : 0.0;
     std::fprintf(stderr,
         "gemma4 ExpertStore[%s]: fetches=%llu hits=%llu misses=%llu (hit rate %.1f%%) "
         "prefetch_reads=%llu waits=%llu evictions=%llu bytes_read=%.1f MiB "
-        "peak_resident=%.1f MiB budget=%.1f MiB prefetch=%s(%dw)\n",
+        "peak_resident=%.1f MiB budget=%.1f MiB prefetch=%s(%dw) "
+        "io_read=%.0f ms io_bw=%.2f GiB/s/stream\n",
         tag ? tag : "",
         (unsigned long long) stats_.fetches,
         (unsigned long long) stats_.hits,
@@ -450,7 +474,8 @@ void ExpertStore::log_stats(const char * tag) const {
         stats_.peak_bytes / (1024.0 * 1024.0),
         budget_ / (1024.0 * 1024.0),
         prefetch_on_ ? "on" : "off",
-        prefetch_on_ ? n_workers_ : 0);
+        prefetch_on_ ? n_workers_ : 0,
+        io_ms, io_bw);
 }
 
 } // namespace gemma4
