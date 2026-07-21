@@ -806,7 +806,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            if (p.verbose >= 2 && n_gen > 0) {
+            if (p.verbose >= 1 && n_gen > 0) {
                 printf("  decode: %.1fms (%d tokens, %.2f t/s)\n",
                        tg_us / 1000.0f, n_gen, n_gen / (tg_us / 1000000.0f));
                 if (n_emit > 0 && tg_core_us > 0) {
@@ -836,7 +836,7 @@ int main(int argc, char ** argv) {
         llama_synchronize(ctx);
         int64_t t2 = timer_us();
 
-        if (p.verbose >= 2) {
+        if (p.verbose >= 1) {
             float pp_ms = (t2 - t1) / 1000.0f;
             printf("  prefill: %.1fms (%zu tokens, %.1f t/s)\n",
                    pp_ms, tokens.size(), tokens.size() * 1000.0f / pp_ms);
@@ -990,7 +990,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            if (p.verbose >= 2 && n_gen > 0) {
+            if (p.verbose >= 1 && n_gen > 0) {
                 printf("  decode: %.1fms (%d tokens, %.2f t/s)\n",
                        tg_us / 1000.0f, n_gen, n_gen / (tg_us / 1000000.0f));
                 if (n_emit > 0 && tg_core_us > 0) {

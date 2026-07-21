@@ -436,7 +436,7 @@ bool llm_inference(
 
     int64_t t2_start = ggml_time_us();
     float t_prompt_eval_ms = (t2_start - t1_start) / 1000.0f;
-    if (params.verbose == 2) {
+    if (params.verbose >= 1) {
         printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n", 
             t_prompt_eval_ms, 
             embd.size(), 
@@ -523,7 +523,7 @@ bool llm_inference(
 
     int64_t t_us = (ggml_time_us() - t2_start);
 
-    if (params.verbose == 2) {
+    if (params.verbose >= 1) {
         printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n", 
             t_us / 1000.0f,
             n_tokens_generated, 
@@ -656,7 +656,7 @@ bool llm_infer_multiturn(model_params& params) {
 
     int64_t t2_start = ggml_time_us();
     float t_prompt_eval_ms = (t2_start - t1_start) / 1000.0f;
-    if (params.verbose == 2) {
+    if (params.verbose >= 1) {
         printf("Prompt TTFT = %.2fms (size = %zu) (%.2ft/s) (%.2fms)\n",
             t_prompt_eval_ms,
             tokens_input.size(),
@@ -745,7 +745,7 @@ bool llm_infer_multiturn(model_params& params) {
 
     int64_t t_us = (ggml_time_us() - t2_start);
 
-    if (params.verbose == 2) {
+    if (params.verbose >= 1) {
         printf("> token generation time = %.2fms (%d) (%.2ft/s) (%.2fms)\n",
             t_us / 1000.0f,
             n_tokens_generated,
