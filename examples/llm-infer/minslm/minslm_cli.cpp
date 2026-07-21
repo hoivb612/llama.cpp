@@ -604,7 +604,7 @@ int main(int argc, char ** argv) {
             if (ctx_dft) llama_synchronize(ctx_dft);
             int64_t t2 = timer_us();
 
-            if (p.verbose >= 2) {
+            if (p.verbose >= 1) {
                 float pp_ms = (t2 - t1) / 1000.0f;
                 printf("  prefill: %.1fms (%d tokens, %.1f t/s)\n",
                        pp_ms, n_pref, n_pref * 1000.0f / pp_ms);
