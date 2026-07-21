@@ -555,6 +555,219 @@ Open follow-ups noted in plan: (a) per_layer_model_proj → MatmulCtx (~5-10 ms)
 
 ===================================================================================
 
+Improving perf:
+
+The full prefill breakdown (14.2 s) is far more revealing:
+
+┌────────────────────────────────────┬─────────┬───────┐
+│ Bucket                             │ Time    │ %     │
+├────────────────────────────────────┼─────────┼───────┤
+│ ple (per-layer embeddings)         │ 4006 ms │ 28.2% │
+├────────────────────────────────────┼─────────┼───────┤
+│ attention (scalar QK^T/softmax/×V) │ 3755 ms │ 26.4% │
+├────────────────────────────────────┼─────────┼───────┤
+│ gelu*up (elementwise GeLU)         │ 2716 ms │ 19.1% │
+├────────────────────────────────────┼─────────┼───────┤
+│ ffn_gate+up+down (matmuls)         │ 2361 ms │ 16.6% │
+├────────────────────────────────────┼─────────┼───────┤
+│ Q/K/V/wo proj + RoPE + norms       │ ~650 ms │ 4.6%  │
+└────────────────────────────────────┴─────────┴───────┘
+
+So prefill isn't one bottleneck — it's three scalar hand-kernels eating 74%: PLE (28%), attention (26%), and gelu*up (19%). The actual matmuls are only 17%. The  gelu*up  at 2.7 s for a pure elementwise op is a screaming red flag — that should be SIMD and near-free.
+
+Decode has the same scalar-kernel story (24 tokens, 34 ms/tok):
+
+┌────────────────────────────────────────┬────────┬──────┐
+│ Decode bucket                          │ Time   │ %    │
+├────────────────────────────────────────┼────────┼──────┤
+│ ple + PLE merge (per-layer embeddings) │ 259 ms │ ~32% │
+├────────────────────────────────────────┼────────┼──────┤
+│ ffn matmuls (gate+up+down)             │ 261 ms │ 32%  │
+├────────────────────────────────────────┼────────┼──────┤
+│ gelu*up (elementwise)                  │ 135 ms │ 24%  │
+├────────────────────────────────────────┼────────┼──────┤
+│ lm_head                                │ 42 ms  │ 5%   │
+├────────────────────────────────────────┼────────┼──────┤
+│ Q/wo/attention                         │ 84 ms  │ 10%  │
+└────────────────────────────────────────┴────────┴──────┘
+
+Verdict — the gap is scalar hand-kernels, not the matmuls
+
+The ccx-affin work already optimized the matmuls (ffn/lm_head). What's left — and what separates gemma4 from minslm — is three scalar kernels that ggml does in SIMD:
+
+1.  gelu*up  — 19% prefill / 24% decode, for a pure elementwise op. This should be near-free. Biggest bang-for-effort, helps both gaps.
+2.  ple  +  PLE merge  (per-layer embedding dequant/merge) — 28% prefill / 32% decode. Gather+dequant+scale — SIMD-able.
+3.  attention  (scalar QK^T/softmax/×V) — 26% prefill, negligible in decode. The unique prefill cost; hardest to fix.
+
+This directly matches your standing preference to never leave SIMD hot paths in scalar mode. For the decode 1.86× gap, vectorizing  gelu*up  +  ple  (together ~56% of decode) is the lever. For the prefill 5× gap, add scalar  attention .
+
+Confirmed the root cause.  gelu_f32  (gemma4_kernels.cpp:48) is scalar and does the worst-case per element: two F16 round-trips ( fp16_to_fp32(fp32_to_fp16(x)) ) plus a  std::tanh  — for every element. That's why a "free" elementwise op costs 24% of decode.
+
+The key insight: it's written this way to bit-match ggml's gelu — but ggml itself doesn't compute tanh per element. ggml uses a 64K F16 lookup table ( ggml_table_gelu_f16 ): one F16 conversion + one table index, no tanh. So replacing this scalar tanh loop with the same LUT ggml uses is both bit-identical to the oracle (the oracle is that table) and ~5–10× faster. Clean, safe, high-value.
+
+Summary of the pinpoint (both gaps)
+
+┌───────────────────────┬───────────┬──────────┬─────────────────────────────────────┬─────────────────────────────────┐
+│ Kernel                │ Prefill % │ Decode % │ Nature                              │ Fix                             │
+├───────────────────────┼───────────┼──────────┼─────────────────────────────────────┼─────────────────────────────────┤
+│ gelu*up               │ 19%       │ 24%      │ scalar tanh + 2× F16 roundtrip/elem │ F16 LUT (bit-exact, easy)       │
+├───────────────────────┼───────────┼──────────┼─────────────────────────────────────┼─────────────────────────────────┤
+│ ple / PLE merge       │ 28%       │ 32%      │ scalar dequant/gather/merge         │ SIMD / cache                    │
+├───────────────────────┼───────────┼──────────┼─────────────────────────────────────┼─────────────────────────────────┤
+│ attention             │ 26%       │ ~0%      │ scalar QK^T/softmax/×V              │ flash/SIMD (prefill-only, hard) │
+├───────────────────────┼───────────┼──────────┼─────────────────────────────────────┼─────────────────────────────────┤
+│ matmuls (ffn/lm_head) │ 17%       │ 32%      │ ggml SIMD (already ccx-tuned)       │ done                            │
+└───────────────────────┴───────────┴──────────┴─────────────────────────────────────┴─────────────────────────────────┘
+
+To reproduce on your UMA box (same profiler, realistic ~476-tok prefill):
+
+bin\RelWithDebInfo\Gemma4.exe -m c:\llama.cpp\models\gemma-4-E2B-it-Q4_K_M.gguf --threads-prefill 8 --threads-gen 8 --gemma4-ccx-affin --gemma4-network-profile "<paste a ~400-word paragraph>" 16
+
+(The bucket ratios should match; absolute times differ.)
+
+Step 1 (gelu F16-LUT) done — clean, bit-exact win. Apples-to-apples (short prompt, ccx-affin):
+
+┌─────────────────┬──────────┬────────────────────────────┐
+│                 │ Before   │ After                      │
+├─────────────────┼──────────┼────────────────────────────┤
+│ decode gelu*up  │ 134.7 ms │ 22.8 ms (5.9×)             │
+├─────────────────┼──────────┼────────────────────────────┤
+│ decode/tok      │ 33.98 ms │ 29.24 ms (+16% t/s → 34.2) │
+├─────────────────┼──────────┼────────────────────────────┤
+│ prefill gelu*up │ 2716 ms  │ 386 ms (7×)                │
+├─────────────────┼──────────┼────────────────────────────┤
+│ prefill t/s     │ 33.5     │ 39.6 (+18%)                │
+└─────────────────┴──────────┴────────────────────────────┘
+
+ gelu*up  fell from 24%→5% of decode. Kernel self-test passes; table is bit-identical to the old scalar formula.
+
+Now step 2:  ple  — the biggest remaining bucket (prefill 32% / decode 30%).
+
+The  lf_ple_ns  scope wraps the whole PLE block, which includes two matmuls ( inp_gate  1536×256,  proj  256×1536) plus scalar ops — per layer × 35. Two tiny matvecs shouldn't cost 8.8 ms/tok. Let me see how  dispatch_matmul  handles these vs the fast ffn path:
+
+The big top-level  ple  bucket (4006 ms) is outside the layer loop — separate from the per-layer PLE block I just read (that's "PLE merge"). It's likely the upfront per-layer-embedding dequant for all tokens. Compute_per_layer_inputs  does a scalar  matmul_f32  (line 1191) projecting  [n_embd=1536] → [M = n_epl×n_layer = 256×35 = 8960]  per token — that's the biggest matmul in the model after lm_head, run single-threaded scalar instead of the fast ggml path that ffn/lm_head use. The readme already flagged this: "compute_per_layer_inputs still uses F32 matmul_f32... could be moved to qquant (ple bucket ~14% of decode)." The quantized tensor  w.per_layer_model_proj  exists (gemma4_weights.h:144) but ModelF32 only keeps the F32 vector.
+
+matmul_f32  is scalar, single-threaded, double-accumulate — worst case. For prefill that's 476×8960×1536 ≈ 6.5B double-MACs single-threaded. The fix: route through  matmul_qf32  with the quantized  per_layer_model_proj  tensor (same path as ffn) — faster and closer to upstream's quantized matmul.  m.mm  is  mutable  (accessible from const), and  compute_per_layer_inputs  is only ever called from  network_step  where  mm  is ready. I'll add the quantized tensor handle to ModelF32, populate it, and branch to  matmul_qf32. Now the core change — route the projection through  matmul_qf32.
+
+Step 2 (ple → qf32) is a massive win:
+
+┌───────────────┬─────────────────────┬─────────────────────┐
+│               │ Before              │ After               │
+├───────────────┼─────────────────────┼─────────────────────┤
+│ prefill ple   │ 3875 ms             │ 31 ms (125×)        │
+├───────────────┼─────────────────────┼─────────────────────┤
+│ decode ple    │ 211 ms              │ 6.9 ms (30×)        │
+├───────────────┼─────────────────────┼─────────────────────┤
+│ prefill total │ 12.0 s (39.6 t/s)   │ 8.0 s (59.2 t/s)    │
+├───────────────┼─────────────────────┼─────────────────────┤
+│ decode/tok    │ 29.24 ms (34.2 t/s) │ 20.45 ms (48.9 t/s) │
+└───────────────┴─────────────────────┴─────────────────────┘
+
+16/16 greedy tokens still match upstream.
+
+Combined progress (steps 1+2, Threadripper profiler, E2B, ccx-affin)
+
+┌────────────┬─────────────────────┬─────────────────────┬──────────┐
+│            │ Baseline            │ +gelu +ple          │ Gain     │
+├────────────┼─────────────────────┼─────────────────────┼──────────┤
+│ decode/tok │ 33.98 ms (29.4 t/s) │ 20.45 ms (48.9 t/s) │ +66% t/s │
+├────────────┼─────────────────────┼─────────────────────┼──────────┤
+│ prefill    │ 33.5 t/s            │ 59.2 t/s            │ +77% t/s │
+└────────────┴─────────────────────┴─────────────────────┴──────────┘
+
+Both were scalar-kernel wins routed to the fast path (gelu→ggml's F16 LUT, ple→qf32 matmul), bit-faithful to upstream.
+
+Remaining: prefill is now dominated by  attention  (3642 ms, 48%) — that's step 3, the scalar O(n²) QK^T/softmax/×V. It's the biggest remaining prefill cost but also the hardest/riskiest change (decode is barely affected by it).
+
+Now step 3: the scalar attention (48% of prefill). Let me study the current implementation (gemma4_forward.cpp).
+
+The scalar attention has two inefficiencies: (1) the QK^T dot is scalar double-accumulate over head_dim=512 contiguous floats (ideal for SIMD), and (2) the V-accumulation has a cache-hostile loop order (inner loop over  k  strides  V  by  n_kv  per element). There's already a pattern for reusing ggml's SIMD  vec_dot  (used in  lmhead_argmax_qf32 ). For F32 Q·K I can fetch ggml's F32  vec_dot  the same way — SIMD, no hand intrinsics, consistent with the codebase. And the V-accumulation just needs a loop-order fix (k-outer, contiguous d-inner) to become cache-friendly + auto-vectorizable.  I'll use ggml's F32  vec_dot  for QK^T (SIMD, reused) and reorder the V-accumulation to be cache-friendly + auto-vectorizable.
+
+Step 3 (attention) is a big prefill win:
+
+┌───────────────────┬──────────────────┬──────────────────────────┐
+│                   │ Before           │ After                    │
+├───────────────────┼──────────────────┼──────────────────────────┤
+│ prefill attention │ 3642 ms          │ 1314 ms (2.77×)          │
+├───────────────────┼──────────────────┼──────────────────────────┤
+│ prefill total     │ 8.0 s (59.2 t/s) │ 5.8 s (82.1 t/s)         │
+├───────────────────┼──────────────────┼──────────────────────────┤
+│ decode            │ 20.45 ms/tok     │ 20.75 ms/tok (unchanged) │
+└───────────────────┴──────────────────┴──────────────────────────┘
+
+Prefill is now matmul-bound (ffn ~41%, attention 25%) — like minslm.
+
+Final summary:
+
+Optimization results — E2B, Threadripper profiler, ccx-affin
+
+┌────────────┬─────────────────────┬─────────────────────┬───────────────┐
+│ Metric     │ Baseline            │ Final               │ Gain          │
+├────────────┼─────────────────────┼─────────────────────┼───────────────┤
+│ decode/tok │ 33.98 ms (29.4 t/s) │ 20.45 ms (48.9 t/s) │ +66% t/s      │
+├────────────┼─────────────────────┼─────────────────────┼───────────────┤
+│ prefill    │ 33.5 t/s            │ 82.1 t/s            │ +145% (2.45×) │
+└────────────┴─────────────────────┴─────────────────────┴───────────────┘
+
+What changed (two commits, all bit-faithful)
+
+ b1b625368  — steps 1+2:
+
+• gelu → ggml's 65536-entry F16 LUT (drops per-element  tanh ): decode 135→23 ms, prefill 2716→386 ms
+• ple (per-layer-embedding projection) →  matmul_qf32  on the quantized weight (was scalar double-accumulate  matmul_f32 ): decode 211→7 ms, prefill 3875→31 ms
+
+ ca52e79e1  — step 3:
+
+• attention Q·K → ggml SIMD F32  vec_dot ; scores·V reordered to cache-friendly k-outer with a bit-exact double accumulator: prefill 3642→1314 ms
+
+Outstanding results on UMA 395. Here's the full end-to-end journey (real  -cpf  workload, 555-tok prompt):
+
+UMA 395 E2B — before vs after all three optimizations
+
+┌───────────────────────────┬────────────────────┬───────────────┬───────────────────┬──────────────┐
+│                           │ Prefill (no-affin) │ Prefill (ccx) │ Decode (no-affin) │ Decode (ccx) │
+├───────────────────────────┼────────────────────┼───────────────┼───────────────────┼──────────────┤
+│ Before (start of session) │ 34.8 t/s           │ 35.8 t/s      │ 14.0 t/s          │ 23.3 t/s     │
+├───────────────────────────┼────────────────────┼───────────────┼───────────────────┼──────────────┤
+│ After (gelu+ple+attn)     │ 98.2               │ 103.3         │ 28.3              │ 40.9         │
+├───────────────────────────┼────────────────────┼───────────────┼───────────────────┼──────────────┤
+│ gain                      │ +182%              │ +189%         │ +102%             │ +76%         │
+└───────────────────────────┴────────────────────┴───────────────┴───────────────────┴──────────────┘
+
+vs the target (minslm-cli ccx on UMA: decode 43.4, prefill 180)
+
+• Decode: 40.9 vs 43.4 t/s → gemma4 is now ~94% of minslm (was 54%). Effectively at parity. 🎯
+• Prefill: 103.3 vs 180 t/s → 57% of minslm (was 20%). Closed most of the gap; the remainder is minslm's more efficient batched ffn/attention matmuls.
+
+The image confirms the ccx-spread working — the burst pattern shows work landing across both CCDs' cores rather than packing one CCD.
+
+Bottom line: the decode gap vs minslm is essentially closed on the dense model — which was the key prerequisite for MoE streaming to match resident perf. Prefill improved 2.9× but still trails (batched-matmul efficiency).
+
+==========================================================
+
+┌────────────────────────────────────────────────┬──────────┬───────┐
+│ Component                                      │ Time     │ Share │
+├────────────────────────────────────────────────┼──────────┼───────┤
+│ matmul compute (ggml_graph_compute, 245 calls) │ 1470 ms  │ 53%   │
+├────────────────────────────────────────────────┼──────────┼───────┤
+│ matmul build/setup (init+graph+plan, per-call) │ 103 ms   │ 3.7%  │
+├────────────────────────────────────────────────┼──────────┼───────┤
+│ non-matmul (attention pool + scalar glue)      │ ~1193 ms │ 43%   │
+└────────────────────────────────────────────────┴──────────┴───────┘
+
+Key conclusions:
+
+• Per-dispatch build overhead is only 6.6% of matmul time → a prefill-shape graph cache would barely help (~+4%). Ruled out.
+• The matmul compute uses the identical ggml kernel minslm uses, yet gemma4's total is ~2× slower — so the gap lives in the structural difference: minslm runs one fused graph per prefill (all ops multithreaded, pool stays hot, ~1 barrier), while gemma4 issues 245 separate  ggml_graph_compute  calls and runs the glue (gelu*up = 190 ms, rope, rmsnorm, residuals, PLE scalar) single-threaded between them.
+
+Options to close it
+
+1. Parallelize the single-threaded scalar kernels (geluup, rope, rmsnorm, residuals) across the existing pool — low risk, self-contained, est. +8–15% prefill. geluup alone (190→~25 ms) is the biggest single item.
+2. Fuse each layer's ops into one ggml sub-graph (norm→qkv→...→ffn as one graph, ~35 computes instead of 245) — medium change, keeps hand control of MoE, recovers barrier + quantization-reuse efficiency.
+3. Full fused ggml graph for the dense path (matches minslm) — biggest win, biggest change/risk, and would diverge from the hand-coded forward that the MoE-streaming path relies on.
+
+===================================================================================
+
 CLI reference — Gemma4.exe
 ==========================
 

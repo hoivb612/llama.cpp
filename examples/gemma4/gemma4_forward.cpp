@@ -14,12 +14,47 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <random>
 #include <sstream>
 #include <vector>
 
 namespace gemma4 {
+
+// ---------------------------------------------------------------------
+// G6.1 - threshold-guarded data-parallel for over the persistent attn pool.
+// ---------------------------------------------------------------------
+// Splits an index space [0,n) into W contiguous [lo,hi) sub-ranges (one per
+// pool worker, main-as-worker) and runs `body(lo,hi)` on each. Falls back to
+// an inline serial call when n*work_per_unit is below the pool wakeup
+// break-even, so the single-token decode path is never slowed. The body must
+// be data-parallel over the index (no cross-index reduction) so the result is
+// bit-identical to the equivalent serial loop.
+namespace {
+struct ParForCtx {
+    std::size_t n;
+    const std::function<void(std::size_t, std::size_t)> * body;
+};
+void parfor_trampoline(int wid, int W, void * ud) {
+    auto * c = static_cast<ParForCtx *>(ud);
+    const std::size_t n     = c->n;
+    const std::size_t chunk = (n + (std::size_t) W - 1) / (std::size_t) W;
+    const std::size_t lo    = std::min((std::size_t) wid * chunk, n);
+    const std::size_t hi    = std::min(lo + chunk, n);
+    if (lo < hi) (*c->body)(lo, hi);
+}
+} // namespace
+
+static inline void parallel_for(MatmulCtx * mm, std::size_t n,
+                                std::size_t work_per_unit,
+                                const std::function<void(std::size_t, std::size_t)> & body) {
+    if (n == 0) return;
+    constexpr std::size_t kParWork = 1u << 15;  // ~32K element-ops break-even
+    if (!mm || n * work_per_unit < kParWork) { body(0, n); return; }
+    ParForCtx c{ n, &body };
+    attn_pool_run(*mm, &parfor_trampoline, &c);
+}
 
 // ---------------------------------------------------------------------
 // Profiling (opt-in; zero overhead in the disabled fast path)
@@ -545,11 +580,13 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- attn_norm: norm1[t,:] = rmsnorm(hidden_in[t,:]) * attn_norm --
     std::vector<float> norm1((size_t) n_embd * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_attn_norm_ns);
-    for (int t = 0; t < n_new; ++t) {
-        rmsnorm_mul_f32(norm1.data() + (size_t) t * n_embd,
-                        hidden_in + (size_t) t * n_embd,
-                        L.attn_norm.data(), n_embd, eps);
-    }
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            rmsnorm_mul_f32(norm1.data() + t * n_embd,
+                            hidden_in + t * n_embd,
+                            L.attn_norm.data(), n_embd, eps);
+        }
+    });
     }
 
     // -------- Q = wq @ norm1, then q_norm + RoPE (always own) --------
@@ -560,21 +597,25 @@ bool layer_forward_f32_cached(const LayerF32 & L,
                          "wq", error)) return false;
     }
     { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
-    for (int t = 0; t < n_new; ++t) {
-        rmsnorm_per_head_f32(Q.data() + (size_t) t * n_q,
-                             Q.data() + (size_t) t * n_q,
-                             L.attn_q_norm.data(), head_dim, n_head, eps);
-    }
+    parallel_for(mm, (size_t) n_new, (size_t) n_q, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            rmsnorm_per_head_f32(Q.data() + t * n_q,
+                                 Q.data() + t * n_q,
+                                 L.attn_q_norm.data(), head_dim, n_head, eps);
+        }
+    });
     }
     { prof::Scope _s(&prof::g_acc.lf_rope_ns);
-    for (int t = 0; t < n_new; ++t) {
-        const int p = pos_all[n_past + t];
-        for (int h = 0; h < n_head; ++h) {
-            float * q_th = Q.data() + (size_t) t * n_q + (size_t) h * head_dim;
-            rope_neox_f32(q_th, q_th, L.freq_factors,
-                          L.rope_dim, head_dim, p, L.rope_base);
+    parallel_for(mm, (size_t) n_new, (size_t) n_q, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            const int p = pos_all[n_past + (int) t];
+            for (int h = 0; h < n_head; ++h) {
+                float * q_th = Q.data() + t * n_q + (size_t) h * head_dim;
+                rope_neox_f32(q_th, q_th, L.freq_factors,
+                              L.rope_dim, head_dim, p, L.rope_base);
+            }
         }
-    }
+    });
     }
 
     // -------- K, V for new tokens (skip entirely on reuse layers) --------
@@ -601,29 +642,31 @@ bool layer_forward_f32_cached(const LayerF32 & L,
         }
 
         { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
-        // K norm (per kv-head)
-        for (int t = 0; t < n_new; ++t) {
-            rmsnorm_per_head_f32(K_new + (size_t) t * n_kv,
-                                 K_new + (size_t) t * n_kv,
-                                 L.attn_k_norm.data(), head_dim, n_head_kv, eps);
-        }
-        // V norm (no weight, gemma4 quirk)
-        for (int t = 0; t < n_new; ++t) {
-            rmsnorm_per_head_f32(V_new + (size_t) t * n_kv,
-                                 V_new + (size_t) t * n_kv,
-                                 /*w=*/nullptr, head_dim, n_head_kv, eps);
-        }
+        parallel_for(mm, (size_t) n_new, (size_t) n_kv * 2, [&](size_t lo, size_t hi){
+            for (size_t t = lo; t < hi; ++t) {
+                // K norm (per kv-head)
+                rmsnorm_per_head_f32(K_new + t * n_kv,
+                                     K_new + t * n_kv,
+                                     L.attn_k_norm.data(), head_dim, n_head_kv, eps);
+                // V norm (no weight, gemma4 quirk)
+                rmsnorm_per_head_f32(V_new + t * n_kv,
+                                     V_new + t * n_kv,
+                                     /*w=*/nullptr, head_dim, n_head_kv, eps);
+            }
+        });
         }
         // RoPE on K (new positions only)
         { prof::Scope _s(&prof::g_acc.lf_rope_ns);
-        for (int t = 0; t < n_new; ++t) {
-            const int p = pos_all[n_past + t];
-            for (int h = 0; h < n_head_kv; ++h) {
-                float * k_th = K_new + (size_t) t * n_kv + (size_t) h * head_dim;
-                rope_neox_f32(k_th, k_th, L.freq_factors,
-                              L.rope_dim, head_dim, p, L.rope_base);
+        parallel_for(mm, (size_t) n_new, (size_t) n_kv, [&](size_t lo, size_t hi){
+            for (size_t t = lo; t < hi; ++t) {
+                const int p = pos_all[n_past + (int) t];
+                for (int h = 0; h < n_head_kv; ++h) {
+                    float * k_th = K_new + t * n_kv + (size_t) h * head_dim;
+                    rope_neox_f32(k_th, k_th, L.freq_factors,
+                                  L.rope_dim, head_dim, p, L.rope_base);
+                }
             }
-        }
+        });
         }
     }
 
@@ -673,14 +716,15 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- post_attn_norm + residual1 --------
     std::vector<float> attn_out2((size_t) n_embd * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_post_attn_ns);
-    for (int t = 0; t < n_new; ++t) {
-        rmsnorm_mul_f32(attn_out2.data() + (size_t) t * n_embd,
-                        attn_out.data() + (size_t) t * n_embd,
-                        L.post_attn_norm.data(), n_embd, eps);
-    }
-    for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
-        attn_out2[i] += hidden_in[i];
-    }
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            float * o = attn_out2.data() + t * n_embd;
+            rmsnorm_mul_f32(o, attn_out.data() + t * n_embd,
+                            L.post_attn_norm.data(), n_embd, eps);
+            const float * hin = hidden_in + t * n_embd;
+            for (int i = 0; i < n_embd; ++i) o[i] += hin[i];
+        }
+    });
     }
 
     // -------- FFN (dense) or MoE block --------
@@ -719,11 +763,13 @@ bool layer_forward_f32_cached(const LayerF32 & L,
         // -------- ffn_norm --------
         std::vector<float> ff_in((size_t) n_embd * n_new, 0.0f);
         { prof::Scope _s(&prof::g_acc.lf_ffn_norm_ns);
-        for (int t = 0; t < n_new; ++t) {
-            rmsnorm_mul_f32(ff_in.data() + (size_t) t * n_embd,
-                            attn_out2.data() + (size_t) t * n_embd,
-                            L.ffn_norm.data(), n_embd, eps);
-        }
+        parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+            for (size_t t = lo; t < hi; ++t) {
+                rmsnorm_mul_f32(ff_in.data() + t * n_embd,
+                                attn_out2.data() + t * n_embd,
+                                L.ffn_norm.data(), n_embd, eps);
+            }
+        });
         }
 
         // -------- gate, up, gelu(gate)*up --------
@@ -740,8 +786,11 @@ bool layer_forward_f32_cached(const LayerF32 & L,
                              "ffn_up", error)) return false;
         }
         { prof::Scope _s(&prof::g_acc.lf_gelu_mul_ns);
-        gelu_f32(gate.data(), gate.data(), n_ff * n_new);
-        for (size_t i = 0; i < (size_t) n_ff * n_new; ++i) gate[i] *= up[i];
+        float * g = gate.data(); const float * u = up.data();
+        parallel_for(mm, (size_t) n_ff * n_new, 1, [&](size_t lo, size_t hi){
+            gelu_f32(g + lo, g + lo, (int) (hi - lo));
+            for (size_t i = lo; i < hi; ++i) g[i] *= u[i];
+        });
         }
 
         // -------- ffn_down --------
@@ -755,14 +804,15 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     // -------- post_ffw_norm + residual2 --------
     std::vector<float> pe_in((size_t) n_embd * n_new, 0.0f);
     { prof::Scope _s(&prof::g_acc.lf_post_ffw_ns);
-    for (int t = 0; t < n_new; ++t) {
-        rmsnorm_mul_f32(pe_in.data() + (size_t) t * n_embd,
-                        ff_out.data() + (size_t) t * n_embd,
-                        L.post_ffw_norm.data(), n_embd, eps);
-    }
-    for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
-        pe_in[i] += attn_out2[i];
-    }
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            float * o = pe_in.data() + t * n_embd;
+            rmsnorm_mul_f32(o, ff_out.data() + t * n_embd,
+                            L.post_ffw_norm.data(), n_embd, eps);
+            const float * a = attn_out2.data() + t * n_embd;
+            for (int i = 0; i < n_embd; ++i) o[i] += a[i];
+        }
+    });
     }
 
     // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
@@ -775,22 +825,24 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     if (!dispatch_matmul(mm, L.inp_gate_t, L.inp_gate.empty() ? nullptr : L.inp_gate.data(),
                          pe_in.data(), ple_a.data(), n_embd, n_epl, n_new,
                          "inp_gate", error)) return false;
-    gelu_f32(ple_a.data(), ple_a.data(), n_epl * n_new);
-    for (size_t i = 0; i < (size_t) n_epl * n_new; ++i) {
-        ple_a[i] *= per_layer_input[i];
+    { float * a = ple_a.data(); const float * s = per_layer_input;
+      parallel_for(mm, (size_t) n_epl * n_new, 1, [&](size_t lo, size_t hi){
+          gelu_f32(a + lo, a + lo, (int) (hi - lo));
+          for (size_t i = lo; i < hi; ++i) a[i] *= s[i];
+      });
     }
     std::vector<float> ple_b((size_t) n_embd * n_new, 0.0f);
     if (!dispatch_matmul(mm, L.proj_t, L.proj.empty() ? nullptr : L.proj.data(),
                          ple_a.data(), ple_b.data(), n_epl, n_embd, n_new,
                          "proj", error)) return false;
-    for (int t = 0; t < n_new; ++t) {
-        rmsnorm_mul_f32(ple_b.data() + (size_t) t * n_embd,
-                        ple_b.data() + (size_t) t * n_embd,
-                        L.post_norm.data(), n_embd, eps);
-    }
-    for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
-        pe_in[i] += ple_b[i];
-    }
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            float * o = ple_b.data() + t * n_embd;
+            rmsnorm_mul_f32(o, o, L.post_norm.data(), n_embd, eps);
+            float * d = pe_in.data() + t * n_embd;
+            for (int i = 0; i < n_embd; ++i) d[i] += o[i];
+        }
+    });
     }
 
     // -------- layer_output_scale --------
