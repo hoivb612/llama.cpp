@@ -1000,6 +1000,14 @@ A/B (dev box TR7995WX AVX-512, 26B-A4B Q4_K, hand resident, network-profile
      the win over the fused baseline includes the cost of dropping fusion.
      Real verdict still on UMA 395.
 
+UMA 395 (QAT smart-Q4_0 26B "Q4_K_XL", ccx-affin, -cpf, threads 8/8, warm
+prompts 2-3):
+  baseline (fused, no repack)  prefill ~49.2 t/s  gen ~21.2 t/s
+  repack-xbcg (non-fused, _x8) prefill ~59.4 t/s  gen ~22.5 t/s
+  => prefill +21%, gen +6%, coherent. Confirms Phase 2 helps most on the
+     target box (the _x8 gain is not masked by AVX-512 as it is on the dev
+     box). Note the QAT experts are Q4_0, exercising the nb[] fixup above.
+
 ===================================================================================
 
 CLI reference — Gemma4.exe
