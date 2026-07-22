@@ -22,6 +22,7 @@
 #include "gemma4_loader.h"
 #include "gemma4_moe.h"
 #include "gemma4_expert_store.h"
+#include "gemma4_route_stats.h"
 #include "gemma4_weights.h"
 
 #include <cstdio>
@@ -150,6 +151,7 @@ static void print_usage(int /*argc*/, char ** argv) {
         "    --gemma4-moe-budget MiB            P1: hard-cap MoE expert RAM, stream rest via pread (0=all-resident)\n"
         "    --gemma4-moe-prefetch 0|1          P2: overlap expert preads with compute via a worker (default 1)\n"
         "    --gemma4-moe-prefetch-threads N    P2: number of concurrent prefetch I/O workers (default 2)\n"
+        "    --gemma4-moe-route-stats           print per-layer expert-routing telemetry (skew + temporal locality)\n"
         "    --gemma4-repack-ggml|-xbox|-xbcg   dense-weight repack (attn/MLP/lm_head) to _x8 layout; loads writable (no mmap)\n"
         "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
         "                                       per-stage timing for prefill + N_DECODE decode steps\n"
@@ -217,6 +219,7 @@ int main(int argc, char ** argv) {
     int         moe_budget_mib = 0;    // --gemma4-moe-budget MiB (0 = all-resident)
     int         moe_prefetch   = 1;    // --gemma4-moe-prefetch 0|1 (overlap I/O with compute)
     int         moe_prefetch_threads = 2; // --gemma4-moe-prefetch-threads N (concurrent I/O workers)
+    bool        moe_route_stats = false;  // --gemma4-moe-route-stats (routing telemetry)
     // Phase 1 dense-weight repack: repack attn/MLP/lm_head weights (the
     // matmul_qf32 sites) to an _x8 layout for faster GEMV/GEMM, mirroring
     // minslm-cli's repack-* modes. MoE expert tensors are NOT touched here.
@@ -340,6 +343,8 @@ int main(int argc, char ** argv) {
                 moe_prefetch = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-moe-prefetch-threads") == 0 && i + 1 < argc) {
                 moe_prefetch_threads = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-moe-route-stats") == 0) {
+                moe_route_stats = true;
             } else if (std::strcmp(argv[i], "--gemma4-repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (std::strcmp(argv[i], "--gemma4-repack-xbox") == 0) {
@@ -531,6 +536,10 @@ int main(int argc, char ** argv) {
     // non-fused per-expert MoE path (mul_mat_id has no _x8 kernel).
     gemma4::set_repack_active(tensor_repack_mode != GGML_TENSOR_REPACK_MODE_NONE);
 
+    // Read-only MoE routing telemetry: when on, moe_ffn records per-layer
+    // expert-selection skew + consecutive-token overlap (see gemma4_route_stats).
+    gemma4::set_route_stats_enabled(moe_route_stats);
+
     // ---------- G3.2: --gemma4-kernel-test ----------
     // Self-tests are model-independent; run before loading anything.
     if (kernel_test) {
@@ -721,6 +730,7 @@ int main(int argc, char ** argv) {
             estore.log_stats("network-test");
             gemma4::set_expert_store(nullptr);
         }
+        gemma4::route_stats_log("network-test");
         if (!ok) {
             std::fprintf(stderr, "gemma4 network_self_test: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);
@@ -768,6 +778,7 @@ int main(int argc, char ** argv) {
             estore.log_stats("network-gen");
             gemma4::set_expert_store(nullptr);
         }
+        gemma4::route_stats_log("network-gen");
         if (!ok) {
             std::fprintf(stderr, "gemma4 network_gen_self_test: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);
@@ -814,6 +825,7 @@ int main(int argc, char ** argv) {
             estore.log_stats("network-drift");
             gemma4::set_expert_store(nullptr);
         }
+        gemma4::route_stats_log("network-drift");
         if (!ok) {
             std::fprintf(stderr, "gemma4 network_drift_self_test: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);
@@ -1062,6 +1074,7 @@ int main(int argc, char ** argv) {
             estore.log_stats("cpf");
             gemma4::set_expert_store(nullptr);
         }
+        gemma4::route_stats_log("cpf");
         if (!ok) {
             std::fprintf(stderr, "gemma4 -cpf: FAIL: %s\n", terr.c_str());
             gemma4_unload_raw_model(raw);

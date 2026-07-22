@@ -1421,3 +1421,40 @@ must miss the cache: either drop the OS standby/page cache between runs
 (cold run) or use an uncached read path (FILE_FLAG_NO_BUFFERING with
 sector-aligned rounding). The io_bw metric is what makes those comparisons
 visible once the cache is bypassed.
+
+P2d - MoE routing telemetry (--gemma4-moe-route-stats)
+
+Read-only instrumentation to decide whether a smarter ExpertStore retention
+policy will help at sub-working-set budgets. The budget sweep showed the
+smoking gun: at budget >= working set (UMA 12288 MiB) hit=100%, evictions=0,
+bytes_read=11.3 GiB, decode ~20 t/s (~= resident 21). At 0.63x WS (7168 MiB)
+the SAME run reads 227 GiB (~20x re-read amplification), 137,867 evictions,
+io_read 5977 -> 93,798 ms, decode 15 t/s. That 20x re-read at 0.63x WS is the
+classic LRU cyclic-sweep pathology: every decode token sweeps layers 0..29,
+LRU keeps the last-touched (late) layers, so layer 0's blocks - needed first
+next token - are always the ones just evicted. Belady-optimal at 0.63x WS
+re-reads ~1.6x, not 20x; that gap is recoverable with a sweep-aware policy.
+
+Whether such a policy pays off hinges on two routing properties, which this
+flag measures per layer, split by phase (prefill = multi-token step, decode =
+single-token step):
+  * GLOBAL SKEW - per-expert selection histogram. Reported as distinct
+    experts used and topK_conc% (share of selections captured by the
+    n_expert_used most-used experts). High => pin the hot set per layer.
+  * TEMPORAL LOCALITY - overlap between consecutive tokens' selected expert
+    sets at the same layer (overlap/K absolute and overlap% of K). High =>
+    a sweep-aware policy keeps the reused experts resident.
+
+moe_ffn records sel[] (top-k) into gemma4_route_stats.cpp; recording is a
+no-op unless the flag is set and never alters routing/streaming (pure
+telemetry, single consumer thread => lockless). The block prints next to the
+ExpertStore stats in -cpf / --gemma4-network-{gen,test,drift}. Works in both
+resident and streaming modes (routing is model-inherent). Decode is bucketed
+by n_new==1 so prefill's many columns don't pollute the decode-locality
+signal; the decode ALL row is the money metric.
+
+Early read (QAT, 12-tok network-gen, tiny sample): decode topK_conc ~54%,
+~32/128 distinct experts/layer, mean overlap ~2.9/8 (~37%), with per-layer
+spread from ~1.6/8 (layers 0/24/27) to ~4.0-4.3/8 (layers 13/14/29). Both
+skew and locality are non-trivial - promising for a retention policy - but
+the decisive numbers come from a full 7 GiB cpf run.

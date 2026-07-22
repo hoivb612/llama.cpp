@@ -10,6 +10,7 @@
 #include "gemma4_matmul.h"
 #include "gemma4_kernels.h"
 #include "gemma4_expert_store.h"
+#include "gemma4_route_stats.h"
 
 #include "ggml.h"
 
@@ -146,6 +147,7 @@ bool moe_ffn(MatmulCtx & mm, const MoeInputs & in,
                         n_expert * sizeof(float));
             softmax_inplace(rprobs.data(), n_expert);
             top_k_indices(rprobs.data(), n_expert, n_expert_used, rsel.data());
+            route_stats_record(in.il, n_expert, rsel.data(), n_expert_used, n_new == 1);
             float wsum = 0.0f;
             for (int j = 0; j < n_expert_used; ++j) wsum += rprobs[rsel[j]];
             wsum = std::max(wsum, 6.103515625e-5f); // ggml clamp
@@ -220,6 +222,7 @@ bool moe_ffn(MatmulCtx & mm, const MoeInputs & in,
                     n_expert * sizeof(float));
         softmax_inplace(probs.data(), n_expert);
         top_k_indices(probs.data(), n_expert, n_expert_used, sel.data());
+        route_stats_record(in.il, n_expert, sel.data(), n_expert_used, n_new == 1);
 
         float wsum = 0.0f;
         std::vector<float> wsel(n_expert_used);

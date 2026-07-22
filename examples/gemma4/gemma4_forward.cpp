@@ -736,6 +736,7 @@ bool layer_forward_f32_cached(const LayerF32 & L,
     if (L.is_moe_layer) {
         if (!mm) { error = "layer_forward_f32_cached: MoE layer requires MatmulCtx"; return false; }
         MoeInputs in;
+        in.il            = L.il;
         in.n_embd        = n_embd;
         in.n_ff          = n_ff;
         in.n_ff_exp      = L.n_ff_exp;

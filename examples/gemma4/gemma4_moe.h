@@ -27,6 +27,7 @@ struct MatmulCtx;
 // read directly (require -ngl 0); ffn_norm is a plain F32 pointer since the
 // forward path already keeps that norm as a std::vector<float>.
 struct MoeInputs {
+    int il            = -1;  // layer index (for routing telemetry; -1 = unknown)
     int n_embd        = 0;
     int n_ff          = 0;   // shared/dense FFN width
     int n_ff_exp      = 0;   // per-expert FFN width
