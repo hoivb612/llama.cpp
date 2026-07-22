@@ -208,6 +208,81 @@ bool get_prefill_fused() {
     return g_prefill_fused.load(std::memory_order_relaxed);
 }
 
+static std::atomic<bool> g_repack_active{false};
+
+void set_repack_active(bool on) {
+    g_repack_active.store(on, std::memory_order_relaxed);
+}
+bool get_repack_active() {
+    return g_repack_active.load(std::memory_order_relaxed);
+}
+
+// Phase 2 - repack one resident expert bank [n_in, n_out, n_expert] in place.
+// The bank is a stack of n_expert contiguous [n_in, n_out] slabs (expert dim
+// outermost). ggml_cpu_repack_tensor_callgraph() (XBCG) repacks the src0 of
+// each MUL_MAT node in place and flips that node's src0->type to the _x8
+// variant, but the persistent bank tensor's own ->type is not touched by it.
+// So we build a throwaway graph with one MUL_MAT per expert slab (each slab a
+// distinct 2D src0 aliasing the bank's data at expert*nb[2]), run the
+// callgraph to repack every slab's bytes, then flip the bank tensor's ->type
+// once. The per-expert 2D view in matmul_expert_qf32 then inherits the _x8
+// type and the fast kernel engages. Repack is a pure in-place reordering, so
+// the bank's nb[] (row/slab byte strides) stay valid.
+bool repack_expert_bank(const ggml_tensor * bank_c, std::string & error) {
+    if (!bank_c) return true;
+    ggml_tensor * bank = const_cast<ggml_tensor *>(bank_c);
+    if (bank->ne[2] <= 0) return true;
+    // Only XBCG at graph-build time actually repacks; the callgraph is a
+    // no-op otherwise, and single_thread rejects n_in % 256 != 0 anyway.
+    if (bank->ne[0] % 256 != 0) return true;   // e.g. down bank (n_ff_exp=704)
+
+    const int64_t ne0 = bank->ne[0];
+    const int64_t ne1 = bank->ne[1];
+    const int64_t ne2 = bank->ne[2];           // n_expert
+    const enum ggml_type base_type = bank->type;
+
+    const size_t n_nodes = (size_t) ne2;
+    const size_t mem = ggml_tensor_overhead() * (n_nodes * 2 + 8)
+                     + ggml_graph_overhead_custom(n_nodes + 8, false)
+                     + 4096;
+    ggml_init_params ip{ mem, nullptr, /*no_alloc=*/true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { error = "repack_expert_bank: ggml_init failed"; return false; }
+
+    // Shared F32 rhs; no_alloc so data stays null (the callgraph never reads
+    // it -- it only checks src1->type == F32).
+    ggml_tensor * rhs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 1);
+    if (!rhs) { error = "repack_expert_bank: alloc rhs failed"; ggml_free(ctx); return false; }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_nodes + 8, false);
+    if (!gf) { error = "repack_expert_bank: new_graph failed"; ggml_free(ctx); return false; }
+
+    for (int64_t e = 0; e < ne2; ++e) {
+        ggml_tensor * slab = ggml_new_tensor_2d(ctx, base_type, ne0, ne1);
+        if (!slab) { error = "repack_expert_bank: alloc slab failed"; ggml_free(ctx); return false; }
+        // A fresh contiguous 2D tensor of the same type/ne0 has the same
+        // row stride as the bank, so pointing its data at expert e's slab
+        // makes single_thread repack exactly that slab's bytes.
+        slab->data = (char *) bank->data + (size_t) e * bank->nb[2];
+        ggml_tensor * y = ggml_mul_mat(ctx, slab, rhs);
+        if (!y) { error = "repack_expert_bank: mul_mat failed"; ggml_free(ctx); return false; }
+        ggml_build_forward_expand(gf, y);
+    }
+
+    ggml_cpu_repack_tensor_callgraph(gf);
+
+    // Flip the bank type once to whatever the slabs became (unchanged if the
+    // mode is off / not XBCG -- then this is a harmless no-op).
+    enum ggml_type new_type = base_type;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * n = ggml_graph_node(gf, i);
+        if (n->op == GGML_OP_MUL_MAT && n->src[0]) { new_type = n->src[0]->type; break; }
+    }
+    bank->type = new_type;
+    ggml_free(ctx);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 
 bool matmul_ctx_init(MatmulCtx & mm, std::size_t arena_bytes, int n_threads,

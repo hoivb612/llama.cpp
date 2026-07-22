@@ -1423,6 +1423,36 @@ bool dequant_model(const llama_model * model, const Weights & w,
         }
     }
 
+    // Phase 2 - resident MoE expert repack. When a repack mode is active and
+    // this is a MoE model running resident (no streaming ExpertStore), repack
+    // the gate/up expert banks to their _x8 layout up-front and force the
+    // fused mul_mat_id path off: mul_mat_id has no _x8 kernel, so experts must
+    // go through the per-expert matmul_expert_qf32 view, which inherits the
+    // repacked bank type. The down bank (n_in = n_ff_exp) is not 256-aligned
+    // and stays as-is. Streaming reads raw blocks from the ExpertStore, so the
+    // resident bank is unused there and left untouched.
+    if (get_repack_active()) {
+        ExpertStore * store = get_expert_store();
+        const bool streaming = (store && store->ready());
+        bool any_moe = false;
+        for (int il = 0; il < w.n_layer; ++il) any_moe |= out.layers[il].is_moe_layer;
+        if (any_moe && !streaming) {
+            for (int il = 0; il < w.n_layer; ++il) {
+                LayerF32 & L = out.layers[il];
+                if (!L.is_moe_layer) continue;
+                if (!repack_expert_bank(L.moe_gate_up_exps, error)) return false;
+                if (!repack_expert_bank(L.moe_gate_exps,    error)) return false;
+                if (!repack_expert_bank(L.moe_up_exps,      error)) return false;
+                // moe_down_exps: n_in = n_ff_exp (e.g. 704), not 256-aligned.
+            }
+            set_moe_fused(false);
+            std::fprintf(stderr,
+                "gemma4 repack: resident MoE gate/up expert banks repacked to "
+                "_x8; forcing --gemma4-moe-fused 0 (mul_mat_id has no _x8 "
+                "kernel). down_exps left unrepacked (n_ff_exp not 256-aligned).\n");
+        }
+    }
+
     // Initialise the shared matmul shim. Single ggml arena must hold:
     //   * one F32 activation copy (worst case lm_head input: n_embd*1 = 6 KiB on E4B)
     //   * one F32 result (worst case lm_head output: n_vocab = 262 144 * 4 = 1 MiB)

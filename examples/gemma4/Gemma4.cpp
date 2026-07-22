@@ -526,6 +526,11 @@ int main(int argc, char ** argv) {
     // set below on the load params).
     llama_set_tensor_repack_mode(tensor_repack_mode);
 
+    // Phase 2 - tell the gemma4 forward path a repack mode is active so
+    // dequant_model repacks the resident gate/up expert banks and forces the
+    // non-fused per-expert MoE path (mul_mat_id has no _x8 kernel).
+    gemma4::set_repack_active(tensor_repack_mode != GGML_TENSOR_REPACK_MODE_NONE);
+
     // ---------- G3.2: --gemma4-kernel-test ----------
     // Self-tests are model-independent; run before loading anything.
     if (kernel_test) {

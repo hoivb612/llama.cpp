@@ -893,6 +893,21 @@ How each matmul shim maps to repack effort:
 My recommendation: phase it, starting with the dense weights — that's where the observed Gemma4 gain in minslm comes from (attn + MLP dominate the non-expert matmul time), it works identically in both resident and streaming modes, and it's the lowest-risk piece (the shim already expects in-place repack).
 
 Phase 1 — dense-weight repack (attn/MLP/lm_head) — IMPLEMENTED
+
+┌─────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+│ Path                                    │ Repack effect                                                                       │
+├─────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+│ Dense attn/MLP/lm_head (prefill +       │ Phase 1 _x8 repack (already shipped)                                                │
+│ decode)                                 │                                                                                     │
+├─────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+│ --gemma4-prefill-fused 1 (dense layers) │ unchanged, still fused                                                              │
+├─────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+│ Resident MoE experts                    │ auto-forced to non-fused, gate/up banks repacked to _x8 (down bank skipped,         │
+│ (--gemma4-moe-fused)                    │ 704%256≠0)                                                                          │
+├─────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+│ Streaming MoE experts                   │ separate phase (transient blocks) — not covered by this change                      │
+└─────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────┘
+
 -------------------------------------------------------------
 CLI: --gemma4-repack-ggml | --gemma4-repack-xbox | --gemma4-repack-xbcg
 Wiring: llama_set_tensor_repack_mode() after ggml_backend_load_all();
@@ -930,6 +945,50 @@ native Q4_K kernel already beats _x8, so repacking only the small dense
 slice is a net loss. The 26B win requires Phase 2 (repack the experts).
 Verdict for dense-only repack should be taken on UMA 395 (the target box)
 where the _x8 gain is not masked by strong AVX-512.
+
+Phase 2 — resident MoE expert repack (IMPLEMENTED)
+--------------------------------------------------
+Goal: extend repack to the routed experts, which dominate ~80-85% of the 26B
+FFN compute (Phase 1 only touched the small dense slice). Only the resident
+(all-experts-in-memory) path is covered here; streaming is Phase 3.
+
+Why a special case is needed (and why "do nothing" is not enough): the expert
+banks never flow through matmul_qf32, so the Phase 1 callgraph never touches
+them — with no extra work they simply run unrepacked (safe, zero gain). To get
+the _x8 speedup we must repack the gate/up banks ourselves. But the DEFAULT
+resident path is the FUSED ggml_mul_mat_id (matmul_moe_id_qf32), and mul_mat_id
+has no _x8 kernel. Repacking a bank flips its shared ->type to _x8 for every
+reader, so once repacked the fused path can no longer consume it. Therefore
+repack + resident MUST force the per-expert non-fused path (matmul_expert_qf32),
+whose ggml_view_2d over each expert slab inherits the _x8 bank type.
+
+Wiring:
+  set_repack_active(mode != NONE) in Gemma4.cpp (after llama_set_tensor_repack_mode).
+  dequant_model(): if repack active && any MoE layer && NOT streaming, repack
+    each layer's gate_up (merged) or gate+up banks via repack_expert_bank(),
+    then set_moe_fused(false) and print a warning.
+  repack_expert_bank() (gemma4_matmul.cpp): builds a throwaway no_alloc graph
+    with one MUL_MAT per expert slab (each slab a 2D src0 aliasing bank->data
+    + e*nb[2]), runs ggml_cpu_repack_tensor_callgraph() to repack every slab's
+    bytes in place, then flips bank->type once to the _x8 type. Per-slab is
+    mandatory: single_thread uses ne[1] (not ne[1]*ne[2]) as nrows, so calling
+    it on the whole 3D bank would repack only expert 0 yet retype the whole
+    tensor. Repack is a pure in-place reorder so the bank's nb[] stay valid.
+
+Not repacked: down_exps has ne[0]=n_ff_exp=704 (704%256=192!=0), which
+single_thread rejects — left as Q4_K. Streaming (ExpertStore ready) is skipped
+entirely (the resident bank is unused there; blocks come from pread).
+
+A/B (dev box TR7995WX AVX-512, 26B-A4B Q4_K, hand resident, network-profile
+"The meaning of life is", 6-tok prefill + 8 decode, threads 8/8):
+  baseline (fused, no repack)  prefill 6.8 t/s   decode 9.49 t/s
+  repack-xbcg (non-fused, _x8) prefill 12.2 t/s  decode 11.90 t/s
+  => prefill +79%, decode +25%. Coherent JSON on -cpf (first 4 prompts spot-
+     checked; down bank staying Q4_K keeps numerics sane). Note: unlike the
+     dense-only Phase 1 (which regressed 26B on this AVX-512 box), Phase 2 wins
+     here because it moves the experts — the bulk of the compute — to _x8, and
+     the win over the fused baseline includes the cost of dropping fusion.
+     Real verdict still on UMA 395.
 
 ===================================================================================
 

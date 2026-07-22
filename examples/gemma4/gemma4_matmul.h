@@ -249,6 +249,23 @@ bool get_lmhead_fused();
 void set_prefill_fused(bool on);
 bool get_prefill_fused();
 
+// Phase 2 - global flag: a tensor repack mode (e.g. --gemma4-repack-xbcg) is
+// active. Set once from Gemma4.cpp after llama_set_tensor_repack_mode(). When
+// true and the model is MoE and resident (not streaming), dequant_model
+// repacks the gate/up expert banks to their _x8 layout up-front and forces
+// the fused mul_mat_id path off (mul_mat_id has no _x8 kernel), so experts
+// run through matmul_expert_qf32 which consumes the repacked banks.
+void set_repack_active(bool on);
+bool get_repack_active();
+
+// Repack a resident 3D expert bank [n_in, n_out, n_expert] in place to the
+// _x8 layout, one contiguous per-expert slab at a time, then flip the bank
+// tensor's type once. No-op (returns true) unless a repack mode is active and
+// the bank is repackable (supported type and n_in % 256 == 0); the down bank
+// (n_in = n_ff_exp, e.g. 704) is not repackable and should not be passed here.
+// Returns false only on an internal ggml error.
+bool repack_expert_bank(const ggml_tensor * bank, std::string & error);
+
 // Allocate the arena, store the thread count, and (when n_threads > 1)
 // spin up the persistent ggml_threadpool. arena_bytes should be large
 // enough to hold one matmul's worth of tensor metadata + the F32
