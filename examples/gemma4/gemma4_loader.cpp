@@ -73,6 +73,7 @@ bool gemma4_load_raw_model(const Gemma4LoadParams & params,
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = params.n_gpu_layers;
+    mp.use_mmap     = params.use_mmap;
 
     out.model = llama_model_load_from_file(params.model_path.c_str(), mp);
     if (!out.model) {

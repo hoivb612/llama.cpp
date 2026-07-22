@@ -150,6 +150,7 @@ static void print_usage(int /*argc*/, char ** argv) {
         "    --gemma4-moe-budget MiB            P1: hard-cap MoE expert RAM, stream rest via pread (0=all-resident)\n"
         "    --gemma4-moe-prefetch 0|1          P2: overlap expert preads with compute via a worker (default 1)\n"
         "    --gemma4-moe-prefetch-threads N    P2: number of concurrent prefetch I/O workers (default 2)\n"
+        "    --gemma4-repack-ggml|-xbox|-xbcg   dense-weight repack (attn/MLP/lm_head) to _x8 layout; loads writable (no mmap)\n"
         "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
         "                                       per-stage timing for prefill + N_DECODE decode steps\n"
         "    --gemma4-save-kv PATH [PROMPT] [N] prefill, save KV state to PATH, continue greedy gen N tokens\n"
@@ -216,6 +217,10 @@ int main(int argc, char ** argv) {
     int         moe_budget_mib = 0;    // --gemma4-moe-budget MiB (0 = all-resident)
     int         moe_prefetch   = 1;    // --gemma4-moe-prefetch 0|1 (overlap I/O with compute)
     int         moe_prefetch_threads = 2; // --gemma4-moe-prefetch-threads N (concurrent I/O workers)
+    // Phase 1 dense-weight repack: repack attn/MLP/lm_head weights (the
+    // matmul_qf32 sites) to an _x8 layout for faster GEMV/GEMM, mirroring
+    // minslm-cli's repack-* modes. MoE expert tensors are NOT touched here.
+    ggml_tensor_repack_mode_t tensor_repack_mode = GGML_TENSOR_REPACK_MODE_NONE;
     // G4.4: chat loop with sampling
     bool        chat_mode    = false;  // --gemma4-chat
     bool        chat_test    = false;  // --gemma4-chat-test
@@ -335,6 +340,12 @@ int main(int argc, char ** argv) {
                 moe_prefetch = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-moe-prefetch-threads") == 0 && i + 1 < argc) {
                 moe_prefetch_threads = std::stoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--gemma4-repack-ggml") == 0) {
+                tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
+            } else if (std::strcmp(argv[i], "--gemma4-repack-xbox") == 0) {
+                tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBOX;
+            } else if (std::strcmp(argv[i], "--gemma4-repack-xbcg") == 0) {
+                tensor_repack_mode = GGML_TENSOR_REPACK_MODE_XBCG;
             } else if (std::strcmp(argv[i], "--gemma4-network-profile") == 0) {
                 network_profile = true;
                 if (i + 1 < argc && argv[i+1][0] != '-') {
@@ -509,6 +520,12 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
+    // Phase 1 dense-weight repack. Must run after the CPU backend is loaded
+    // (the mode is a backend-global) and before any matmul. XBCG/GGML repack
+    // src0 in place, so the model must be loaded writable (use_mmap=false,
+    // set below on the load params).
+    llama_set_tensor_repack_mode(tensor_repack_mode);
+
     // ---------- G3.2: --gemma4-kernel-test ----------
     // Self-tests are model-independent; run before loading anything.
     if (kernel_test) {
@@ -524,6 +541,10 @@ int main(int argc, char ** argv) {
     Gemma4LoadParams lp;
     lp.model_path   = model_path;
     lp.n_gpu_layers = ngl;
+    // In-place repack (XBCG/GGML/XBOX) writes into the weight tensors, which
+    // must not be read-only mmap pages. Load writable when any repack mode is
+    // active; otherwise keep the default mmap fast-path.
+    lp.use_mmap     = (tensor_repack_mode == GGML_TENSOR_REPACK_MODE_NONE);
 
     Gemma4RawModel raw;
     std::string err;

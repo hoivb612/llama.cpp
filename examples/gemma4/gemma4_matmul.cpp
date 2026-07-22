@@ -311,6 +311,13 @@ bool build_cache_entry(MatmulCtx & mm, const ggml_tensor * W,
     if (!e.gf) { error = "matmul_qf32 cache: ggml_new_graph_custom failed"; e.ctx.reset(); return false; }
     ggml_build_forward_expand(e.gf, e.y_t);
 
+    // Phase 1 dense-weight repack (XBCG). No-op unless a repack mode is set.
+    // XBCG repacks src0 (W, the model weight) in place and flips its type;
+    // planning below then reads the repacked type so the fast _x8 kernel is
+    // selected. e.w_type is captured after this so the cache invariant guard
+    // sees the post-repack type and does not thrash-rebuild.
+    ggml_cpu_repack_tensor_callgraph(e.gf);
+
     e.cplan = ggml_graph_plan(e.gf, mm.n_threads, mm.pool.get());
     if (e.cplan.work_size > mm.work_buf.size()) {
         mm.work_buf.assign(e.cplan.work_size, 0);
@@ -409,6 +416,11 @@ bool matmul_qf32(MatmulCtx & mm, const ggml_tensor * W,
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y_t);
+
+    // Phase 1 dense-weight repack (XBCG). No-op unless a repack mode is set.
+    // Prefill (large n_cols) reaches this per-call path first and repacks W
+    // in place once; later calls see the already-repacked type and skip.
+    ggml_cpu_repack_tensor_callgraph(gf);
 
     ggml_status status;
     if (mm.pool) {

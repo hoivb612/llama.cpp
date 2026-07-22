@@ -18,6 +18,7 @@
 struct Gemma4LoadParams {
     std::string model_path;
     int n_gpu_layers = 99;
+    bool use_mmap = true;   // set false when in-place tensor repack is active
 };
 
 struct Gemma4RawModel {

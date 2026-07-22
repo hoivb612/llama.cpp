@@ -1385,6 +1385,21 @@ bool dequant_model(const llama_model * model, const Weights & w,
     out.per_layer_tok_embd_quant = w.per_layer_tok_embd;
     out.per_layer_model_proj_quant = w.per_layer_model_proj;
 
+    // Phase 1 dense-weight repack safety: tok_embd is dual-use -- it is read
+    // row-by-row via dequant_row() for per-token input embeddings (assuming
+    // its original K-quant layout) AND used as the tied lm_head via
+    // matmul_qf32(). In-place XBCG repack would flip its type/layout and
+    // corrupt the embedding lookup (crash on the next token). per_layer_tok_embd
+    // is likewise read via dequant_row. Mark both NO_REPACK so the callgraph
+    // repack pass skips them. (The dense attn/MLP weights are matmul-only and
+    // remain repackable.)
+    if (out.tok_embd_quant) {
+        const_cast<ggml_tensor *>(out.tok_embd_quant)->flags |= GGML_TENSOR_FLAG_NO_REPACK;
+    }
+    if (out.per_layer_tok_embd_quant) {
+        const_cast<ggml_tensor *>(out.per_layer_tok_embd_quant)->flags |= GGML_TENSOR_FLAG_NO_REPACK;
+    }
+
     // Dequant every layer. layer_forward_f32 needs LayerF32.freq_factors
     // pointing at OUR freq_factors_data (so the original model could in
     // principle be unloaded). We rebuild this pointer after dequant.

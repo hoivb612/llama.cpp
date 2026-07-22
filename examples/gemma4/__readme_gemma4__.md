@@ -866,6 +866,73 @@ The prototype is validated and pushed. Where it stands vs minslm: the remaining 
 
 ===================================================================================
 
+How repack works here (XBCG):  ggml_cpu_repack_tensor_callgraph(graph)  walks a graph, and for each  MUL_MAT  node repacks  src0  (the weight) in place and flips  src0->type  to the repacked type — a one-time cost that persists. You enable it globally via  llama_set_tensor_repack_mode(XBCG) . Both APIs are reachable from gemma4 (it links llama + ggml).
+
+Two hard prerequisites I found:
+
+1.  use_mmap=false  when repack is on. Resident weights currently point into read-only mmap ( gemma4_loader.cpp  uses default params) — in-place repack would fault. Must load writable.
+2. The callgraph pass only handles  GGML_OP_MUL_MAT , not  MUL_MAT_ID . So the fused resident MoE ( matmul_moe_id_qf32 ) won't repack via this path.
+
+How each matmul shim maps to repack effort:
+
+┌──────────────────────┬────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ Path                 │ Shim               │ Repack fit                                                                        │
+├──────────────────────┼────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Dense (attn q/k/v/o, │ matmul_qf32        │ Easy — references W directly, cache already rebuilds on type drift. Repack once,  │
+│ shared MLP, lm_head) │                    │ persists. This is the bulk of minslm's gain, identical in resident & streaming.   │
+├──────────────────────┼────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Resident MoE experts │ matmul_expert_qf32 │ Medium — src0 is a view of the bank; must repack the whole bank tensor once       │
+│                      │                    │ up-front, not per-view                                                            │
+├──────────────────────┼────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Fused resident MoE   │ matmul_moe_id_qf32 │ Hard — MUL_MAT_ID, not covered by the callgraph pass                              │
+├──────────────────────┼────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ Streaming MoE        │ matmul_qblock_qf32 │ Tricky — blocks are transient; repack-per-fetch likely helps prefill but not      │
+│ experts              │                    │ decode GEMV; would need repack-in-store to persist                                │
+└──────────────────────┴────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+My recommendation: phase it, starting with the dense weights — that's where the observed Gemma4 gain in minslm comes from (attn + MLP dominate the non-expert matmul time), it works identically in both resident and streaming modes, and it's the lowest-risk piece (the shim already expects in-place repack).
+
+Phase 1 — dense-weight repack (attn/MLP/lm_head) — IMPLEMENTED
+-------------------------------------------------------------
+CLI: --gemma4-repack-ggml | --gemma4-repack-xbox | --gemma4-repack-xbcg
+Wiring: llama_set_tensor_repack_mode() after ggml_backend_load_all();
+        loader gets use_mmap=false when any repack mode is on (in-place
+        repack must not write read-only mmap pages).
+Injection: ggml_cpu_repack_tensor_callgraph(gf) in BOTH matmul_qf32 paths
+        (cached build + per-call). No-op unless a mode is set. Repacks
+        src0 (=W, the model weight) in place once; the matmul_qf32 cache
+        already rebuilds on w_type drift so it self-heals to the _x8 type.
+CRITICAL FIX: tok_embd (and per_layer_tok_embd) are DUAL-USE — read
+        row-by-row via dequant_row() for per-token input embeddings
+        (original K-quant layout) AND used as the tied lm_head via
+        matmul_qf32(). Repacking the lm_head flips the shared tensor to
+        _x8 in place -> the next token's embedding lookup reads _x8 bytes
+        as Q4_K -> access violation. Marked both GGML_TENSOR_FLAG_NO_REPACK
+        in dequant_model so the callgraph pass skips them. Dense attn/MLP
+        weights are matmul-only and stay repackable.
+
+Results (dev box, Threadripper, AVX-512), 8 threads:
+  E2B (dense, Q4_K_M):
+    baseline  decode 26.46 t/s   prefill 18.6 t/s   network-gen 16/16
+    xbcg      decode 29.22 t/s   prefill 22.7 t/s   network-gen 15/16
+              (+10% decode, +22% prefill; the one flip is a benign
+               near-tie "occupied"/"puzzled" from _x8 reduction-order
+               drift — baseline is 16/16, same tradeoff as minslm repack)
+  26B-A4B (MoE, Q4_K_M), -cpf, moe-budget 4096, prefetch on:
+    baseline  gen ~8.1 t/s   prefill ~29.3 t/s   coherent JSON
+    xbcg      gen ~6.7 t/s   prefill ~29   t/s   coherent JSON  (-17% gen)
+
+Key finding: Phase 1 helps DENSE models (E2B/E4B — it repacks all their
+matmuls) but REGRESSES the 26B MoE on this box, because the dense weights
+(attn + shared MLP) are a small slice while the EXPERTS dominate ~85% of
+FFN compute and Phase 1 does not touch them. On the AVX-512 dev box the
+native Q4_K kernel already beats _x8, so repacking only the small dense
+slice is a net loss. The 26B win requires Phase 2 (repack the experts).
+Verdict for dense-only repack should be taken on UMA 395 (the target box)
+where the _x8 gain is not masked by strong AVX-512.
+
+===================================================================================
+
 CLI reference — Gemma4.exe
 ==========================
 
