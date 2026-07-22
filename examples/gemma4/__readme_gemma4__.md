@@ -979,6 +979,16 @@ Not repacked: down_exps has ne[0]=n_ff_exp=704 (704%256=192!=0), which
 single_thread rejects — left as Q4_K. Streaming (ExpertStore ready) is skipped
 entirely (the resident bank is unused there; blocks come from pread).
 
+Q4_0 nb[] fixup: after flipping bank->type we recompute nb[] for the new type.
+The repack is in-place (row stride nb[1] and total bytes preserved), but some
+_x8 linkage types change (blck_size, type_size): Q4_0 (blck 32, tsize 18) ->
+Q4_0_x8 (blck 256, tsize 144). ggml_nbytes() reads ne[0]*nb[0]/blck_size, so a
+stale nb[0]=18 with the new blck 256 undercounts the bank 8x and the per-expert
+ggml_view_2d bounds assert fires (seen on a QAT smart-Q4_0 build). K-quant _x8
+types keep the base (blck, tsize) so the recompute is a no-op for them; the
+dense matmul_qf32 path is unaffected because it uses W directly (no view / no
+ggml_nbytes bounds check).
+
 A/B (dev box TR7995WX AVX-512, 26B-A4B Q4_K, hand resident, network-profile
 "The meaning of life is", 6-tok prefill + 8 decode, threads 8/8):
   baseline (fused, no repack)  prefill 6.8 t/s   decode 9.49 t/s

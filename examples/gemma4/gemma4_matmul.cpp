@@ -272,13 +272,27 @@ bool repack_expert_bank(const ggml_tensor * bank_c, std::string & error) {
     ggml_cpu_repack_tensor_callgraph(gf);
 
     // Flip the bank type once to whatever the slabs became (unchanged if the
-    // mode is off / not XBCG -- then this is a harmless no-op).
+    // mode is off / not XBCG -- then this is a harmless no-op). When the type
+    // changes we must also recompute nb[] for the new type: the repack is a
+    // pure in-place reorder (row stride nb[1] and total bytes are preserved),
+    // but some _x8 linkage types have a different (blck_size, type_size) pair
+    // than their base -- e.g. Q4_0 (blck 32, tsize 18) -> Q4_0_x8 (blck 256,
+    // tsize 144). ggml_nbytes() reads ne[0]*nb[0]/blck_size, so a stale nb[0]
+    // (18) with the new blck_size (256) undercounts the bank 8x and the
+    // per-expert ggml_view_2d bounds assert (ggml.c) fires. K-quant _x8 types
+    // keep the base (blck, tsize) so this is a no-op for them.
     enum ggml_type new_type = base_type;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * n = ggml_graph_node(gf, i);
         if (n->op == GGML_OP_MUL_MAT && n->src[0]) { new_type = n->src[0]->type; break; }
     }
-    bank->type = new_type;
+    if (new_type != base_type) {
+        bank->type  = new_type;
+        bank->nb[0] = ggml_type_size(new_type);
+        bank->nb[1] = bank->nb[0] * (bank->ne[0] / ggml_blck_size(new_type));
+        bank->nb[2] = bank->nb[1] * bank->ne[1];
+        bank->nb[3] = bank->nb[2] * bank->ne[2];
+    }
     ggml_free(ctx);
     return true;
 }
