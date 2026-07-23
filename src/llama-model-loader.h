@@ -81,6 +81,7 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::vector<std::string> file_paths;  // backing GGUF path per file_idx (for layer-window streaming)
     llama_ftype ftype;
     llama_fver  fver;
 
