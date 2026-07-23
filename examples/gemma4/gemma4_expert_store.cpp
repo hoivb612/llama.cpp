@@ -66,6 +66,14 @@ namespace { ExpertStore * g_expert_store = nullptr; }
 void          set_expert_store(ExpertStore * s) { g_expert_store = s; }
 ExpertStore * get_expert_store()                { return g_expert_store; }
 
+// Default eviction policy, consumed by ExpertStore::init.
+namespace { bool g_evict_lfu = false; int g_evict_cap = 64; }
+
+void set_expert_evict_policy(bool lfu, int freq_cap) {
+    g_evict_lfu = lfu;
+    g_evict_cap = freq_cap > 0 ? freq_cap : 64;
+}
+
 // ---------------------------------------------------------------------------
 // ExpertStore.
 // ---------------------------------------------------------------------------
@@ -149,6 +157,10 @@ bool ExpertStore::init(const llama_model * model, const std::string & gguf_path,
     const size_t floor_bytes = max_block * 3;
     budget_ = std::max(budget_bytes, floor_bytes);
 
+    // Adopt the process-wide default eviction policy.
+    evict_lfu_ = g_evict_lfu;
+    freq_cap_  = g_evict_cap;
+
     // 3) Open a private read handle on the GGUF (positioned reads only; we
     //    never touch the mmap'd expert pages so RSS stays capped).
 #if defined(_WIN32)
@@ -175,9 +187,10 @@ bool ExpertStore::init(const llama_model * model, const std::string & gguf_path,
 
     std::fprintf(stderr,
         "gemma4 ExpertStore: %zu expert tensors indexed, max block = %.2f MiB, "
-        "budget = %.1f MiB (>= floor %.1f MiB)\n",
+        "budget = %.1f MiB (>= floor %.1f MiB), evict = %s\n",
         recs_.size(), max_block / (1024.0 * 1024.0),
-        budget_ / (1024.0 * 1024.0), floor_bytes / (1024.0 * 1024.0));
+        budget_ / (1024.0 * 1024.0), floor_bytes / (1024.0 * 1024.0),
+        evict_lfu_ ? "clock-lfu" : "lru");
     return true;
 }
 
@@ -219,14 +232,28 @@ bool ExpertStore::read_at(uint64_t offset, void * dst, size_t bytes, std::string
 }
 
 void ExpertStore::evict_to_budget() {
-    // Evict least-recently-used blocks (list back) until within budget,
-    // never evicting the pinned block (the one currently feeding a matmul).
-    // Caller holds mtx_.
+    // Reclaim blocks until within budget, never evicting the pinned block (the
+    // one currently feeding a matmul). Caller holds mtx_.
+    //
+    // LRU policy: evict the list tail (least recently used).
+    // CLOCK LFU-aging policy: sweep the tail; a block with a reference credit
+    // is aged (credit--) and rotated to the front for a second chance, so only
+    // credit-exhausted (cold) blocks are evicted. Hot experts thus survive the
+    // layer sweep that makes plain LRU re-read them every token. The sweep
+    // terminates because credits are capped and strictly decrease each pass;
+    // total rotation work is bounded by total hits (each hit adds <=1 credit).
     while (cur_bytes_ > budget_ && lru_.size() > 1) {
         Node & back = lru_.back();
         if (back.buf == pinned_) {
             // Pinned block sits at the LRU tail: rotate it to the front so the
             // next-oldest becomes the eviction candidate, then re-examine.
+            lru_.splice(lru_.begin(), lru_, std::prev(lru_.end()));
+            map_[Key{ back.t, back.e }] = lru_.begin();
+            continue;
+        }
+        if (evict_lfu_ && back.freq > 0) {
+            // Second chance: age the credit and give the block another lap.
+            back.freq--;
             lru_.splice(lru_.begin(), lru_, std::prev(lru_.end()));
             map_[Key{ back.t, back.e }] = lru_.begin();
             continue;
@@ -239,9 +266,25 @@ void ExpertStore::evict_to_budget() {
     }
 }
 
+void ExpertStore::promote_on_hit(std::list<Node>::iterator it) {
+    // Caller holds mtx_. LFU: bump the CLOCK credit (capped) in place -- the
+    // block keeps its list position; its accumulated credit is what protects
+    // it during the eviction sweep. LRU: splice to the MRU front. Either way
+    // the returned block is pinned so eviction cannot reclaim it mid-matmul.
+    // (std::list::splice preserves iterators, so map_ stays valid untouched.)
+    if (evict_lfu_) {
+        if (it->freq < (uint32_t) freq_cap_) ++it->freq;
+    } else {
+        lru_.splice(lru_.begin(), lru_, it);
+    }
+    pinned_ = it->buf;
+}
+
 void * ExpertStore::insert_locked(const ggml_tensor * t, int e, void * buf, size_t bytes) {
-    // Caller holds mtx_. Publishes a freshly-read block at the MRU front.
-    lru_.push_front(Node{ t, e, buf, bytes });
+    // Caller holds mtx_. Publishes a freshly-read block at the MRU front. Under
+    // the LFU policy it starts with one reference credit so it survives the
+    // immediate eviction sweep (it is about to be used / was just prefetched).
+    lru_.push_front(Node{ t, e, buf, bytes, evict_lfu_ ? 1u : 0u });
     map_[Key{ t, e }] = lru_.begin();
     cur_bytes_ += bytes;
     evict_to_budget();
@@ -262,8 +305,7 @@ const void * ExpertStore::fetch(const ggml_tensor * W3d, int expert, std::string
         auto mit = map_.find(key);
         if (mit != map_.end()) {
             ++stats_.hits;
-            lru_.splice(lru_.begin(), lru_, mit->second); // promote to MRU
-            pinned_ = mit->second->buf;
+            promote_on_hit(mit->second);
             return mit->second->buf;
         }
         if (claimed_.count(key)) {
@@ -316,8 +358,7 @@ const void * ExpertStore::fetch(const ggml_tensor * W3d, int expert, std::string
     auto mit2 = map_.find(key);
     if (mit2 != map_.end()) {
         aligned_free_bytes(buf);
-        lru_.splice(lru_.begin(), lru_, mit2->second);
-        pinned_ = mit2->second->buf;
+        promote_on_hit(mit2->second);
         return mit2->second->buf;
     }
     stats_.bytes_read += bytes;
@@ -460,7 +501,7 @@ void ExpertStore::log_stats(const char * tag) const {
     std::fprintf(stderr,
         "gemma4 ExpertStore[%s]: fetches=%llu hits=%llu misses=%llu (hit rate %.1f%%) "
         "prefetch_reads=%llu waits=%llu evictions=%llu bytes_read=%.1f MiB "
-        "peak_resident=%.1f MiB budget=%.1f MiB prefetch=%s(%dw) "
+        "peak_resident=%.1f MiB budget=%.1f MiB prefetch=%s(%dw) evict=%s "
         "io_read=%.0f ms io_bw=%.2f GiB/s/stream\n",
         tag ? tag : "",
         (unsigned long long) stats_.fetches,
@@ -475,6 +516,7 @@ void ExpertStore::log_stats(const char * tag) const {
         budget_ / (1024.0 * 1024.0),
         prefetch_on_ ? "on" : "off",
         prefetch_on_ ? n_workers_ : 0,
+        evict_lfu_ ? "clock-lfu" : "lru",
         io_ms, io_bw);
 }
 

@@ -152,6 +152,8 @@ static void print_usage(int /*argc*/, char ** argv) {
         "    --gemma4-moe-prefetch 0|1          P2: overlap expert preads with compute via a worker (default 1)\n"
         "    --gemma4-moe-prefetch-threads N    P2: number of concurrent prefetch I/O workers (default 2)\n"
         "    --gemma4-moe-route-stats           print per-layer expert-routing telemetry (skew + temporal locality)\n"
+        "    --gemma4-moe-evict-lfu             MoE stream eviction: CLOCK LFU-aging (keep hot experts) instead of LRU\n"
+        "    --gemma4-moe-evict-freqcap N       LFU-aging per-block reference-credit cap (default 64)\n"
         "    --gemma4-repack-ggml|-xbox|-xbcg   dense-weight repack (attn/MLP/lm_head) to _x8 layout; loads writable (no mmap)\n"
         "    --gemma4-network-profile [PROMPT] [N_DECODE]\n"
         "                                       per-stage timing for prefill + N_DECODE decode steps\n"
@@ -220,6 +222,8 @@ int main(int argc, char ** argv) {
     int         moe_prefetch   = 1;    // --gemma4-moe-prefetch 0|1 (overlap I/O with compute)
     int         moe_prefetch_threads = 2; // --gemma4-moe-prefetch-threads N (concurrent I/O workers)
     bool        moe_route_stats = false;  // --gemma4-moe-route-stats (routing telemetry)
+    bool        moe_evict_lfu = false;    // --gemma4-moe-evict-lfu (CLOCK LFU-aging eviction)
+    int         moe_evict_freqcap = 64;   // --gemma4-moe-evict-freqcap N (per-block credit cap)
     // Phase 1 dense-weight repack: repack attn/MLP/lm_head weights (the
     // matmul_qf32 sites) to an _x8 layout for faster GEMV/GEMM, mirroring
     // minslm-cli's repack-* modes. MoE expert tensors are NOT touched here.
@@ -345,6 +349,10 @@ int main(int argc, char ** argv) {
                 moe_prefetch_threads = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-moe-route-stats") == 0) {
                 moe_route_stats = true;
+            } else if (std::strcmp(argv[i], "--gemma4-moe-evict-lfu") == 0) {
+                moe_evict_lfu = true;
+            } else if (std::strcmp(argv[i], "--gemma4-moe-evict-freqcap") == 0 && i + 1 < argc) {
+                moe_evict_freqcap = std::stoi(argv[++i]);
             } else if (std::strcmp(argv[i], "--gemma4-repack-ggml") == 0) {
                 tensor_repack_mode = GGML_TENSOR_REPACK_MODE_GGML;
             } else if (std::strcmp(argv[i], "--gemma4-repack-xbox") == 0) {
@@ -539,6 +547,9 @@ int main(int argc, char ** argv) {
     // Read-only MoE routing telemetry: when on, moe_ffn records per-layer
     // expert-selection skew + consecutive-token overlap (see gemma4_route_stats).
     gemma4::set_route_stats_enabled(moe_route_stats);
+
+    // MoE streaming eviction policy (consumed by every ExpertStore::init).
+    gemma4::set_expert_evict_policy(moe_evict_lfu, moe_evict_freqcap);
 
     // ---------- G3.2: --gemma4-kernel-test ----------
     // Self-tests are model-independent; run before loading anything.

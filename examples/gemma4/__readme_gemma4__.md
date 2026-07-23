@@ -1458,3 +1458,41 @@ Early read (QAT, 12-tok network-gen, tiny sample): decode topK_conc ~54%,
 spread from ~1.6/8 (layers 0/24/27) to ~4.0-4.3/8 (layers 13/14/29). Both
 skew and locality are non-trivial - promising for a retention policy - but
 the decisive numbers come from a full 7 GiB cpf run.
+
+P2e - CLOCK / LFU-aging ExpertStore eviction (--gemma4-moe-evict-lfu)
+
+The sweep-aware retention policy P2d motivated. Reuses the existing LRU list:
+each Node carries a small reference credit (freq) capped at freq_cap_
+(--gemma4-moe-evict-freqcap N). A cache hit bumps the credit (in place, no
+splice); eviction sweeps the list tail as a CLOCK second-chance - a block
+with credit>0 is aged (credit--) and rotated to the front (spared this pass),
+only credit==0 blocks are evicted. Frequency-aware retention with intrinsic
+aging, still O(1) amortized. Perf-only: eviction never changes fetch results
+(a miss always reads the correct block), so hand output is byte-identical to
+LRU; verified via network-gen 24 (identical fetches, identical tokens).
+Default is LRU (evict_lfu_ = false); the flag opts in.
+
+The freq cap is the decisive knob - it sets the retention hysteresis depth,
+i.e. how many eviction encounters a hot block survives between touches. It
+must exceed the inter-touch eviction distance of the cross-prompt hot set or
+the signal is aged away before reuse. cpf A/B at 0.63x WS (7168 MiB budget,
+QAT 26B-A4B, 18 prompts, prefetch on 2w, dev box) shows a sharp threshold:
+
+  freq cap | bytes_read | evictions | io_read  | vs LRU
+  ---------|------------|-----------|----------|-------
+  LRU      | 227,092 MiB| 137,865   | 109,068  |   -
+  4        | 224,840    | 136,457   | 101,739  |  -1%
+  16       | 225,050    | 136,591   |  99,094  |  -1%
+  32       | 180,859    | 108,886   |  82,849  | -20%
+  64       | 168,770    | 101,308   |  74,725  | -26%
+  128      | 168,772    | 101,309   |  72,183  | -26% (saturated)
+
+Retention only engages once the credit reserve is deep enough (>=32) to carry
+a hot block across a full 11 GiB -> 7 GiB layer sweep; it saturates at 64
+(128 identical). Below 32 it degenerates to LRU. Default freq cap is 64.
+Caveat: cap 4 (the first cut) looked like LFU "failed" (-1%) - the cap, not
+the policy, was the limiter. The addressable traffic here is the cross-prompt
+re-read of recurring experts; within a single prefill pass every expert is
+touched about once (near-uniform, distinct ~115/128), so the discriminating
+signal is cross-prompt and a deep-enough reserve is what preserves it.
+UMA (more BW-limited, io_bw 1.84-2.36) A/B still pending.

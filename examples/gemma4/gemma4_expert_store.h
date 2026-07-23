@@ -144,6 +144,7 @@ private:
         int                 e = 0;
         void *              buf = nullptr;
         size_t              bytes = 0;
+        uint32_t            freq = 0;   // CLOCK reference credit (LFU-aging only)
     };
 
     // (tensor, expert) key -> position in the LRU list (front = most recent).
@@ -161,9 +162,14 @@ private:
 
     bool read_at(uint64_t offset, void * dst, size_t bytes, std::string & error);
 
-    // Evict LRU blocks until within budget. Must be called with mtx_ held.
-    // Never evicts the pinned block (the one the consumer is using now).
+    // Evict blocks until within budget. Must be called with mtx_ held. Never
+    // evicts the pinned block (the one the consumer is using now). With the
+    // LFU-aging policy this is a CLOCK second-chance sweep (see evict_lfu_).
     void evict_to_budget();
+
+    // Register a hit on the block at `it`: bump its CLOCK credit (LFU policy)
+    // or promote it to the MRU front (LRU policy), and pin it. mtx_ held.
+    void promote_on_hit(std::list<Node>::iterator it);
 
     // Insert a freshly-read block. Must be called with mtx_ held. Takes
     // ownership of buf. Returns a pointer to the resident buffer.
@@ -180,6 +186,16 @@ private:
 
     size_t budget_    = 0;
     size_t cur_bytes_ = 0;
+
+    // Eviction policy. false (default) = pure LRU (evict list tail). true =
+    // CLOCK / second-chance with a small per-block frequency credit capped at
+    // freq_cap_: a hit bumps the credit; eviction sweeps the tail, decrementing
+    // (aging) any block with credit>0 and rotating it to the front, evicting
+    // only credit==0 blocks. This is frequency-aware retention with intrinsic
+    // aging -- it keeps hot experts across the layer sweep, breaking the LRU
+    // cyclic-sweep pathology, while staying O(1) amortized on the same list.
+    bool   evict_lfu_ = false;
+    int    freq_cap_  = 64;
 
     // Platform file handle (void* to keep this header free of <windows.h>).
     void * handle_       = nullptr;
@@ -208,5 +224,10 @@ private:
 // expert blocks through the store instead of the resident mmap path.
 void          set_expert_store(ExpertStore * s);
 ExpertStore * get_expert_store();
+
+// Default eviction policy applied by ExpertStore::init to every store. Set
+// once from the CLI before installing any store. lfu=true selects the CLOCK
+// LFU-aging policy (freq_cap = per-block credit cap); lfu=false keeps LRU.
+void set_expert_evict_policy(bool lfu, int freq_cap);
 
 } // namespace gemma4
