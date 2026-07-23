@@ -198,11 +198,34 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
         evict_to_budget(layer_idx);
     }
 
-    // For mmap: the data pointer is already valid (points into mmap).
-    // We just need to "touch" the pages to ensure they're paged in.
+    // Determine where this layer's weights physically live. Host-pointer
+    // buffers (CPU, or DX12/Vulkan UMA when the weight buffer wraps the mmap
+    // via buffer_from_host_ptr) are read by the backend directly out of the
+    // mmap, so paging the mmap in is enough. A separate DEVICE buffer (Vulkan/
+    // CUDA that copies weights into device memory at load time) holds its own
+    // copy that the windowing skip-load left UNFILLED for deferred layers -- it
+    // must be re-uploaded on residency even in mmap mode, otherwise the GPU
+    // computes on uninitialized (garbage) weights.
+    bool layer_on_device = false;
+    for (const auto & loc : it->second) {
+        if (loc.tensor && loc.tensor->buffer && !ggml_backend_buffer_is_host(loc.tensor->buffer)) {
+            layer_on_device = true;
+            break;
+        }
+    }
+    if (use_mmap && layer_on_device) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            printf("layer_window: weights in a device buffer (e.g. Vulkan/CUDA) — "
+                   "streaming deferred layers via device upload (mmap = byte source)\n");
+        }
+    }
+    // For host-pointer buffers under mmap: the data pointer already points into
+    // the mmap. We just need to "touch" the pages to ensure they're paged in.
     // On Windows: VirtualLock pins pages in physical RAM.
     // On Linux: madvise(WILLNEED) + mlock.
-    if (use_mmap) {
+    if (use_mmap && !layer_on_device) {
         for (const auto & loc : it->second) {
             if (!loc.tensor || !loc.tensor->data) continue;
 #ifdef _WIN32
@@ -284,8 +307,21 @@ void layer_window_manager::evict_layer(int layer_idx) {
     auto it = layer_tensors.find(layer_idx);
     if (it == layer_tensors.end()) return;  // no recorded tensors — can't reload
 
-    // For mmap: release physical pages back to OS
-    if (use_mmap) {
+    // Mirror ensure_layer_resident: host-pointer buffers freed their pages via
+    // the mmap release below; DEVICE buffers (Vulkan/CUDA, incl. under mmap)
+    // need their GPU tiles decommitted to actually free physical memory.
+    bool layer_on_device = false;
+    for (const auto & loc : it->second) {
+        if (loc.tensor && loc.tensor->buffer && !ggml_backend_buffer_is_host(loc.tensor->buffer)) {
+            layer_on_device = true;
+            break;
+        }
+    }
+
+    // For host-pointer buffers under mmap: release physical pages back to OS.
+    // (Device-buffer layers already discarded their mmap source pages right
+    // after the upload in ensure_layer_resident, so skip them here.)
+    if (use_mmap && !layer_on_device) {
         for (const auto & loc : it->second) {
             if (!loc.tensor || !loc.tensor->data) continue;
 #ifdef _WIN32
@@ -297,9 +333,10 @@ void layer_window_manager::evict_layer(int layer_idx) {
 #endif
         }
     }
-    // For non-mmap: decommit GPU tiles (reserved resource) to free physical memory
+    // For DEVICE buffers (Vulkan/CUDA, including under mmap): decommit GPU tiles
+    // (reserved resource) to free physical memory.
     // SOFT_EVICT: skip the GPU unmap but still do bookkeeping — isolates tile unmap bugs
-    if (!use_mmap && !lw_soft_evict()) {
+    if (layer_on_device && !lw_soft_evict()) {
         for (const auto & loc : it->second) {
             if (!loc.tensor) continue;
             ggml_backend_tensor_decommit(loc.tensor);
