@@ -284,6 +284,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "cpu"))    { p.force_cpu = true; }
         else if (!strcmp(argv[i], "ccx-affin")) { common_ccx_affinity_init(true); }
         else if (!strcmp(argv[i], "--no-mmap") || !strcmp(argv[i], "-nm")) { p.no_mmap = true; }
+        else if (!strcmp(argv[i], "--no-direct-io") || !strcmp(argv[i], "-ndio")) { p.direct_io = false; }
         else if (!strcmp(argv[i], "repack-xbcg")) { p.repack_xbcg = true; }
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) { p.main_gpu = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-sm") && i + 1 < argc) {
@@ -397,6 +398,17 @@ int main(int argc, char ** argv) {
     }
     if (p.no_mmap) {
         model_params.use_mmap = false;
+    }
+    // Layer-window streaming on a GPU is fastest when weights are mmap-aliased
+    // into the device buffer (buffer_from_host_ptr): residency is then managed
+    // by page (un)locking instead of re-uploading whole layers every token.
+    // direct_io disables mmap, so when windowing is active on a GPU (and the
+    // user hasn't forced --no-mmap) prefer mmap over direct I/O. Override with
+    // an explicit -ndio is unnecessary; pass --no-mmap to opt out entirely.
+    if (p.weight_budget_mb > 0 && !p.force_cpu && !p.no_mmap && p.direct_io) {
+        p.direct_io = false;
+        printf("[main]: layer windowing on GPU — preferring mmap over direct I/O "
+               "(enables zero-copy weight aliasing on UMA)\n");
     }
     if (p.direct_io) {
         model_params.use_direct_io = true;

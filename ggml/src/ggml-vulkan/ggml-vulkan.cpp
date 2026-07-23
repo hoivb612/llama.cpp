@@ -16888,7 +16888,12 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ false,
+        // Enable zero-copy weight aliasing (buffer_from_host_ptr) only on
+        // integrated/UMA GPUs that support VK_EXT_external_memory_host. This
+        // lets the loader map mmap'd weights directly into a Vulkan buffer, so
+        // layer-window streaming controls residency via page (un)locking rather
+        // than re-uploading whole layers every token. On dGPU it stays false.
+        /* .buffer_from_host_ptr  = */ ctx->is_integrated_gpu && ctx->external_memory_host,
         /* .events                = */ true,
     };
 }
