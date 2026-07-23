@@ -65,6 +65,19 @@ struct layer_window_manager {
     // mmap base addresses (set after load, indexed by file_idx)
     std::vector<const uint8_t *> mmap_bases;
 
+    // On-demand file-read source (used when mmap is disabled, e.g. direct_io or
+    // GPU offload). Indexed by file_idx; paths registered from the loader. When
+    // mmap_bases is unavailable for a deferred layer, its weight bytes are read
+    // from these files at the recorded file_offset and uploaded via tensor_set.
+    std::vector<std::string> src_file_paths;
+    std::vector<void *>      src_file_handles;   // lazily opened FILE* per file_idx
+    std::vector<uint8_t>     reload_scratch;     // reused per-tensor read buffer
+
+    // Register the backing GGUF file path for a given file_idx (from the loader).
+    void set_source_file(uint16_t file_idx, const std::string & path);
+    // Read n_bytes at file_offset from file_idx into dst. Returns false on error.
+    bool read_tensor_bytes(uint16_t file_idx, size_t file_offset, size_t n_bytes, void * dst);
+
     // Initialize from measured layer sizes
     void init(int n_layers, size_t budget_mb);
 

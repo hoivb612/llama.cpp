@@ -51,6 +51,36 @@ void layer_window_manager::set_layer_size(int layer_idx, size_t bytes) {
     }
 }
 
+void layer_window_manager::set_source_file(uint16_t file_idx, const std::string & path) {
+    if (src_file_paths.size() <= file_idx) {
+        src_file_paths.resize(file_idx + 1);
+        src_file_handles.resize(file_idx + 1, nullptr);
+    }
+    src_file_paths[file_idx] = path;
+}
+
+bool layer_window_manager::read_tensor_bytes(uint16_t file_idx, size_t file_offset, size_t n_bytes, void * dst) {
+    if (file_idx >= src_file_paths.size() || src_file_paths[file_idx].empty()) {
+        return false;
+    }
+    FILE * f = (FILE *) src_file_handles[file_idx];
+    if (!f) {
+        f = fopen(src_file_paths[file_idx].c_str(), "rb");
+        if (!f) {
+            fprintf(stderr, "LW: failed to open source file '%s' for streaming\n",
+                    src_file_paths[file_idx].c_str());
+            return false;
+        }
+        src_file_handles[file_idx] = f;
+    }
+#ifdef _WIN32
+    if (_fseeki64(f, (long long) file_offset, SEEK_SET) != 0) return false;
+#else
+    if (fseeko(f, (off_t) file_offset, SEEK_SET) != 0) return false;
+#endif
+    return fread(dst, 1, n_bytes, f) == n_bytes;
+}
+
 bool layer_window_manager::should_load_layer(int layer_idx) const {
     if (budget_bytes == 0) {
         return true;  // unlimited — load everything
@@ -217,6 +247,33 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
             break;
         }
     }
+    {
+        // One-shot decisive diagnostic: dump the actual residency state for the
+        // first deferred layer we're asked to make resident. This disambiguates
+        // the Vulkan garbage-output bug (upload vs alias vs not-recorded).
+        static bool dumped = false;
+        if (!dumped && lw_diag_enabled()) {
+            dumped = true;
+            const tensor_location * l0 = nullptr;
+            for (const auto & loc : it->second) { if (loc.tensor) { l0 = &loc; break; } }
+            const uint8_t * mmap_src0 = (l0 && l0->file_idx < mmap_bases.size() && mmap_bases[l0->file_idx])
+                ? mmap_bases[l0->file_idx] + l0->file_offset : nullptr;
+            ggml_backend_buffer_t buf = l0 && l0->tensor ? l0->tensor->buffer : nullptr;
+            fprintf(stderr,
+                "LW-DIAG: first deferred layer=%d n_tensors=%zu use_mmap=%d mmap_bases=%zu\n"
+                "         needs_upload=%d tensor0=%s data=%p mmap_src=%p equal=%d\n"
+                "         buffer=%p is_host=%d buft=%s\n",
+                layer_idx, it->second.size(), (int)use_mmap, mmap_bases.size(),
+                (int)layer_needs_upload,
+                l0 ? l0->name.c_str() : "(none)",
+                l0 && l0->tensor ? l0->tensor->data : nullptr, (const void *)mmap_src0,
+                (int)(l0 && l0->tensor && (const void*)l0->tensor->data == (const void*)mmap_src0),
+                (void *)buf,
+                buf ? (int)ggml_backend_buffer_is_host(buf) : -1,
+                buf ? ggml_backend_buffer_name(buf) : "(none)");
+            fflush(stderr);
+        }
+    }
     if (use_mmap && layer_needs_upload) {
         static bool announced = false;
         if (!announced) {
@@ -251,13 +308,29 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
                 fprintf(stderr, "LW: SOFT_NOUP layer=%d — skipping upload (tiles retained)\n", layer_idx);
             }
         } else {
-            // Non-mmap: batch upload all tensors for this layer to GPU in one submission
+            // Non-mmap: batch upload all tensors for this layer to GPU in one submission.
+            // Byte source is the mmap (when aliased/available) OR an on-demand file read
+            // (direct_io / GPU offload disables mmap — the layer bytes are streamed from
+            // the GGUF at the recorded file_offset). File-read tensors are uploaded
+            // immediately (their scratch buffer is transient); mmap tensors are batched.
             std::vector<ggml_tensor *> batch_tensors;
             std::vector<const void *>  batch_data;
             std::vector<size_t>        batch_sizes;
             for (const auto & loc : it->second) {
                 if (!loc.tensor) continue;
-                if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
+                const bool have_mmap =
+                    loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
+                if (!have_mmap) {
+                    // Stream this tensor's bytes from the backing GGUF file.
+                    if (reload_scratch.size() < loc.n_bytes) reload_scratch.resize(loc.n_bytes);
+                    if (!read_tensor_bytes(loc.file_idx, loc.file_offset, loc.n_bytes, reload_scratch.data())) {
+                        fprintf(stderr, "LW: FAILED to stream layer=%d tensor=%s (%zu bytes @ off=%zu file=%u)\n",
+                                layer_idx, loc.name.c_str(), loc.n_bytes, loc.file_offset, (unsigned)loc.file_idx);
+                        continue;
+                    }
+                    ggml_backend_tensor_set(loc.tensor, reload_scratch.data(), 0, loc.n_bytes);
+                    continue;
+                }
 
                 // Verify mmap data integrity before upload (GGML_LW_DIAG)
                 if (lw_diag_enabled() && loc.checksum != 0) {

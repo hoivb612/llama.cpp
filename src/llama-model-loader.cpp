@@ -555,6 +555,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -637,6 +638,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1484,6 +1486,11 @@ bool llama_model_loader::load_all_data(
             lwm->non_layer_bytes = non_layer_size;
             for (const auto & [idx, sz] : layer_sizes) {
                 lwm->set_layer_size(idx, sz);
+            }
+            // Register backing GGUF paths so deferred layers can be streamed via
+            // on-demand file reads when mmap is unavailable (direct_io / GPU offload).
+            for (size_t i = 0; i < file_paths.size(); i++) {
+                lwm->set_source_file((uint16_t)i, file_paths[i]);
             }
             lwm->print_config();
         }
