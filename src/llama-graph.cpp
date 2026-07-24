@@ -11,6 +11,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-stream.h"
 
 #include <cassert>
 #include <cmath>
@@ -1488,6 +1489,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // MoE expert streaming (Vulkan UMA weight-budget): the expert weight matrices
+    // are never resident (layer-window residency split); serve them per ubatch by
+    // gathering the needed experts from mmap. Decode (n_tokens==1) gathers only the
+    // routed experts; prefill (n_tokens>1) gathers all n_expert (static shape).
+    const bool moe_stream = llama_moe_stream_enabled() && il >= 0;
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -1627,7 +1634,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = nullptr;
+        if (moe_stream) {
+            gate_up = llama_moe_streamed_mul_mat_id(ctx0, gate_up_exps, cur, selected_experts, n_expert_used, n_expert, n_tokens, il, 0);
+        }
+        if (!gate_up) {
+            gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        }
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1651,7 +1664,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = nullptr;
+        if (moe_stream) {
+            up = llama_moe_streamed_mul_mat_id(ctx0, up_exps, cur, selected_experts, n_expert_used, n_expert, n_tokens, il, 1);
+        }
+        if (!up) {
+            up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        }
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1669,7 +1688,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            ggml_tensor * gate_out = nullptr;
+            if (moe_stream) {
+                gate_out = llama_moe_streamed_mul_mat_id(ctx0, gate_exps, cur, selected_experts, n_expert_used, n_expert, n_tokens, il, 2);
+            }
+            if (!gate_out) {
+                gate_out = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            }
+            cur = gate_out;
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1759,7 +1785,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = nullptr;
+    if (moe_stream) {
+        experts = llama_moe_streamed_mul_mat_id(ctx0, down_exps, cur, selected_experts, n_expert_used, n_expert, n_tokens, il, 3);
+    }
+    if (!experts) {
+        experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

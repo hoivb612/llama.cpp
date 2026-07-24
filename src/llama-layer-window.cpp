@@ -16,6 +16,38 @@
 #include <sys/mman.h>
 #endif
 
+// ---- MoE expert-streaming residency split ----
+//
+// When GGML_LW_MOE_STREAM=1, the big per-expert weight matrices
+// (blk.N.ffn_{gate,gate_up,up,down}_exps.weight) are NEVER made resident by the
+// layer-window: they are served token-by-token by the CPU gather custom-op
+// (src/llama-moe-stream.cpp) which reads their quantized bytes directly from the
+// mmap'd GGUF. Excluding them here means (a) they are skipped in the per-layer
+// VA reserve/commit/fill/import, so a layer's resident footprint shrinks to just
+// its attention + norms + router + dense-MLP + expert *scales*, and (b) the
+// weight budget only ever gates that small non-expert residency (which always
+// fits), eliminating the whole-layer expert thrash that killed decode throughput.
+// The expert *scale* tensors (..._exps.scale) are tiny and consumed as real graph
+// nodes via get_rows(selected_experts), so they MUST stay resident and are NOT
+// matched here (only "_exps.weight" is).
+// Enabled by default whenever a weight budget is active (--weight-budget). The
+// GGML_LW_MOE_STREAM env var is an explicit override: set to 0 to force off, or
+// to 1 to force on without a budget (e.g. for isolated testing).
+static bool lw_moe_expert_stream() {
+    static const int env = []() {
+        const char * v = getenv("GGML_LW_MOE_STREAM");
+        if (!v || !v[0]) return -1;           // unset -> follow the weight budget
+        return (v[0] != '0') ? 1 : 0;         // explicit override
+    }();
+    if (env >= 0) return env != 0;
+    const layer_window_manager * m = llama_get_layer_window_manager();
+    return m && m->budget_bytes > 0;
+}
+
+static inline bool lw_is_streamed_expert_weight(const std::string & name) {
+    return name.find("_exps.weight") != std::string::npos;
+}
+
 // Global instance pointer
 static layer_window_manager * g_layer_window_mgr = nullptr;
 
@@ -87,6 +119,14 @@ bool layer_window_manager::should_load_layer(int layer_idx) const {
     }
     if (layer_idx < 0 || layer_idx >= total_layers) {
         return true;  // safety: always load unknown
+    }
+
+    // MoE expert-streaming: expert weight matrices are never resident (gather
+    // serves them), so the only thing residency costs is each layer's small
+    // non-expert set, which fits any usable budget. Keep every layer's
+    // non-expert part resident and let the gather honor the budget for experts.
+    if (lw_moe_expert_stream()) {
+        return true;
     }
 
     // Strategy: load the first N layers that fit within the budget.
@@ -735,10 +775,14 @@ bool layer_window_manager::alloc_layer_va(int layer_idx) {
     if (align == 0) align = 256;
 
     // Pack tensors densely with buft alignment; compute the total reserved size.
+    // Under MoE expert-streaming, expert weight matrices are excluded here (kept
+    // non-resident on the dummy buffer); the gather serves them from mmap.
+    const bool moe_stream = lw_moe_expert_stream();
     std::vector<size_t> packed_off(locs.size(), 0);
     size_t packed = 0;
     for (size_t i = 0; i < locs.size(); i++) {
         if (!locs[i].tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(locs[i].name)) continue;
         packed = (packed + align - 1) & ~(align - 1);
         packed_off[i] = packed;
         packed += locs[i].n_bytes;
@@ -756,6 +800,7 @@ bool layer_window_manager::alloc_layer_va(int layer_idx) {
     // Set each tensor's data into the reserved VA (stable across residency cycles).
     for (size_t i = 0; i < locs.size(); i++) {
         if (!locs[i].tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(locs[i].name)) continue;
         locs[i].tensor->data = (uint8_t *) anon + packed_off[i];
     }
 
@@ -803,11 +848,15 @@ bool layer_window_manager::build_layer_aliased(int layer_idx) {
     }
 
     // Fill each tensor from mmap (preferred) or by streaming from the GGUF file,
-    // writing directly to the stable data pointer set by alloc_layer_va.
+    // writing directly to the stable data pointer set by alloc_layer_va. Under
+    // MoE expert-streaming, expert weight matrices are skipped (never resident;
+    // the gather serves them from mmap) and excluded from the imported buffer.
+    const bool moe_stream = lw_moe_expert_stream();
     size_t max_tsize = 0;
     bool fill_ok = true;
     for (auto & loc : locs) {
         if (!loc.tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(loc.name)) continue;
         if (loc.n_bytes > max_tsize) max_tsize = loc.n_bytes;
         void * dst = loc.tensor->data;
         const bool have_mmap = loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
@@ -832,6 +881,7 @@ bool layer_window_manager::build_layer_aliased(int layer_idx) {
     // Re-point the layer's weight tensors at the imported buffer (data unchanged).
     for (auto & loc : locs) {
         if (!loc.tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(loc.name)) continue;
         loc.tensor->buffer = buf;
     }
 
@@ -929,7 +979,14 @@ bool layer_window_manager::migrate_residual_tensor(ggml_tensor * t) {
 // ---- Stage 2b: load-time aliased streaming ----
 
 bool layer_window_manager::alias_stream_enabled() {
-    static const int v = (getenv("GGML_LW_ALIAS_STREAM") != nullptr) ? 1 : 0;
+    // Default ON; the caller additionally gates on a non-zero weight budget, so
+    // this only takes effect under --weight-budget. GGML_LW_ALIAS_STREAM=0 forces
+    // it off (non-alias path OOMs under a budget, so this is an escape hatch only).
+    static const int v = []() {
+        const char * e = getenv("GGML_LW_ALIAS_STREAM");
+        if (!e || !e[0]) return 1;            // unset -> default ON
+        return (e[0] != '0') ? 1 : 0;         // explicit override
+    }();
     return v != 0;
 }
 
