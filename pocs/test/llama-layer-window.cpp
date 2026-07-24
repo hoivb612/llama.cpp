@@ -723,6 +723,56 @@ bool layer_window_manager::convert_layers_to_aliased_cache() {
 #endif
 }
 
+// Stage 2a: migrate one residual GPU-resident weight (non-blk.* tensor sharing the
+// big layer buffer, e.g. output.weight) into its own imported anonymous buffer.
+bool layer_window_manager::migrate_residual_tensor(ggml_tensor * t) {
+#ifdef _WIN32
+    if (!t || !t->buffer) return false;
+
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+    const unsigned long MEM_RELEASE_ = 0x8000;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (!dev) return false;
+    size_t align = ggml_backend_buft_get_alignment(buft);
+    if (align == 0) align = 256;
+
+    const size_t nbytes = ggml_nbytes(t);
+    if (nbytes == 0) return false;
+    const size_t total = (nbytes + align - 1) & ~(align - 1);
+
+    void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+    if (!anon) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed migrating residual %s\n", total, t->name);
+        return false;
+    }
+
+    // Pull the tensor's current bytes back from the device into host memory.
+    ggml_backend_tensor_get(t, anon, 0, nbytes);
+
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, nbytes);
+    if (!buf) {
+        fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed migrating residual %s (%zu bytes)\n",
+                t->name, total);
+        VirtualFree(anon, 0, MEM_RELEASE_);
+        return false;
+    }
+
+    t->buffer = buf;
+    t->data   = anon;
+
+    alias_anon.push_back(anon);
+    alias_bufs.push_back((void *) buf);
+    return true;
+#else
+    (void) t;
+    return false;
+#endif
+}
+
 void layer_window_manager::release_mmap_pages() {
     if (budget_bytes == 0 || use_mmap) return;
     if (mmap_bases.empty()) return;

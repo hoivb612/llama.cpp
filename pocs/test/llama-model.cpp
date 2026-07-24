@@ -31,6 +31,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1715,32 +1716,74 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // host-ptr import and no sparse residency), convert each layer to a
             // per-layer imported ANONYMOUS buffer so compute is zero-copy.
             if (!lwm->use_mmap) {
+                // Capture the device buffer(s) that back the layer weights BEFORE
+                // conversion re-points them. These are exactly the buffers Stage 2a
+                // wants to vacate + free; anything else (CPU non-layer buffer) is
+                // left alone.
+                std::set<ggml_backend_buffer_t> layer_bufs;
+                for (auto & [li, locs] : lwm->layer_tensors) {
+                    for (auto & loc : locs) {
+                        if (loc.tensor && loc.tensor->buffer) layer_bufs.insert(loc.tensor->buffer);
+                    }
+                }
                 if (lwm->convert_layers_to_aliased_cache()) {
                     // Stage 2a: every layer tensor now points at its own per-layer
                     // imported anonymous buffer, so the original monolithic device
-                    // weight buffer that held the layer weights is fully orphaned
-                    // (double-allocated RAM). Free any weight buffer that no longer
-                    // has a single tensor referent to reclaim it (~9.5 GiB on the
-                    // AMD Vulkan/UMA path). Self-limiting: buffers that still back
-                    // live tensors (e.g. the CPU non-layer embed/output buffer, or
-                    // GPU-resident non-layer tensors in other offload configs) keep
-                    // their referents and are left untouched.
+                    // weight buffer that held the layer weights is orphaned EXCEPT
+                    // for residual non-blk.* weights that shared it (e.g. a GPU-
+                    // offloaded output.weight). Migrate those residual tensors into
+                    // their own imported anonymous buffers so the big buffer is
+                    // fully vacated, then free it (~9.5 GiB on AMD Vulkan/UMA).
+                    int    migrated       = 0;
+                    size_t migrated_bytes = 0;
+                    for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
+                        ggml_context * cx = ctx_ptr.get();
+                        for (ggml_tensor * t = ggml_get_first_tensor(cx); t != nullptr; t = ggml_get_next_tensor(cx, t)) {
+                            if (t->buffer && layer_bufs.count(t->buffer)) {
+                                size_t nb = ggml_nbytes(t);
+                                if (lwm->migrate_residual_tensor(t)) {
+                                    migrated++;
+                                    migrated_bytes += nb;
+                                }
+                            }
+                        }
+                    }
+                    if (migrated > 0) {
+                        LLAMA_LOG_INFO("%s: layer_window: migrated %d residual non-layer weight(s) "
+                                       "(%.1f MiB) off the layer buffer into imported anonymous buffers\n",
+                                       __func__, migrated, migrated_bytes / (1024.0 * 1024.0));
+                    }
+
+                    // Free any weight buffer that no longer has a single tensor
+                    // referent to reclaim it. Referents are gathered GLOBALLY across
+                    // every model context — a tensor's buffer is not guaranteed to be
+                    // stored in the same ctxs_bufs entry as the tensor, so a per-entry
+                    // scan can wrongly free a still-referenced buffer.
+                    std::set<ggml_backend_buffer_t> referenced;
+                    for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
+                        ggml_context * cx = ctx_ptr.get();
+                        for (ggml_tensor * t = ggml_get_first_tensor(cx); t != nullptr; t = ggml_get_next_tensor(cx, t)) {
+                            if (t->buffer) referenced.insert(t->buffer);
+                        }
+                    }
                     size_t freed_bytes = 0;
                     int    freed_bufs  = 0;
                     for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
-                        ggml_context * cx = ctx_ptr.get();
                         for (auto & bp : bufs) {
                             if (!bp) continue;
                             ggml_backend_buffer_t raw = bp.get();
-                            bool referenced = false;
-                            for (ggml_tensor * t = ggml_get_first_tensor(cx); t != nullptr; t = ggml_get_next_tensor(cx, t)) {
-                                if (t->buffer == raw) { referenced = true; break; }
+                            if (referenced.count(raw)) {
+                                LLAMA_LOG_INFO("%s: layer_window: keeping weight buffer %s (%.1f MiB) — still has tensor referents\n",
+                                               __func__, ggml_backend_buffer_name(raw),
+                                               ggml_backend_buffer_get_size(raw) / (1024.0 * 1024.0));
+                                continue;
                             }
-                            if (!referenced) {
-                                freed_bytes += ggml_backend_buffer_get_size(raw);
-                                freed_bufs++;
-                                bp.reset();  // frees now; teardown sees null -> no double free
-                            }
+                            freed_bytes += ggml_backend_buffer_get_size(raw);
+                            freed_bufs++;
+                            LLAMA_LOG_INFO("%s: layer_window: freeing orphaned weight buffer %s (%.1f MiB)\n",
+                                           __func__, ggml_backend_buffer_name(raw),
+                                           ggml_backend_buffer_get_size(raw) / (1024.0 * 1024.0));
+                            bp.reset();  // frees now; teardown sees null -> no double free
                         }
                     }
                     if (freed_bufs > 0) {

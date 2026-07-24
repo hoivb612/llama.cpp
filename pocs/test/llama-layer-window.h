@@ -144,6 +144,14 @@ struct layer_window_manager {
     std::vector<void *> alias_bufs;          // per-layer ggml_backend_buffer_t (kept alive)
     bool convert_layers_to_aliased_cache();
 
+    // Stage 2a: migrate a single residual GPU-resident weight (e.g. output.weight)
+    // that shares the monolithic layer buffer but is NOT a blk.* layer tensor into
+    // its own imported ANONYMOUS buffer. Reads the tensor's current bytes back from
+    // the device, imports host memory zero-copy, and re-points the tensor. This
+    // vacates the last referents off the big layer buffer so it can be freed.
+    // Returns true on success (tensor re-pointed); false leaves the tensor as-is.
+    bool migrate_residual_tensor(ggml_tensor * t);
+
     // Compute reference checksums for mmap data integrity verification
     // Must be called AFTER mmap_bases is populated and BEFORE release_mmap_pages
     void compute_reference_checksums();
