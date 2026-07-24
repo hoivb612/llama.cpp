@@ -140,6 +140,14 @@ struct layer_window_manager {
     // imported buffer so compute reads host memory directly — no per-token
     // upload copy. Returns true if at least one layer was converted.
     bool aliased_cache = false;              // set true after successful conversion
+    // Stage 2b-2: when aliased_streaming is true the aliased path does NOT keep
+    // every layer resident — only budget-worth are built at load and the rest
+    // are streamed on demand (build_layer_aliased) / evicted (free_layer_aliased).
+    // alias_dummy_buf is the 0-size Vulkan buffer that deferred/evicted layer
+    // tensors point at (valid buft for graph_reserve; never dereferenced while
+    // non-resident).
+    bool aliased_streaming = false;
+    void * alias_dummy_buf = nullptr;
     std::vector<void *> alias_anon;          // non-layer anonymous bases (for free)
     std::vector<void *> alias_bufs;          // non-layer ggml_backend_buffer_t (kept alive)
     std::map<int, void *> layer_alias_anon;  // layer_idx -> anonymous base (per-layer free)

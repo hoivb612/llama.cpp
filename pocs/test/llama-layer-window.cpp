@@ -223,6 +223,24 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
         return false;
     }
 
+    // Stage 2b-2: aliased-stream mode — build this layer's imported anonymous
+    // buffer on demand (re-pointing its tensors off the dummy buffer). Eviction
+    // is handled separately (deferred to ask=false) so allow_evict mirrors the
+    // non-aliased path: build here, free evicted layers post-compute.
+    if (aliased_streaming) {
+        if (allow_evict) {
+            evict_to_budget(layer_idx);
+        }
+        if (!build_layer_aliased(layer_idx)) {
+            fprintf(stderr, "LW-ALIAS: failed to build layer %d on demand\n", layer_idx);
+            return false;
+        }
+        entries[layer_idx].resident = true;
+        entries[layer_idx].last_access = ++access_counter;
+        resident_bytes += entries[layer_idx].memory_size;
+        return true;
+    }
+
     // Evict BEFORE committing tiles — make room for the incoming layer
     if (allow_evict) {
         evict_to_budget(layer_idx);
@@ -384,6 +402,24 @@ void layer_window_manager::evict_layer(int layer_idx) {
     auto it = layer_tensors.find(layer_idx);
     if (it == layer_tensors.end()) return;  // no recorded tensors — can't reload
 
+    // Stage 2b-2: aliased-stream mode — free this layer's imported anonymous
+    // buffer to release its RAM. Re-point its tensors at the dummy 0-size buffer
+    // first so they keep a valid buft (graph_reserve/supports_buft read buft, not
+    // data); they are never dereferenced while the layer is non-resident.
+    if (aliased_streaming) {
+        for (auto & loc : it->second) {
+            if (!loc.tensor) continue;
+            loc.tensor->buffer = (ggml_backend_buffer_t) alias_dummy_buf;
+            loc.tensor->data   = nullptr;
+        }
+        free_layer_aliased(layer_idx);
+        entries[layer_idx].resident = false;
+        if (resident_bytes >= entries[layer_idx].memory_size) {
+            resident_bytes -= entries[layer_idx].memory_size;
+        }
+        return;
+    }
+
     // Mirror ensure_layer_resident: mmap-aliased weights freed their pages via
     // the mmap release below; separate device/host-visible buffers (Vulkan/CUDA,
     // incl. under mmap) need their tiles decommitted to free physical memory.
@@ -484,8 +520,10 @@ bool layer_window_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     layer_window_manager * lwm = (layer_window_manager *)user_data;
     if (!lwm || lwm->budget_bytes == 0) return false;
     // Stage 1: aliased cache keeps every layer resident in imported anonymous
-    // buffers, so compute reads them directly — no per-token load/evict.
-    if (lwm->aliased_cache) return false;
+    // buffers, so compute reads them directly — no per-token load/evict. In
+    // Stage 2b-2 streaming mode the cache is partial, so DON'T early-return:
+    // fall through to on-demand build/evict.
+    if (lwm->aliased_cache && !lwm->aliased_streaming) return false;
 
     int layer = layer_window_manager::get_layer_from_tensor(t);
 
@@ -630,16 +668,40 @@ bool layer_window_manager::convert_layers_to_aliased_cache() {
 #ifdef _WIN32
     if (budget_bytes == 0 || layer_tensors.empty()) return false;
 
+    // Stage 2b-2: in aliased-stream load mode with a real budget that doesn't fit
+    // every layer, build ONLY the initially-resident (should_load) layers and leave
+    // the rest on the dummy buffer to be streamed on demand. Capture the dummy
+    // buffer so evicted layers can be re-pointed at it (valid buft for graph_reserve).
+    bool streaming = false;
+    if (aliased_load_mode) {
+        for (auto & [layer_idx, locs] : layer_tensors) {
+            for (auto & loc : locs) {
+                if (loc.tensor && loc.tensor->buffer) { alias_dummy_buf = (void *) loc.tensor->buffer; break; }
+            }
+            if (alias_dummy_buf) break;
+        }
+        int fit = get_initial_resident_count();
+        streaming = (fit < total_layers);
+    }
+
     size_t converted_layers = 0;
     for (auto & [layer_idx, locs] : layer_tensors) {
         if (locs.empty()) continue;
+        if (streaming && !should_load_layer(layer_idx)) continue;  // deferred: stream later
         if (build_layer_aliased(layer_idx)) converted_layers++;
     }
 
     if (converted_layers > 0) {
-        aliased_cache = true;
-        printf("layer_window: aliased-cache active — %zu layers converted to imported "
-               "anonymous buffers, zero-copy compute\n", converted_layers);
+        aliased_cache     = true;
+        aliased_streaming = streaming;
+        if (streaming) {
+            printf("layer_window: aliased-cache active (streaming) — %zu of %d layers built into "
+                   "imported anonymous buffers; %d deferred (stream on demand)\n",
+                   converted_layers, total_layers, total_layers - (int)converted_layers);
+        } else {
+            printf("layer_window: aliased-cache active — %zu layers converted to imported "
+                   "anonymous buffers, zero-copy compute\n", converted_layers);
+        }
         fflush(stdout);
     }
     return aliased_cache;
