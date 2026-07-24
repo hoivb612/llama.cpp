@@ -1611,14 +1611,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // this non-CPU windowed ctx a dummy 0-size buffer instead: the layer
             // window manager OWNS every weight in it, building per-layer imported
             // anonymous buffers from mmap/file post-load and streaming on demand —
-            // so the full buffer is never allocated.
-            layer_window_manager * lwm_alias = llama_get_layer_window_manager();
+            // so the full buffer is never allocated. The manager doesn't exist yet
+            // (it's created later in load_all_data), so gate purely on env vars and
+            // stash the decision in aliased_load_pending for load_all_data to apply.
+            static const char * budget_env_alias = getenv("GGML_WEIGHT_BUDGET_MB");
+            size_t budget_mb_alias = budget_env_alias ? (size_t)atoi(budget_env_alias) : 0;
             bool use_aliased_dummy = !is_cpu_dev
                 && layer_window_manager::alias_stream_enabled()
-                && lwm_alias && lwm_alias->budget_bytes > 0;
+                && budget_mb_alias > 0;
             if (ml.no_alloc || use_aliased_dummy) {
                 if (use_aliased_dummy) {
-                    lwm_alias->aliased_load_mode = true;
+                    layer_window_manager::aliased_load_pending = true;
+                    if (layer_window_manager * lwm_now = llama_get_layer_window_manager()) {
+                        lwm_now->aliased_load_mode = true;
+                    }
                     LLAMA_LOG_INFO("%s: layer_window: GGML_LW_ALIAS_STREAM — skipping full %s buffer "
                                    "allocation; manager owns weights (dummy buffer)\n",
                                    __func__, ggml_backend_buft_name(buft));

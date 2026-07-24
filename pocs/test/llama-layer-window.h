@@ -179,6 +179,10 @@ struct layer_window_manager {
     int build_non_layer_aliased();
     // True when the aliased-stream load path should be used (env-gated).
     static bool alias_stream_enabled();
+    // The alloc path (llama-model.cpp) decides to use a dummy buffer BEFORE the
+    // manager is created (creation happens later in load_all_data). It records
+    // that decision here so load_all_data can transfer it onto the manager.
+    static bool aliased_load_pending;
 
     // Compute reference checksums for mmap data integrity verification
     // Must be called AFTER mmap_bases is populated and BEFORE release_mmap_pages

@@ -816,6 +816,8 @@ bool layer_window_manager::alias_stream_enabled() {
     return v != 0;
 }
 
+bool layer_window_manager::aliased_load_pending = false;
+
 void layer_window_manager::record_non_layer_location(const std::string & name, uint16_t file_idx,
                                                      size_t offset, size_t n_bytes, ggml_tensor * tensor) {
     non_layer_locs.push_back({name, file_idx, offset, n_bytes, tensor, 0});

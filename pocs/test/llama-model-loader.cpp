@@ -1484,6 +1484,11 @@ bool llama_model_loader::load_all_data(
                 lwm->init(n_layers, lwm->budget_bytes / (1024 * 1024));
             }
             lwm->non_layer_bytes = non_layer_size;
+            // Stage 2b: the alloc path may have chosen dummy buffers (aliased-stream
+            // mode) before this manager existed — transfer that decision now.
+            if (layer_window_manager::aliased_load_pending) {
+                lwm->aliased_load_mode = true;
+            }
             for (const auto & [idx, sz] : layer_sizes) {
                 lwm->set_layer_size(idx, sz);
             }
