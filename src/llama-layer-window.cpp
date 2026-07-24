@@ -223,6 +223,24 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
         return false;
     }
 
+    // Stage 2b-2: aliased-stream mode — build this layer's imported anonymous
+    // buffer on demand (re-pointing its tensors off the dummy buffer). Eviction
+    // is handled separately (deferred to ask=false) so allow_evict mirrors the
+    // non-aliased path: build here, free evicted layers post-compute.
+    if (aliased_streaming) {
+        if (allow_evict) {
+            evict_to_budget(layer_idx);
+        }
+        if (!build_layer_aliased(layer_idx)) {
+            fprintf(stderr, "LW-ALIAS: failed to build layer %d on demand\n", layer_idx);
+            return false;
+        }
+        entries[layer_idx].resident = true;
+        entries[layer_idx].last_access = ++access_counter;
+        resident_bytes += entries[layer_idx].memory_size;
+        return true;
+    }
+
     // Evict BEFORE committing tiles — make room for the incoming layer
     if (allow_evict) {
         evict_to_budget(layer_idx);
@@ -384,6 +402,19 @@ void layer_window_manager::evict_layer(int layer_idx) {
     auto it = layer_tensors.find(layer_idx);
     if (it == layer_tensors.end()) return;  // no recorded tensors — can't reload
 
+    // Stage 2b-2: aliased-stream mode — free this layer's imported buffer and
+    // decommit its pages to reclaim RAM. free_layer_aliased re-points the layer's
+    // tensors back at the dummy buffer while keeping their stable data pointer, so
+    // the graph allocator stays happy and the layer can be rebuilt in place.
+    if (aliased_streaming) {
+        free_layer_aliased(layer_idx);
+        entries[layer_idx].resident = false;
+        if (resident_bytes >= entries[layer_idx].memory_size) {
+            resident_bytes -= entries[layer_idx].memory_size;
+        }
+        return;
+    }
+
     // Mirror ensure_layer_resident: mmap-aliased weights freed their pages via
     // the mmap release below; separate device/host-visible buffers (Vulkan/CUDA,
     // incl. under mmap) need their tiles decommitted to free physical memory.
@@ -484,8 +515,10 @@ bool layer_window_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     layer_window_manager * lwm = (layer_window_manager *)user_data;
     if (!lwm || lwm->budget_bytes == 0) return false;
     // Stage 1: aliased cache keeps every layer resident in imported anonymous
-    // buffers, so compute reads them directly — no per-token load/evict.
-    if (lwm->aliased_cache) return false;
+    // buffers, so compute reads them directly — no per-token load/evict. In
+    // Stage 2b-2 streaming mode the cache is partial, so DON'T early-return:
+    // fall through to on-demand build/evict.
+    if (lwm->aliased_cache && !lwm->aliased_streaming) return false;
 
     int layer = layer_window_manager::get_layer_from_tensor(t);
 
@@ -630,16 +663,46 @@ bool layer_window_manager::convert_layers_to_aliased_cache() {
 #ifdef _WIN32
     if (budget_bytes == 0 || layer_tensors.empty()) return false;
 
+    // Stage 2b-2: in aliased-stream load mode with a real budget that doesn't fit
+    // every layer, build ONLY the initially-resident (should_load) layers and leave
+    // the rest on the dummy buffer to be streamed on demand. Capture the dummy
+    // buffer so evicted layers can be re-pointed at it (valid buft for graph_reserve).
+    bool streaming = false;
+    if (aliased_load_mode) {
+        for (auto & [layer_idx, locs] : layer_tensors) {
+            for (auto & loc : locs) {
+                if (loc.tensor && loc.tensor->buffer) { alias_dummy_buf = (void *) loc.tensor->buffer; break; }
+            }
+            if (alias_dummy_buf) break;
+        }
+        int fit = get_initial_resident_count();
+        streaming = (fit < total_layers);
+    }
+
     size_t converted_layers = 0;
     for (auto & [layer_idx, locs] : layer_tensors) {
         if (locs.empty()) continue;
+        if (streaming && !should_load_layer(layer_idx)) {
+            // Deferred: reserve a stable VA + set data pointers so the graph
+            // allocator treats these weights as pre-allocated (skips them). No
+            // physical/commit cost until the layer is streamed in on demand.
+            alloc_layer_va(layer_idx);
+            continue;
+        }
         if (build_layer_aliased(layer_idx)) converted_layers++;
     }
 
     if (converted_layers > 0) {
-        aliased_cache = true;
-        printf("layer_window: aliased-cache active — %zu layers converted to imported "
-               "anonymous buffers, zero-copy compute\n", converted_layers);
+        aliased_cache     = true;
+        aliased_streaming = streaming;
+        if (streaming) {
+            printf("layer_window: aliased-cache active (streaming) — %zu of %d layers built into "
+                   "imported anonymous buffers; %d deferred (stream on demand)\n",
+                   converted_layers, total_layers, total_layers - (int)converted_layers);
+        } else {
+            printf("layer_window: aliased-cache active — %zu layers converted to imported "
+                   "anonymous buffers, zero-copy compute\n", converted_layers);
+        }
         fflush(stdout);
     }
     return aliased_cache;
@@ -648,60 +711,105 @@ bool layer_window_manager::convert_layers_to_aliased_cache() {
 #endif
 }
 
-// Build (VirtualAlloc + fill from mmap/file + import + re-point) one layer's
-// aliased buffer. Idempotent-safe: if the layer already has an aliased buffer,
-// returns true without rebuilding.
-bool layer_window_manager::build_layer_aliased(int layer_idx) {
+// Stage 2b-2: reserve a stable per-layer VA (no physical/commit cost) and point
+// each of the layer's weight tensors' data into it. Deferred weights then look
+// "pre-allocated" to the graph allocator (data != NULL) so gallocr skips them,
+// yet cost no RAM until the layer is committed (build_layer_aliased). Idempotent.
+bool layer_window_manager::alloc_layer_va(int layer_idx) {
 #ifdef _WIN32
-    if (layer_alias_buf.count(layer_idx)) return true;  // already built
+    if (layer_alias_anon.count(layer_idx)) return true;  // already reserved
 
     auto it = layer_tensors.find(layer_idx);
     if (it == layer_tensors.end() || it->second.empty()) return false;
     auto & locs = it->second;
 
-    const unsigned long MEM_COMMIT_  = 0x00001000;
     const unsigned long MEM_RESERVE_ = 0x00002000;
     const unsigned long PAGE_RW_     = 0x04;
-    const unsigned long MEM_RELEASE_ = 0x8000;
 
-    // Derive backend device + alignment from the first tensor's buffer.
+    // Derive alignment from the first tensor's buffer (dummy Vulkan buffer at load).
     ggml_tensor * t0 = nullptr;
     for (auto & loc : locs) { if (loc.tensor && loc.tensor->buffer) { t0 = loc.tensor; break; } }
     if (!t0) return false;
-
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t0->buffer);
-    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
-    if (!dev) return false;
     size_t align = ggml_backend_buft_get_alignment(buft);
     if (align == 0) align = 256;
 
-    // Pack tensors densely with buft alignment; compute packed offsets.
+    // Pack tensors densely with buft alignment; compute the total reserved size.
     std::vector<size_t> packed_off(locs.size(), 0);
     size_t packed = 0;
-    size_t max_tsize = 0;
     for (size_t i = 0; i < locs.size(); i++) {
         if (!locs[i].tensor) continue;
         packed = (packed + align - 1) & ~(align - 1);
         packed_off[i] = packed;
         packed += locs[i].n_bytes;
-        if (locs[i].n_bytes > max_tsize) max_tsize = locs[i].n_bytes;
     }
     const size_t total = (packed + align - 1) & ~(align - 1);
     if (total == 0) return false;
 
-    // Anonymous committed host memory (64K-aligned base — safe to import).
-    void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+    // Reserve VA only — no physical pages, no commit charge until committed.
+    void * anon = VirtualAlloc(nullptr, total, MEM_RESERVE_, PAGE_RW_);
     if (!anon) {
-        fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed for layer %d\n", total, layer_idx);
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(RESERVE %zu) failed for layer %d\n", total, layer_idx);
         return false;
     }
 
-    // Fill from mmap (preferred) or by streaming from the GGUF file.
-    bool fill_ok = true;
+    // Set each tensor's data into the reserved VA (stable across residency cycles).
     for (size_t i = 0; i < locs.size(); i++) {
-        auto & loc = locs[i];
+        if (!locs[i].tensor) continue;
+        locs[i].tensor->data = (uint8_t *) anon + packed_off[i];
+    }
+
+    layer_alias_anon[layer_idx] = anon;
+    layer_alias_size[layer_idx] = total;
+    return true;
+#else
+    (void) layer_idx;
+    return false;
+#endif
+}
+
+// Build one layer's aliased buffer: ensure its VA is reserved, COMMIT the pages,
+// fill from mmap/file, import zero-copy, and re-point the layer's tensors' buffer
+// at the imported buffer (data is already set by alloc_layer_va). Idempotent — if
+// the layer is already resident (has an imported buffer), returns true.
+bool layer_window_manager::build_layer_aliased(int layer_idx) {
+#ifdef _WIN32
+    if (layer_alias_buf.count(layer_idx)) return true;  // already resident
+    if (!alloc_layer_va(layer_idx)) return false;
+
+    auto it = layer_tensors.find(layer_idx);
+    if (it == layer_tensors.end() || it->second.empty()) return false;
+    auto & locs = it->second;
+
+    const unsigned long MEM_COMMIT_   = 0x00001000;
+    const unsigned long MEM_DECOMMIT_ = 0x00004000;
+    const unsigned long PAGE_RW_      = 0x04;
+
+    void * anon  = layer_alias_anon[layer_idx];
+    size_t total = layer_alias_size[layer_idx];
+
+    // Derive device from the first tensor's (dummy) buffer.
+    ggml_tensor * t0 = nullptr;
+    for (auto & loc : locs) { if (loc.tensor && loc.tensor->buffer) { t0 = loc.tensor; break; } }
+    if (!t0) return false;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t0->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (!dev) return false;
+
+    // Commit the reserved pages (physical RAM allocated here).
+    if (!VirtualAlloc(anon, total, MEM_COMMIT_, PAGE_RW_)) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(COMMIT %zu) failed for layer %d\n", total, layer_idx);
+        return false;
+    }
+
+    // Fill each tensor from mmap (preferred) or by streaming from the GGUF file,
+    // writing directly to the stable data pointer set by alloc_layer_va.
+    size_t max_tsize = 0;
+    bool fill_ok = true;
+    for (auto & loc : locs) {
         if (!loc.tensor) continue;
-        void * dst = (uint8_t *) anon + packed_off[i];
+        if (loc.n_bytes > max_tsize) max_tsize = loc.n_bytes;
+        void * dst = loc.tensor->data;
         const bool have_mmap = loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
         if (have_mmap) {
             memcpy(dst, mmap_bases[loc.file_idx] + loc.file_offset, loc.n_bytes);
@@ -711,25 +819,23 @@ bool layer_window_manager::build_layer_aliased(int layer_idx) {
             break;
         }
     }
-    if (!fill_ok) { VirtualFree(anon, 0, MEM_RELEASE_); return false; }
+    if (!fill_ok) { VirtualFree(anon, total, MEM_DECOMMIT_); return false; }
 
-    // Import the anonymous buffer into the backend (zero-copy alias).
+    // Import the committed anonymous buffer into the backend (zero-copy alias).
     ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, max_tsize);
     if (!buf) {
         fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed for layer %d (%zu bytes)\n", layer_idx, total);
-        VirtualFree(anon, 0, MEM_RELEASE_);
+        VirtualFree(anon, total, MEM_DECOMMIT_);
         return false;
     }
 
-    // Re-point the layer's weight tensors at the imported buffer.
-    for (size_t i = 0; i < locs.size(); i++) {
-        if (!locs[i].tensor) continue;
-        locs[i].tensor->buffer = buf;
-        locs[i].tensor->data   = (uint8_t *) anon + packed_off[i];
+    // Re-point the layer's weight tensors at the imported buffer (data unchanged).
+    for (auto & loc : locs) {
+        if (!loc.tensor) continue;
+        loc.tensor->buffer = buf;
     }
 
-    layer_alias_anon[layer_idx] = anon;
-    layer_alias_buf[layer_idx]  = (void *) buf;
+    layer_alias_buf[layer_idx] = (void *) buf;
     return true;
 #else
     (void) layer_idx;
@@ -737,21 +843,32 @@ bool layer_window_manager::build_layer_aliased(int layer_idx) {
 #endif
 }
 
-// Free one layer's aliased buffer: destroy the imported backend buffer, then
-// release its anonymous host memory. The layer's tensors keep stale pointers —
-// they must not be accessed until the layer is rebuilt (windowing guarantees a
-// layer's ops only run while it is resident).
+// Evict one layer: destroy the imported backend buffer, re-point the layer's
+// tensors back at the dummy 0-size buffer (keeping their stable data pointer),
+// then DECOMMIT the pages to reclaim physical RAM. The VA stays reserved so the
+// data pointer remains valid for the graph allocator; it is never dereferenced
+// while the layer is non-resident (windowing guarantees ops run only when it is).
 void layer_window_manager::free_layer_aliased(int layer_idx) {
 #ifdef _WIN32
+    const unsigned long MEM_DECOMMIT_ = 0x00004000;
+
+    // Re-point tensors off the imported buffer BEFORE freeing it (data stays).
+    auto it = layer_tensors.find(layer_idx);
+    if (it != layer_tensors.end()) {
+        for (auto & loc : it->second) {
+            if (loc.tensor) loc.tensor->buffer = (ggml_backend_buffer_t) alias_dummy_buf;
+        }
+    }
     auto bit = layer_alias_buf.find(layer_idx);
     if (bit != layer_alias_buf.end()) {
         ggml_backend_buffer_free((ggml_backend_buffer_t) bit->second);
         layer_alias_buf.erase(bit);
     }
+    // Decommit physical pages but keep the VA reserved (data pointer stays valid).
     auto ait = layer_alias_anon.find(layer_idx);
-    if (ait != layer_alias_anon.end()) {
-        VirtualFree(ait->second, 0, 0x8000 /*MEM_RELEASE*/);
-        layer_alias_anon.erase(ait);
+    auto sit = layer_alias_size.find(layer_idx);
+    if (ait != layer_alias_anon.end() && sit != layer_alias_size.end()) {
+        VirtualFree(ait->second, sit->second, MEM_DECOMMIT_);
     }
 #else
     (void) layer_idx;

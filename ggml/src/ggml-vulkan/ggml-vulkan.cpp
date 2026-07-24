@@ -7486,7 +7486,12 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
-        auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+        // Follow view_src so a view of a streamed (aliased) weight resolves to the
+        // base weight's CURRENT buffer, mirroring vk_tensor_offset. The view's own
+        // ->buffer may be a stale pointer captured at graph-allocation time (before
+        // the deferred layer was made resident).
+        const ggml_tensor * bt = tensor->view_src ? tensor->view_src : tensor;
+        auto buf_ctx = (ggml_backend_vk_buffer_context *)bt->buffer->context;
         buffer = buf_ctx->dev_buffer;
         offset = vk_tensor_offset(tensor) + tensor->view_offs;
     }
@@ -8567,8 +8572,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t r3 = ne13 / ne03;
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
-    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)(src0->view_src ? src0->view_src : src0)->buffer->context;
+    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)(src1->view_src ? src1->view_src : src1)->buffer->context;
 
     vk_buffer d_Qx = nullptr;
     size_t qx_buf_offset = 0;
@@ -9479,9 +9484,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t n_as = ne02;
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
-    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
-    ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
+    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)(src0->view_src ? src0->view_src : src0)->buffer->context;
+    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)(src1->view_src ? src1->view_src : src1)->buffer->context;
+    ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)(ids->view_src ? ids->view_src : ids)->buffer->context;
 
     vk_buffer d_Qx = nullptr;
     size_t qx_buf_offset = 0;
@@ -14254,17 +14259,44 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         // Destination nodes are checked against both the written/read lists. Source nodes are only
         // checked against the written list. Two nodes overlap in memory if they come from the same
         // buffer and the tensor or view ranges overlap.
+        // Layer-window streaming (B612): a weight tensor may point at the 0-size
+        // "dummy" buffer (deferred/evicted layer) whose dev_buffer has size 0, or
+        // at a buffer that has been freed by eviction. Such tensors own no real
+        // device memory, so they can never overlap another node for barrier
+        // purposes. Guard against dereferencing a null/invalid buffer context and
+        // treat these as non-overlapping. A one-shot diagnostic logs the first few
+        // offenders so the exact tensor can be root-caused.
+        auto const &lw_buf_of = [&](const ggml_tensor *t) -> vk_buffer {
+            if (!t || !t->buffer) { return nullptr; }
+            const ggml_tensor * bt = t->view_src ? t->view_src : t;
+            if (!bt->buffer) { return nullptr; }
+            ggml_backend_vk_buffer_context * bctx = (ggml_backend_vk_buffer_context *)bt->buffer->context;
+            if (!bctx) {
+                static int lw_warned = 0;
+                if (lw_warned < 8) {
+                    lw_warned++;
+                    fprintf(stderr, "LW-VK: skip sync for tensor '%s' op=%s buffer=%p (null context)\n",
+                            t->name, ggml_op_name(t->op), (void *)bt->buffer);
+                }
+                return nullptr;
+            }
+            return bctx->dev_buffer;
+        };
         auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
+            vk_buffer a_buf = lw_buf_of(node);
+            if (!a_buf || a_buf->size == 0) {
+                return false;
+            }
             auto n_base = vk_tensor_offset(node) + node->view_offs;
             auto n_size = ggml_nbytes(node);
-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
+                vk_buffer o_buf = lw_buf_of(other);
+                if (!o_buf || o_buf->size == 0) {
+                    continue;
+                }
                 if (a_buf == o_buf) {
                     auto o_base = vk_tensor_offset(other) + other->view_offs;
                     auto o_size = ggml_nbytes(other);

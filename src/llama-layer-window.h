@@ -140,18 +140,34 @@ struct layer_window_manager {
     // imported buffer so compute reads host memory directly — no per-token
     // upload copy. Returns true if at least one layer was converted.
     bool aliased_cache = false;              // set true after successful conversion
+    // Stage 2b-2: when aliased_streaming is true the aliased path does NOT keep
+    // every layer resident — only budget-worth are built at load and the rest
+    // are streamed on demand (build_layer_aliased) / evicted (free_layer_aliased).
+    // alias_dummy_buf is the 0-size Vulkan buffer that deferred/evicted layer
+    // tensors point at (valid buft for graph_reserve; never dereferenced while
+    // non-resident).
+    bool aliased_streaming = false;
+    void * alias_dummy_buf = nullptr;
     std::vector<void *> alias_anon;          // non-layer anonymous bases (for free)
     std::vector<void *> alias_bufs;          // non-layer ggml_backend_buffer_t (kept alive)
-    std::map<int, void *> layer_alias_anon;  // layer_idx -> anonymous base (per-layer free)
-    std::map<int, void *> layer_alias_buf;   // layer_idx -> ggml_backend_buffer_t
+    std::map<int, void *> layer_alias_anon;  // layer_idx -> reserved VA base (per-layer)
+    std::map<int, void *> layer_alias_buf;   // layer_idx -> ggml_backend_buffer_t (resident only)
+    std::map<int, size_t> layer_alias_size;  // layer_idx -> reserved VA size (for commit/decommit/free)
     bool convert_layers_to_aliased_cache();
 
-    // Build (VirtualAlloc + fill from mmap/file + import + re-point) the aliased
-    // buffer for a single layer. Stores anon/buf in the per-layer maps. Returns
-    // true on success. Used by convert_layers_to_aliased_cache and Stage 2b
-    // on-demand streaming.
+    // Stage 2b-2: reserve a stable per-layer VA (no physical/commit cost) and set
+    // each of the layer's weight tensors' data pointer into it. This makes deferred
+    // weights look "pre-allocated" to the graph allocator (data != NULL) so gallocr
+    // skips them, while costing no RAM until the layer becomes resident. Idempotent.
+    bool alloc_layer_va(int layer_idx);
+    // Build the aliased buffer for a single layer: ensure its VA is reserved,
+    // COMMIT the pages, fill from mmap/file, import zero-copy, and re-point the
+    // layer's tensors' buffer at the imported buffer (data already set by
+    // alloc_layer_va). Idempotent — returns true if already resident.
     bool build_layer_aliased(int layer_idx);
-    // Free a single layer's aliased buffer (destroy imported buffer + VirtualFree).
+    // Evict a single layer: destroy the imported buffer, re-point the layer's
+    // tensors back at the dummy buffer, and DECOMMIT the pages (keeping the VA
+    // reserved + data pointer stable). Physical RAM is reclaimed.
     void free_layer_aliased(int layer_idx);
 
     // Stage 2a: migrate a single residual GPU-resident weight (e.g. output.weight)
