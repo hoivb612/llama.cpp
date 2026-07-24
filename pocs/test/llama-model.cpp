@@ -1715,7 +1715,40 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // host-ptr import and no sparse residency), convert each layer to a
             // per-layer imported ANONYMOUS buffer so compute is zero-copy.
             if (!lwm->use_mmap) {
-                lwm->convert_layers_to_aliased_cache();
+                if (lwm->convert_layers_to_aliased_cache()) {
+                    // Stage 2a: every layer tensor now points at its own per-layer
+                    // imported anonymous buffer, so the original monolithic device
+                    // weight buffer that held the layer weights is fully orphaned
+                    // (double-allocated RAM). Free any weight buffer that no longer
+                    // has a single tensor referent to reclaim it (~9.5 GiB on the
+                    // AMD Vulkan/UMA path). Self-limiting: buffers that still back
+                    // live tensors (e.g. the CPU non-layer embed/output buffer, or
+                    // GPU-resident non-layer tensors in other offload configs) keep
+                    // their referents and are left untouched.
+                    size_t freed_bytes = 0;
+                    int    freed_bufs  = 0;
+                    for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
+                        ggml_context * cx = ctx_ptr.get();
+                        for (auto & bp : bufs) {
+                            if (!bp) continue;
+                            ggml_backend_buffer_t raw = bp.get();
+                            bool referenced = false;
+                            for (ggml_tensor * t = ggml_get_first_tensor(cx); t != nullptr; t = ggml_get_next_tensor(cx, t)) {
+                                if (t->buffer == raw) { referenced = true; break; }
+                            }
+                            if (!referenced) {
+                                freed_bytes += ggml_backend_buffer_get_size(raw);
+                                freed_bufs++;
+                                bp.reset();  // frees now; teardown sees null -> no double free
+                            }
+                        }
+                    }
+                    if (freed_bufs > 0) {
+                        LLAMA_LOG_INFO("%s: layer_window: freed %d orphaned weight buffer(s) "
+                                       "(%.1f MiB) after aliased-cache conversion\n",
+                                       __func__, freed_bufs, freed_bytes / (1024.0 * 1024.0));
+                    }
+                }
             }
             // Compute reference checksums before releasing mmap pages
             lwm->compute_reference_checksums();
