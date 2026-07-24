@@ -1484,6 +1484,11 @@ bool llama_model_loader::load_all_data(
                 lwm->init(n_layers, lwm->budget_bytes / (1024 * 1024));
             }
             lwm->non_layer_bytes = non_layer_size;
+            // Stage 2b: the alloc path may have chosen dummy buffers (aliased-stream
+            // mode) before this manager existed — transfer that decision now.
+            if (layer_window_manager::aliased_load_pending) {
+                lwm->aliased_load_mode = true;
+            }
             for (const auto & [idx, sz] : layer_sizes) {
                 lwm->set_layer_size(idx, sz);
             }
@@ -1620,6 +1625,17 @@ bool llama_model_loader::load_all_data(
                 // Record file location for ALL layers (even initially loaded ones)
                 // so they can be evicted and reloaded later during windowing
                 lwm->record_tensor_location(layer_idx, name, weight->idx, weight->offs, n_size, cur);
+            }
+            // Stage 2b: aliased-stream load mode — the manager owns every windowed
+            // (non-host) weight via a dummy buffer. Record its file location and skip
+            // the loader fill entirely; build_layer_aliased / build_non_layer_aliased
+            // populate it from disk post-load. Never allocates the full device buffer.
+            if (lwm->aliased_load_mode && cur->buffer && !ggml_backend_buffer_is_host(cur->buffer)) {
+                if (layer_idx < 0) {
+                    lwm->record_non_layer_location(name, weight->idx, weight->offs, n_size, cur);
+                }
+                size_done += n_size;
+                continue;
             }
             if (layer_idx >= 0 && !lwm->should_load_layer(layer_idx)) {
 

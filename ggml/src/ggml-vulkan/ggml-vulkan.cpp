@@ -1005,6 +1005,11 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    // UMA zero-copy weight aliasing: true when this buffer was imported from a
+    // host pointer (VK_EXT_external_memory_host). Such buffers address tensors
+    // relative to the imported base (buf->ptr), not the vk_ptr_base sentinel.
+    bool is_imported = false;
+
     // Sparse buffer support (layer windowing)
     bool is_sparse = false;
     vk::DeviceMemory backing_memory = VK_NULL_HANDLE;  // pool of 64KB pages
@@ -2167,11 +2172,18 @@ struct ggml_backend_vk_context {
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
+// For UMA zero-copy weight aliasing (buffer_from_host_ptr), an imported buffer's
+// tensors carry their real mmap host address in tensor->data, so offsets must be
+// taken relative to the imported base rather than the vk_ptr_base sentinel.
+// Returns the imported host base for such buffers, or nullptr otherwise.
+static void * vk_imported_base(const ggml_tensor * t);
+
 static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
-    if (tensor->view_src) {
-        return (uint8_t *) tensor->view_src->data - (uint8_t *) vk_ptr_base;
+    const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
+    if (void * ibase = vk_imported_base(t)) {
+        return (uint8_t *) t->data - (uint8_t *) ibase;
     }
-    return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
+    return (uint8_t *) t->data - (uint8_t *) vk_ptr_base;
 }
 
 static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t)
@@ -3082,6 +3094,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             import_info.setPNext(&mem_flags_info);
             buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
         } catch (const vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: imported host-ptr allocateMemory failed (size=%zu, memtype=%u): %s\n",
+                          (size_t) size, memory_type_idx, e.what());
         }
     } else {
         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
@@ -3126,6 +3140,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     if (import_ptr) {
         buf->ptr = import_ptr;
+        buf->is_imported = true;
     } else {
         if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
             buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
@@ -14869,6 +14884,17 @@ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
     return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
 }
 
+static void * vk_imported_base(const ggml_tensor * t) {
+    if (!t || !t->buffer || !ggml_backend_buffer_is_vk(t->buffer)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
+    if (!ctx || !ctx->dev_buffer || !ctx->dev_buffer->is_imported) {
+        return nullptr;
+    }
+    return ctx->dev_buffer->ptr;
+}
+
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
@@ -14877,9 +14903,13 @@ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 }
 
 static void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    if (ctx && ctx->dev_buffer && ctx->dev_buffer->is_imported) {
+        // UMA aliasing: tensors point into the imported mmap; report the real base
+        // so ggml_backend_tensor_alloc range asserts and vk_tensor_offset stay consistent.
+        return ctx->dev_buffer->ptr;
+    }
     return vk_ptr_base;
-
-    UNUSED(buffer);
 }
 
 static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -17553,24 +17583,106 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
         return {};
     }
 
-    uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
-    if (uptr & (device->min_imported_host_pointer_alignment - 1)) {
+    const uintptr_t align = device->min_imported_host_pointer_alignment;
+    if (align == 0 || (align & (align - 1)) != 0) {
+        // Non power-of-two (or unknown) alignment: cannot safely align — bail.
         return {};
     }
-    if (size & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
-    }
+
+    // The GGUF mmap hands us a pointer at a 32-byte tensor offset, which won't
+    // satisfy the (typically 4096-byte) import alignment. Import a page-aligned
+    // super-range [aligned_ptr, aligned_ptr + aligned_size) that fully covers
+    // [ptr, ptr + size). Tensor offsets are then taken relative to aligned_ptr
+    // (see get_base / vk_tensor_offset / is_imported). The mmap base is already
+    // page-aligned and mmap maps whole pages, so the rounded-up tail stays within
+    // valid host memory.
+    const uintptr_t uptr         = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t aligned_ptr  = uptr & ~(align - 1);
+    const size_t    head         = (size_t)(uptr - aligned_ptr);
+    const size_t    aligned_size = (head + size + (align - 1)) & ~(align - 1);
 
     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
 
     vk_buffer buf {};
     try {
-        buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
+        buf = ggml_vk_create_buffer(device, aligned_size, { property_flags }, (void *) aligned_ptr);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
     }
 
     return buf;
+}
+
+#ifdef _WIN32
+// Minimal decls to avoid pulling in <windows.h> for the host-ptr import probe.
+extern "C" __declspec(dllimport) void * __stdcall VirtualAlloc(void *, size_t, unsigned long, unsigned long);
+extern "C" __declspec(dllimport) int    __stdcall VirtualFree(void *, size_t, unsigned long);
+#endif
+
+// One-shot diagnostic (gated by GGML_VK_TEST_HOSTPTR=1) that answers whether this
+// Vulkan driver will import ANONYMOUS host memory via VK_EXT_external_memory_host —
+// the file-backed mmap import fails with ErrorInvalidExternalHandle, so before
+// building a VirtualAlloc-backed streaming cache we must confirm anonymous import
+// works, and whether a reserved-but-partially-committed range can be imported.
+static void ggml_vk_test_host_ptr_import(vk_device & device) {
+#ifdef _WIN32
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long MEM_RELEASE_ = 0x00008000;
+    const unsigned long PAGE_RW_     = 0x04;
+
+    const size_t A   = device->min_imported_host_pointer_alignment ?
+                       (size_t) device->min_imported_host_pointer_alignment : 4096;
+    GGML_LOG_WARN("hostptr-test: external_memory_host=%d min_import_align=%zu max_buffer_size=%zu\n",
+                  (int) device->external_memory_host, A, (size_t) device->max_buffer_size);
+
+    // Variant 1: fully-committed anonymous memory (the baseline Option-2 assumption).
+    {
+        const size_t sz = (16u * 1024 * 1024 + A - 1) & ~(A - 1);
+        void * p = VirtualAlloc(nullptr, sz, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+        if (!p) {
+            GGML_LOG_WARN("hostptr-test: VirtualAlloc(commit,16M) failed\n");
+        } else {
+            memset(p, 0xAB, sz);
+            vk_buffer b = ggml_vk_buffer_from_host_ptr(device, p, sz);
+            GGML_LOG_WARN("hostptr-test: [1] committed-anonymous import(16M) => %s\n",
+                          b ? "SUCCEEDED" : "FAILED");
+            ggml_vk_destroy_buffer(b);
+            VirtualFree(p, 0, MEM_RELEASE_);
+        }
+    }
+
+    // Variant 2: reserve a large range, commit only a prefix, then try to import
+    // (a) the whole reserved range and (b) only the committed prefix. This tells us
+    // whether the driver requires the entire imported range to be committed.
+    {
+        const size_t reserve_sz = 256u * 1024 * 1024;
+        const size_t commit_sz  = (16u * 1024 * 1024 + A - 1) & ~(A - 1);
+        void * r = VirtualAlloc(nullptr, reserve_sz, MEM_RESERVE_, PAGE_RW_);
+        if (!r) {
+            GGML_LOG_WARN("hostptr-test: VirtualAlloc(reserve,256M) failed\n");
+        } else {
+            void * c = VirtualAlloc(r, commit_sz, MEM_COMMIT_, PAGE_RW_);
+            if (!c) {
+                GGML_LOG_WARN("hostptr-test: partial commit(16M) failed\n");
+            } else {
+                memset(r, 0xCD, commit_sz);
+                vk_buffer bfull = ggml_vk_buffer_from_host_ptr(device, r, reserve_sz);
+                GGML_LOG_WARN("hostptr-test: [2a] reserved(256M)/committed(16M) import FULL range => %s\n",
+                              bfull ? "SUCCEEDED" : "FAILED");
+                ggml_vk_destroy_buffer(bfull);
+
+                vk_buffer bsub = ggml_vk_buffer_from_host_ptr(device, r, commit_sz);
+                GGML_LOG_WARN("hostptr-test: [2b] reserved/committed import COMMITTED subrange(16M) => %s\n",
+                              bsub ? "SUCCEEDED" : "FAILED");
+                ggml_vk_destroy_buffer(bsub);
+            }
+            VirtualFree(r, 0, MEM_RELEASE_);
+        }
+    }
+#else
+    GGML_UNUSED(device);
+#endif
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -17580,15 +17692,25 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
+    if (getenv("GGML_VK_TEST_HOSTPTR") || true) {
+        static bool tested = false;
+        if (!tested) { tested = true; ggml_vk_test_host_ptr_import(device); }
+    }
+
     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
 
     if (!buf) {
         return {};
     }
 
+    // The imported buffer spans a page-aligned super-range whose base (buf->ptr)
+    // sits at or below `ptr`. Report that aligned size so ggml_backend_tensor_alloc's
+    // range check (addr + nbytes <= get_base() + buffer_size) holds for every tensor.
+    const size_t aligned_size = buf->size;
+
     ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
 
-    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
+    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, aligned_size);
 
     return ret;
 }

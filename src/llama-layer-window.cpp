@@ -483,6 +483,9 @@ void layer_window_manager::evict_to_budget(int protected_layer) {
 bool layer_window_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     layer_window_manager * lwm = (layer_window_manager *)user_data;
     if (!lwm || lwm->budget_bytes == 0) return false;
+    // Stage 1: aliased cache keeps every layer resident in imported anonymous
+    // buffers, so compute reads them directly — no per-token load/evict.
+    if (lwm->aliased_cache) return false;
 
     int layer = layer_window_manager::get_layer_from_tensor(t);
 
@@ -617,6 +620,273 @@ void layer_window_manager::mark_initially_resident() {
             resident_bytes += entries[i].memory_size;
         }
     }
+}
+
+// Stage 1: convert each layer's weights into a per-layer ANONYMOUS host buffer
+// that is imported (zero-copy) into the backend, then re-point the layer's
+// tensors at the imported buffer. Used when the backend cannot alias the
+// file-backed mmap directly and has no sparse residency (AMD Vulkan/Windows).
+bool layer_window_manager::convert_layers_to_aliased_cache() {
+#ifdef _WIN32
+    if (budget_bytes == 0 || layer_tensors.empty()) return false;
+
+    size_t converted_layers = 0;
+    for (auto & [layer_idx, locs] : layer_tensors) {
+        if (locs.empty()) continue;
+        if (build_layer_aliased(layer_idx)) converted_layers++;
+    }
+
+    if (converted_layers > 0) {
+        aliased_cache = true;
+        printf("layer_window: aliased-cache active — %zu layers converted to imported "
+               "anonymous buffers, zero-copy compute\n", converted_layers);
+        fflush(stdout);
+    }
+    return aliased_cache;
+#else
+    return false;
+#endif
+}
+
+// Build (VirtualAlloc + fill from mmap/file + import + re-point) one layer's
+// aliased buffer. Idempotent-safe: if the layer already has an aliased buffer,
+// returns true without rebuilding.
+bool layer_window_manager::build_layer_aliased(int layer_idx) {
+#ifdef _WIN32
+    if (layer_alias_buf.count(layer_idx)) return true;  // already built
+
+    auto it = layer_tensors.find(layer_idx);
+    if (it == layer_tensors.end() || it->second.empty()) return false;
+    auto & locs = it->second;
+
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+    const unsigned long MEM_RELEASE_ = 0x8000;
+
+    // Derive backend device + alignment from the first tensor's buffer.
+    ggml_tensor * t0 = nullptr;
+    for (auto & loc : locs) { if (loc.tensor && loc.tensor->buffer) { t0 = loc.tensor; break; } }
+    if (!t0) return false;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t0->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (!dev) return false;
+    size_t align = ggml_backend_buft_get_alignment(buft);
+    if (align == 0) align = 256;
+
+    // Pack tensors densely with buft alignment; compute packed offsets.
+    std::vector<size_t> packed_off(locs.size(), 0);
+    size_t packed = 0;
+    size_t max_tsize = 0;
+    for (size_t i = 0; i < locs.size(); i++) {
+        if (!locs[i].tensor) continue;
+        packed = (packed + align - 1) & ~(align - 1);
+        packed_off[i] = packed;
+        packed += locs[i].n_bytes;
+        if (locs[i].n_bytes > max_tsize) max_tsize = locs[i].n_bytes;
+    }
+    const size_t total = (packed + align - 1) & ~(align - 1);
+    if (total == 0) return false;
+
+    // Anonymous committed host memory (64K-aligned base — safe to import).
+    void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+    if (!anon) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed for layer %d\n", total, layer_idx);
+        return false;
+    }
+
+    // Fill from mmap (preferred) or by streaming from the GGUF file.
+    bool fill_ok = true;
+    for (size_t i = 0; i < locs.size(); i++) {
+        auto & loc = locs[i];
+        if (!loc.tensor) continue;
+        void * dst = (uint8_t *) anon + packed_off[i];
+        const bool have_mmap = loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
+        if (have_mmap) {
+            memcpy(dst, mmap_bases[loc.file_idx] + loc.file_offset, loc.n_bytes);
+        } else if (!read_tensor_bytes(loc.file_idx, loc.file_offset, loc.n_bytes, dst)) {
+            fprintf(stderr, "LW-ALIAS: failed to fill layer %d tensor %s\n", layer_idx, loc.name.c_str());
+            fill_ok = false;
+            break;
+        }
+    }
+    if (!fill_ok) { VirtualFree(anon, 0, MEM_RELEASE_); return false; }
+
+    // Import the anonymous buffer into the backend (zero-copy alias).
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, max_tsize);
+    if (!buf) {
+        fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed for layer %d (%zu bytes)\n", layer_idx, total);
+        VirtualFree(anon, 0, MEM_RELEASE_);
+        return false;
+    }
+
+    // Re-point the layer's weight tensors at the imported buffer.
+    for (size_t i = 0; i < locs.size(); i++) {
+        if (!locs[i].tensor) continue;
+        locs[i].tensor->buffer = buf;
+        locs[i].tensor->data   = (uint8_t *) anon + packed_off[i];
+    }
+
+    layer_alias_anon[layer_idx] = anon;
+    layer_alias_buf[layer_idx]  = (void *) buf;
+    return true;
+#else
+    (void) layer_idx;
+    return false;
+#endif
+}
+
+// Free one layer's aliased buffer: destroy the imported backend buffer, then
+// release its anonymous host memory. The layer's tensors keep stale pointers —
+// they must not be accessed until the layer is rebuilt (windowing guarantees a
+// layer's ops only run while it is resident).
+void layer_window_manager::free_layer_aliased(int layer_idx) {
+#ifdef _WIN32
+    auto bit = layer_alias_buf.find(layer_idx);
+    if (bit != layer_alias_buf.end()) {
+        ggml_backend_buffer_free((ggml_backend_buffer_t) bit->second);
+        layer_alias_buf.erase(bit);
+    }
+    auto ait = layer_alias_anon.find(layer_idx);
+    if (ait != layer_alias_anon.end()) {
+        VirtualFree(ait->second, 0, 0x8000 /*MEM_RELEASE*/);
+        layer_alias_anon.erase(ait);
+    }
+#else
+    (void) layer_idx;
+#endif
+}
+
+
+// Stage 2a: migrate one residual GPU-resident weight (non-blk.* tensor sharing the
+// big layer buffer, e.g. output.weight) into its own imported anonymous buffer.
+bool layer_window_manager::migrate_residual_tensor(ggml_tensor * t) {
+#ifdef _WIN32
+    if (!t || !t->buffer) return false;
+
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+    const unsigned long MEM_RELEASE_ = 0x8000;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (!dev) return false;
+    size_t align = ggml_backend_buft_get_alignment(buft);
+    if (align == 0) align = 256;
+
+    const size_t nbytes = ggml_nbytes(t);
+    if (nbytes == 0) return false;
+    const size_t total = (nbytes + align - 1) & ~(align - 1);
+
+    void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+    if (!anon) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed migrating residual %s\n", total, t->name);
+        return false;
+    }
+
+    // Pull the tensor's current bytes back from the device into host memory.
+    ggml_backend_tensor_get(t, anon, 0, nbytes);
+
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, nbytes);
+    if (!buf) {
+        fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed migrating residual %s (%zu bytes)\n",
+                t->name, total);
+        VirtualFree(anon, 0, MEM_RELEASE_);
+        return false;
+    }
+
+    t->buffer = buf;
+    t->data   = anon;
+
+    alias_anon.push_back(anon);
+    alias_bufs.push_back((void *) buf);
+    return true;
+#else
+    (void) t;
+    return false;
+#endif
+}
+
+// ---- Stage 2b: load-time aliased streaming ----
+
+bool layer_window_manager::alias_stream_enabled() {
+    static const int v = (getenv("GGML_LW_ALIAS_STREAM") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+
+bool layer_window_manager::aliased_load_pending = false;
+
+void layer_window_manager::record_non_layer_location(const std::string & name, uint16_t file_idx,
+                                                     size_t offset, size_t n_bytes, ggml_tensor * tensor) {
+    non_layer_locs.push_back({name, file_idx, offset, n_bytes, tensor, 0});
+}
+
+// Build imported anonymous buffers for every recorded non-layer GPU weight
+// (e.g. output.weight), filling from mmap/file. Each tensor gets its own buffer.
+// Returns the number successfully built.
+int layer_window_manager::build_non_layer_aliased() {
+#ifdef _WIN32
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+    const unsigned long MEM_RELEASE_ = 0x8000;
+
+    int    built = 0;
+    size_t built_bytes = 0;
+    for (auto & loc : non_layer_locs) {
+        ggml_tensor * t = loc.tensor;
+        if (!t || !t->buffer) continue;
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+        if (!dev) continue;
+        size_t align = ggml_backend_buft_get_alignment(buft);
+        if (align == 0) align = 256;
+
+        const size_t total = (loc.n_bytes + align - 1) & ~(align - 1);
+        if (total == 0) continue;
+
+        void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+        if (!anon) {
+            fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed for non-layer %s\n", total, loc.name.c_str());
+            continue;
+        }
+
+        const bool have_mmap = loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
+        if (have_mmap) {
+            memcpy(anon, mmap_bases[loc.file_idx] + loc.file_offset, loc.n_bytes);
+        } else if (!read_tensor_bytes(loc.file_idx, loc.file_offset, loc.n_bytes, anon)) {
+            fprintf(stderr, "LW-ALIAS: failed to fill non-layer %s\n", loc.name.c_str());
+            VirtualFree(anon, 0, MEM_RELEASE_);
+            continue;
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, loc.n_bytes);
+        if (!buf) {
+            fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed for non-layer %s (%zu bytes)\n",
+                    loc.name.c_str(), total);
+            VirtualFree(anon, 0, MEM_RELEASE_);
+            continue;
+        }
+
+        t->buffer = buf;
+        t->data   = anon;
+        alias_anon.push_back(anon);
+        alias_bufs.push_back((void *) buf);
+        built++;
+        built_bytes += total;
+    }
+    if (built > 0) {
+        printf("layer_window: built %d non-layer weight(s) (%.1f MiB) into imported anonymous buffers\n",
+               built, built_bytes / (1024.0 * 1024.0));
+        fflush(stdout);
+    }
+    return built;
+#else
+    return 0;
+#endif
 }
 
 void layer_window_manager::release_mmap_pages() {

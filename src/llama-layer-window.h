@@ -132,6 +132,58 @@ struct layer_window_manager {
     // Release mmap pages to reclaim physical RAM (call after mmap_bases is set)
     void release_mmap_pages();
 
+    // ---- Stage 1: per-layer zero-copy aliased cache (Vulkan UMA fallback) ----
+    // When the backend cannot alias the file-backed mmap directly (e.g. AMD
+    // Vulkan on Windows: no file-backed host-ptr import, no sparse residency),
+    // convert each layer's weights into a per-layer ANONYMOUS host buffer that
+    // IS imported into the backend (zero-copy). Tensors are re-pointed at the
+    // imported buffer so compute reads host memory directly — no per-token
+    // upload copy. Returns true if at least one layer was converted.
+    bool aliased_cache = false;              // set true after successful conversion
+    std::vector<void *> alias_anon;          // non-layer anonymous bases (for free)
+    std::vector<void *> alias_bufs;          // non-layer ggml_backend_buffer_t (kept alive)
+    std::map<int, void *> layer_alias_anon;  // layer_idx -> anonymous base (per-layer free)
+    std::map<int, void *> layer_alias_buf;   // layer_idx -> ggml_backend_buffer_t
+    bool convert_layers_to_aliased_cache();
+
+    // Build (VirtualAlloc + fill from mmap/file + import + re-point) the aliased
+    // buffer for a single layer. Stores anon/buf in the per-layer maps. Returns
+    // true on success. Used by convert_layers_to_aliased_cache and Stage 2b
+    // on-demand streaming.
+    bool build_layer_aliased(int layer_idx);
+    // Free a single layer's aliased buffer (destroy imported buffer + VirtualFree).
+    void free_layer_aliased(int layer_idx);
+
+    // Stage 2a: migrate a single residual GPU-resident weight (e.g. output.weight)
+    // that shares the monolithic layer buffer but is NOT a blk.* layer tensor into
+    // its own imported ANONYMOUS buffer. Reads the tensor's current bytes back from
+    // the device, imports host memory zero-copy, and re-points the tensor. This
+    // vacates the last referents off the big layer buffer so it can be freed.
+    // Returns true on success (tensor re-pointed); false leaves the tensor as-is.
+    bool migrate_residual_tensor(ggml_tensor * t);
+
+    // ---- Stage 2b: load-time aliased streaming (never allocate the full buffer) ----
+    // When GGML_LW_ALIAS_STREAM is set, the loader gives the windowed weight ctx a
+    // dummy 0-size buffer instead of the monolithic device buffer (which OOMs on
+    // constrained UMA systems). The manager then OWNS every windowed weight: it
+    // builds per-layer imported anonymous buffers from mmap/file post-load and (in
+    // 2b) streams deferred layers on demand. Non-blk.* GPU weights (output.weight)
+    // are recorded separately so they too can be built from disk (no device copy
+    // exists to read back).
+    bool aliased_load_mode = false;                 // set by loader when dummy buffer chosen
+    std::vector<tensor_location> non_layer_locs;    // recorded non-blk.* GPU weights
+    void record_non_layer_location(const std::string & name, uint16_t file_idx,
+                                   size_t offset, size_t n_bytes, ggml_tensor * tensor);
+    // Build imported anonymous buffers for all recorded non-layer GPU weights,
+    // filling from mmap/file. Returns the number built.
+    int build_non_layer_aliased();
+    // True when the aliased-stream load path should be used (env-gated).
+    static bool alias_stream_enabled();
+    // The alloc path (llama-model.cpp) decides to use a dummy buffer BEFORE the
+    // manager is created (creation happens later in load_all_data). It records
+    // that decision here so load_all_data can transfer it onto the manager.
+    static bool aliased_load_pending;
+
     // Compute reference checksums for mmap data integrity verification
     // Must be called AFTER mmap_bases is populated and BEFORE release_mmap_pages
     void compute_reference_checksums();
