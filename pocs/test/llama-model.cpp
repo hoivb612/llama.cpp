@@ -1605,7 +1605,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         if ((!ml.use_mmap || !use_mmap_buffer || !buffer_from_host_ptr_supported || !is_default_buft) || buffer_from_host_ptr_failed) {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            // Stage 2b: on the AMD Vulkan/UMA windowing path the monolithic device
+            // weight buffer (full model size) OOMs on constrained systems and has
+            // no sparse residency to page it. When GGML_LW_ALIAS_STREAM is set, give
+            // this non-CPU windowed ctx a dummy 0-size buffer instead: the layer
+            // window manager OWNS every weight in it, building per-layer imported
+            // anonymous buffers from mmap/file post-load and streaming on demand —
+            // so the full buffer is never allocated.
+            layer_window_manager * lwm_alias = llama_get_layer_window_manager();
+            bool use_aliased_dummy = !is_cpu_dev
+                && layer_window_manager::alias_stream_enabled()
+                && lwm_alias && lwm_alias->budget_bytes > 0;
+            if (ml.no_alloc || use_aliased_dummy) {
+                if (use_aliased_dummy) {
+                    lwm_alias->aliased_load_mode = true;
+                    LLAMA_LOG_INFO("%s: layer_window: GGML_LW_ALIAS_STREAM — skipping full %s buffer "
+                                   "allocation; manager owns weights (dummy buffer)\n",
+                                   __func__, ggml_backend_buft_name(buft));
+                }
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -1716,6 +1733,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // host-ptr import and no sparse residency), convert each layer to a
             // per-layer imported ANONYMOUS buffer so compute is zero-copy.
             if (!lwm->use_mmap) {
+                // Stage 2b: aliased-stream load mode — no monolithic device buffer
+                // was ever allocated (the ctx has only a dummy 0-size buffer). Build
+                // per-layer imported anonymous buffers directly from mmap/file for
+                // every windowed weight, then the non-layer GPU weights (output.weight).
+                // There is no big buffer to migrate off of or free.
+                if (lwm->aliased_load_mode) {
+                    lwm->convert_layers_to_aliased_cache();
+                    lwm->build_non_layer_aliased();
+                } else {
                 // Capture the device buffer(s) that back the layer weights BEFORE
                 // conversion re-points them. These are exactly the buffers Stage 2a
                 // wants to vacate + free; anything else (CPU non-layer buffer) is
@@ -1792,6 +1818,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                                        __func__, freed_bufs, freed_bytes / (1024.0 * 1024.0));
                     }
                 }
+                } // else (!aliased_load_mode)
             }
             // Compute reference checksums before releasing mmap pages
             lwm->compute_reference_checksums();
