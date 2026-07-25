@@ -490,3 +490,23 @@ ggml_tensor * llama_moe_streamed_mul_mat_id(
 
     return ggml_mul_mat_id(ctx0, compact, cur, iota);
 }
+
+size_t llama_moe_stream_pool_bytes(int * n_pools, long long * total_slots, double * hit_rate) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    size_t    bytes = 0;
+    int       pools = 0;
+    long long slots = 0;
+    uint64_t  hits  = 0, miss = 0;
+    for (const expert_pool * p : g_pools) {
+        if (!p || !p->inited || p->failed) continue;
+        pools += 1;
+        bytes += p->total;
+        slots += p->pool_slots;
+        hits  += p->hits;
+        miss  += p->misses;
+    }
+    if (n_pools)     *n_pools     = pools;
+    if (total_slots) *total_slots = slots;
+    if (hit_rate)    *hit_rate    = (hits + miss) ? 100.0 * (double) hits / (double) (hits + miss) : 0.0;
+    return bytes;
+}

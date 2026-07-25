@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-layer-window.h"
+#include "llama-moe-stream.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -4363,6 +4364,45 @@ void llama_perf_context_print(const llama_context * ctx) {
                    pmc.PeakWorkingSetSize / (1024.0 * 1024.0),
                    pmc.WorkingSetSize / (1024.0 * 1024.0),
                    pmc.PrivateUsage / (1024.0 * 1024.0));
+
+            // Break down the private/committed pages under --weight-budget. The
+            // committed contributors are: the host-coherent expert pools
+            // (VirtualAlloc'd, also GPU-visible on UMA), the always-resident
+            // non-expert layer weights (imported anonymous host buffers), and the
+            // non-layer weights (embed/output). Whatever remains is KV cache +
+            // compute buffers + CRT heap. The streamed expert weights are NOT
+            // committed — they live in reclaimable file-backed page cache (the
+            // large working-set/private gap), so they must be subtracted from the
+            // layer-window's resident_bytes (which counts each layer's FULL size,
+            // experts included) to get the truly-committed non-expert weights.
+            if (lwm && lwm->budget_bytes > 0) {
+                int       n_pools = 0;
+                long long n_slots = 0;
+                double    hit     = 0.0;
+                const size_t pool_b = llama_moe_stream_pool_bytes(&n_pools, &n_slots, &hit);
+
+                // streamed (non-committed) expert weight bytes = sum of _exps.weight
+                size_t exp_b = 0;
+                for (const auto & kv : lwm->layer_tensors) {
+                    for (const auto & loc : kv.second) {
+                        if (loc.name.find("_exps.weight") != std::string::npos) exp_b += loc.n_bytes;
+                    }
+                }
+
+                const double MiB      = 1024.0 * 1024.0;
+                const double priv_mib = pmc.PrivateUsage / MiB;
+                const double pool_mib = pool_b / MiB;
+                const double nonexp_committed = (lwm->resident_bytes > exp_b)
+                                              ? (lwm->resident_bytes - exp_b) / MiB : 0.0;
+                const double nonl_mib = lwm->non_layer_bytes / MiB;
+                const double other    = priv_mib - pool_mib - nonexp_committed - nonl_mib;
+                LLAMA_LOG_INFO("private_breakdown (MiB): total=%.1f = expert_pools=%.1f (%d pools, %lld slots, hit %.1f%%)"
+                               " + resident_nonexpert=%.1f + nonlayer=%.1f + other(kv/compute/heap)=%.1f\n",
+                       priv_mib, pool_mib, n_pools, n_slots, hit, nonexp_committed, nonl_mib,
+                       other >= 0.0 ? other : 0.0);
+                LLAMA_LOG_INFO("  (streamed experts = %.1f MiB, NOT committed — served from mmap page cache; "
+                               "working_set includes them, private does not)\n", exp_b / MiB);
+            }
         }
     }
 #endif

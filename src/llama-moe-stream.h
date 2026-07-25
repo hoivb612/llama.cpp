@@ -22,6 +22,15 @@ struct ggml_tensor;
 // True when GGML_LW_MOE_STREAM is set (env-gated, checked once).
 bool llama_moe_stream_enabled();
 
+// Aggregate committed memory of all Phase-A2 expert pools. Each pool is a
+// VirtualAlloc'd (MEM_COMMIT) host block imported as a host-coherent Vulkan
+// buffer, so on UMA this memory counts BOTH toward the process private/committed
+// pages AND toward what the GPU can read. Returns total committed bytes across
+// all pools; optional out-params report the pool count, the summed slot count,
+// and the cumulative decode hit-rate (0..100). Safe to call any time (returns 0
+// before any pool is created).
+size_t llama_moe_stream_pool_bytes(int * n_pools, long long * total_slots, double * hit_rate);
+
 // Build a mul_mat_id over the routed experts by gathering their slabs from the
 // model's mmap/file into a compact per-call tensor, so the full expert weight
 // matrix never needs to be resident.
