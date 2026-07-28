@@ -435,8 +435,18 @@ inline static void ggml_vec_mad_f32(const int n, float * GGML_RESTRICT y, const 
             }
         }
 
+        // vectorize the GGML_F32_EPR-sized remainder before the scalar tail
+        // (e.g. head_dim=96 with GGML_F32_STEP=64 leaves 32 elems)
+        const int np2 = (n & ~(GGML_F32_EPR - 1));
+        for (int i = np; i < np2; i += GGML_F32_EPR) {
+            GGML_F32_VEC rx = GGML_F32_VEC_LOAD(x + i);
+            GGML_F32_VEC ry = GGML_F32_VEC_LOAD(y + i);
+            ry = GGML_F32_VEC_FMA(ry, rx, vx);
+            GGML_F32_VEC_STORE(y + i, ry);
+        }
+
         // leftovers
-        for (int i = np; i < n; ++i) {
+        for (int i = np2; i < n; ++i) {
             y[i] += x[i]*v;
         }
     #endif
@@ -566,7 +576,7 @@ GGML_VEC_ALWAYS_INLINE static void ggml_vec_mad_f16(const int n, ggml_fp16_t * G
         const int np = 0;
     #endif
 #elif defined(GGML_SIMD)
-    const int np = (n & ~(GGML_F16_STEP - 1));
+    int np = (n & ~(GGML_F16_STEP - 1));
 
     GGML_F16_VEC vx = GGML_F16_VEC_SET1(v);
 
@@ -582,6 +592,18 @@ GGML_VEC_ALWAYS_INLINE static void ggml_vec_mad_f16(const int n, ggml_fp16_t * G
             GGML_F16_VEC_STORE(y + i + j*GGML_F16_EPR, ay, j);
         }
     }
+
+    // vectorize the GGML_F16_EPR-sized remainder before the scalar tail
+    // (e.g. head_dim=96 with GGML_F16_STEP=64 leaves 32 elems)
+    const int np2 = (n & ~(GGML_F16_EPR - 1));
+    for (int i = np; i < np2; i += GGML_F16_EPR) {
+        ax[0] = GGML_F16_VEC_LOAD(x + i, 0);
+        ay[0] = GGML_F16_VEC_LOAD(y + i, 0);
+        ay[0] = GGML_F16_VEC_FMA(ay[0], ax[0], vx);
+
+        GGML_F16_VEC_STORE(y + i, ay, 0);
+    }
+    np = np2;
 #else
     // scalar path
     const int np = 0;
@@ -765,8 +787,17 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
             }
         }
 
+        // vectorize the GGML_F32_EPR-sized remainder before the scalar tail
+        // (e.g. head_dim=96 with GGML_F32_STEP=64 leaves 32 elems)
+        const int np2 = (n & ~(GGML_F32_EPR - 1));
+        for (int i = np; i < np2; i += GGML_F32_EPR) {
+            GGML_F32_VEC ry = GGML_F32_VEC_LOAD(y + i);
+            ry = GGML_F32_VEC_MUL(ry, vx);
+            GGML_F32_VEC_STORE(y + i, ry);
+        }
+
         // leftovers
-        for (int i = np; i < n; ++i) {
+        for (int i = np2; i < n; ++i) {
             y[i] *= v;
         }
     #endif
@@ -843,7 +874,7 @@ GGML_VEC_ALWAYS_INLINE static void ggml_vec_scale_f16(const int n, ggml_fp16_t *
         const int np = 0;
     #endif
 #elif defined(GGML_SIMD)
-    const int np = (n & ~(GGML_F16_STEP - 1));
+    int np = (n & ~(GGML_F16_STEP - 1));
 
     GGML_F16_VEC vx = GGML_F16_VEC_SET1(v);
 
@@ -857,6 +888,17 @@ GGML_VEC_ALWAYS_INLINE static void ggml_vec_scale_f16(const int n, ggml_fp16_t *
             GGML_F16_VEC_STORE(y + i + j*GGML_F16_EPR, ay, j);
         }
     }
+
+    // vectorize the GGML_F16_EPR-sized remainder before the scalar tail
+    // (e.g. head_dim=96 with GGML_F16_STEP=64 leaves 32 elems)
+    const int np2 = (n & ~(GGML_F16_EPR - 1));
+    for (int i = np; i < np2; i += GGML_F16_EPR) {
+        ay[0] = GGML_F16_VEC_LOAD(y + i, 0);
+        ay[0] = GGML_F16_VEC_MUL(ay[0], vx);
+
+        GGML_F16_VEC_STORE(y + i, ay, 0);
+    }
+    np = np2;
 #else
     // scalar path
     const int np = 0;
