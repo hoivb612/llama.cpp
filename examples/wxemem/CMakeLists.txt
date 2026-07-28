@@ -46,4 +46,34 @@ if (WIN32)
         WIN32_LEAN_AND_MEAN
         NOMINMAX
     )
+
+    # -----------------------------------------------------------------------
+    # usampler - admin-free user-mode sampling profiler (Very-Sleepy style).
+    # Launches a child process, samples each thread's RIP, then symbolizes
+    # against the child's PDBs (dbghelp) and prints the hottest functions.
+    # Two builds of the same tool:
+    #   usampler   - the C++ implementation (usampler.cpp, C++17)
+    #   usampler_c - the pure-C89 port     (usampler.c) for older toolchains
+    # dbghelp: symbolization; winmm: 1 ms timer resolution.
+    # -----------------------------------------------------------------------
+    add_executable(usampler usampler.cpp)
+    install(TARGETS usampler RUNTIME)
+    target_compile_features(usampler PRIVATE cxx_std_17)
+    target_compile_definitions(usampler PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(usampler PRIVATE dbghelp winmm)
+
+    add_executable(usampler_c usampler.c)
+    install(TARGETS usampler_c RUNTIME)
+    target_compile_definitions(usampler_c PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(usampler_c PRIVATE dbghelp winmm)
 endif()
