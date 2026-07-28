@@ -14,6 +14,18 @@
 // floating point type used to accumulate sums
 typedef double ggml_float;
 
+// Force-inline for hot F16 accumulators. In large translation units (e.g. ops.cpp)
+// MSVC's /Ob1 heuristics decline to inline these, leaving the flash-attn KV loop
+// calling them with a runtime n instead of the compile-time-constant head dim,
+// which loses full-unroll/constant-propagation and ~2x the FA decode cost.
+#if defined(_MSC_VER)
+#  define GGML_VEC_ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__)
+#  define GGML_VEC_ALWAYS_INLINE inline __attribute__((__always_inline__))
+#else
+#  define GGML_VEC_ALWAYS_INLINE inline
+#endif
+
 #if defined(__ARM_FEATURE_SVE)
 inline static void ggml_sve_f16_fma_widened(
         svfloat32_t * acc_lo,
@@ -436,7 +448,7 @@ inline static void ggml_vec_mad_f32(const int n, float * GGML_RESTRICT y, const 
 #endif
 }
 
-inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
+GGML_VEC_ALWAYS_INLINE static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
 #if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
     const int sve_register_length = svcntb() * 8;
     const int ggml_f16_epr = sve_register_length / 16;
@@ -766,7 +778,7 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
 #endif
 }
 
-inline static void ggml_vec_scale_f16(const int n, ggml_fp16_t * y, const float v) {
+GGML_VEC_ALWAYS_INLINE static void ggml_vec_scale_f16(const int n, ggml_fp16_t * y, const float v) {
 #if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE)
     const int sve_register_length = svcntb() * 8;
     const int ggml_f16_epr = sve_register_length / 16;

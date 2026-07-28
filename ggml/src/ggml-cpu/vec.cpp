@@ -341,6 +341,45 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
                 sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
             }
         #endif // __riscv_zvfh
+    #elif defined(__AVX512F__) && !defined(__AVX512FP16__)
+        // Specialized AVX-512 path: keep the four accumulators register-resident
+        // (mirrors the b612 vec-dot). The generic `GGML_F16_VEC sum[GGML_F16_ARR]
+        // = { GGML_F16_VEC_ZERO }` aggregate-init makes MSVC round the accumulators
+        // through the stack, and the per-call overhead dominates at small n
+        // (e.g. head_dim=96), so we hand-roll it here. Also vectorizes the
+        // GGML_F16_EPR-sized remainder (32 elems at n=96) that would otherwise
+        // fall to a scalar loop.
+        GGML_F16_VEC sum0 = GGML_F16_VEC_ZERO;
+        GGML_F16_VEC sum1 = GGML_F16_VEC_ZERO;
+        GGML_F16_VEC sum2 = GGML_F16_VEC_ZERO;
+        GGML_F16_VEC sum3 = GGML_F16_VEC_ZERO;
+
+        const int np = (n & ~(GGML_F16_STEP - 1));
+
+        int i = 0;
+        for (; i < np; i += GGML_F16_STEP) {
+            sum0 = GGML_F16_VEC_FMA(sum0, GGML_F16_VEC_LOAD(x + i + 0*GGML_F16_EPR, 0), GGML_F16_VEC_LOAD(y + i + 0*GGML_F16_EPR, 0));
+            sum1 = GGML_F16_VEC_FMA(sum1, GGML_F16_VEC_LOAD(x + i + 1*GGML_F16_EPR, 1), GGML_F16_VEC_LOAD(y + i + 1*GGML_F16_EPR, 1));
+            sum2 = GGML_F16_VEC_FMA(sum2, GGML_F16_VEC_LOAD(x + i + 2*GGML_F16_EPR, 2), GGML_F16_VEC_LOAD(y + i + 2*GGML_F16_EPR, 2));
+            sum3 = GGML_F16_VEC_FMA(sum3, GGML_F16_VEC_LOAD(x + i + 3*GGML_F16_EPR, 3), GGML_F16_VEC_LOAD(y + i + 3*GGML_F16_EPR, 3));
+        }
+
+        const int np2 = (n & ~(GGML_F16_EPR - 1));
+        for (; i < np2; i += GGML_F16_EPR) {
+            sum0 = GGML_F16_VEC_FMA(sum0, GGML_F16_VEC_LOAD(x + i, 0), GGML_F16_VEC_LOAD(y + i, 0));
+        }
+
+        sum0 = GGML_F16_VEC_ADD(sum0, sum1);
+        sum2 = GGML_F16_VEC_ADD(sum2, sum3);
+        sum0 = GGML_F16_VEC_ADD(sum0, sum2);
+        sumf = (ggml_float) _mm512_reduce_add_ps(sum0);
+
+        // leftovers
+        for (; i < n; ++i) {
+            sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
+        }
+        // if you hit this, you are likely running outside the FP range
+        assert(!isnan(sumf) && !isinf(sumf));
     #else
         const int np = (n & ~(GGML_F16_STEP - 1));
 
@@ -358,11 +397,20 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
             }
         }
 
+        // vectorize the EPR-sized remainder before falling to scalar
+        // (e.g. head_dim=96 with GGML_F16_STEP=64 leaves 32 elems that must not run scalar)
+        const int np2 = (n & ~(GGML_F16_EPR - 1));
+        for (int i = np; i < np2; i += GGML_F16_EPR) {
+            ax[0] = GGML_F16_VEC_LOAD(x + i, 0);
+            ay[0] = GGML_F16_VEC_LOAD(y + i, 0);
+            sum[0] = GGML_F16_VEC_FMA(sum[0], ax[0], ay[0]);
+        }
+
         // reduce sum0..sum3 to sum0
         GGML_F16_VEC_REDUCE(sumf, sum);
 
         // leftovers
-        for (int i = np; i < n; ++i) {
+        for (int i = np2; i < n; ++i) {
             sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
         }
         // if you hit this, you are likely running outside the FP range
