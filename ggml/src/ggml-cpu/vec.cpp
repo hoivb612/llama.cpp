@@ -100,6 +100,42 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
         vl = __riscv_vsetvlmax_e32m8();
         vs = __riscv_vfredusum_vs_f32m8_f32m1(vsum, vs, vl);
         sumf += __riscv_vfmv_f_s_f32m1_f32(vs);
+    #elif defined(__AVX512F__)
+        // Specialized AVX-512 path mirroring ggml_vec_dot_f16: keep the four
+        // accumulators register-resident (avoids MSVC spilling the
+        // `GGML_F32_VEC sum[GGML_F32_ARR] = { GGML_F32_VEC_ZERO }` aggregate-init
+        // to the stack), and vectorize the GGML_F32_EPR-sized remainder
+        // (32 elems at head_dim=96, GGML_F32_STEP=64) that would otherwise
+        // fall to a scalar loop.
+        GGML_F32_VEC sum0 = GGML_F32_VEC_ZERO;
+        GGML_F32_VEC sum1 = GGML_F32_VEC_ZERO;
+        GGML_F32_VEC sum2 = GGML_F32_VEC_ZERO;
+        GGML_F32_VEC sum3 = GGML_F32_VEC_ZERO;
+
+        const int np = (n & ~(GGML_F32_STEP - 1));
+
+        int i = 0;
+        for (; i < np; i += GGML_F32_STEP) {
+            sum0 = GGML_F32_VEC_FMA(sum0, GGML_F32_VEC_LOAD(x + i + 0*GGML_F32_EPR), GGML_F32_VEC_LOAD(y + i + 0*GGML_F32_EPR));
+            sum1 = GGML_F32_VEC_FMA(sum1, GGML_F32_VEC_LOAD(x + i + 1*GGML_F32_EPR), GGML_F32_VEC_LOAD(y + i + 1*GGML_F32_EPR));
+            sum2 = GGML_F32_VEC_FMA(sum2, GGML_F32_VEC_LOAD(x + i + 2*GGML_F32_EPR), GGML_F32_VEC_LOAD(y + i + 2*GGML_F32_EPR));
+            sum3 = GGML_F32_VEC_FMA(sum3, GGML_F32_VEC_LOAD(x + i + 3*GGML_F32_EPR), GGML_F32_VEC_LOAD(y + i + 3*GGML_F32_EPR));
+        }
+
+        const int np2 = (n & ~(GGML_F32_EPR - 1));
+        for (; i < np2; i += GGML_F32_EPR) {
+            sum0 = GGML_F32_VEC_FMA(sum0, GGML_F32_VEC_LOAD(x + i), GGML_F32_VEC_LOAD(y + i));
+        }
+
+        sum0 = GGML_F32_VEC_ADD(sum0, sum1);
+        sum2 = GGML_F32_VEC_ADD(sum2, sum3);
+        sum0 = GGML_F32_VEC_ADD(sum0, sum2);
+        sumf = _mm512_reduce_add_ps(sum0);
+
+        // leftovers
+        for (; i < n; ++i) {
+            sumf += x[i]*y[i];
+        }
     #else
         const int np = (n & ~(GGML_F32_STEP - 1));
 
@@ -117,11 +153,20 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
             }
         }
 
+        // vectorize the GGML_F32_EPR-sized remainder before reducing
+        // (e.g. head_dim=96 with GGML_F32_STEP=64 leaves 32 elems)
+        const int np2 = (n & ~(GGML_F32_EPR - 1));
+        for (int i = np; i < np2; i += GGML_F32_EPR) {
+            ax[0] = GGML_F32_VEC_LOAD(x + i);
+            ay[0] = GGML_F32_VEC_LOAD(y + i);
+            sum[0] = GGML_F32_VEC_FMA(sum[0], ax[0], ay[0]);
+        }
+
         // reduce sum0..sum3 to sum0
         GGML_F32_VEC_REDUCE(sumf, sum);
 
         // leftovers
-        for (int i = np; i < n; ++i) {
+        for (int i = np2; i < n; ++i) {
             sumf += x[i]*y[i];
         }
     #endif
