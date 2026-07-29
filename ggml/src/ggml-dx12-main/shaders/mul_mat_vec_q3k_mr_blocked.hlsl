@@ -22,6 +22,37 @@
 
 groupshared float shared_acc[64];  // 2 * max_waves (max 32 waves for wave_size=8)
 
+// Q3_K block stride is 110 bytes, so block_off (and any qs/hmask sub-offset)
+// can be 2-byte misaligned. ByteAddressBuffer.Load4 requires 4-byte
+// alignment -- desktop AMD GCN/RDNA tolerates 2-byte alignment, but
+// some AMD console HW (Xbox GDKX) silently masks the low bits and
+// returns the wrong 16 bytes. This helper does an aligned Load4 on
+// the fast path, and reconstructs the 16 bytes from 5 aligned word
+// loads on the misaligned path. Mirrors load4_u_q6k in
+// mul_mat_vec_q6k_mr_blocked.hlsl.
+uint4 load4_u_q3k(uint byte_off) {
+    uint shift = (byte_off & 3u) * 8u;
+    if (shift == 0u) {
+        return src0.Load4(byte_off);
+    }
+    uint base = byte_off & ~3u;
+    uint w0 = src0.Load(base);
+    uint w1 = src0.Load(base + 4);
+    uint w2 = src0.Load(base + 8);
+    uint w3 = src0.Load(base + 12);
+    uint w4 = src0.Load(base + 16);
+    uint isr = 32u - shift;
+    uint4 r;
+    r.x = (w0 >> shift) | (w1 << isr);
+    r.y = (w1 >> shift) | (w2 << isr);
+    r.z = (w2 >> shift) | (w3 << isr);
+    r.w = (w3 >> shift) | (w4 << isr);
+    return r;
+}
+
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
@@ -110,9 +141,9 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             float scale_d = d * float(scale_signed);
 
             // qs: 16 contiguous bytes for this scale group
-            uint4 qs4 = src0.Load4(block_off + qs_chunk_off);
+            uint4 qs4 = load4_u_q3k(block_off + qs_chunk_off);
             // hmask: 16 contiguous bytes (same region for both n; differs by m_bit)
-            uint4 hm4 = src0.Load4(block_off + hm_chunk_off);
+            uint4 hm4 = load4_u_q3k(block_off + hm_chunk_off);
 
             // Extract per-element 2-bit qs values (shift = j*2, mask 0x03)
             uint4 q_lo4 = (qs4 >> shift) & 0x03030303u;

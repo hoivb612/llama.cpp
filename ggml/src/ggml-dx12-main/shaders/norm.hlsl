@@ -4,8 +4,9 @@
 // Uses wave intrinsics (SM 6.0) for efficient reduction
 #include "ggml_common.hlsli"
 
-groupshared float wave_vals[16];
+groupshared float wave_vals[32];
 
+WAVE_SIZE_ATTR
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
@@ -19,8 +20,10 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
 
     float eps = op_param_f32(0);
     uint local_id = gtid.x;
-    uint wave_count = 256 / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    // Runtime wave width (Intel iGPUs ignore forced [WaveSize(N)]).
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     // Compute mean - per-thread partial sum
     precise float local_sum = 0.0f;
@@ -36,14 +39,13 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     }
     GroupMemoryBarrierWithGroupSync();
 
-    float total = 0.0f;
-    if (local_id < wave_count) {
-        total = wave_vals[local_id];
+    if (local_id == 0) {
+        float acc = wave_vals[0];
+        for (uint w = 1; w < wave_count; w++) acc += wave_vals[w];
+        wave_vals[0] = acc;
     }
-    total = WaveActiveSum(total);
-    if (local_id == 0) { wave_vals[0] = total; }
     GroupMemoryBarrierWithGroupSync();
-    total = wave_vals[0];
+    float total = wave_vals[0];
     float mean = total / (float)ne00;
 
     // Compute variance - per-thread partial sum
@@ -62,11 +64,11 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     GroupMemoryBarrierWithGroupSync();
 
     float total_var = 0.0f;
-    if (local_id < wave_count) {
-        total_var = wave_vals[local_id];
+    if (local_id == 0) {
+        float acc = wave_vals[0];
+        for (uint w = 1; w < wave_count; w++) acc += wave_vals[w];
+        wave_vals[0] = acc;
     }
-    total_var = WaveActiveSum(total_var);
-    if (local_id == 0) { wave_vals[0] = total_var; }
     GroupMemoryBarrierWithGroupSync();
     total_var = wave_vals[0];
     float inv_std = 1.0f / sqrt(total_var / (float)ne00 + eps);

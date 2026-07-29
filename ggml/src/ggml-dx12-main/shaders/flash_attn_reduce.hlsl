@@ -13,6 +13,9 @@
 #define GROUP_SIZE 256
 #define D_MAX 256
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint local_id = gtid.x;
@@ -23,11 +26,16 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     if (query_idx >= ne01) return;
 
     uint D = ne00;
+    // D_v (= hsv) lives in the high 24 bits of op5 (low 8 bits are src2 element
+    // size). For backward compat (and for shaders dispatched in contexts where
+    // op5 was set to esize-only), fall back to D when the high bits are 0.
+    uint D_v = op5 >> 8;
+    if (D_v == 0u) D_v = D;
     uint n_splits = op15 & 0xFFFFu;  // GQA-folded FA packs gqa_ratio in high 16 bits
     uint n_heads = ne02;
 
-    // Partial layout: [batch][head][query][split] × (max + sum + D floats)
-    uint partial_stride = (D + 2) * 4;  // bytes per partial
+    // Partial layout: [batch][head][query][split] × (max + sum + D_v floats)
+    uint partial_stride = (D_v + 2) * 4;  // bytes per partial
     uint base_off = ((batch_idx * n_heads + head_idx) * (uint)ne01 + query_idx) * n_splits;
 
     // Online softmax reduction across splits
@@ -49,7 +57,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         // Correct existing accumulators and add new partial
         for (uint ai = 0; ai < 4; ai++) {
             uint d_out = local_id + ai * GROUP_SIZE;
-            if (d_out < D) {
+            if (d_out < D_v) {
                 float p_o = asfloat(temp.Load(p_off + 8 + d_out * 4));
                 acc[ai] = acc[ai] * old_correction + p_o * new_correction;
             }
@@ -62,7 +70,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
     for (uint ai = 0; ai < 4; ai++) {
         uint d_out = local_id + ai * GROUP_SIZE;
-        if (d_out < D) {
+        if (d_out < D_v) {
             uint out_off = dst_offset + d_out * nb0 + head_idx * nb1 + query_idx * nb2 + batch_idx * nb3;
             store_auto(dst, out_off, acc[ai] * inv_sum, dst_esize);
         }

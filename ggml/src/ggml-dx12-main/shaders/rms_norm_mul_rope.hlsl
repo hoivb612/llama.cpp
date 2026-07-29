@@ -31,9 +31,10 @@
 
 #define BLOCK_SIZE 256
 
-groupshared float wave_sums[16];
+groupshared float wave_sums[32];
 groupshared float norm_data[1024];
 
+WAVE_SIZE_ATTR
 [numthreads(BLOCK_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
@@ -46,8 +47,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint i1 = rem % ne01;
 
     uint local_id = gtid.x;
-    uint wave_count = BLOCK_SIZE / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (BLOCK_SIZE + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     float eps = op_param_f32(0);
 
@@ -64,9 +66,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     GroupMemoryBarrierWithGroupSync();
 
     float total = 0.0f;
-    if (local_id < wave_count) total = wave_sums[local_id];
-    total = WaveActiveSum(total);
-    if (local_id == 0) wave_sums[0] = total;
+    if (local_id == 0) {
+        total = wave_sums[0];
+        for (uint w = 1; w < wave_count; ++w) total += wave_sums[w];
+        wave_sums[0] = total;
+    }
     GroupMemoryBarrierWithGroupSync();
     total = wave_sums[0];
 

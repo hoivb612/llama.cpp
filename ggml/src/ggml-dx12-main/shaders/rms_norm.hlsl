@@ -5,9 +5,11 @@
 // Uses wave intrinsics (SM 6.0) for efficient reduction
 #include "ggml_common.hlsli"
 
-// Wave-level reduction needs only one entry per wave (max 256/16 = 16 waves)
-groupshared float wave_sums[16];
+// Wave-level reduction: one entry per wave. At the smallest supported wave
+// width (8) a 256-thread group has 32 waves, so size for 32.
+groupshared float wave_sums[32];
 
+WAVE_SIZE_ATTR
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
@@ -22,8 +24,13 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
 
     float eps = op_param_f32(0);
     uint local_id = gtid.x;
-    uint wave_count = 256 / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    // Use the RUNTIME wave size, not compile-time WARP_SIZE. Some drivers
+    // (Intel iGPUs) ignore the forced [WaveSize(N)] and dispatch a wider
+    // SIMD, which would alias multiple hardware waves onto one wave_sums
+    // slot and race. WaveGetLaneCount() gives the true wave width.
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     // Compute sum of squares for this row
     precise float local_sum = 0.0f;
@@ -40,18 +47,17 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Cross-wave reduction (first wave reduces, then broadcast to all threads)
-    float total = 0.0f;
-    if (local_id < wave_count) {
-        total = wave_sums[local_id];
-    }
-    total = WaveActiveSum(total);
-    // Broadcast result: first lane of first wave writes, all threads read
+    // Cross-wave reduction: fold all wave partials in a single thread. A
+    // second WaveActiveSum would only cover one hardware wave, so it breaks
+    // when wave_count > lane_count (e.g. 32 waves of 8 lanes). Broadcast via
+    // shared memory.
     if (local_id == 0) {
-        wave_sums[0] = total;
+        float acc = wave_sums[0];
+        for (uint w = 1; w < wave_count; w++) acc += wave_sums[w];
+        wave_sums[0] = acc;
     }
     GroupMemoryBarrierWithGroupSync();
-    total = wave_sums[0];
+    float total = wave_sums[0];
 
     float rms = sqrt(total / (float)ne00 + eps);
     float scale_val = 1.0f / rms;

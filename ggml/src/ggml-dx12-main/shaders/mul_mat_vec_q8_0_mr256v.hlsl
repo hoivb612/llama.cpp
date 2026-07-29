@@ -43,6 +43,9 @@ float dot4_q8(uint packed_q, float x0, float x1, float x2, float x3) {
     return float(q0) * x0 + float(q1) * x1 + float(q2) * x2 + float(q3) * x3;
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

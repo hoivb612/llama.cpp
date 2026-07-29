@@ -1,5 +1,5 @@
-// pad.hlsl - Pad tensor with zeros (non-circular)
-// op_params: [0]=lp0 [1]=rp0 [2]=lp1 [3]=rp1 [4]=lp2 [5]=rp2 [6]=lp3 [7]=rp3
+// pad.hlsl - Pad tensor (constant=0 fill or circular wrap)
+// op_params: [0]=lp0 [1]=rp0 [2]=lp1 [3]=rp1 [4]=lp2 [5]=rp2 [6]=lp3 [7]=rp3 [8]=circular
 // dst is contiguous F32
 #include "ggml_common.hlsli"
 
@@ -17,9 +17,28 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int lp1 = asint(op2); int rp1 = asint(op3);
     int lp2 = asint(op4); int rp2 = asint(op5);
     int lp3 = asint(op6); int rp3 = asint(op7);
+    int circular = asint(op8);
 
     // dst is contiguous — use flat index
     uint off_d = dst_offset + idx * 4;
+
+    if (circular != 0) {
+        // Circular (torus) wrap: ((coord % size) + size) % size — handles
+        // negative coord (i.e. inside the left pad region) and coord >= size
+        // (right pad). Per-dim ne0X is src0 extent.
+        int c0 = (int)i0 - lp0;
+        int c1 = (int)i1 - lp1;
+        int c2 = (int)i2 - lp2;
+        int c3 = (int)i3 - lp3;
+        uint si0 = (uint)(((c0 % (int)ne00) + (int)ne00) % (int)ne00);
+        uint si1 = (uint)(((c1 % (int)ne01) + (int)ne01) % (int)ne01);
+        uint si2 = (uint)(((c2 % (int)ne02) + (int)ne02) % (int)ne02);
+        uint si3 = (uint)(((c3 % (int)ne03) + (int)ne03) % (int)ne03);
+        uint off0 = offset_4d(si0, si1, si2, si3, nb00, nb01, nb02, nb03, src0_offset);
+        float val = load_auto(src0, off0, src0_esize);
+        dst.Store(off_d, asuint(val));
+        return;
+    }
 
     if ((int)i0 >= lp0 && (int)i0 < (int)ne0 - rp0 &&
         (int)i1 >= lp1 && (int)i1 < (int)ne1 - rp1 &&

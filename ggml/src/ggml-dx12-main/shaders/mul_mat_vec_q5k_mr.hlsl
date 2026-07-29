@@ -19,6 +19,9 @@ uint safe_load_u16(ByteAddressBuffer buf, uint byte_addr) {
 
 groupshared float shared_acc[64];
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

@@ -18,11 +18,16 @@
 #define Q8_0_BSIZE 34
 #define NUM_ROWS   4
 
+#if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
+groupshared float wave_sums[NUM_ROWS][GROUP_SIZE / WAVE_SIZE];
+#endif
+
 float read_f16_v(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
     return f16_to_f32((word >> ((byte_off & 2u) * 8u)) & 0xFFFFu);
 }
 
+WAVE_SIZE_ATTR
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
@@ -70,8 +75,36 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         }
     }
 
-    // Single-wave reduction: GROUP_SIZE == WARP_SIZE on the dispatched-to GPU
-    // (gated by wave_size>=64 in the dispatcher). No shared memory, no barrier.
+    // Single-wave reduction: WAVE_SIZE_ATTR pins the dispatch to a full
+    // GROUP_SIZE-lane wave (dispatcher gates on wave_size>=64), so
+    // WaveActiveSum closes each row directly. When a compiled variant runs
+    // the group as multiple narrower waves, the per-wave partials are
+    // combined through groupshared memory.
+#if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
+    [unroll]
+    for (uint r = 0; r < NUM_ROWS; r++) {
+        float s = WaveActiveSum(acc[r]);
+        if (WaveIsFirstLane()) {
+            wave_sums[r][local_id / WAVE_SIZE] = s;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (local_id == 0) {
+        [unroll]
+        for (uint r = 0; r < NUM_ROWS; r++) {
+            if ((row0 + r) < ne0) {
+                float s = 0.0f;
+                [unroll]
+                for (uint w = 0; w < GROUP_SIZE / WAVE_SIZE; ++w) {
+                    s += wave_sums[r][w];
+                }
+                s += load_fused_bias(row0 + r, i2, i3);
+                uint off_d = offset_4d(row0 + r, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+                store_auto(dst, off_d, s, dst_esize);
+            }
+        }
+    }
+#else
     [unroll]
     for (uint r = 0; r < NUM_ROWS; r++) {
         float s = WaveActiveSum(acc[r]);
@@ -81,4 +114,5 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
             store_auto(dst, off_d, s, dst_esize);
         }
     }
+#endif
 }

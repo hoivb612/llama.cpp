@@ -6,11 +6,18 @@
 // across all gqa_ratio Q-heads. For SmolVLM2 (gqa_ratio=3) this cuts KV
 // bandwidth ~3x compared to the per-Q-head dispatch in flash_attn.hlsl.
 //
-// op_params layout (matches flash_attn.hlsl with one extension):
+// op_params layout (matches flash_attn.hlsl):
 //   op0..op6:  same as flash_attn (src2_*, scale)
-//   op7:       n_kv_heads
-//   op8..op14: mask params (same as flash_attn)
-//   op15:      packed: low16 = n_splits, high16 = gqa_ratio (1..MAX_GQA)
+//   op7:       logit_softcap (float, 0 = softcap off)
+//   op8:       mask info (bit 0 has_mask, bits 8-15 mask_nb0, bits 16-23 mask_es, bit 24 has_sinks)
+//   op9..op12: mask offset / nb1 / nb2 / nb3
+//   op13:      packed mask_ne2 (low 16) | mask_ne3 (high 16)
+//   op14:      max_bias (float, 0 = ALiBi off; shader derives m0/m1/n_head_log2)
+//   op15:      packed n_splits (low 16) | gqa_ratio (high 16)
+//
+// n_kv_heads is read directly from ne12.
+//
+// src4 binding (when has_sinks): F32 vector of length n_heads.
 //
 // Dispatch: groups_x = N_queries, groups_y = n_kv_heads,
 //           groups_z = batch * n_splits
@@ -28,6 +35,9 @@ float load_mask(uint byte_offset, uint elem_stride) {
     return load_auto(src3, byte_offset, elem_stride);
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint local_id  = gtid.x;
@@ -56,17 +66,26 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint  src2_nb1  = op2;
     uint  src2_nb2  = op3;
     uint  src2_nb3  = op4;
-    uint  src2_es   = op5;
+    // op5: low 8 bits = src2 element size, high 24 bits = D_v (= hsv).
+    // Diverges from D (= hsk) for MLA-style attention.
+    uint  src2_es   = op5 & 0xFFu;
+    uint  D_v       = op5 >> 8;
     uint  mask_info = op8;
     uint  has_mask  = mask_info & 1u;
+    uint  has_sinks = (mask_info >> 24) & 1u;
     uint  mask_nb0  = (mask_info >> 8) & 0xFFu;
     uint  mask_es   = (mask_info >> 16) & 0xFFu;
     uint  mask_off  = op9;
     uint  mask_nb1  = op10;
     uint  mask_nb2  = op11;
     uint  mask_nb3  = op12;
-    uint  mask_ne2  = op13;
-    uint  mask_ne3  = op14;
+    uint  mask_ne2  = op13 & 0xFFFFu;
+    uint  mask_ne3  = (op13 >> 16) & 0xFFFFu;
+
+    // ALiBi / softcap params (zero = disabled). Per-Q-head slope is computed
+    // below; m0/m1/n_head_log2 derived from max_bias + n_head (= ne02).
+    float max_bias      = asfloat(op14);
+    float logit_softcap = asfloat(op7);
 
     uint D    = ne00;
     uint N_kv = ne11;
@@ -118,8 +137,27 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
     }
 
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
-    uint wave_id   = local_id / WARP_SIZE;
+    // Pre-compute per-Q-head ALiBi slope once per workgroup (max_bias == 0 → slope=1).
+    float slope_g[MAX_GQA];
+    [unroll] for (uint gi = 0; gi < MAX_GQA; gi++) slope_g[gi] = 1.0f;
+    if (max_bias > 0.0f) {
+        uint n_head_log2 = (n_heads > 0u) ? (1u << firstbithigh(n_heads)) : 1u;
+        float n_head_log2_f = (float)n_head_log2;
+        float m0_alibi = exp2(-max_bias        / n_head_log2_f);
+        float m1_alibi = exp2(-max_bias * 0.5f / n_head_log2_f);
+        [loop] for (uint gi2 = 0; gi2 < gqa_ratio; gi2++) {
+            uint head_idx_g2 = kv_head * gqa_ratio + gi2;
+            if (head_idx_g2 < n_head_log2) {
+                slope_g[gi2] = pow(m0_alibi, (float)(head_idx_g2 + 1u));
+            } else {
+                slope_g[gi2] = pow(m1_alibi, (float)(2u * (head_idx_g2 - n_head_log2) + 1u));
+            }
+        }
+    }
+
+    uint lane_count = WaveGetLaneCount();
+    uint num_waves = (GROUP_SIZE + lane_count - 1) / lane_count;
+    uint wave_id   = local_id / lane_count;
 
     for (uint tile_start = kv_start; tile_start < kv_end; tile_start += TILE_KV) {
         uint tile_end  = min(tile_start + TILE_KV, kv_end);
@@ -139,7 +177,10 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
             [loop] for (uint g = 0; g < gqa_ratio; g++) {
                 float mv = 0.0f;
-                if (has_mask) mv = load_mask(mask_base[g] + kv * mask_nb0, mask_es);
+                if (has_mask) {
+                    mv = load_mask(mask_base[g] + kv * mask_nb0, mask_es);
+                    mv *= slope_g[g];
+                }
 
                 float my_score = -3.402823466e+38f;
                 if (!isinf(mv)) {
@@ -173,7 +214,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                                  * load_auto(src1, k_base    + d * nb10, src1_esize);
                         }
                     }
-                    my_score = dot * scale + mv;
+                    float scaled = dot * scale;
+                    if (logit_softcap != 0.0f) {
+                        scaled = logit_softcap * tanh(scaled);
+                    }
+                    my_score = scaled + mv;
                 }
                 s_scores[g][local_id] = my_score;
             }
@@ -192,10 +237,10 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             float wave_max  = WaveActiveMax(local_max);
             if (WaveIsFirstLane()) s_reduce[wave_id] = wave_max;
             GroupMemoryBarrierWithGroupSync();
-            if (local_id < num_waves) {
-                float v = s_reduce[local_id];
-                v = WaveActiveMax(v);
-                if (local_id == 0) s_reduce[0] = v;
+            if (local_id == 0) {
+                float v = s_reduce[0];
+                for (uint w = 1; w < num_waves; ++w) v = max(v, s_reduce[w]);
+                s_reduce[0] = v;
             }
             GroupMemoryBarrierWithGroupSync();
             float tile_max = s_reduce[0];
@@ -224,10 +269,10 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             float wave_sum    = WaveActiveSum(local_score);
             if (WaveIsFirstLane()) s_reduce[wave_id] = wave_sum;
             GroupMemoryBarrierWithGroupSync();
-            if (local_id < num_waves) {
-                float v = s_reduce[local_id];
-                v = WaveActiveSum(v);
-                if (local_id == 0) s_reduce[0] = v;
+            if (local_id == 0) {
+                float v = s_reduce[0];
+                for (uint w = 1; w < num_waves; ++w) v += s_reduce[w];
+                s_reduce[0] = v;
             }
             GroupMemoryBarrierWithGroupSync();
             global_sum[g] += s_reduce[0];
@@ -238,7 +283,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         // amortised across all gqa_ratio Q-heads (the second win vs flash_attn).
         for (uint a = 0; a < 4; a++) {
             uint d_out = local_id + a * GROUP_SIZE;
-            if (d_out < D) {
+            if (d_out < D_v) {
                 float tile_acc[MAX_GQA];
                 [unroll] for (uint gi = 0; gi < MAX_GQA; gi++) tile_acc[gi] = 0.0f;
 
@@ -258,6 +303,21 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
 
+    // Attention sinks tail (apply only on first KV split, once per Q-head).
+    if (has_sinks != 0u && split_id == 0u) {
+        [loop] for (uint g = 0; g < gqa_ratio; g++) {
+            uint head_idx_g_sink = kv_head * gqa_ratio + g;
+            if (head_idx_g_sink >= n_heads) break;
+            float sink_s = asfloat(src4.Load(head_idx_g_sink * 4u));
+            float new_max = max(global_max[g], sink_s);
+            float correction = (global_sum[g] > 0.0f) ? exp(global_max[g] - new_max) : 0.0f;
+            float vs = exp(sink_s - new_max);
+            [unroll] for (uint a = 0; a < 4; a++) acc[g][a] *= correction;
+            global_sum[g] = global_sum[g] * correction + vs;
+            global_max[g] = new_max;
+        }
+    }
+
     // Write outputs (one per Q-head this workgroup owns).
     if (n_splits <= 1) {
         [loop] for (uint g = 0; g < gqa_ratio; g++) {
@@ -266,14 +326,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             float inv_sum = (global_sum[g] > 0.0f) ? (1.0f / global_sum[g]) : 0.0f;
             for (uint a = 0; a < 4; a++) {
                 uint d_out = local_id + a * GROUP_SIZE;
-                if (d_out < D) {
+                if (d_out < D_v) {
                     uint out_off = dst_offset + d_out * nb0 + head_idx_g * nb1 + query_idx * nb2 + batch_idx * nb3;
                     store_auto(dst, out_off, acc[g][a] * inv_sum, dst_esize);
                 }
             }
         }
     } else {
-        uint partial_stride = (D + 2) * 4;
+        uint partial_stride = (D_v + 2) * 4;
         [loop] for (uint g = 0; g < gqa_ratio; g++) {
             uint head_idx_g = kv_head * gqa_ratio + g;
             if (head_idx_g >= n_heads) break;
@@ -285,7 +345,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
             for (uint a = 0; a < 4; a++) {
                 uint d_out = local_id + a * GROUP_SIZE;
-                if (d_out < D) {
+                if (d_out < D_v) {
                     temp.Store(partial_off + 8 + d_out * 4, asuint(acc[g][a]));
                 }
             }

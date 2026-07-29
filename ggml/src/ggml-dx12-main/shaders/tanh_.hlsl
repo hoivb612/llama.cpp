@@ -1,4 +1,10 @@
 // tanh_.hlsl - Tanh activation: dst = tanh(src0)
+//
+// HLSL's tanh() intrinsic computes via (exp(x)-exp(-x))/(exp(x)+exp(-x)),
+// which overflows to inf/inf = NaN for |x| larger than ~88 (f32) or ~11
+// (f16). Clamp the input to a safe range before calling tanh(): tanh
+// saturates to +/-1 well before that, so the clamp is numerically exact
+// (matches CPU output to the last bit).
 #include "ggml_common.hlsli"
 
 [numthreads(256, 1, 1)]
@@ -13,5 +19,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint off0  = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
     uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
 
-    store_auto(dst, off_d, tanh(load_auto(src0, off0, src0_esize)), dst_esize);
+    float x = load_auto(src0, off0, src0_esize);
+    store_auto(dst, off_d, tanh(clamp(x, -20.0f, 20.0f)), dst_esize);
 }

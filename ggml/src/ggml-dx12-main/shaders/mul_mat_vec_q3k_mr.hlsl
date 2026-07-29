@@ -78,6 +78,9 @@ float dequant_q3k_element(uint src0_row, uint k) {
     return scale_d * float(q_lo - q_hi);
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

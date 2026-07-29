@@ -41,6 +41,9 @@ float read_f16_q5_0(ByteAddressBuffer buf, uint byte_off) {
     return f16_to_f32((word >> ((byte_off & 2u) * 8u)) & 0xFFFFu);
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;

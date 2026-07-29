@@ -35,7 +35,7 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     uint src0_row = src0_offset + i0 * nb01 + (uint)expert_id * nb02;
 
     // Input row: src1[*, i2]
-    uint i1_src1 = i1 * ne11 / ne1;
+    uint i1_src1 = i1 % ne11;
     uint src1_row = src1_offset + i1_src1 * nb11 + i2 * nb12 + i3 * nb13;
 
     precise float acc = 0.0f;

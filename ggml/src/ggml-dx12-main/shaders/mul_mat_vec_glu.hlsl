@@ -40,6 +40,9 @@
 
 groupshared float shared_acc[128];
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tid = gtid.x;
@@ -140,8 +143,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     float wave_gate1 = WaveActiveSum(acc_gate1);
     float wave_up1   = WaveActiveSum(acc_up1);
 
-    uint wave_id   = tid / WARP_SIZE;
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
+    uint wave_id   = tid / WaveGetLaneCount();
+    uint num_waves = (GROUP_SIZE + WaveGetLaneCount() - 1) / WaveGetLaneCount();
 
     if (WaveIsFirstLane()) {
         shared_acc[wave_id]      = wave_gate0;

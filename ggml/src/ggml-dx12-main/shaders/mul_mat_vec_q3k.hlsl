@@ -39,6 +39,9 @@ uint load_u16_q3k(ByteAddressBuffer buf, uint addr) {
     return load_u32_q3k(buf, addr) & 0xFFFFu;
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint i0 = group_x_2d(group_id);
@@ -159,29 +162,22 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         acc += scale_d * sum_qy;
     }
 
-    // Wave-intrinsic reduction
+    // Wave-intrinsic stage-1 reduction within each wave is fine, then explicit
+    // shared-memory tree for cross-wave reduction. The earlier
+    //   if (tid < num_waves) { v = WaveActiveSum(shared_acc[tid]); }
+    // pattern broke on AMD wave64 with num_waves=4 (4 of 64 lanes active),
+    // producing wrong results — the same partial-wave bias that caused the
+    // Q8_1 quantize bug. Use a deterministic explicit reduction instead.
     float wave_sum = WaveActiveSum(acc);
-    uint wave_id = tid / WARP_SIZE;
+    uint wave_id = tid / WaveGetLaneCount();
+    uint num_waves = (GROUP_SIZE + WaveGetLaneCount() - 1) / WaveGetLaneCount();
+    if (num_waves == 0) num_waves = 1;
     if (WaveIsFirstLane()) shared_acc[wave_id] = wave_sum;
     GroupMemoryBarrierWithGroupSync();
 
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
-    if (num_waves <= WARP_SIZE) {
-        if (tid < num_waves) {
-            float v = shared_acc[tid];
-            v = WaveActiveSum(v);
-            if (tid == 0) shared_acc[0] = v;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    } else {
-        for (uint s = num_waves / 2; s > 0; s /= 2) {
-            if (tid < s) shared_acc[tid] += shared_acc[tid + s];
-            GroupMemoryBarrierWithGroupSync();
-        }
-    }
-
     if (tid == 0) {
         float result = shared_acc[0];
+        for (uint w = 1; w < num_waves; ++w) result += shared_acc[w];
         result += load_fused_bias(i0, i2, i3);
         uint off_d = offset_4d(i0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d, result, dst_esize);

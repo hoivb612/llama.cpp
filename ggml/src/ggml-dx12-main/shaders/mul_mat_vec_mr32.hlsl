@@ -12,8 +12,11 @@
 #define GROUP_SIZE 32
 #define NUM_ROWS   2
 
-groupshared float shared_acc[8];  // max 4 waves x 2 rows (defensive sizing)
+groupshared float shared_acc[8];  // max 4 waves (min lane count 8) x 2 rows
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tid = gtid.x;
@@ -37,7 +40,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     precise float acc0 = 0.0f;
     precise float acc1 = 0.0f;
 
-    if (src0_esize == 2) {
+    bool k_contig = (nb00 == src0_esize) && (nb10 == 4u);
+
+    if (src0_esize == 2 && k_contig) {
         // F16 weights: 4 elements per iteration using Load2 for weights + Load4 for activations
         uint k = tid * 4;
         for (; k + 3 < K; k += GROUP_SIZE * 4) {
@@ -67,7 +72,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             acc0 = mad(load_auto(src0, src0_row0 + k * 2, 2), x, acc0);
             acc1 = mad(load_auto(src0, src0_row1 + k * 2, 2), x, acc1);
         }
-    } else {
+    } else if (src0_esize == 4 && k_contig) {
         // F32 weights
         uint k = tid * 4;
         for (; k + 3 < K; k += GROUP_SIZE * 4) {
@@ -88,16 +93,27 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             acc0 = mad(asfloat(src0.Load(src0_row0 + k * 4)), x, acc0);
             acc1 = mad(asfloat(src0.Load(src0_row1 + k * 4)), x, acc1);
         }
+    } else {
+        // Strided fallback: per-element scalar loads using nb00 / nb10.
+        for (uint k = tid; k < K; k += GROUP_SIZE) {
+            float x = asfloat(src1.Load(src1_base + k * nb10));
+            acc0 = mad(load_auto(src0, src0_row0 + k * nb00, src0_esize), x, acc0);
+            acc1 = mad(load_auto(src0, src0_row1 + k * nb00, src0_esize), x, acc1);
+        }
     }
 
-    // Wave reduction — with 32 threads and wave=16, we have 2 waves.
-    // With wave=64 (AMD RDNA) all 32 threads are 1 wave, num_waves=0.
-    // Use max(num_waves, 1) for the row-1 offset to keep rows separate.
+    // Wave reduction. Use the RUNTIME wave size (WaveGetLaneCount) for slot
+    // indexing rather than compile-time WARP_SIZE: some drivers (Intel iGPUs)
+    // ignore the forced [WaveSize(N)] and run a wider SIMD, which would alias
+    // two hardware waves onto one shared_acc slot and race. row1 uses a fixed
+    // base of 4 (= GROUP_SIZE / min-lane-count 8) so the two rows never
+    // overlap regardless of the actual lane count.
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
-    uint wave_id = tid / WARP_SIZE;
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
-    uint row1_off = (num_waves > 0) ? num_waves : 1;  // at least 1 slot between rows
+    uint lane_count = WaveGetLaneCount();
+    uint wave_id = tid / lane_count;
+    uint num_waves = (GROUP_SIZE + lane_count - 1) / lane_count;
+    const uint row1_off = 4;  // GROUP_SIZE / min-lane-count(8)
 
     if (WaveIsFirstLane()) {
         shared_acc[wave_id] = wave_sum0;

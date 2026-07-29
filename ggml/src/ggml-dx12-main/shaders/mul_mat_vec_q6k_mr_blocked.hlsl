@@ -13,13 +13,46 @@
 
 #include "ggml_common.hlsli"
 
+#ifndef GROUP_SIZE
 #define GROUP_SIZE  256
+#endif
 #define QK_K        256
 #define Q6K_BSIZE   210
 #define NUM_ROWS    2
 
 groupshared float shared_acc[64];  // 2 * max_waves (max 32 waves for wave_size=8)
 
+// Q6_K block stride is 210 bytes, so block_off (and any ql/qh sub-offset)
+// can be 2-byte misaligned. ByteAddressBuffer.Load4 requires 4-byte
+// alignment -- desktop AMD GCN/RDNA tolerates 2-byte alignment, but
+// some AMD console HW (Xbox GDKX) silently masks the low bits and
+// returns the wrong 16 bytes. This helper does an aligned Load4 on
+// the fast path, and reconstructs the 16 bytes from 5 aligned word
+// loads on the misaligned path. See sibling mul_mat_vec_q6k_dp4a.hlsl
+// for the same pattern at u32 granularity.
+uint4 load4_u_q6k(uint byte_off) {
+    uint shift = (byte_off & 3u) * 8u;
+    if (shift == 0u) {
+        return src0.Load4(byte_off);
+    }
+    uint base = byte_off & ~3u;
+    uint w0 = src0.Load(base);
+    uint w1 = src0.Load(base + 4);
+    uint w2 = src0.Load(base + 8);
+    uint w3 = src0.Load(base + 12);
+    uint w4 = src0.Load(base + 16);
+    uint isr = 32u - shift;
+    uint4 r;
+    r.x = (w0 >> shift) | (w1 << isr);
+    r.y = (w1 >> shift) | (w2 << isr);
+    r.z = (w2 >> shift) | (w3 << isr);
+    r.w = (w3 >> shift) | (w4 << isr);
+    return r;
+}
+
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
@@ -96,11 +129,11 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 
             // ql: 16 contiguous bytes for this scale group
             uint ql_base = block_off + ip * 64u + ql_chunk * 16u;
-            uint4 ql4 = src0.Load4(ql_base);
+            uint4 ql4 = load4_u_q6k(ql_base);
 
             // qh: 16 contiguous bytes (each holds 4 high-bit pairs for different sub-blocks)
             uint qh_base = block_off + 128u + ip * 32u + qh_chunk * 16u;
-            uint4 qh4 = src0.Load4(qh_base);
+            uint4 qh4 = load4_u_q6k(qh_base);
 
             // Decode 16 elements and accumulate q_u * x
             float dot_q;
@@ -146,6 +179,19 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     // Two-level reduction: wave-level + cross-wave shared memory
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
+#if defined(WAVE_SIZE) && (GROUP_SIZE == WAVE_SIZE)
+    if (WaveIsFirstLane()) {
+        float result0 = wave_sum0 + load_fused_bias(row0, i2, i3);
+        uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+        store_auto(dst, off_d0, result0, dst_esize);
+
+        if (row0 + 1 < ne0) {
+            float result1 = wave_sum1 + load_fused_bias(row0 + 1, i2, i3);
+            uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+            store_auto(dst, off_d1, result1, dst_esize);
+        }
+    }
+#else
     uint wave_id = tid / WARP_SIZE;
     uint num_waves = GROUP_SIZE / WARP_SIZE;
 
@@ -176,4 +222,5 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             store_auto(dst, off_d1, result1, dst_esize);
         }
     }
+#endif
 }

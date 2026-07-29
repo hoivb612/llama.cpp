@@ -13,6 +13,9 @@
 
 groupshared float shared_acc[64];
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tid = gtid.x;
@@ -36,7 +39,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     precise float acc0 = 0.0f;
     precise float acc1 = 0.0f;
 
-    if (src0_esize == 2) {
+    // Fast path requires the K axes contiguous in both operands so the
+    // Load4/Load2 reads stay aligned. Permuted-view callers — typically the
+    // V·softmax(QK^T) matmul under -fa 0, where V is permuted so its
+    // KV-position axis is the K axis — hit the strided fallback below.
+    bool k_contig = (nb00 == src0_esize) && (nb10 == 4u);
+
+    if (src0_esize == 2 && k_contig) {
         // F16 weights: Load4 = 2×uint32 = 4 F16 values per iteration
         // Use mad() chains for FMA optimization
         uint k = tid * 4;
@@ -74,7 +83,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             acc0 = mad(load_auto(src0, src0_row0 + k * 2, 2), x, acc0);
             acc1 = mad(load_auto(src0, src0_row1 + k * 2, 2), x, acc1);
         }
-    } else {
+    } else if (src0_esize == 4 && k_contig) {
         // F32 weights: Load4 = 4 floats per iteration, mad() chains
         uint k = tid * 4;
         for (; k + 3 < K; k += GROUP_SIZE * 4) {
@@ -95,13 +104,30 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             acc0 = mad(asfloat(src0.Load(src0_row0 + k * 4)), x, acc0);
             acc1 = mad(asfloat(src0.Load(src0_row1 + k * 4)), x, acc1);
         }
+    } else {
+        // Strided fallback: per-element scalar loads using nb00 / nb10.
+        // ~4x slower MAC throughput than the vectorized path, but only hit by
+        // permuted views (small-K attention matmuls), so absolute cost is low
+        // and far cheaper than CPU-fallback round-trip.
+        for (uint k = tid; k < K; k += GROUP_SIZE) {
+            float x = asfloat(src1.Load(src1_base + k * nb10));
+            acc0 = mad(load_auto(src0, src0_row0 + k * nb00, src0_esize), x, acc0);
+            acc1 = mad(load_auto(src0, src0_row1 + k * nb00, src0_esize), x, acc1);
+        }
     }
 
-    // Two-level reduction with tree reduction for cross-vendor correctness
+    // Two-level reduction with tree reduction for cross-vendor correctness.
+    // Use the RUNTIME wave size (WaveGetLaneCount) for the slot indexing —
+    // not the compile-time WARP_SIZE. Some drivers (Intel iGPUs) ignore the
+    // forced [WaveSize(N)] and run a different SIMD width; deriving wave_id /
+    // num_waves from the true lane count keeps each hardware wave on its own
+    // shared_acc slot, avoiding a cross-wave write collision (race) that
+    // silently drops lanes and corrupts the sum.
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
-    uint wave_id = tid / WARP_SIZE;
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
+    uint lane_count = WaveGetLaneCount();
+    uint wave_id = tid / lane_count;
+    uint num_waves = (GROUP_SIZE + lane_count - 1) / lane_count;
 
     if (WaveIsFirstLane()) {
         shared_acc[wave_id] = wave_sum0;
@@ -109,22 +135,18 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint s = num_waves / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared_acc[tid] += shared_acc[tid + s];
-            shared_acc[32 + tid] += shared_acc[32 + tid + s];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
     if (tid == 0) {
         float result0 = shared_acc[0];
+        float result1 = shared_acc[32];
+        for (uint w = 1; w < num_waves; w++) {
+            result0 += shared_acc[w];
+            result1 += shared_acc[32 + w];
+        }
         result0 += load_fused_bias(row0, i2, i3);
         uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
 
         if (row0 + 1 < ne0) {
-            float result1 = shared_acc[32];
             result1 += load_fused_bias(row0 + 1, i2, i3);
             uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

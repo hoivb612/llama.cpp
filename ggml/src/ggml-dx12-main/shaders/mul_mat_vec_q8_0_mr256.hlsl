@@ -25,6 +25,9 @@ int read_sbyte_v(ByteAddressBuffer buf, uint byte_off) {
     return (b < 128) ? (int)b : (int)b - 256;
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

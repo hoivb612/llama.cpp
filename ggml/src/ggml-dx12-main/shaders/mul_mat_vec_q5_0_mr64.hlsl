@@ -29,6 +29,10 @@
 #define NUM_ROWS    4
 #define BLOCKS_PER_ITER (GROUP_SIZE / 8)
 
+#if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
+groupshared float wave_sums[NUM_ROWS][GROUP_SIZE / WAVE_SIZE];
+#endif
+
 uint read_u32_q5_0(ByteAddressBuffer buf, uint byte_off) {
     uint aligned = byte_off & ~3u;
     uint shift = (byte_off & 3u) * 8u;
@@ -43,6 +47,7 @@ float read_f16_q5_0(ByteAddressBuffer buf, uint byte_off) {
     return f16_to_f32((word >> ((byte_off & 2u) * 8u)) & 0xFFFFu);
 }
 
+WAVE_SIZE_ATTR
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
@@ -165,6 +170,32 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         }
     }
 
+#if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
+    float acc[NUM_ROWS] = { acc0, acc1, acc2, acc3 };
+    [unroll]
+    for (uint r = 0; r < NUM_ROWS; r++) {
+        float s = WaveActiveSum(acc[r]);
+        if (WaveIsFirstLane()) {
+            wave_sums[r][tid / WAVE_SIZE] = s;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (tid == 0) {
+        [unroll]
+        for (uint r = 0; r < NUM_ROWS; r++) {
+            if ((row0 + r) < ne0) {
+                float s = 0.0f;
+                [unroll]
+                for (uint w = 0; w < GROUP_SIZE / WAVE_SIZE; w++) {
+                    s += wave_sums[r][w];
+                }
+                s += load_fused_bias(row0 + r, i2, i3);
+                uint off_d = offset_4d(row0 + r, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+                store_auto(dst, off_d, s, dst_esize);
+            }
+        }
+    }
+#else
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
     float wave_sum2 = WaveActiveSum(acc2);
@@ -191,4 +222,5 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             store_auto(dst, off_d3, result3, dst_esize);
         }
     }
+#endif
 }

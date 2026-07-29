@@ -18,8 +18,11 @@
 
 #include "ggml_common.hlsli"
 
+// GROUP_SIZE is a pure threadgroup-size knob (work split + reduction width),
+// so this file is built as a WBLOB_GS tuning family. The fallthrough blob must
+// match the WBLOB_GS "64" case.
 #ifndef GROUP_SIZE
-#define GROUP_SIZE  32
+#define GROUP_SIZE  64
 #endif
 #define QK8_0       32
 #define Q8_0_BSIZE  34
@@ -27,9 +30,9 @@
 #define NUM_ROWS    2
 #define BLOCKS_PER_ITER (GROUP_SIZE / 8)
 
-// Two rows × up to 4 waves: 8 entries is enough for any GROUP_SIZE up to 256
-// when the wave size is at least the smallest variant we ship (16).
-groupshared float shared_acc[2 * 8];
+// Two rows x up to MAX_WAVES waves. GROUP_SIZE 512 over wave 32 needs 16.
+#define MAX_WAVES 16
+groupshared float shared_acc[2 * MAX_WAVES];
 
 // Q8_0 qs starts 2 bytes into the block (after the f16 scale), so qs+l0 is
 // 2-byte aligned but not 4-byte aligned. Load two adjacent words and shift.
@@ -47,6 +50,9 @@ float read_f16_q80(ByteAddressBuffer buf, uint byte_off) {
     return f16_to_f32((word >> ((byte_off & 2u) * 8u)) & 0xFFFFu);
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
@@ -123,7 +129,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 
     if (WaveIsFirstLane()) {
         shared_acc[wave_id] = wave_sum0;
-        shared_acc[8 + wave_id] = wave_sum1;
+        shared_acc[MAX_WAVES + wave_id] = wave_sum1;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -135,8 +141,8 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         store_auto(dst, off_d0, result0, dst_esize);
 
         if (row0 + 1 < ne0) {
-            float result1 = shared_acc[8];
-            for (uint w = 1; w < num_waves; w++) result1 += shared_acc[8 + w];
+            float result1 = shared_acc[MAX_WAVES];
+            for (uint w = 1; w < num_waves; w++) result1 += shared_acc[MAX_WAVES + w];
             result1 += load_fused_bias(row0 + 1, i2, i3);
             uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

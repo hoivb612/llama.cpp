@@ -43,6 +43,9 @@ int dequant_q5_0_qs(ByteAddressBuffer buf, uint block_off, uint qh, uint elem) {
     }
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

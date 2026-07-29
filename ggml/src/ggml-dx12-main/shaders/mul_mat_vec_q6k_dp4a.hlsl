@@ -109,6 +109,9 @@ void decode_q6k_row(uint block_off, uint t,
     uq3 = ql_w3 | (qh_w3 << 4);
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * NUM_ROWS;
@@ -157,12 +160,16 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         uint q8_qs2 = src1.Load(q8_off + 4 + q8_byte_off + 8);
         uint q8_qs3 = src1.Load(q8_off + 4 + q8_byte_off + 12);
 
-        // psum: sum of 16 Q8 bytes (used for the -32 bias correction)
-        int q8_psum = 0;
-        q8_psum = dot4add_i8packed(0x01010101u, q8_qs0, q8_psum);
-        q8_psum = dot4add_i8packed(0x01010101u, q8_qs1, q8_psum);
-        q8_psum = dot4add_i8packed(0x01010101u, q8_qs2, q8_psum);
-        q8_psum = dot4add_i8packed(0x01010101u, q8_qs3, q8_psum);
+        // psum: sum of 16 Q8 bytes (used for the -32 bias correction).
+        // Use separate zero-initialized dot4add accumulators (as in
+        // mul_mat_vec_q4k_dp4a.hlsl) rather than chaining into one running
+        // accumulator with a constant first operand -- the chained-constant
+        // form is miscompiled on some drivers and yields a wrong sum.
+        int p0 = 0; p0 = dot4add_i8packed(0x01010101u, q8_qs0, p0);
+        int p1 = 0; p1 = dot4add_i8packed(0x01010101u, q8_qs1, p1);
+        int p2 = 0; p2 = dot4add_i8packed(0x01010101u, q8_qs2, p2);
+        int p3 = 0; p3 = dot4add_i8packed(0x01010101u, q8_qs3, p3);
+        int q8_psum = p0 + p1 + p2 + p3;
 
         // --- Row 0 ---
         {
