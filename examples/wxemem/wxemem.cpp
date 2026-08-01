@@ -72,6 +72,7 @@ typedef LONG KPRIORITY;
 enum {
     SystemPerformanceInformation_Class    = 2,
     SystemModuleInformation_Class         = 11,
+    SystemPoolTagInformation_Class        = 22,
     SystemMemoryListInformation_Class     = 80,
 };
 
@@ -150,6 +151,27 @@ struct RTL_PROCESS_MODULE_INFORMATION {
 struct RTL_PROCESS_MODULES {
     ULONG NumberOfModules;
     RTL_PROCESS_MODULE_INFORMATION Modules[1];
+};
+
+// SYSTEM_POOLTAG — per-pool-tag allocation accounting. Pool tagging is always
+// enabled on 64-bit Windows, so NonPagedUsed/PagedUsed are the current in-use
+// bytes charged to each 4-character tag. This is what poolmon / !poolused read.
+struct SYSTEM_POOLTAG_ENTRY {
+    union {
+        UCHAR Tag[4];
+        ULONG TagUlong;
+    };
+    ULONG  PagedAllocs;
+    ULONG  PagedFrees;
+    SIZE_T PagedUsed;
+    ULONG  NonPagedAllocs;
+    ULONG  NonPagedFrees;
+    SIZE_T NonPagedUsed;
+};
+
+struct SYSTEM_POOLTAG_INFORMATION {
+    ULONG Count;
+    SYSTEM_POOLTAG_ENTRY TagInfo[1];
 };
 }  // extern "C"
 #endif // _WIN32
@@ -271,6 +293,18 @@ struct MemList {
     uint64_t modified_bytes = 0;
     uint64_t standby_bytes  = 0;
     bool     available      = false;
+};
+
+// Per-pool-tag usage (Windows). 'tag' holds the 4 tag characters sanitized to
+// printable ASCII; 'tag_raw' is the exact little-endian ULONG so consumers can
+// key on it unambiguously even when a tag byte is non-printable.
+struct PoolTag {
+    char     tag[5]      = {0};   // printable, NUL-terminated
+    uint32_t tag_raw     = 0;
+    uint64_t nonpaged    = 0;     // bytes currently in use (non-paged)
+    uint64_t paged       = 0;     // bytes currently in use (paged)
+    uint64_t np_outstanding = 0;  // NonPagedAllocs - NonPagedFrees
+    uint64_t pg_outstanding = 0;  // PagedAllocs - PagedFrees
 };
 
 struct ProcInfo {
@@ -630,6 +664,51 @@ static std::vector<DriverInfo> collect_drivers() {
     return out;
 }
 
+// Query per-pool-tag usage via SystemPoolTagInformation. Returns tags sorted by
+// non-paged bytes (descending). Empty if the query fails or no admin rights.
+static std::vector<PoolTag> collect_pooltags() {
+    std::vector<PoolTag> out;
+    ULONG len = 0x20000;  // ~128 KiB to start; grows on mismatch.
+    std::vector<uint8_t> buf;
+    NTSTATUS s;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        buf.resize(len);
+        ULONG ret = 0;
+        s = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)SystemPoolTagInformation_Class,
+                                     buf.data(), len, &ret);
+        if (s == STATUS_SUCCESS) break;
+        // STATUS_INFO_LENGTH_MISMATCH (0xC0000004): grow and retry.
+        if ((ULONG)s == 0xC0000004) {
+            len = (ret > len) ? (ret + 0x10000) : (len * 2);
+            continue;
+        }
+        return out;  // any other error: pool tagging off / no access.
+    }
+    if (s != STATUS_SUCCESS) return out;
+
+    auto * info = reinterpret_cast<SYSTEM_POOLTAG_INFORMATION *>(buf.data());
+    out.reserve(info->Count);
+    for (ULONG i = 0; i < info->Count; ++i) {
+        const auto & e = info->TagInfo[i];
+        if (e.NonPagedUsed == 0 && e.PagedUsed == 0) continue;  // skip empties
+        PoolTag pt;
+        pt.tag_raw = e.TagUlong;
+        for (int b = 0; b < 4; ++b) {
+            unsigned char c = e.Tag[b];
+            pt.tag[b] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        pt.tag[4] = '\0';
+        pt.nonpaged        = (uint64_t)e.NonPagedUsed;
+        pt.paged           = (uint64_t)e.PagedUsed;
+        pt.np_outstanding  = (uint64_t)(e.NonPagedAllocs - e.NonPagedFrees);
+        pt.pg_outstanding  = (uint64_t)(e.PagedAllocs - e.PagedFrees);
+        out.push_back(pt);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const PoolTag & a, const PoolTag & b) { return a.nonpaged > b.nonpaged; });
+    return out;
+}
+
 static std::vector<PageFile> collect_pagefiles() {
     std::vector<PageFile> out;
     SYSTEM_INFO si{};
@@ -907,6 +986,11 @@ static std::vector<DriverInfo> collect_drivers() {
     return out;
 }
 
+static std::vector<PoolTag> collect_pooltags() {
+    // Windows-specific concept; no equivalent on Linux.
+    return {};
+}
+
 static std::vector<PageFile> collect_pagefiles() {
     std::vector<PageFile> out;
     std::string sw;
@@ -950,6 +1034,7 @@ struct Options {
     bool        no_services     = false;
     bool        show_all_procs  = false;
     int         top_n           = 30;
+    int         top_npp         = 0;    // 0 = don't show pool-tag table in human output
     bool        help            = false;
 };
 
@@ -960,6 +1045,7 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
                         const std::vector<ServiceInfo> & all_services,
                         const std::map<DWORD, std::vector<ServiceInfo>> & services_by_pid,
                         const std::vector<DriverInfo> & drivers_top,
+                        const std::vector<PoolTag> & pooltags,
                         const Options & opts, bool admin) {
     auto line = []{ printf("--------------------------------------------------------------------------------\n"); };
 
@@ -1099,6 +1185,29 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
                            format_bytes(drivers_top[i].image_size, 10).c_str(),
                            drivers_top[i].name.c_str());
                 }
+            }
+            line();
+        }
+
+        // Top non-paged pool tags (only when requested via --topNPP / --all).
+        int npp_rows = opts.show_all_procs ? (int)pooltags.size() : opts.top_npp;
+        if (npp_rows > 0 && !pooltags.empty()) {
+            uint64_t np_total = 0;
+            for (const auto & t : pooltags) np_total += t.nonpaged;
+            printf(" Top non-paged pool tags by bytes (%zu tags in use, ~%s non-paged)\n",
+                   pooltags.size(), format_bytes(np_total, 0).c_str());
+            int shown = (int)std::min<size_t>(pooltags.size(), (size_t)npp_rows);
+            printf("   %-6s %12s %12s %16s\n", "tag", "nonpaged", "paged", "outstanding");
+            for (int i = 0; i < shown; ++i) {
+                const auto & t = pooltags[i];
+                char allocs[32];
+                snprintf(allocs, sizeof(allocs), "%llu allocs",
+                         (unsigned long long)t.np_outstanding);
+                printf("   %-6s %12s %12s %16s\n",
+                       t.tag,
+                       format_bytes(t.nonpaged, 0).c_str(),
+                       format_bytes(t.paged, 0).c_str(),
+                       allocs);
             }
             line();
         }
@@ -1322,6 +1431,7 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
                        const std::vector<ServiceInfo> & all_services,
                        const std::map<DWORD, std::vector<ServiceInfo>> & services_by_pid,
                        const std::vector<DriverInfo> & drivers_top,
+                       const std::vector<PoolTag> & pooltags,
                        const Options & opts, bool admin) {
     printf("{\n");
     printf("  \"admin\": %s,\n", admin ? "true" : "false");
@@ -1385,6 +1495,25 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
             printf(", \"hotpatch_for\": \"%s\"", json_escape(orig).c_str());
         }
         printf("}%s\n", (i + 1 < drivers_top.size() ? "," : ""));
+    }
+    printf("  ],\n");
+
+    // Per-pool-tag usage. Emitted in full (all tags with any bytes in use) so a
+    // diff between two snapshots can attribute pool growth to a specific tag,
+    // regardless of any --topNPP display cap. tag_hex is the exact raw value.
+    printf("  \"pool_tags\": [\n");
+    for (size_t i = 0; i < pooltags.size(); ++i) {
+        const auto & t = pooltags[i];
+        printf("    {\"tag\": \"%s\", \"tag_hex\": \"0x%08x\", "
+               "\"nonpaged_bytes\": %llu, \"paged_bytes\": %llu, "
+               "\"nonpaged_allocs\": %llu, \"paged_allocs\": %llu}%s\n",
+               json_escape(t.tag).c_str(),
+               (unsigned)t.tag_raw,
+               (unsigned long long)t.nonpaged,
+               (unsigned long long)t.paged,
+               (unsigned long long)t.np_outstanding,
+               (unsigned long long)t.pg_outstanding,
+               (i + 1 < pooltags.size() ? "," : ""));
     }
     printf("  ],\n");
 
@@ -1476,6 +1605,8 @@ static void print_usage() {
         "Options:\n"
         "  --json              emit JSON instead of human-readable text\n"
         "  --top N             show top N processes by working set (default 30)\n"
+        "  --topNPP N          show top N non-paged pool tags by bytes (Windows;\n"
+        "                      JSON always includes the full per-tag breakdown)\n"
         "  --all               show all processes and all loaded drivers (overrides --top\n"
         "                      and lifts the default driver-list cap)\n"
         "  --processes-only    only print the process table\n"
@@ -1499,6 +1630,11 @@ static bool parse_args(int argc, char ** argv, Options & opts) {
             if (++i >= argc) { fprintf(stderr, "wxemem: --top requires N\n"); return false; }
             opts.top_n = atoi(argv[i]);
             if (opts.top_n <= 0) { fprintf(stderr, "wxemem: --top must be positive\n"); return false; }
+        }
+        else if (a == "--topNPP") {
+            if (++i >= argc) { fprintf(stderr, "wxemem: --topNPP requires N\n"); return false; }
+            opts.top_npp = atoi(argv[i]);
+            if (opts.top_npp <= 0) { fprintf(stderr, "wxemem: --topNPP must be positive\n"); return false; }
         }
         else {
             fprintf(stderr, "wxemem: unknown option '%s'\n", a.c_str());
@@ -1541,10 +1677,12 @@ int main(int argc, char ** argv) {
     std::vector<DriverInfo> drivers_top = drivers;
     if (!opts.show_all_procs && drivers_top.size() > 64) drivers_top.resize(64);
 
+    std::vector<PoolTag> pooltags = collect_pooltags();
+
     if (opts.json) {
-        print_json(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
+        print_json(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, pooltags, opts, admin);
     } else {
-        print_human(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
+        print_human(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, pooltags, opts, admin);
     }
     return 0;
 }

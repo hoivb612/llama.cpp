@@ -9,6 +9,8 @@
 //         - kernel data (non-paged pool, resident paged pool, driver code,
 //           system cache)
 //         - new / removed drivers
+//         - per-pool-tag non-paged pool growth (which ExAllocatePoolWithTag
+//           tag is responsible), when both snapshots include `pool_tags`
 //
 // The goal is to zero in on *what* changed from stage to stage and build to
 // build. Output is plain, aligned text so it stays diff-able and consistent
@@ -137,6 +139,13 @@ struct Drv {
     i64 size = 0;
 };
 
+struct PoolTagInfo {
+    std::string tag;         // 4-char tag string
+    i64 nonpaged = 0;        // nonpaged_bytes
+    i64 paged = 0;           // paged_bytes
+    i64 np_allocs = 0;       // nonpaged_allocs (outstanding)
+};
+
 struct Snapshot {
     std::string label;
     bool admin = false;
@@ -151,6 +160,9 @@ struct Snapshot {
     json services_summary;                      // kept raw for count deltas
 
     std::map<std::string, i64> drivers;         // name -> image_size_bytes
+
+    bool has_pool_tags = false;
+    std::map<std::string, PoolTagInfo> pool_tags;  // keyed by tag_hex
 };
 
 static i64 jget(const json& j, const char* key, i64 def = 0) {
@@ -245,6 +257,22 @@ static bool loadSnapshot(const std::string& path, Snapshot& s, std::string& err)
         for (const json& dj : j["drivers_top"]) {
             std::string name = jstr(dj, "name");
             if (!name.empty()) s.drivers[name] = jget(dj, "image_size_bytes");
+        }
+    }
+
+    if (j.contains("pool_tags") && j["pool_tags"].is_array()) {
+        s.has_pool_tags = true;
+        for (const json& tj : j["pool_tags"]) {
+            PoolTagInfo pt;
+            pt.tag       = jstr(tj, "tag");
+            pt.nonpaged  = jget(tj, "nonpaged_bytes");
+            pt.paged     = jget(tj, "paged_bytes");
+            pt.np_allocs = jget(tj, "nonpaged_allocs");
+            // Key by tag_hex so identical tag strings from different raw values
+            // stay distinct; fall back to the tag string if hex is missing.
+            std::string key = jstr(tj, "tag_hex");
+            if (key.empty()) key = pt.tag;
+            s.pool_tags[key] = pt;
         }
     }
 
@@ -531,6 +559,117 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
         for (const auto& d : v)
             o << "   " << padL(signedBytes(d.delta), 14) << "   " << padR(d.name, 30)
               << " (" << humanBytes(d.a) << " -> " << humanBytes(d.b) << ")\n";
+    }
+    o << "\n";
+
+    // -- Non-paged pool by tag --------------------------------------------
+    o << rule() << "\n";
+    o << " Non-paged pool by tag (metric = current in-use non-paged bytes per\n";
+    o << " pool tag; this is true ExAllocatePoolWithTag(NonPaged) usage and\n";
+    o << " directly attributes non-paged pool growth to the responsible tag.)\n";
+    o << rule() << "\n";
+
+    if (!A.has_pool_tags || !B.has_pool_tags) {
+        o << "\n   (no pool_tags in "
+          << (!A.has_pool_tags && !B.has_pool_tags ? "either snapshot"
+              : !A.has_pool_tags ? "snapshot A" : "snapshot B")
+          << "; re-capture with a wxemem build that emits pool_tags to enable\n"
+             "    per-tag non-paged pool attribution.)\n";
+    } else {
+        struct TagDelta {
+            std::string key, tag;
+            i64 a = 0, b = 0, delta = 0;
+        };
+        std::map<std::string, TagDelta> m;
+        for (const auto& kv : A.pool_tags) {
+            TagDelta& d = m[kv.first];
+            d.key = kv.first;
+            d.tag = kv.second.tag;
+            d.a   = kv.second.nonpaged;
+        }
+        for (const auto& kv : B.pool_tags) {
+            TagDelta& d = m[kv.first];
+            d.key = kv.first;
+            if (d.tag.empty()) d.tag = kv.second.tag;
+            d.b = kv.second.nonpaged;
+        }
+        std::vector<TagDelta> v;
+        i64 tagTotalDelta = 0;
+        for (auto& kv : m) {
+            kv.second.delta = kv.second.b - kv.second.a;
+            tagTotalDelta += kv.second.delta;
+            v.push_back(kv.second);
+        }
+
+        o << "\n   Sum of per-tag non-paged delta: " << signedBytes(tagTotalDelta)
+          << "   (kernel 'non-paged pool' counter delta: "
+          << signedBytes(B.kern.non_paged_pool - A.kern.non_paged_pool) << ")\n";
+
+        // New tags (present only in B).
+        {
+            std::vector<TagDelta> nw;
+            for (const auto& d : v)
+                if (d.a == 0 && d.b > 0) nw.push_back(d);
+            std::sort(nw.begin(), nw.end(),
+                      [](const TagDelta& x, const TagDelta& y) { return x.b > y.b; });
+            o << "\n NEW tags (allocating in B, none in A):\n";
+            if (nw.empty()) o << "   (none)\n";
+            int shown = 0;
+            for (const auto& d : nw) {
+                if (shown++ >= topN) break;
+                o << "   " << padL("+" + humanBytes(d.b), 14) << "   " << padR(d.tag, 6)
+                  << "  " << d.key << "\n";
+            }
+        }
+        // Gone tags (present only in A).
+        {
+            std::vector<TagDelta> gone;
+            for (const auto& d : v)
+                if (d.b == 0 && d.a > 0) gone.push_back(d);
+            std::sort(gone.begin(), gone.end(),
+                      [](const TagDelta& x, const TagDelta& y) { return x.a > y.a; });
+            o << "\n GONE tags (allocating in A, none in B):\n";
+            if (gone.empty()) o << "   (none)\n";
+            int shown = 0;
+            for (const auto& d : gone) {
+                if (shown++ >= topN) break;
+                o << "   " << padL("-" + humanBytes(d.a), 14) << "   " << padR(d.tag, 6)
+                  << "  " << d.key << "\n";
+            }
+        }
+        // Top growers (present in both, by non-paged delta).
+        {
+            std::vector<TagDelta> both;
+            for (const auto& d : v)
+                if (d.a > 0 && d.b > 0) both.push_back(d);
+            std::sort(both.begin(), both.end(),
+                      [](const TagDelta& x, const TagDelta& y) {
+                          return x.delta > y.delta;
+                      });
+            o << "\n TOP GROWERS (in both, by non-paged delta):\n";
+            o << "   " << padL("delta", 14) << "   " << padL("A", 12)
+              << padL("B", 12) << "   tag\n";
+            int shown = 0;
+            for (const auto& d : both) {
+                if (d.delta <= 0) break;
+                if (shown++ >= topN) break;
+                o << "   " << padL(signedBytes(d.delta), 14) << "   "
+                  << padL(humanBytes(d.a), 12) << padL(humanBytes(d.b), 12) << "   "
+                  << padR(d.tag, 6) << "  " << d.key << "\n";
+            }
+            if (shown == 0) o << "   (no tags grew)\n";
+
+            o << "\n TOP SHRINKERS (in both, by non-paged delta):\n";
+            shown = 0;
+            for (auto it = both.rbegin(); it != both.rend(); ++it) {
+                if (it->delta >= 0) break;
+                if (shown++ >= topN) break;
+                o << "   " << padL(signedBytes(it->delta), 14) << "   "
+                  << padL(humanBytes(it->a), 12) << padL(humanBytes(it->b), 12)
+                  << "   " << padR(it->tag, 6) << "  " << it->key << "\n";
+            }
+            if (shown == 0) o << "   (no tags shrank)\n";
+        }
     }
     o << "\n";
     o << rule() << "\n";
