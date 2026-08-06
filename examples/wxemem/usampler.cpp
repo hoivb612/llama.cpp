@@ -132,23 +132,77 @@ int main(int argc, char** argv) {
     ResumeThread(pi.hThread);
 
     std::vector<ModInfo> mods;
+    const bool dbg = getenv("USAMPLER_DBG") != NULL;
+    // Module capture. CreateToolhelp32Snapshot(TH32CS_SNAPMODULE) can transiently
+    // fail with ERROR_PARTIAL_COPY (299) / ERROR_BAD_LENGTH (24) while the target
+    // is still loading DLLs or its loader list is changing, so retry briefly.
+    // Called on a wall-clock cadence (not iteration count) so it reliably fires
+    // mid-run once the process is loaded, and keeps catching delay-loaded DLLs.
     auto refreshMods = [&]() {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-        if (snap == INVALID_HANDLE_VALUE) return;
-        MODULEENTRY32 me; me.dwSize = sizeof(me);
-        if (Module32First(snap, &me)) {
-            do {
-                uint64_t base = (uint64_t)me.modBaseAddr;
-                bool found = false;
-                for (auto& m : mods) if (m.base == base) { found = true; break; }
-                if (!found) {
-                    ModInfo mi; mi.base = base; mi.size = me.modBaseSize;
-                    mi.name = me.szModule; mi.path = me.szExePath;
-                    mods.push_back(mi);
-                }
-            } while (Module32Next(snap, &me));
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+            if (snap == INVALID_HANDLE_VALUE) {
+                DWORD e = GetLastError();
+                if (e == ERROR_BAD_LENGTH || e == ERROR_PARTIAL_COPY) { Sleep(1); continue; }
+                if (dbg) fprintf(stderr, "[dbg] SNAPMODULE INVALID err=%lu mods=%zu\n", e, mods.size());
+                return;
+            }
+            MODULEENTRY32 me; me.dwSize = sizeof(me);
+            if (Module32First(snap, &me)) {
+                do {
+                    uint64_t base = (uint64_t)me.modBaseAddr;
+                    bool found = false;
+                    for (auto& m : mods) if (m.base == base) { found = true; break; }
+                    if (!found) {
+                        ModInfo mi; mi.base = base; mi.size = me.modBaseSize;
+                        mi.name = me.szModule; mi.path = me.szExePath;
+                        mods.push_back(mi);
+                    }
+                } while (Module32Next(snap, &me));
+            }
+            CloseHandle(snap);
+            if (dbg) fprintf(stderr, "[dbg] SNAPMODULE ok mods=%zu\n", mods.size());
+            return;
         }
-        CloseHandle(snap);
+        if (dbg) fprintf(stderr, "[dbg] SNAPMODULE gave up (partial-copy) mods=%zu\n", mods.size());
+    };
+
+    // Cache of the target's thread handles. TH32CS_SNAPTHREAD is system-wide (no
+    // per-pid filter), so snapshotting + walking every thread on the box each
+    // sweep is O(all-system-threads) and collapses on big machines (e.g. a 96-core
+    // host with 20k+ threads across 400+ processes): the sample loop crawls and
+    // module capture starves. Instead we rebuild the handle cache on a coarse
+    // cadence and reuse the handles for the tight per-sweep suspend/sample.
+    struct TgtThread { DWORD tid; HANDLE h; };
+    std::vector<TgtThread> threads;
+    auto refreshThreads = [&]() {
+        HANDLE tsnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (tsnap == INVALID_HANDLE_VALUE) return;
+        std::unordered_map<DWORD, bool> live;
+        THREADENTRY32 te; te.dwSize = sizeof(te);
+        if (Thread32First(tsnap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid) continue;
+                live[te.th32ThreadID] = true;
+                bool have = false;
+                for (auto& t : threads) if (t.tid == te.th32ThreadID) { have = true; break; }
+                if (!have) {
+                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                          FALSE, te.th32ThreadID);
+                    if (h) threads.push_back({ te.th32ThreadID, h });
+                }
+            } while (Thread32Next(tsnap, &te));
+        }
+        CloseHandle(tsnap);
+        // release handles for threads that have exited
+        for (size_t i = 0; i < threads.size(); ) {
+            if (!live.count(threads[i].tid)) {
+                CloseHandle(threads[i].h);
+                threads[i] = threads.back();
+                threads.pop_back();
+            } else ++i;
+        }
+        if (dbg) fprintf(stderr, "[dbg] threads cached=%zu\n", threads.size());
     };
 
     // High-resolution inter-sweep wait.
@@ -162,46 +216,41 @@ int main(int argc, char** argv) {
         }
     };
 
+    auto elapsedMs = [&]() -> double {
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        return (now.QuadPart - tStart.QuadPart) * qpcToUs / 1000.0;
+    };
+
     std::unordered_map<uint64_t, uint32_t> hits;
     uint64_t total = 0, skipped = 0;
-    int refreshCountdown = 0;
     bool warmupDone = (skipMs <= 0);
+    // Worker threads are created once at startup and are stable thereafter, and
+    // the module set settles quickly, so both refreshes are coarse. This keeps
+    // the expensive system-wide snapshots to a few per second regardless of the
+    // sample rate.
+    double lastModMs = -1e9, lastThrMs = -1e9;
 
     while (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) {
-        if (--refreshCountdown <= 0) { refreshMods(); refreshCountdown = 200; }
+        const double ms = elapsedMs();
+        if (ms - lastModMs >= 250.0) { refreshMods();    lastModMs = ms; }
+        if (ms - lastThrMs >= 500.0) { refreshThreads(); lastThrMs = ms; }
 
-        if (!warmupDone) {
-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            if ((now.QuadPart - tStart.QuadPart) * qpcToUs >= (double)skipMs * 1000.0)
-                warmupDone = true;
-        }
+        if (!warmupDone && ms >= (double)skipMs) warmupDone = true;
 
-        HANDLE tsnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (tsnap != INVALID_HANDLE_VALUE) {
-            THREADENTRY32 te; te.dwSize = sizeof(te);
-            if (Thread32First(tsnap, &te)) {
-                do {
-                    if (te.th32OwnerProcessID != pid) continue;
-                    HANDLE ht = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
-                                           FALSE, te.th32ThreadID);
-                    if (!ht) continue;
-                    if (SuspendThread(ht) != (DWORD)-1) {
-                        CONTEXT ctx; ZeroMemory(&ctx, sizeof(ctx));
-                        ctx.ContextFlags = CONTEXT_CONTROL;
-                        if (GetThreadContext(ht, &ctx)) {
-                            if (warmupDone) { hits[ctx.Rip]++; total++; }
-                            else            { skipped++; }
-                        }
-                        ResumeThread(ht);
-                    }
-                    CloseHandle(ht);
-                } while (Thread32Next(tsnap, &te));
+        for (auto& t : threads) {
+            if (SuspendThread(t.h) == (DWORD)-1) continue;
+            CONTEXT ctx; ZeroMemory(&ctx, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(t.h, &ctx)) {
+                if (warmupDone) { hits[ctx.Rip]++; total++; }
+                else            { skipped++; }
             }
-            CloseHandle(tsnap);
+            ResumeThread(t.h);
         }
         waitInterval();
     }
     refreshMods();
+    for (auto& t : threads) CloseHandle(t.h);
     timeEndPeriod(1);
 
     emit("[usampler] child exited. total samples = %llu (warmup-skipped = %llu) across %zu modules.\n",
