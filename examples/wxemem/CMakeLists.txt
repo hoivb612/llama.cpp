@@ -39,6 +39,8 @@ endif()
 # behaviour (see topo.c and bwtest.c headers). Windows-only.
 #   topo   - dumps LP -> core -> CCX(L3) -> NUMA topology
 #   bwtest - measures aggregate read bandwidth vs thread placement
+#   ccxrun - launches any command with CCX-spread CPU placement (group-aware)
+#   membw  - memory bandwidth test
 # ---------------------------------------------------------------------------
 if (WIN32)
     add_executable(topo topo.c)
@@ -53,6 +55,24 @@ if (WIN32)
     add_executable(bwtest bwtest.c)
     install(TARGETS bwtest RUNTIME)
     target_compile_definitions(bwtest PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+
+    add_executable(ccxrun ccxrun.c)
+    install(TARGETS ccxrun RUNTIME)
+    target_compile_definitions(ccxrun PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+
+    add_executable(membw membw.cpp)
+    install(TARGETS membw RUNTIME)
+    target_compile_definitions(ccxrun PRIVATE
         _WIN32_WINNT=0x0601
         _CRT_SECURE_NO_WARNINGS
         WIN32_LEAN_AND_MEAN
