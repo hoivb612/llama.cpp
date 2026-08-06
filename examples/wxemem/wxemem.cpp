@@ -71,7 +71,9 @@ typedef LONG KPRIORITY;
 // SYSTEM_INFORMATION_CLASS values we use (others exist in winternl.h).
 enum {
     SystemPerformanceInformation_Class    = 2,
+    SystemProcessInformation_Class        = 5,
     SystemModuleInformation_Class         = 11,
+    SystemPoolTagInformation_Class        = 22,
     SystemMemoryListInformation_Class     = 80,
 };
 
@@ -150,6 +152,66 @@ struct RTL_PROCESS_MODULE_INFORMATION {
 struct RTL_PROCESS_MODULES {
     ULONG NumberOfModules;
     RTL_PROCESS_MODULE_INFORMATION Modules[1];
+};
+
+// SYSTEM_POOLTAG — per-pool-tag allocation accounting. Pool tagging is always
+// enabled on 64-bit Windows, so NonPagedUsed/PagedUsed are the current in-use
+// bytes charged to each 4-character tag. This is what poolmon / !poolused read.
+struct SYSTEM_POOLTAG_ENTRY {
+    union {
+        UCHAR Tag[4];
+        ULONG TagUlong;
+    };
+    ULONG  PagedAllocs;
+    ULONG  PagedFrees;
+    SIZE_T PagedUsed;
+    ULONG  NonPagedAllocs;
+    ULONG  NonPagedFrees;
+    SIZE_T NonPagedUsed;
+};
+
+struct SYSTEM_POOLTAG_INFORMATION {
+    ULONG Count;
+    SYSTEM_POOLTAG_ENTRY TagInfo[1];
+};
+
+// SYSTEM_PROCESS_INFORMATION (leading fields; layout per phnt / ntddk). We only
+// read UniqueProcessId, WorkingSetPrivateSize and WorkingSetSize. The value of
+// this class is that it is a single system-wide query needing NO per-process
+// handle, so it returns the private working set even for Protected Process Light
+// (PPL) processes (Defender's MsMpEng.exe, MsSense.exe, lsass.exe, etc.) that
+// deny PROCESS_VM_READ to administrators and therefore cannot be walked with
+// QueryWorkingSet. This is the same source Task Manager / Process Explorer use.
+struct SYSTEM_PROCESS_INFORMATION_WXE {
+    ULONG         NextEntryOffset;
+    ULONG         NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;   // private working set, bytes (Vista+)
+    ULONG         HardFaultCount;
+    ULONG         NumberOfThreadsHighWatermark;
+    ULONGLONG     CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY     BasePriority;
+    HANDLE        UniqueProcessId;
+    HANDLE        InheritedFromUniqueProcessId;
+    ULONG         HandleCount;
+    ULONG         SessionId;
+    ULONG_PTR     UniqueProcessKey;
+    SIZE_T        PeakVirtualSize;
+    SIZE_T        VirtualSize;
+    ULONG         PageFaultCount;
+    SIZE_T        PeakWorkingSetSize;
+    SIZE_T        WorkingSetSize;
+    SIZE_T        QuotaPeakPagedPoolUsage;
+    SIZE_T        QuotaPagedPoolUsage;
+    SIZE_T        QuotaPeakNonPagedPoolUsage;
+    SIZE_T        QuotaNonPagedPoolUsage;
+    SIZE_T        PagefileUsage;
+    SIZE_T        PeakPagefileUsage;
+    SIZE_T        PrivatePageCount;
+    // I/O counters and per-thread array follow; not needed here.
 };
 }  // extern "C"
 #endif // _WIN32
@@ -273,12 +335,27 @@ struct MemList {
     bool     available      = false;
 };
 
+// Per-pool-tag usage (Windows). 'tag' holds the 4 tag characters sanitized to
+// printable ASCII; 'tag_raw' is the exact little-endian ULONG so consumers can
+// key on it unambiguously even when a tag byte is non-printable.
+struct PoolTag {
+    char     tag[5]      = {0};   // printable, NUL-terminated
+    uint32_t tag_raw     = 0;
+    uint64_t nonpaged    = 0;     // bytes currently in use (non-paged)
+    uint64_t paged       = 0;     // bytes currently in use (paged)
+    uint64_t np_outstanding = 0;  // NonPagedAllocs - NonPagedFrees
+    uint64_t pg_outstanding = 0;  // PagedAllocs - PagedFrees
+};
+
 struct ProcInfo {
     DWORD       pid          = 0;
     std::string name;
-    uint64_t    ws           = 0;  // working set (resident)
+    uint64_t    ws           = 0;  // working set (resident: private + shared)
     uint64_t    peak_ws      = 0;
-    uint64_t    private_bytes = 0; // PrivateUsage on PROCESS_MEMORY_COUNTERS_EX
+    uint64_t    private_bytes = 0; // PrivateUsage on PROCESS_MEMORY_COUNTERS_EX (committed)
+    uint64_t    private_ws   = 0;  // resident private working set (private pages in RAM now)
+    uint64_t    shared_ws    = 0;  // resident shared working set (WS - private_ws)
+    bool        private_ws_known = false;  // was private WS resolved for this pid?
     uint64_t    pagefile     = 0;
 };
 
@@ -441,8 +518,50 @@ static MemList collect_memlist() {
     return m;
 }
 
+// Build a pid -> (private working set, working set) map from a single system-wide
+// NtQuerySystemInformation(SystemProcessInformation) call. Unlike QueryWorkingSet
+// this needs no per-process handle and therefore also returns the WS figures of
+// Protected Process Light (PPL) / SYSTEM / minimal processes (Defender, lsass,
+// Registry, Secure System, ...) that deny PROCESS_VM_READ even to elevated
+// administrators. .first = WorkingSetPrivateSize, .second = WorkingSetSize (both
+// bytes). Returns an empty map on failure (callers treat private WS as unknown).
+static std::map<DWORD, std::pair<uint64_t, uint64_t>> collect_private_ws_map() {
+    std::map<DWORD, std::pair<uint64_t, uint64_t>> out;
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+    const NTSTATUS STATUS_INFO_LENGTH_MISMATCH = (NTSTATUS)0xC0000004L;
+#endif
+    ULONG cap = 1u << 20;  // 1 MiB to start; grow on mismatch
+    std::vector<char> buf;
+    NTSTATUS s = STATUS_INFO_LENGTH_MISMATCH;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        buf.resize(cap);
+        ULONG needed = 0;
+        s = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)SystemProcessInformation_Class,
+                                     buf.data(), cap, &needed);
+        if (s == STATUS_INFO_LENGTH_MISMATCH) {
+            cap = (needed > cap) ? (needed + (needed / 4) + 65536) : (cap * 2);
+            continue;
+        }
+        break;
+    }
+    if (s != STATUS_SUCCESS) return out;
+
+    const char * p = buf.data();
+    for (;;) {
+        auto * spi = (const SYSTEM_PROCESS_INFORMATION_WXE *)p;
+        DWORD pid = (DWORD)(ULONG_PTR)spi->UniqueProcessId;
+        uint64_t priv = (uint64_t)spi->WorkingSetPrivateSize.QuadPart;
+        uint64_t ws   = (uint64_t)spi->WorkingSetSize;
+        out[pid] = { priv, ws };
+        if (spi->NextEntryOffset == 0) break;
+        p += spi->NextEntryOffset;
+    }
+    return out;
+}
+
 static std::vector<ProcInfo> collect_processes() {
     std::vector<ProcInfo> out;
+    std::map<DWORD, std::pair<uint64_t, uint64_t>> priv_ws = collect_private_ws_map();
     std::vector<DWORD> pids(2048);
     DWORD got_bytes = 0;
     for (;;) {
@@ -498,6 +617,26 @@ static std::vector<ProcInfo> collect_processes() {
             pi.peak_ws       = pmc.PeakWorkingSetSize;
             pi.private_bytes = pmc.PrivateUsage;
             pi.pagefile      = pmc.PagefileUsage;
+        }
+
+        pi.private_ws = 0;
+        {
+            auto it = priv_ws.find(pid);
+            if (it != priv_ws.end()) {
+                uint64_t map_priv = it->second.first;
+                uint64_t map_ws   = it->second.second;
+                // Backfill WS from the system-wide query when the per-handle WS
+                // is missing or smaller than the private WS (happens for minimal
+                // / protected processes such as Registry or Secure System where
+                // GetProcessMemoryInfo returns only a tiny WS). Keeps the
+                // decomposition WS = PrivWS + SharWS self-consistent.
+                if (pi.ws < map_priv) pi.ws = map_ws;
+                pi.private_ws = (map_priv > pi.ws) ? pi.ws : map_priv;
+                pi.private_ws_known = true;
+            }
+        }
+        if (pi.private_ws_known && pi.ws >= pi.private_ws) {
+            pi.shared_ws = pi.ws - pi.private_ws;
         }
 
         CloseHandle(h);
@@ -627,6 +766,51 @@ static std::vector<DriverInfo> collect_drivers() {
         d.image_base = (uintptr_t)m.ImageBase;
         out.push_back(d);
     }
+    return out;
+}
+
+// Query per-pool-tag usage via SystemPoolTagInformation. Returns tags sorted by
+// non-paged bytes (descending). Empty if the query fails or no admin rights.
+static std::vector<PoolTag> collect_pooltags() {
+    std::vector<PoolTag> out;
+    ULONG len = 0x20000;  // ~128 KiB to start; grows on mismatch.
+    std::vector<uint8_t> buf;
+    NTSTATUS s;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        buf.resize(len);
+        ULONG ret = 0;
+        s = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)SystemPoolTagInformation_Class,
+                                     buf.data(), len, &ret);
+        if (s == STATUS_SUCCESS) break;
+        // STATUS_INFO_LENGTH_MISMATCH (0xC0000004): grow and retry.
+        if ((ULONG)s == 0xC0000004) {
+            len = (ret > len) ? (ret + 0x10000) : (len * 2);
+            continue;
+        }
+        return out;  // any other error: pool tagging off / no access.
+    }
+    if (s != STATUS_SUCCESS) return out;
+
+    auto * info = reinterpret_cast<SYSTEM_POOLTAG_INFORMATION *>(buf.data());
+    out.reserve(info->Count);
+    for (ULONG i = 0; i < info->Count; ++i) {
+        const auto & e = info->TagInfo[i];
+        if (e.NonPagedUsed == 0 && e.PagedUsed == 0) continue;  // skip empties
+        PoolTag pt;
+        pt.tag_raw = e.TagUlong;
+        for (int b = 0; b < 4; ++b) {
+            unsigned char c = e.Tag[b];
+            pt.tag[b] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        pt.tag[4] = '\0';
+        pt.nonpaged        = (uint64_t)e.NonPagedUsed;
+        pt.paged           = (uint64_t)e.PagedUsed;
+        pt.np_outstanding  = (uint64_t)(e.NonPagedAllocs - e.NonPagedFrees);
+        pt.pg_outstanding  = (uint64_t)(e.PagedAllocs - e.PagedFrees);
+        out.push_back(pt);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const PoolTag & a, const PoolTag & b) { return a.nonpaged > b.nonpaged; });
     return out;
 }
 
@@ -797,6 +981,9 @@ static std::vector<ProcInfo> collect_processes() {
         }
         if (priv == 0) priv = proc_kb(status, "RssAnon");
         pi.private_bytes = priv;
+        pi.private_ws    = priv;  // on Linux this figure is already resident-private
+        pi.private_ws_known = true;
+        pi.shared_ws     = (pi.ws >= priv) ? pi.ws - priv : 0;
 
         out.push_back(std::move(pi));
     }
@@ -907,6 +1094,11 @@ static std::vector<DriverInfo> collect_drivers() {
     return out;
 }
 
+static std::vector<PoolTag> collect_pooltags() {
+    // Windows-specific concept; no equivalent on Linux.
+    return {};
+}
+
 static std::vector<PageFile> collect_pagefiles() {
     std::vector<PageFile> out;
     std::string sw;
@@ -950,6 +1142,7 @@ struct Options {
     bool        no_services     = false;
     bool        show_all_procs  = false;
     int         top_n           = 30;
+    int         top_npp         = 0;    // 0 = don't show pool-tag table in human output
     bool        help            = false;
 };
 
@@ -960,6 +1153,7 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
                         const std::vector<ServiceInfo> & all_services,
                         const std::map<DWORD, std::vector<ServiceInfo>> & services_by_pid,
                         const std::vector<DriverInfo> & drivers_top,
+                        const std::vector<PoolTag> & pooltags,
                         const Options & opts, bool admin) {
     auto line = []{ printf("--------------------------------------------------------------------------------\n"); };
 
@@ -1102,39 +1296,67 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
             }
             line();
         }
+
+        // Top non-paged pool tags (only when requested via --topNPP / --all).
+        int npp_rows = opts.show_all_procs ? (int)pooltags.size() : opts.top_npp;
+        if (npp_rows > 0 && !pooltags.empty()) {
+            uint64_t np_total = 0;
+            for (const auto & t : pooltags) np_total += t.nonpaged;
+            printf(" Top non-paged pool tags by bytes (%zu tags in use, ~%s non-paged)\n",
+                   pooltags.size(), format_bytes(np_total, 0).c_str());
+            int shown = (int)std::min<size_t>(pooltags.size(), (size_t)npp_rows);
+            printf("   %-6s %12s %12s %16s\n", "tag", "nonpaged", "paged", "outstanding");
+            for (int i = 0; i < shown; ++i) {
+                const auto & t = pooltags[i];
+                char allocs[32];
+                snprintf(allocs, sizeof(allocs), "%llu allocs",
+                         (unsigned long long)t.np_outstanding);
+                printf("   %-6s %12s %12s %16s\n",
+                       t.tag,
+                       format_bytes(t.nonpaged, 0).c_str(),
+                       format_bytes(t.paged, 0).c_str(),
+                       allocs);
+            }
+            line();
+        }
     }
 
  /* 
  Working Set (WS) = All physical RAM pages currently mapped to the process — includes:
    - Private pages (heap, stack, allocations)
    - Shared pages (DLLs like ntdll.dll, kernel32.dll, mapped files, shared sections)
-  Private Bytes = Only pages exclusively owned by this process — cannot be shared with other processes.
+  Private Bytes = Only pages exclusively owned by this process (committed) — cannot be shared.
   The difference (WS − Private) ≈ shared memory — primarily loaded DLLs and memory-mapped files.
 
+  PrivWS(res) = Private Working Set = the private pages that are actually RESIDENT in RAM right now.
+  Sourced from NtQuerySystemInformation(SystemProcessInformation).WorkingSetPrivateSize -- a single
+  system-wide query that needs no per-process handle, so it resolves even Protected Process Light
+  (PPL) / SYSTEM processes (Defender's MsMpEng.exe, MsSense.exe, lsass.exe, ...) that deny
+  PROCESS_VM_READ to administrators. This is the "private working set" figure Task Manager shows.
+  SharWS(res) = Shared Working Set = WS - PrivWS(res) = the resident shared pages (DLLs, mapped files,
+  shared sections). Shown 0 only in the rare case the system query fails and PrivWS is unknown.
+
+  Resident RAM identity:   WS = PrivWS(res) + SharWS(res)
+  Committed vs resident:   Private = PrivWS(res) + (non-resident private)   [non-resident not shown;
+                           it is paged out / never-touched commit and consumes no physical RAM]
+
+  Relationship:  PrivWS(res) <= Private   and   PrivWS(res) <= WS.
+    - Private   is committed private memory (resident OR paged out / never touched).
+    - PrivWS    is only the resident slice of that private memory.
+    - WS        is PrivWS(res) + resident shared pages (DLLs, mapped files).
+
   Example:
-   svchost.exe  WS=42.7 MB  Private=9.9 MB  → ~32.8 MB shared (DLLs, etc.)
-   MsMpEng.exe  WS=220 MB   Private=533 MB  → Private > WS!
-  When Private > WS (like Defender), it means the process has allocated more private memory than 
-  is currently resident in RAM — some private pages have been paged out to the pagefile or are in 
-  modified/standby lists. The WS only counts what's physically in RAM right now.
+   svchost.exe  WS=42.7 MB  Private=9.9 MB  PrivWS=8.5 MB  SharWS=34.2 MB → shared DLLs dominate.
+   MsMpEng.exe  WS=265 MB   Private=568 MB  PrivWS=210 MB  SharWS=55 MB  → Private > WS (much of it
+                                                            paged out); only ~210 MB private is resident.
+  When Private > WS (like Defender), the process has committed more private memory than is currently
+  resident — some private pages are paged out to the pagefile or sitting on modified/standby lists.
 
-  The "PageFile" column is actually reporting commit charge (also called "pagefile usage" in Windows APIs), 
-  not actual bytes written to the pagefile.
-
-  Commit charge = the total amount of virtual address space the OS has promised to back with storage if needed. 
-  For private memory, this equals Private Bytes exactly, because:
-   - Every private allocation must be committed (backed by either RAM or pagefile)
-   - Shared pages (DLLs) are backed by their file on disk, not the pagefile — so they don't count
-
-  That's why PageFile == Private in every row. They're the same metric viewed from two angles:
-  ┌──────────────┬─────────────────────────────────────────────────────────────────────────────┐
-  │ Private      │ "How much memory does only this process own?"                               │
-  ├──────────────┼─────────────────────────────────────────────────────────────────────────────┤
-  │ PageFile     │ "How much pagefile space is reserved to back this process's private pages?" │
-  └──────────────┴─────────────────────────────────────────────────────────────────────────────┘
-
-  And notably, if pagefile.sys shows 0 bytes actually used — then nothing has been paged out yet. 
-  The "PageFile" column per-process is the reservation, not actual I/O to disk.
+  NOTE: the per-process PageFile / commit-charge value equals Private Bytes exactly (every private
+  page must be committed and is backed by RAM-or-pagefile; shared DLL pages are backed by their file
+  on disk, not the pagefile). Because it was always identical to the Private column it is no longer
+  displayed in the human table; it is still emitted as "pagefile_bytes" in --json for scripting.
+  Note also this is the reservation, not bytes actually written to pagefile.sys.
   */
 
     if (!opts.no_processes) {
@@ -1144,15 +1366,16 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
         for (size_t i = 0; i < to_show; ++i) top_ws_total += procs_sorted[i].ws;
         printf(" Top %zu processes by working set (of %zu total): %s\n",
                to_show, procs_sorted.size(), format_bytes(top_ws_total).c_str());
-        printf("    %6s  %15s  %15s  %15s   %s\n",
-               "PID", "WorkingSet", "Private", "PageFile", "Image / [services]");
+        printf("    %6s  %15s  %15s  %15s  %15s   %s\n",
+               "PID", "WorkingSet", "Private", "PrivWS(res)", "SharWS(res)", "Image / [services]");
         for (size_t i = 0; i < to_show; ++i) {
             const ProcInfo & pi = procs_sorted[i];
-            printf("    %6lu  %15s  %15s  %15s   %s",
+            printf("    %6lu  %15s  %15s  %15s  %15s   %s",
                    (unsigned long)pi.pid,
                    format_bytes(pi.ws,            12).c_str(),
                    format_bytes(pi.private_bytes, 12).c_str(),
-                   format_bytes(pi.pagefile,      12).c_str(),
+                   format_bytes(pi.private_ws,    12).c_str(),
+                   format_bytes(pi.shared_ws,     12).c_str(),
                    pi.name.c_str());
             auto it = services_by_pid.find(pi.pid);
             if (it != services_by_pid.end() && !it->second.empty()) {
@@ -1181,6 +1404,42 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
                 printf("]");
             }
             printf("\n");
+        }
+
+        // WS totals across ALL processes (not just the shown top-N), split into
+        // resident-private vs resident-shared. See the note above: Sum(SharWS)
+        // double-counts shared physical pages (a shared DLL page is in every
+        // mapper's WS), so it is NOT physical shared RAM -- it answers "how much
+        // of the summed WS is shared mappings". Access-denied processes have
+        // PrivWS=SharWS=0 but a real WS, so their WS is bucketed as "unreadable"
+        // to keep the parts adding up. (De-duping to true physical shared RAM
+        // would require walking per-page PFNs, which the WS APIs don't expose.)
+        {
+            uint64_t sum_ws = 0, sum_priv = 0, sum_shar = 0, sum_unread = 0;
+            for (const auto & pi : procs_sorted) {
+                sum_ws += pi.ws;
+                if (!pi.private_ws_known && pi.ws > 0) {
+                    sum_unread += pi.ws;  // private WS could not be resolved
+                } else {
+                    sum_priv += pi.private_ws;
+                    sum_shar += pi.shared_ws;
+                }
+            }
+            double shar_pct = sum_ws ? 100.0 * (double)sum_shar / (double)sum_ws : 0.0;
+            printf("\n WS totals across all %zu processes: %s\n",
+                   procs_sorted.size(), format_bytes(sum_ws).c_str());
+            printf("   %-20s %15s   (physical, summable)\n",
+                   "resident-private:", format_bytes(sum_priv, 12).c_str());
+            printf("   %-20s %15s   (%.0f%% of WS; mappings -- double-counts shared physical pages)\n",
+                   "resident-shared:", format_bytes(sum_shar, 12).c_str(), shar_pct);
+            if (sum_unread > 0) {
+                printf("   %-20s %15s   (private WS unresolved; SystemProcessInformation query failed)\n",
+                       "unreadable:", format_bytes(sum_unread, 12).c_str());
+            }
+            printf("   NOTE: resident-shared is NOT physical shared RAM. Shared pages are counted\n");
+            printf("         once in RAM but appear in every mapping process's WS, so this sum\n");
+            printf("         over-counts them. True physical shared RAM needs per-page PFN de-dup,\n");
+            printf("         which the working-set APIs do not expose.\n");
         }
         line();
     }
@@ -1322,6 +1581,7 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
                        const std::vector<ServiceInfo> & all_services,
                        const std::map<DWORD, std::vector<ServiceInfo>> & services_by_pid,
                        const std::vector<DriverInfo> & drivers_top,
+                       const std::vector<PoolTag> & pooltags,
                        const Options & opts, bool admin) {
     printf("{\n");
     printf("  \"admin\": %s,\n", admin ? "true" : "false");
@@ -1388,6 +1648,25 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
     }
     printf("  ],\n");
 
+    // Per-pool-tag usage. Emitted in full (all tags with any bytes in use) so a
+    // diff between two snapshots can attribute pool growth to a specific tag,
+    // regardless of any --topNPP display cap. tag_hex is the exact raw value.
+    printf("  \"pool_tags\": [\n");
+    for (size_t i = 0; i < pooltags.size(); ++i) {
+        const auto & t = pooltags[i];
+        printf("    {\"tag\": \"%s\", \"tag_hex\": \"0x%08x\", "
+               "\"nonpaged_bytes\": %llu, \"paged_bytes\": %llu, "
+               "\"nonpaged_allocs\": %llu, \"paged_allocs\": %llu}%s\n",
+               json_escape(t.tag).c_str(),
+               (unsigned)t.tag_raw,
+               (unsigned long long)t.nonpaged,
+               (unsigned long long)t.paged,
+               (unsigned long long)t.np_outstanding,
+               (unsigned long long)t.pg_outstanding,
+               (i + 1 < pooltags.size() ? "," : ""));
+    }
+    printf("  ],\n");
+
     // Full services list (user-mode + kernel drivers) with start kind for
     // boot-charge analysis.
     {
@@ -1438,11 +1717,13 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
     printf("  \"processes\": [\n");
     for (size_t i = 0; i < to_show; ++i) {
         const auto & pi = procs_sorted[i];
-        printf("    {\"pid\": %lu, \"name\": \"%s\", \"ws_bytes\": %llu, \"private_bytes\": %llu, \"pagefile_bytes\": %llu",
+        printf("    {\"pid\": %lu, \"name\": \"%s\", \"ws_bytes\": %llu, \"private_bytes\": %llu, \"private_ws_bytes\": %llu, \"shared_ws_bytes\": %llu, \"pagefile_bytes\": %llu",
                (unsigned long)pi.pid,
                json_escape(pi.name).c_str(),
                (unsigned long long)pi.ws,
                (unsigned long long)pi.private_bytes,
+               (unsigned long long)pi.private_ws,
+               (unsigned long long)pi.shared_ws,
                (unsigned long long)pi.pagefile);
         auto it = services_by_pid.find(pi.pid);
         if (it != services_by_pid.end() && !it->second.empty()) {
@@ -1476,6 +1757,8 @@ static void print_usage() {
         "Options:\n"
         "  --json              emit JSON instead of human-readable text\n"
         "  --top N             show top N processes by working set (default 30)\n"
+        "  --topNPP N          show top N non-paged pool tags by bytes (Windows;\n"
+        "                      JSON always includes the full per-tag breakdown)\n"
         "  --all               show all processes and all loaded drivers (overrides --top\n"
         "                      and lifts the default driver-list cap)\n"
         "  --processes-only    only print the process table\n"
@@ -1499,6 +1782,11 @@ static bool parse_args(int argc, char ** argv, Options & opts) {
             if (++i >= argc) { fprintf(stderr, "wxemem: --top requires N\n"); return false; }
             opts.top_n = atoi(argv[i]);
             if (opts.top_n <= 0) { fprintf(stderr, "wxemem: --top must be positive\n"); return false; }
+        }
+        else if (a == "--topNPP") {
+            if (++i >= argc) { fprintf(stderr, "wxemem: --topNPP requires N\n"); return false; }
+            opts.top_npp = atoi(argv[i]);
+            if (opts.top_npp <= 0) { fprintf(stderr, "wxemem: --topNPP must be positive\n"); return false; }
         }
         else {
             fprintf(stderr, "wxemem: unknown option '%s'\n", a.c_str());
@@ -1541,10 +1829,12 @@ int main(int argc, char ** argv) {
     std::vector<DriverInfo> drivers_top = drivers;
     if (!opts.show_all_procs && drivers_top.size() > 64) drivers_top.resize(64);
 
+    std::vector<PoolTag> pooltags = collect_pooltags();
+
     if (opts.json) {
-        print_json(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
+        print_json(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, pooltags, opts, admin);
     } else {
-        print_human(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, opts, admin);
+        print_human(p, k, ml, pagefiles, procs, svcs, svc_by_pid, drivers_top, pooltags, opts, admin);
     }
     return 0;
 }

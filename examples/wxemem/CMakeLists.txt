@@ -22,6 +22,18 @@ if (MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# wxememdiff - diff two wxemem --json snapshots and attribute memory growth.
+# Cross-platform (pure C++17 + nlohmann/json); no OS-specific libraries.
+# ---------------------------------------------------------------------------
+add_executable(wxememdiff wxememdiff.cpp)
+install(TARGETS wxememdiff RUNTIME)
+target_compile_features(wxememdiff PRIVATE cxx_std_17)
+target_include_directories(wxememdiff PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+if (MSVC)
+    target_compile_definitions(wxememdiff PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# ---------------------------------------------------------------------------
 # Standalone Windows OS utilities (CPU topology + memory-bandwidth probes).
 # These are self-contained Win32 diagnostics used to investigate NUMA / CCX
 # behaviour (see topo.c and bwtest.c headers). Windows-only.
