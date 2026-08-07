@@ -1,5 +1,10 @@
 #include "ggml_common.hlsli"
 
+// RMS_FUSED variant (mul_mat_vec_glu_q5_0_subgroup_rms.hlsl): folds the
+// preceding RMS_NORM + MUL(norm_weight) in. src1 carries the pre-norm
+// activation x and src6 the norm weight g; one pass accumulates the dots
+// against x*g plus sum(x*x) and applies 1/rms once. op14 = eps (float bits).
+
 #ifndef GROUP_SIZE
 #define GROUP_SIZE        64
 #endif
@@ -13,6 +18,9 @@
 #if !(defined(WAVE_SIZE) && (GROUP_SIZE == WAVE_SIZE))
 groupshared float glu_wave_gate[GROUP_SIZE / 16];
 groupshared float glu_wave_up[GROUP_SIZE / 16];
+#if RMS_FUSED
+groupshared float glu_wave_ss[GROUP_SIZE / 16];
+#endif
 #endif
 
 uint read_u32_unaligned(ByteAddressBuffer buf, uint byte_offset) {
@@ -87,11 +95,19 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
 
     float gate = 0.0f;
     float up = 0.0f;
+#if RMS_FUSED
+    float ss = 0.0f;
+#endif
     for (uint k = local_id * VALUES_PER_THREAD; k < ne00; k += GROUP_SIZE * VALUES_PER_THREAD) {
         uint block = k / QK5_0;
         uint elem = k & (QK5_0 - 1u);
         float4 x0 = asfloat(src1.Load4(src1_base + k * 4u));
         float4 x1 = asfloat(src1.Load4(src1_base + (k + 4u) * 4u));
+#if RMS_FUSED
+        ss += dot(x0, x0) + dot(x1, x1);
+        x0 *= asfloat(src6.Load4(k * 4u));
+        x1 *= asfloat(src6.Load4((k + 4u) * 4u));
+#endif
         gate += q5_0_dot(src0, gate_row + block * Q5_0_BSIZE, elem, x0, x1);
         up += q5_0_dot(src2, up_row + block * Q5_0_BSIZE, elem, x0, x1);
     }
@@ -99,6 +115,11 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
 #if defined(WAVE_SIZE) && (GROUP_SIZE == WAVE_SIZE)
     gate = WaveActiveSum(gate);
     up = WaveActiveSum(up);
+#if RMS_FUSED
+    float rms_scale = 1.0f / sqrt(WaveActiveSum(ss) / (float)ne00 + asfloat(op14));
+    gate *= rms_scale;
+    up   *= rms_scale;
+#endif
     if (local_id == 0u) {
         float result = (gate / (1.0f + exp(-gate))) * up;
         uint dst_row = offset_4d(row, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
@@ -107,20 +128,37 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
 #else
     float wave_gate = WaveActiveSum(gate);
     float wave_up   = WaveActiveSum(up);
+#if RMS_FUSED
+    float wave_ss   = WaveActiveSum(ss);
+#endif
     uint  wave_id   = local_id / WARP_SIZE;
     uint  num_waves = GROUP_SIZE / WARP_SIZE;
     if (WaveIsFirstLane()) {
         glu_wave_gate[wave_id] = wave_gate;
         glu_wave_up[wave_id]   = wave_up;
+#if RMS_FUSED
+        glu_wave_ss[wave_id]   = wave_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
     if (local_id == 0u) {
         float g = 0.0f;
         float u = 0.0f;
+#if RMS_FUSED
+        float s = 0.0f;
+#endif
         for (uint w = 0u; w < num_waves; ++w) {
             g += glu_wave_gate[w];
             u += glu_wave_up[w];
+#if RMS_FUSED
+            s += glu_wave_ss[w];
+#endif
         }
+#if RMS_FUSED
+        float rms_scale = 1.0f / sqrt(s / (float)ne00 + asfloat(op14));
+        g *= rms_scale;
+        u *= rms_scale;
+#endif
         float result = (g / (1.0f + exp(-g))) * u;
         uint dst_row = offset_4d(row, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, dst_row, result, dst_esize);

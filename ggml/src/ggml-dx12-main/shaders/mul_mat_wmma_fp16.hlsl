@@ -11,6 +11,12 @@
 //   - LDS tiles stored as float16_t (half-precision LDS), keeping the LDS
 //     footprint at 4 KiB despite the 2x bigger output tile. Multiply in fp16,
 //     accumulate in fp32.
+//   - K-tile partial sums stay in fp16 and are promoted into the fp32
+//     accumulator once per tile, so the inner loop runs at the fp16 rate.
+//     16 terms cannot lose meaningful precision and cannot plausibly
+//     overflow (fp16 saturates at 65504, so it would take products
+//     averaging ~4000). SmolLM2-135M f16 perplexity is 9.2147 vs 9.2144 for
+//     fp32 accumulation and 9.2143 on the CPU backend; B390 pp512 +10.9%.
 //   - Vectorized typed-half loads via load_auto() casts (TBD: pure typed loads
 //     once a F16x4 wrapper lands).
 //
@@ -106,6 +112,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
         // 4x4 register accumulate. Thread (tx, ty) owns output tile at
         // rows [ty*TM .. ty*TM+3], cols [tx*TN .. tx*TN+3].
+        // The K-tile partial sums stay in fp16 (16 terms cannot lose
+        // meaningful precision) so the inner loop runs at the fp16 rate;
+        // only the per-tile result is promoted into the fp32 accumulator.
+        float16_t tacc[TM][TN];
+        [unroll] for (uint im = 0; im < TM; im++) {
+            [unroll] for (uint in_ = 0; in_ < TN; in_++) {
+                tacc[im][in_] = (float16_t)0;
+            }
+        }
         [unroll]
         for (uint k = 0; k < BK; k++) {
             float16_t a[TM];
@@ -118,8 +133,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             }
             [unroll] for (uint im = 0; im < TM; im++) {
                 [unroll] for (uint in_ = 0; in_ < TN; in_++) {
-                    acc[im][in_] += (float)(a[im] * b[in_]);
+                    tacc[im][in_] += a[im] * b[in_];
                 }
+            }
+        }
+        [unroll] for (uint im = 0; im < TM; im++) {
+            [unroll] for (uint in_ = 0; in_ < TN; in_++) {
+                acc[im][in_] += (float)tacc[im][in_];
             }
         }
 

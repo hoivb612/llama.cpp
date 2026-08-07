@@ -145,6 +145,7 @@ if (DXC_EXECUTABLE)
         argsort
         argsort_large
         top_k
+        top_k_large
         add_id
         count_equal
         acc
@@ -168,8 +169,10 @@ if (DXC_EXECUTABLE)
         flash_attn
         flash_attn_64
         flash_attn_128
-        flash_attn_tiled
-        flash_attn_tiled16
+        flash_attn_pf_64
+        flash_attn_pf_64_wide
+        flash_attn_pf_96
+        flash_attn_pf_128
         flash_attn_gqa
         flash_attn_reduce
         flash_attn_q4_0
@@ -178,6 +181,8 @@ if (DXC_EXECUTABLE)
         flash_attn_q5_1
         flash_attn_q8_0
         flash_attn_iq4_nl
+        flash_attn_tiled
+        flash_attn_tiled16
         set_rows
         rope_set_rows
         rope_scale_k_set_rows
@@ -206,12 +211,16 @@ if (DXC_EXECUTABLE)
         rms_norm_mul_quantize_q8_1
         rms_norm_mul_rope
         rms_norm_mul_rope_set_rows
+        rms_norm_mul_rope_qk
         add_rms_norm_mul
         mul_mat_vec
         mul_mat_vec_mr
         mul_mat_vec_f16_wave64
         mul_mat_vec_qkv_f16_wave64
+        mul_mat_vec_qkv_f16_wave64_rms
         mul_mat_vec_q4k_mr
+        mul_mat_vec_q4k_mr_rms
+        mul_mat_vec_q4k_qk
         mul_mat_vec_q5k_mr
         mul_mat_vec_q5k_subgroup
         mul_mat_vec_q6k_mr
@@ -223,8 +232,12 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q8_0_wave64
         mul_mat_vec_q8_0_wave64_rows2
         mul_mat_vec_qkv_q8_0_wave64_rows2
+        mul_mat_vec_qkv_q8_0_wave64_rms
         mul_mat_vec_qkv_q8_0_mr256
+        mul_mat_vec_qkv_q8_0_mr256_rms
+        mul_mat_vec_qkv_q8_0_dp4a
         mul_mat_vec_glu_q8_0_wave64_rows2
+        mul_mat_vec_glu_q8_0_wave64_rms
         mul_mat_vec_q8_0_dp4a_mr64
         mul_mat_vec_q4k_dp4a_mr4
         mul_mat_vec_q4k_dp4a_nc2
@@ -240,20 +253,27 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q5_0_subgroup
         mul_mat_vec_q5_0_vulkan_rows2
         mul_mat_vec_qkv_q5_0_vulkan_rows2
+        mul_mat_vec_qkv_q5_0_vulkan_rows2_rms
         mul_mat_vec_qkv_q5_0_q8_0_rows2
+        mul_mat_vec_qkv_q5_0_q8_0_rows2_rms
         mul_mat_vec_glu_q5_0_subgroup
+        mul_mat_vec_glu_q5_0_subgroup_rms
         mul_mat_vec_glu_q5_0_vulkan_rows2
+        mul_mat_vec_glu_q5_0_vulkan_rows2_rms
         mul_mat_vec_glu_q5_0
         mul_mat_vec_glu_q4_k
+        mul_mat_vec_glu_q4_k_rms
         mul_mat_vec_glu_q5_k
         mul_mat_vec_glu_q3_k
         mul_mat_vec_glu_q8_0
+        mul_mat_vec_glu_q8_0_rms
         mul_mat_vec_glu_q8_0_dp4a_mr64
         mul_mat_vec_q5_1_mr
         mul_mat_vec_q8_0_mr
         mul_mat_vec_q8_0_mr256
         mul_mat_vec_q8_0_mr256v
         mul_mat_vec_glu
+        mul_mat_vec_glu_rms
         mul_mat_vec_mr32
         mul_mat_q4_0
         mul_mat_q4_1
@@ -290,9 +310,11 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_iq1_s
         mul_mat_vec_iq1_m
         mul_mat_wmma
+        mul_mat_wmma64
         mul_mat_wmma_kfull
         mul_mat_q4k_wmma
         mul_mat_q4k_wmma_lds
+        mul_mat_q4k_wmma_lds64
         mul_mat_q5k_wmma
         mul_mat_q6k_wmma
         mul_mat_q8_0_wmma
@@ -320,6 +342,8 @@ if (DXC_EXECUTABLE)
         mul_mat_id_q8_0_dp4a
         mul_mat_vec_q4_0_dp4a
         mul_mat_vec_q4_0_dp4a_mr256
+        mul_mat_vec_q4_1_dp4a
+        mul_mat_vec_q4_1_dp4a_mr256
         mul_mat_vec_q5_0_dp4a
         mul_mat_vec_q5_0_dp4a_mr256
         mul_mat_vec_q5_1_dp4a
@@ -334,9 +358,13 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_mr32
         mul_mat_vec_f16_wave64
         mul_mat_vec_qkv_f16_wave64
+        mul_mat_vec_qkv_f16_wave64_rms
         mul_mat_vec_glu
+        mul_mat_vec_glu_rms
         flash_attn
         flash_attn_gqa
+        flash_attn_tiled
+        flash_attn_tiled16
     )
 
     # Shaders that REQUIRE native 16-bit shader ops (compiled with
@@ -376,6 +404,10 @@ if (DXC_EXECUTABLE)
         flash_attn_128
         flash_attn_tiled
         flash_attn_tiled16
+        flash_attn_pf_64
+        flash_attn_pf_64_wide
+        flash_attn_pf_96
+        flash_attn_pf_128
         flash_attn_gqa
         flash_attn_reduce
         flash_attn_q4_0
@@ -405,11 +437,18 @@ if (DXC_EXECUTABLE)
     set(DX12_MMV_TUNE_SHADERS
         mul_mat_vec_q5_0_subgroup
         mul_mat_vec_glu_q5_0_subgroup
+        mul_mat_vec_glu_q5_0_subgroup_rms
         mul_mat_vec_glu_q8_0_dp4a_mr64
         mul_mat_vec_q6k_subgroup
         mul_mat_vec_q8_0_dp4a
+        mul_mat_vec_q4k_mr
+        mul_mat_vec_q4k_mr_rms
+        mul_mat_vec_q4k_qk
+        mul_mat_vec_q6k_dp4a
+        mul_mat_vec_glu_q4_k
+        mul_mat_vec_glu_q4_k_rms
     )
-    set(DX12_MMV_TUNE_GROUP_SIZES 16 32 128 256 512)
+    set(DX12_MMV_TUNE_GROUP_SIZES 16 32 64 128 256 512)
 
     # Shader files that are #included by other shaders (transitive deps).
     # Add to DEPENDS so changes trigger rebuilds of dependent shaders.
@@ -423,11 +462,14 @@ if (DXC_EXECUTABLE)
         ${SHADER_INPUT_DIR}/flash_attn.hlsl
         ${SHADER_INPUT_DIR}/flash_attn_tiled.hlsl
         ${SHADER_INPUT_DIR}/flash_attn_cd.hlsli
+        ${SHADER_INPUT_DIR}/flash_attn_pf.hlsli
         ${SHADER_INPUT_DIR}/mul_mat_vec_q4k_dp4a.hlsl
         ${SHADER_INPUT_DIR}/mul_mat_vec_q5k_dp4a.hlsl
         ${SHADER_INPUT_DIR}/mul_mat_vec_q6k_mr_blocked.hlsl
+        ${SHADER_INPUT_DIR}/mul_mat_vec_qkv_q8_0_wave64_rows2.hlsl
         ${SHADER_INPUT_DIR}/gated_delta_net_impl.hlsli
         ${SHADER_INPUT_DIR}/ssm_conv_impl.hlsli
+        ${SHADER_INPUT_DIR}/ssm_scan_body.hlsli
         ${SHADER_INPUT_DIR}/iq2xs_grid.hlsli
         ${SHADER_INPUT_DIR}/iq2s_grid.hlsli
         ${SHADER_INPUT_DIR}/iq3xxs_grid.hlsli

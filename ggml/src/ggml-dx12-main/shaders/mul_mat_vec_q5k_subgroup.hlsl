@@ -22,6 +22,13 @@
 #define QK_K        256
 #define Q5K_BSIZE   176
 
+// The reduction below is a single WaveActiveSum over the whole threadgroup,
+// so the wave has to be exactly GROUP_SIZE lanes. Guarded because [WaveSize(N)]
+// requires the group to hold at least one full wave (the w64 blob is unused
+// here: the dispatcher gates this shader on wave_size == 32).
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

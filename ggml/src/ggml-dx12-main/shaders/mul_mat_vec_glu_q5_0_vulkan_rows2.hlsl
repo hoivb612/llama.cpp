@@ -1,4 +1,9 @@
 // Two fused Q5_0 gate/up output rows per wave64 using Vulkan's lane mapping.
+//
+// RMS_FUSED variant (mul_mat_vec_glu_q5_0_vulkan_rows2_rms.hlsl): folds the
+// preceding RMS_NORM+MUL into this matvec. src1 carries the pre-norm activation
+// x and src6 the norm weight g; one pass accumulates the dots against x*g plus
+// sum(x*x) and applies 1/rms once at the end. op14 = eps (float bits).
 
 #include "ggml_common.hlsli"
 
@@ -71,12 +76,20 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     float gate1 = 0.0f;
     float up0 = 0.0f;
     float up1 = 0.0f;
+#if RMS_FUSED
+    precise float acc_ss = 0.0f;
+#endif
     for (uint col = local_id * 8u; col < ne00; col += GROUP_SIZE * 8u) {
         uint block_start = col & ~(QK5_0 - 1u);
         uint block = col / QK5_0;
         uint iqs = (col & (QK5_0 - 1u)) / 2u;
         float4 x_low = asfloat(src1.Load4(src1_base + (block_start + iqs) * 4u));
         float4 x_high = asfloat(src1.Load4(src1_base + (block_start + iqs + 16u) * 4u));
+#if RMS_FUSED
+        acc_ss += dot(x_low, x_low) + dot(x_high, x_high);
+        x_low  *= asfloat(src6.Load4((block_start + iqs) * 4u));
+        x_high *= asfloat(src6.Load4((block_start + iqs + 16u) * 4u));
+#endif
         float4 x0 = float4(x_low.x, x_high.x, x_low.y, x_high.y);
         float4 x1 = float4(x_low.z, x_high.z, x_low.w, x_high.w);
         gate0 += q5_dot(src0, gate_row0, block, iqs, x0, x1);
@@ -91,6 +104,13 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     gate1 = WaveActiveSum(gate1);
     up0 = WaveActiveSum(up0);
     up1 = WaveActiveSum(up1);
+#if RMS_FUSED
+    float rms_scale = 1.0f / sqrt(WaveActiveSum(acc_ss) / (float)ne00 + asfloat(op14));
+    gate0 *= rms_scale;
+    gate1 *= rms_scale;
+    up0   *= rms_scale;
+    up1   *= rms_scale;
+#endif
     if (local_id == 0u) {
         float result0 = (gate0 / (1.0f + exp(-gate0))) * up0;
         uint dst_row0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);

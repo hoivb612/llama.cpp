@@ -4,7 +4,9 @@
 
 Q4_K/Q5_K/Q6_K quantized batch MUL_MAT can produce cumulative precision errors on NVIDIA GPUs (tested RTX 6000 Ada). Intel (UHD, B390) and AMD (880M) produce correct results. The root cause appears to be NVIDIA's shader JIT floating-point behavior.
 
-The dp4a matvec path (`mul_mat_vec_q4k_dp4a.hlsl`) adds Q8_1 activation quantization on top of Q4_K weight quantization. To avoid amplifying NVIDIA precision drift, the dispatcher in `ggml-dx12.cpp` (~line 1537) gates the dp4a Q4_K matvec (`flags=10`) on `!nvidia`, falling back to the float multi-row path (`flags=9`) on NVIDIA. Intel and AMD use the dp4a path for ~1.5–2x throughput on Q4_K matvec.
+The dp4a matvec path (`mul_mat_vec_q4k_dp4a.hlsl`) adds Q8_1 activation quantization on top of Q4_K weight quantization. To avoid amplifying NVIDIA precision drift, the dispatcher in `ggml-dx12.cpp` gates the dp4a Q4_K matvec (`flags=10`) on `!nvidia`, falling back to the float multi-row path (`flags=9`) on NVIDIA. Intel and AMD use the dp4a path for ~1.5-2x throughput on Q4_K matvec.
+
+Exception: the Pascal+ Tegra iGPU (GB20B, `arch_family == DX12_ARCH_NV_PASCAL_PLUS && is_igpu`) re-enables `flags=10`. The precision drift above was measured in the batched GEMM path on discrete Ada; the M=1 matvec path was re-validated on the GB20B via perplexity forced through the matvec route (`llama-perplexity -ub 1`, which routes single-token eval as `ne[1]==1`). Phi-3 Q4_K PPL was 3.0523 (dp4a) vs 3.0495 (scalar) - a 0.09% delta, well inside the +/-0.18 stderr - for +9.3% decode throughput. Discrete NVIDIA stays on the scalar path.
 
 ## DXC Internal Compiler Error with `dot4add_i8packed`
 

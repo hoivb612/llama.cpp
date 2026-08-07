@@ -4,15 +4,30 @@
 // Uses Load4 for vectorized activation reads and mad() for FMA.
 //
 // Dispatch: groups_x = (N+1)/2, groups_y = 1, groups_z = batch*ne2*ne3
+//
+// RMS_FUSED variant (mul_mat_vec_q4k_mr_rms.hlsl, fl=102): the preceding
+// RMS_NORM+MUL dispatch is absorbed. src1 then carries the *un-normalized*
+// activation x, src6 the norm weight g and op14 the epsilon. Because the RMS
+// scale is a scalar over the row, dot(w, (x/rms)*g) == (1/rms) * sum_k(w_k *
+// g_k * x_k), so the existing pass accumulates sum(x*x) alongside the dot
+// product and applies the scale once at the end. The 16 threads of a block
+// partition its 256 elements exactly, and the ix groups partition the blocks,
+// so the group-wide sum covers every k exactly once.
 
 #include "ggml_common.hlsli"
 
+#ifndef GROUP_SIZE
 #define GROUP_SIZE  256
+#endif
 #define QK_K        256
 #define Q4K_BSIZE   144
 #define NUM_ROWS    2
 
+#if RMS_FUSED
+groupshared float shared_acc[96];  // 3 * max_waves (rows 0/1 + sum(x*x))
+#else
 groupshared float shared_acc[64];  // 2 * max_waves (max 32 waves for wave_size=8)
+#endif
 
 #if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
 [WaveSize(WAVE_SIZE)]
@@ -55,6 +70,9 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
+#if RMS_FUSED
+    float ss = 0.0f;
+#endif
 
     for (uint block_idx = ix; block_idx < num_blocks; block_idx += it_size) {
         // --- Load activation data once (shared across both rows) ---
@@ -76,27 +94,47 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         float by12 = asfloat(a3.x); float by13 = asfloat(a3.y);
         float by14 = asfloat(a3.z); float by15 = asfloat(a3.w);
 
+#if RMS_FUSED
+        ss = mad(by0, by0, mad(by1, by1, mad(by2, by2, mad(by3, by3,
+             mad(by4, by4, mad(by5, by5, mad(by6, by6, mad(by7, by7,
+             mad(by8, by8, mad(by9, by9, mad(by10, by10, mad(by11, by11,
+             mad(by12, by12, mad(by13, by13, mad(by14, by14,
+             mad(by15, by15, ss))))))))))))))));
+
+        uint g1_off = (block_idx * QK_K + y_offset) * 4;
+        uint g2_off = g1_off + 128 * 4;
+        float4 g0 = asfloat(src6.Load4(g1_off));
+        float4 g1 = asfloat(src6.Load4(g1_off + 128));
+        float4 g2 = asfloat(src6.Load4(g2_off));
+        float4 g3 = asfloat(src6.Load4(g2_off + 128));
+
+        by0  *= g0.x; by1  *= g0.y; by2  *= g0.z; by3  *= g0.w;
+        by4  *= g1.x; by5  *= g1.y; by6  *= g1.z; by7  *= g1.w;
+        by8  *= g2.x; by9  *= g2.y; by10 *= g2.z; by11 *= g2.w;
+        by12 *= g3.x; by13 *= g3.y; by14 *= g3.z; by15 *= g3.w;
+#endif
+
         // --- Process both rows ---
         [unroll]
         for (uint r = 0; r < NUM_ROWS; r++) {
             uint block_off = (r == 0 ? src0_row0 : src0_row1) + block_idx * Q4K_BSIZE;
 
-            // Load block header (d, dmin as packed f16 pair)
-            uint dm_raw = src0.Load(block_off);
-            float dall = f16_to_f32(dm_raw & 0xFFFFu);
-            float dmin = f16_to_f32(dm_raw >> 16);
+            // Block header is d(2) + dmin(2) + scales(12) = 16 bytes, so a
+            // single Load4 covers what was 4 separate 32-bit loads.
+            uint4 hdr = src0.Load4(block_off);
+            float dall = f16_to_f32(hdr.x & 0xFFFFu);
+            float dmin = f16_to_f32(hdr.x >> 16);
 
             // Decode scales (12 bytes at block_off + 4)
-            uint scales_off = block_off + 4;
             uint s_raw0, s_raw4, s_raw8;
             if (v_im == 0) {
-                s_raw0 = src0.Load(scales_off) & 0xFFFFu;
-                s_raw4 = src0.Load(scales_off + 4) & 0xFFFFu;
-                s_raw8 = src0.Load(scales_off + 8) & 0xFFFFu;
+                s_raw0 = hdr.y & 0xFFFFu;
+                s_raw4 = hdr.z & 0xFFFFu;
+                s_raw8 = hdr.w & 0xFFFFu;
             } else {
-                s_raw0 = (src0.Load(scales_off) >> 16) & 0xFFFFu;
-                s_raw4 = (src0.Load(scales_off + 4) >> 16) & 0xFFFFu;
-                s_raw8 = (src0.Load(scales_off + 8) >> 16) & 0xFFFFu;
+                s_raw0 = (hdr.y >> 16) & 0xFFFFu;
+                s_raw4 = (hdr.z >> 16) & 0xFFFFu;
+                s_raw8 = (hdr.w >> 16) & 0xFFFFu;
             }
 
             uint scale_0_4_l = (s_raw4 << 16) | s_raw0;
@@ -160,12 +198,18 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     // Two-level reduction with tree reduction for cross-vendor correctness
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
+#if RMS_FUSED
+    float wave_ss = WaveActiveSum(ss);
+#endif
     uint wave_id = tid / WARP_SIZE;
     uint num_waves = GROUP_SIZE / WARP_SIZE;
 
     if (WaveIsFirstLane()) {
         shared_acc[wave_id] = wave_sum0;
         shared_acc[32 + wave_id] = wave_sum1;
+#if RMS_FUSED
+        shared_acc[64 + wave_id] = wave_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -174,23 +218,65 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         if (tid < s) {
             shared_acc[tid] += shared_acc[tid + s];
             shared_acc[32 + tid] += shared_acc[32 + tid + s];
+#if RMS_FUSED
+            shared_acc[64 + tid] += shared_acc[64 + tid + s];
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
     if (tid == 0) {
+#if RMS_FUSED
+        float rms_scale = 1.0f / sqrt(shared_acc[64] / (float)K + asfloat(op14));
+#endif
         // Row 0
         float result0 = shared_acc[0];
+#if RMS_FUSED
+        result0 *= rms_scale;
+#endif
         result0 += load_fused_bias(row0, i2, i3);
-        uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-        store_auto(dst, off_d0, result0, dst_esize);
 
         // Row 1 (guard for odd N)
-        if (row0 + 1 < ne0) {
-            float result1 = shared_acc[32];
+        bool has_row1 = (row0 + 1 < ne0);
+        float result1 = 0.0f;
+        if (has_row1) {
+            result1 = shared_acc[32];
+#if RMS_FUSED
+            result1 *= rms_scale;
+#endif
             result1 += load_fused_bias(row0 + 1, i2, i3);
-            uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-            store_auto(dst, off_d1, result1, dst_esize);
+        }
+
+        if (mmv_scatter_active()) {
+            mmv_store_scatter(row0, 0u, result0);
+            if (has_row1) {
+                mmv_store_scatter(row0 + 1, 0u, result1);
+            }
+        } else {
+#if QK_SPLIT
+            // Rows [0, op2) are the Q projection and land at dst_offset; the
+            // rest are the K projection, a separate tensor in the same buffer
+            // based at op3. Region boundaries are head-dim aligned, so a row
+            // pair never straddles them, but each row picks its own base to
+            // stay correct for odd splits.
+            uint q_rows = op2;
+            uint base0  = (row0 < q_rows) ? dst_offset : op3;
+            uint local0 = (row0 < q_rows) ? row0 : (row0 - q_rows);
+            store_auto(dst, base0 + local0 * nb0, result0, dst_esize);
+            if (has_row1) {
+                uint r1     = row0 + 1u;
+                uint base1  = (r1 < q_rows) ? dst_offset : op3;
+                uint local1 = (r1 < q_rows) ? r1 : (r1 - q_rows);
+                store_auto(dst, base1 + local1 * nb0, result1, dst_esize);
+            }
+#else
+            uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+            store_auto(dst, off_d0, result0, dst_esize);
+            if (has_row1) {
+                uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+                store_auto(dst, off_d1, result1, dst_esize);
+            }
+#endif
         }
     }
 }

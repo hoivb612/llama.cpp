@@ -224,15 +224,27 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         float result0 = shared_acc0[0];
         for (uint w = 1; w < num_waves; w++) result0 += shared_acc0[w];
         result0 += load_fused_bias(row0, i2, i3);
-        uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-        store_auto(dst, off_d0, result0, dst_esize);
 
-        if (row0 + 1 < ne0) {
-            float result1 = shared_acc1[0];
+        bool has_row1 = (row0 + 1 < ne0);
+        float result1 = 0.0f;
+        if (has_row1) {
+            result1 = shared_acc1[0];
             for (uint w = 1; w < num_waves; w++) result1 += shared_acc1[w];
             result1 += load_fused_bias(row0 + 1, i2, i3);
-            uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-            store_auto(dst, off_d1, result1, dst_esize);
+        }
+
+        if (mmv_scatter_active()) {
+            mmv_store_scatter(row0, 0u, result0);
+            if (has_row1) {
+                mmv_store_scatter(row0 + 1, 0u, result1);
+            }
+        } else {
+            uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+            store_auto(dst, off_d0, result0, dst_esize);
+            if (has_row1) {
+                uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+                store_auto(dst, off_d1, result1, dst_esize);
+            }
         }
     }
 }

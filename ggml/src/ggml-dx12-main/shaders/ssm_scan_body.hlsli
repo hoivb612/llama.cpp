@@ -18,6 +18,10 @@
 
 groupshared float temp_reduce[GROUP_SIZE];
 
+// The scan derives C_FACTOR and the (head_idx, head_off) mapping from
+// WARP_SIZE, and WaveActiveSum below must cover exactly one such location,
+// so the dispatch wave size has to match the one we compiled for.
+WAVE_SIZE_ATTR
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint nb02   = op_param_uint(0);

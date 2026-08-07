@@ -81,6 +81,15 @@ static inline bool dx12_flag_default_on(const char * name) {
     return !v || !v[0] || v[0] != '0';
 }
 
+// Shader-path audit (DX12_SHADER_AUDIT=1). Counts dispatches per resolved
+// pipeline and dumps them at device teardown, flagging any pipeline that fell
+// through the specialized selector onto the per-op generic blob. Off by
+// default; the only hot-path cost when enabled is one counter increment.
+static inline bool dx12_shader_audit_enabled() {
+    static const bool on = (getenv("DX12_SHADER_AUDIT") != nullptr);
+    return on;
+}
+
 // Heuristic-pick capture sink: when set, the dispatch path appends each
 // dispatched MUL_MAT(_ID) node's selected key.flags here. Used by the tuner
 // to confirm which variant the heuristic picked for the shape it benched.
@@ -158,6 +167,8 @@ struct dx12_device;
 struct dx12_buffer;
 struct dx12_backend;
 struct dx12_pipeline;
+struct dx12_device;
+static void dx12_shader_audit_report(dx12_device & dev);
 
 // ---------------------------------------------------------------------------
 // Pipeline key — identifies a unique shader variant
@@ -197,6 +208,15 @@ struct dx12_pipeline {
     uint32_t num_root_constants = 0;
     uint32_t num_srvs           = 0;
     uint32_t num_uavs           = 0;
+    // Audit metadata (DX12_SHADER_AUDIT). Written once at PSO creation, read
+    // only by the report; `generic` marks a pipeline that fell through the
+    // specialized selector to the per-op default blob.
+    const char * shader     = nullptr;
+    uint32_t     audit_op    = 0;
+    uint32_t     audit_flags = 0;
+    int          audit_src0  = 0;
+    bool         generic     = false;
+    uint64_t     dispatches  = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -235,6 +255,8 @@ enum dx12_fusion_kind : uint8_t {
     DX12_FUSE_MMV_K_ROPE_SET_ROWS = 12, // MUL_MAT(K proj, M=1) -> RESHAPE -> ROPE -> VIEW -> SET_ROWS: matvec applies RoPE + scatters into KV cache (absorbs ROPE+VIEW+SET_ROWS)
     DX12_FUSE_MMV_QKV_SHARED      = 13, // MUL_MAT(Q proj, M=1) recorded once, absorbing the V and K projection matvecs (which share the activation) plus all three post-ops (Q RoPE, K RoPE+scatter, V scatter) into a single combined dispatch
     DX12_FUSE_QK_ROPE_SCALE_SET_ROWS = 14, // Q ROPE+SCALE plus sibling K ROPE+VIEW+SET_ROWS
+    DX12_FUSE_MMV_QK_MERGE        = 15, // MUL_MAT(Q proj, M=1) absorbing the K projection matvec: contiguous weights and a shared destination buffer let one dispatch cover both (no post-ops, so QK-norm models qualify)
+    DX12_FUSE_QK_NORM_MERGE       = 16, // Q-side RMS_NORM+MUL+ROPE absorbing the sibling K-side RMS_NORM+MUL+ROPE+VIEW+SET_ROWS into one dispatch (QK-Norm models)
 };
 
 // Per-node identity used for cache invalidation.  Layout-stable across tokens
@@ -302,6 +324,12 @@ struct dx12_node_decision {
     int16_t            qk_k_rope_rel;
     int16_t            qk_k_set_rows_rel;
 
+    // RMS_NORM+MUL absorbed into this combined Q/K/V matvec (fl=88). Negative:
+    // the norm sits *before* the matvec, so it cannot ride node_absorbed[] (which
+    // only marks forward). The replay fast path reconstructs the un-normalized
+    // activation and the norm weight via cgraph->nodes[i + rms_fold_rel].
+    int16_t            rms_fold_rel;           // 0 = no RMS folded into this node
+
     bool               is_matvec_dispatch;
     bool               use_dp4a;
     bool               use_dp4a_matvec;
@@ -349,6 +377,7 @@ static_assert(sizeof(dx12_shader_params) / 4 <= 64, "must fit in root constants"
 struct dx12_shader_blob {
     const void * data;
     size_t       size;
+    const char * name = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -421,7 +450,8 @@ enum dx12_arch_subfamily {
     DX12_SUBARCH_AMD_GCN,          // wave64, no WMMA — Vega, Polaris
     DX12_SUBARCH_AMD_CDNA,         // wave64, matrix HW — MI100/200/300 datacenter
     DX12_SUBARCH_AMD_RDNA1_2,      // wave32, no WMMA — Navi10/14 (RDNA1), Navi21-24 (RDNA2), PS5/XSX, Steam Deck
-    DX12_SUBARCH_AMD_RDNA3_PLUS,   // wave32, WMMA32 — Navi31-44 (RDNA3/3.5/4), RDNA3+ APUs (780M/880M/890M/Strix Halo/Krackan)
+    DX12_SUBARCH_AMD_RDNA3_X,      // wave32, WMMA32 — Navi31-33 (RDNA3), RDNA3.5 APUs (780M/880M/890M/Strix Halo/Krackan)
+    DX12_SUBARCH_AMD_RDNA4_PLUS,   // wave32, WMMA32 — Navi44/48 (RDNA4) and newer
 };
 
 static const char * dx12_arch_subfamily_str(dx12_arch_subfamily s) {
@@ -429,10 +459,17 @@ static const char * dx12_arch_subfamily_str(dx12_arch_subfamily s) {
         case DX12_SUBARCH_AMD_GCN:          return "AMD-GCN";
         case DX12_SUBARCH_AMD_CDNA:         return "AMD-CDNA";
         case DX12_SUBARCH_AMD_RDNA1_2:      return "AMD-RDNA1/2";
-        case DX12_SUBARCH_AMD_RDNA3_PLUS:   return "AMD-RDNA3+";
+        case DX12_SUBARCH_AMD_RDNA3_X:      return "AMD-RDNA3.x";
+        case DX12_SUBARCH_AMD_RDNA4_PLUS:   return "AMD-RDNA4+";
         case DX12_SUBARCH_UNKNOWN:
         default:                            return "";
     }
+}
+
+// RDNA3 or newer (wave32 + WMMA32). Tuning validated on RDNA3 that should
+// also apply to later parts tests this rather than a single sub-family.
+static bool dx12_subarch_is_rdna3_plus(dx12_arch_subfamily s) {
+    return s == DX12_SUBARCH_AMD_RDNA3_X || s == DX12_SUBARCH_AMD_RDNA4_PLUS;
 }
 
 // AMD DeviceId → sub-family lookup table. Sourced from libdrm
@@ -463,32 +500,33 @@ struct dx12_amd_did_range {
 
 static const dx12_amd_did_range AMD_DID_TABLE[] = {
     // -- RDNA 3.5 iGPU (gfx115x) --
-    { 0x1114, 0x1114, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Krackan Point (840M / 860M)
-    { 0x150E, 0x150E, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Strix Point (880M / 890M)
-    { 0x1586, 0x1586, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Strix Halo (8050S / 8060S)
+    { 0x1114, 0x1114, DX12_SUBARCH_AMD_RDNA3_X },    // Krackan Point (840M / 860M)
+    { 0x150E, 0x150E, DX12_SUBARCH_AMD_RDNA3_X },    // Strix Point (880M / 890M)
+    { 0x1586, 0x1586, DX12_SUBARCH_AMD_RDNA3_X },    // Strix Halo (8050S / 8060S)
 
     // -- RDNA 3 iGPU (gfx110x) --
-    { 0x15BF, 0x15BF, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Phoenix (740M / 760M / 780M)
-    { 0x15C8, 0x15C8, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Phoenix2 (740M)
-    { 0x1900, 0x1902, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Hawk Point variants (740M / 760M / 780M / 820M / 840M)
+    { 0x15BF, 0x15BF, DX12_SUBARCH_AMD_RDNA3_X },    // Phoenix (740M / 760M / 780M)
+    { 0x15C8, 0x15C8, DX12_SUBARCH_AMD_RDNA3_X },    // Phoenix2 (740M)
+    { 0x1900, 0x1902, DX12_SUBARCH_AMD_RDNA3_X },    // Hawk Point variants (740M / 760M / 780M / 820M / 840M)
 
     // -- RDNA 3 dGPU (gfx110x: Navi 31/32/33) --
-    { 0x7448, 0x744B, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 31 Pro W7800/7900 series
-    { 0x744C, 0x744C, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 31 RX 7900 XTX / XT / GRE / M
-    { 0x745E, 0x745E, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 31 Pro W7800
-    { 0x7460, 0x7461, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 31 cloud V710
-    { 0x7470, 0x7470, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 32 Pro W7700
-    { 0x747E, 0x747E, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 32 RX 7800 XT / 7700 / 7700 XT / 7800M
-    { 0x7480, 0x7483, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 33 RX 7600 / 7600M / 7700S / Steam Machine
-    { 0x7489, 0x7489, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 33 Pro W7500
-    { 0x7499, 0x7499, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 33 Pro W7400 / RX 7400 / 7300
+    { 0x7448, 0x744B, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 31 Pro W7800/7900 series
+    { 0x744C, 0x744C, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 31 RX 7900 XTX / XT / GRE / M
+    { 0x745E, 0x745E, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 31 Pro W7800
+    { 0x7460, 0x7461, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 31 cloud V710
+    { 0x7470, 0x7470, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 32 Pro W7700
+    { 0x747E, 0x747E, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 32 RX 7800 XT / 7700 / 7700 XT / 7800M
+    { 0x7480, 0x7483, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 33 RX 7600 / 7600M / 7700S / Steam Machine
+    { 0x7489, 0x7489, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 33 Pro W7500
+    { 0x7499, 0x7499, DX12_SUBARCH_AMD_RDNA3_X },    // Navi 33 Pro W7400 / RX 7400 / 7300
 
-    // -- RDNA 4 dGPU (gfx12: Navi 48) --
-    { 0x7550, 0x7551, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 48 RX 9070 / 9070 XT / 9070 GRE / AI Pro R9700 / R9600D
-    { 0x7590, 0x7590, DX12_SUBARCH_AMD_RDNA3_PLUS }, // Navi 48 RX 9060 / 9060 XT / 9060 XT LP
+    // -- RDNA 4 dGPU (gfx12: Navi 44/48) --
+    { 0x7550, 0x7551, DX12_SUBARCH_AMD_RDNA4_PLUS }, // Navi 48 RX 9070 / 9070 XT / 9070 GRE / AI Pro R9700 / R9600D
+    { 0x7590, 0x7590, DX12_SUBARCH_AMD_RDNA4_PLUS }, // Navi 44 RX 9060 / 9060 XT / 9060 XT LP
 
     // -- RDNA 2 iGPU (gfx103x) --
     { 0x1506, 0x1506, DX12_SUBARCH_AMD_RDNA1_2 },    // Mendocino (610M)
+    { 0x13C0, 0x13C0, DX12_SUBARCH_AMD_RDNA1_2 },    // Granite Ridge (Ryzen 9000 desktop 2-CU)
     { 0x164E, 0x164E, DX12_SUBARCH_AMD_RDNA1_2 },    // Raphael (610M)
     { 0x1681, 0x1681, DX12_SUBARCH_AMD_RDNA1_2 },    // Rembrandt (660M / 680M)
 
@@ -542,7 +580,8 @@ static dx12_arch_subfamily dx12_amd_subfamily_from_device_id(uint32_t device_id)
 static dx12_arch_family dx12_amd_arch_from_subfamily(dx12_arch_subfamily sub) {
     switch (sub) {
         case DX12_SUBARCH_AMD_RDNA1_2:
-        case DX12_SUBARCH_AMD_RDNA3_PLUS:
+        case DX12_SUBARCH_AMD_RDNA3_X:
+        case DX12_SUBARCH_AMD_RDNA4_PLUS:
             return DX12_ARCH_AMD_RDNA;
         case DX12_SUBARCH_AMD_GCN:
         case DX12_SUBARCH_AMD_CDNA:
@@ -595,8 +634,8 @@ static dx12_arch_family dx12_classify_arch_family(UINT vendor_id,
 }
 
 // Classify into a sub-family. For AMD: uses the DeviceId table for an
-// accurate answer; falls back to wave_mma_supported if the DeviceId is
-// unknown (newer chip we haven't tabled yet). For all other vendors
+// accurate answer; an unknown DeviceId (newer chip we haven't tabled yet)
+// resolves by DeviceId space - see the fallback below. For all other vendors
 // today: returns DX12_SUBARCH_UNKNOWN — caller should fall back to
 // arch_family. NV/Intel sub-arch would need their own DeviceId tables.
 static dx12_arch_subfamily dx12_classify_arch_subfamily(dx12_arch_family fam,
@@ -608,15 +647,22 @@ static dx12_arch_subfamily dx12_classify_arch_subfamily(dx12_arch_family fam,
         if (known != DX12_SUBARCH_UNKNOWN) {
             return known;
         }
-        // Unknown DeviceId — fall back to old wave_mma heuristic. WaveMMA
-        // is a deprecated D3D12 preview that no driver currently exposes
-        // for AMD, so in practice this only fires on chips too new for
-        // our table.
+        // Unknown DeviceId - chip too new for our table (WaveMMA is a
+        // deprecated D3D12 preview no AMD driver exposes, so the old
+        // wave_mma heuristic never fired in practice).
+        //
+        // AMD splits its DeviceId space: APUs live below 0x7000, dGPUs at
+        // 0x7300 and up. The two age very differently - a brand new APU
+        // routinely ships an older graphics IP (Granite Ridge is a Zen 5
+        // part with an RDNA2 iGPU), whereas a new dGPU DeviceId really is
+        // newer silicon. So only untabled dGPUs inherit RDNA4+ tuning;
+        // untabled APUs stay conservative until their DeviceId is added.
+        const bool dgpu_did_space = (uint16_t)device_id >= 0x7000;
         switch (fam) {
             case DX12_ARCH_AMD_WAVE64:
                 return wave_mma ? DX12_SUBARCH_AMD_CDNA : DX12_SUBARCH_AMD_GCN;
             case DX12_ARCH_AMD_RDNA:
-                return wave_mma ? DX12_SUBARCH_AMD_RDNA3_PLUS : DX12_SUBARCH_AMD_RDNA1_2;
+                return dgpu_did_space ? DX12_SUBARCH_AMD_RDNA4_PLUS : DX12_SUBARCH_AMD_RDNA1_2;
             default:
                 return DX12_SUBARCH_UNKNOWN;
         }
@@ -671,6 +717,13 @@ struct dx12_device {
     // on AMD for DXIL compile compatibility, which erases the RDNA signal in
     // wave_size alone.
     uint32_t wave_size_min = 32;
+
+    // Wave the loaded shader blobs were compiled for: wave_size rounded up to
+    // the nearest compiled variant (16/32/64), and pinned into the DXIL by
+    // [WaveSize(N)]. On Intel this differs from wave_size (reports 8, runs the
+    // w16 blob), so any host dispatch math that has to agree with a shader's
+    // WARP_SIZE must use this, not wave_size.
+    uint32_t blob_wave_size = 32;
 
     // Coarse architecture family (NV-Pascal+, AMD-RDNA, Intel-Xe-HPG+, ...).
     // Populated by dx12_classify_arch_family() at end of init() once
@@ -879,23 +932,26 @@ struct dx12_device {
     upload_slot upload_ring[UPLOAD_RING_SIZE];
     size_t      upload_ring_head = 0;
     std::vector<upload_slot *> pending_uploads;
+    // Every copy in a batch records into the first slot acquired since the last
+    // flush, so a flush closes and submits one command list instead of one per
+    // upload. The owning slot carries the batch fence like any other, and the
+    // ring is exactly UPLOAD_RING_SIZE deep, so it cannot be recycled mid-batch.
+    upload_slot * upload_batch_slot = nullptr;
 
     // Submit every recorded upload copy in a single ExecuteCommandLists call.
     // Called before any operation that must observe the uploaded bytes.
     void flush_uploads() {
         if (pending_uploads.empty()) return;
-        ID3D12CommandList * lists[UPLOAD_RING_SIZE];
-        size_t n = 0;
-        for (auto * s : pending_uploads) {
-            lists[n++] = s->cmd_list.Get();
-        }
-        compute_queue->ExecuteCommandLists((UINT)n, lists);
+        upload_batch_slot->cmd_list->Close();
+        ID3D12CommandList * lists[] = { upload_batch_slot->cmd_list.Get() };
+        compute_queue->ExecuteCommandLists(1, lists);
         xfer.fence_value++;
         compute_queue->Signal(xfer.fence.Get(), xfer.fence_value);
         for (auto * s : pending_uploads) {
             s->fence_value = xfer.fence_value;
         }
         pending_uploads.clear();
+        upload_batch_slot = nullptr;
     }
 
     upload_slot * upload_ring_acquire(size_t size) {
@@ -939,6 +995,13 @@ struct dx12_device {
             hr = s.staging->Map(0, &no_read, &s.mapped);
             DX12_CHECK(hr, "Map upload ring staging");
             s.capacity = need;
+        }
+        if (!upload_batch_slot) {
+            HRESULT hr = s.cmd_alloc->Reset();
+            DX12_CHECK(hr, "upload ring cmd_alloc Reset");
+            hr = s.cmd_list->Reset(s.cmd_alloc.Get(), nullptr);
+            DX12_CHECK(hr, "upload ring cmd_list Reset");
+            upload_batch_slot = &s;
         }
         return &s;
     }
@@ -1156,6 +1219,36 @@ struct dx12_backend_context {
     // Global barriers flush all cached memory, so this is only used where the
     // hazard set is unknown/broad; prefer emit_uav_barrier_buffer/_scoped.
     void emit_uav_barrier_global() {
+        // DX12_NO_BARRIERS: measurement only -- skips the actual GPU barrier
+        // while leaving all CPU-side hazard bookkeeping intact, to isolate the
+        // pipeline-drain cost.  PRODUCES INCORRECT RESULTS.  Value N>1 skips
+        // only every Nth barrier, to trace cost against barrier count.
+        static const int no_barriers = []() {
+            const char * s = getenv("DX12_NO_BARRIERS");
+            if (!s) return 0;
+            int v = atoi(s);
+            return v < 1 ? 1 : v;
+        }();
+        // DX12_BARRIER_RUN=K,P: measurement only.  Skips K *consecutive*
+        // barriers out of every P, rather than every Nth.  Same total count as
+        // DX12_NO_BARRIERS=P/K but clustered, so it creates runs of adjacent
+        // barrier-free dispatches.  Distinguishes "fewer barriers" from "longer
+        // overlap windows".  PRODUCES INCORRECT RESULTS.
+        static const std::pair<int,int> barrier_run = []() {
+            const char * s = getenv("DX12_BARRIER_RUN");
+            if (!s || !s[0]) return std::make_pair(0, 0);
+            int k = 0, p = 0;
+            if (sscanf(s, "%d,%d", &k, &p) != 2 || k <= 0 || p <= 0) return std::make_pair(0, 0);
+            return std::make_pair(k, p);
+        }();
+        if (barrier_run.second) {
+            static uint64_t seen_run = 0;
+            if ((seen_run++ % (uint64_t) barrier_run.second) < (uint64_t) barrier_run.first) return;
+        }
+        if (no_barriers) {
+            static uint64_t seen = 0;
+            if (no_barriers == 1 || (seen++ % (uint64_t) no_barriers) == 0) return;
+        }
         if (dev->enhanced_barriers) {
             if (ID3D12GraphicsCommandList7 * cl7 = get_cmd_list7()) {
                 D3D12_GLOBAL_BARRIER gb = {};
@@ -1208,6 +1301,12 @@ struct dx12_backend_context {
     // Resource-scoped compute UAV ordering point over a small set of buffers.
     // Legacy: one UAV barrier per resource. Enhanced: BUFFER barriers scoped
     // to compute shading + unordered-access over each resource's full range.
+    //
+    // Offset/Size are fixed at 0 / UINT64_MAX by the Enhanced Barriers spec:
+    // "For now, Offset must be zero and Size must be either the buffer size in
+    // bytes or UINT64_MAX", and the DDI ignores both.  Narrowing them fails
+    // command-list Close with E_INVALIDARG.  Buffer subregion barriers do not
+    // exist yet; do not try to scope these by byte range.
     void emit_uav_barrier_scoped(ID3D12Resource * const * resources, int n) {
         if (n <= 0) return;
         if (dev->enhanced_barriers) {
@@ -1306,6 +1405,10 @@ struct dx12_backend_context {
     // quantify the barrier-elision path's serialization reduction.
     uint64_t                  dbg_barrier_scoped      = 0;
     uint64_t                  dbg_barrier_global      = 0;
+    std::map<const char *, uint64_t> dbg_barrier_reasons;
+    // Monotonic graph_compute counter, used only to group DX12_BARRIER_TRACE
+    // records by graph.
+    uint64_t                  dbg_trace_graph         = 0;
 
     // Cross-frame adaptive submit threshold (Vulkan ggml-vulkan.cpp:16308-16322).
     // The previous graph_compute records its total estimated FLOPs (matmul,
@@ -1512,9 +1615,113 @@ static dx12_globals_t & g_dx12 = *(new dx12_globals_t());
 // Device initialization
 // ---------------------------------------------------------------------------
 
+// PIX programmatic GPU capture.  llama.cpp never calls Present, so PIX's
+// frame-delimited capture cannot be used at all: the capturer DLL has to be
+// loaded before the D3D12 device exists and the capture bracketed by hand
+// around a chosen graph.  Signatures come from pix3_win.h; only the two
+// exports are needed, so WinPixEventRuntime is not a build dependency.
+struct dx12_pix_capture {
+    using begin_fn = HRESULT (WINAPI *)(const void *);
+    using end_fn   = HRESULT (WINAPI *)(void);
+
+    begin_fn     begin  = nullptr;
+    end_fn       end    = nullptr;
+    std::wstring path;
+    int          first  = 1;
+    int          count  = 1;
+    bool         active = false;
+};
+
+static dx12_pix_capture g_pix;
+
+static std::wstring dx12_pix_find_capturer() {
+    if (const char * override_path = getenv("DX12_PIX_DLL")) {
+        return std::wstring(override_path, override_path + strlen(override_path));
+    }
+    const std::wstring root = L"C:\\Program Files\\Microsoft PIX\\";
+    WIN32_FIND_DATAW   fd;
+    HANDLE             h = FindFirstFileW((root + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    std::wstring best;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == L'.') continue;
+        if (best.empty() || best.compare(fd.cFileName) < 0) best = fd.cFileName;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return best.empty() ? L"" : root + best + L"\\WinPixGpuCapturer.dll";
+}
+
+static void dx12_pix_init() {
+    const char * out = getenv("DX12_PIX_CAPTURE");
+    if (!out) return;
+
+    const std::wstring dll = dx12_pix_find_capturer();
+    if (dll.empty()) {
+        fprintf(stderr, "[PIX] capture: WinPixGpuCapturer.dll not found (set DX12_PIX_DLL)\n");
+        return;
+    }
+    HMODULE mod = LoadLibraryW(dll.c_str());
+    if (!mod) {
+        fprintf(stderr, "[PIX] capture: LoadLibrary failed (error %lu)\n", (unsigned long)GetLastError());
+        return;
+    }
+    auto b = (dx12_pix_capture::begin_fn)GetProcAddress(mod, "BeginProgrammaticGpuCapture");
+    auto e = (dx12_pix_capture::end_fn)  GetProcAddress(mod, "EndProgrammaticGpuCapture");
+    if (!b || !e) {
+        fprintf(stderr, "[PIX] capture: capturer is missing the programmatic capture exports\n");
+        return;
+    }
+    g_pix.begin = b;
+    g_pix.end   = e;
+    g_pix.path.assign(out, out + strlen(out));
+    if (const char * f = getenv("DX12_PIX_CAPTURE_GRAPH"))  g_pix.first = atoi(f);
+    if (const char * n = getenv("DX12_PIX_CAPTURE_GRAPHS")) g_pix.count = atoi(n);
+    if (g_pix.first < 1) g_pix.first = 1;
+    if (g_pix.count < 1) g_pix.count = 1;
+    fprintf(stderr, "[PIX] capture armed: graphs %d..%d -> %s\n",
+                  g_pix.first, g_pix.first + g_pix.count - 1, out);
+}
+
+// Called at the top of each graph.  The capture is closed at the start of the
+// following graph rather than at the end of its own, so that the submit and
+// the logits readback that follows it are both inside the capture.
+static void dx12_pix_graph(int graph_index) {
+    if (!g_pix.begin) return;
+
+    if (g_pix.active) {
+        if (graph_index < g_pix.first + g_pix.count) return;
+        g_pix.end();
+        g_pix.active = false;
+        g_pix.begin  = nullptr;
+        fprintf(stderr, "[PIX] capture written\n");
+        return;
+    }
+    if (graph_index != g_pix.first) return;
+
+    // union PIXCaptureParameters: the GPU arm is a single PCWSTR, but the
+    // union is larger, so pass a zeroed block of its size.
+    struct {
+        const wchar_t * FileName;
+        uint8_t         rest[504];
+    } params = {};
+    params.FileName = g_pix.path.c_str();
+
+    if (SUCCEEDED(g_pix.begin(&params))) {
+        g_pix.active = true;
+        fprintf(stderr, "[PIX] capture begun at graph %d\n", graph_index);
+    } else {
+        fprintf(stderr, "[PIX] capture: BeginProgrammaticGpuCapture failed\n");
+        g_pix.begin = nullptr;
+    }
+}
+
 static void dx12_ensure_initialized() {
     std::lock_guard<std::mutex> lock(g_dx12.init_mutex);
     if (g_dx12.initialized) return;
+
+    // Must happen before any D3D12 object is created.
+    dx12_pix_init();
 
     bool debug_layer_enabled = false;
     auto try_enable_debug_layer = [&]() {
@@ -1572,6 +1779,7 @@ static void dx12_ensure_initialized() {
         ComPtr<IDXGIFactory6> factory6;
         const bool have_factory6 = SUCCEEDED(g_dx12.factory.As(&factory6));
 
+        size_t enumerated_idx = 0;
         for (UINT i = 0; ; ++i) {
             ComPtr<IDXGIAdapter1> adapter;
             if (have_factory6) {
@@ -1655,6 +1863,28 @@ static void dx12_ensure_initialized() {
             test_device.Reset();
 
             if (g_dx12.devices.size() >= GGML_DX12_MAX_DEVICES) break;
+
+            // DX12_VISIBLE_DEVICES=<i>[,<j>...] restricts enumeration to the
+            // listed adapter indices. GPU profilers (RGP) abort a capture when
+            // one process owns D3D12 devices on several adapters, so a
+            // single-adapter run is needed to trace a multi-GPU machine.
+            const int idx = (int)enumerated_idx++;
+            if (const char * vis = getenv("DX12_VISIBLE_DEVICES")) {
+                char want[16];
+                snprintf(want, sizeof(want), "%d", idx);
+                bool listed = false;
+                for (const char * p = strstr(vis, want); p; p = strstr(p + 1, want)) {
+                    const char before = (p == vis) ? ',' : p[-1];
+                    const char after  = p[strlen(want)];
+                    if ((before == ',' || before == ' ') && (after == ',' || after == ' ' || after == '\0')) {
+                        listed = true;
+                        break;
+                    }
+                }
+                if (!listed) {
+                    continue;
+                }
+            }
 
             g_dx12.devices.push_back(std::make_unique<dx12_device>());
             g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
@@ -1741,6 +1971,8 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     qd.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
     hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&compute_queue));
     DX12_CHECK(hr, "CreateCommandQueue(compute)");
+    // No spaces: pixtool's --queue-name option cannot parse a value containing them.
+    compute_queue->SetName(L"llama_dx12_compute");
 
     // VRAM: use DXGI budget for accuracy.
     // For iGPUs (small dedicated VRAM), also include the non-local (shared system RAM)
@@ -2724,15 +2956,9 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
 
             memcpy(slot->mapped, data, size);
 
-            HRESULT hr = slot->cmd_alloc->Reset();
-            DX12_CHECK(hr, "upload ring cmd_alloc Reset");
-            hr = slot->cmd_list->Reset(slot->cmd_alloc.Get(), nullptr);
-            DX12_CHECK(hr, "upload ring cmd_list Reset");
-
             size_t tensor_offset = dx12_tensor_offset(tensor) + offset;
-            slot->cmd_list->CopyBufferRegion(ctx->resource.Get(), tensor_offset,
-                                             slot->staging.Get(), 0, size);
-            slot->cmd_list->Close();
+            ctx->dev->upload_batch_slot->cmd_list->CopyBufferRegion(
+                ctx->resource.Get(), tensor_offset, slot->staging.Get(), 0, size);
 
             ctx->dev->pending_uploads.push_back(slot);
         },
@@ -2867,7 +3093,29 @@ static ggml_backend_buffer_type g_dx12_buffer_types[GGML_DX12_MAX_DEVICES];
 // Supported ops check
 // ---------------------------------------------------------------------------
 
-// Opt-out for the large-N multi-pass ARGSORT/TOP_K path.  Default-on because
+// TOP_K large-N partial-selection path (top_k_large.hlsl, flags=51).
+// Reduces the row in a few passes instead of fully sorting it. KL is the
+// per-block emit count and must be >= K for the reduction to be exact.
+// Returns 0 when the row is not eligible (caller falls back to flags=50).
+static constexpr uint32_t DX12_TOPK_BLOCK = 1024u;
+
+static uint32_t dx12_topk_large_kl(uint32_t ncols, uint32_t K) {
+    if (ncols <= DX12_TOPK_BLOCK || K == 0) return 0;
+    uint32_t kl = 64u;
+    while (kl < K) kl <<= 1u;
+    // Each pass must shrink the candidate set, so KL has to stay well under
+    // the block size; otherwise the reduction never terminates.
+    if (kl > DX12_TOPK_BLOCK / 4u) return 0;
+    return kl;
+}
+
+// Ping-pong region capacity in pairs: the widest candidate set is the one the
+// FIRST pass emits.
+static uint32_t dx12_topk_large_cap(uint32_t ncols, uint32_t kl) {
+    return ((ncols + DX12_TOPK_BLOCK - 1u) / DX12_TOPK_BLOCK) * kl;
+}
+
+
 // it expands test-backend-ops coverage (the small-N shader caps at 1024
 // columns); users running real inference with vocab-sized TOP_K can set
 // DX12_DISABLE_LARGE_SORT=1 to fall back to CPU sort, in case the
@@ -3404,22 +3652,6 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
             const uint32_t head_dim = (uint32_t)op->src[0]->ne[1];
             if (d_state != 128 && d_state != 256) return false;
             if (head_dim % 16 != 0) return false;
-            // Wave-gate the Mamba-2 path: on small waves (Intel UHD wave=8,
-            // Intel Arc wave=16) the per-lane state[C_FACTOR] array grows
-            // large (8 floats at wave=16/d=128, 16 floats at wave=8/d=128,
-            // 32 floats at wave=8/d=256) and the wave-reduction precision
-            // is insufficient to meet test-backend-ops' nmse tolerance.
-            // Substituting an explicit shared-mem tree reduction (matching
-            // Vulkan's !USE_SUBGROUP_ADD path) produces the same magnitude
-            // of error on Intel Arc, indicating a deeper precision issue
-            // specific to small-wave hardware on this op. Real-world
-            // deployments (NVIDIA wave=32, AMD wave=64) are unaffected and
-            // Mamba/Falcon-H1 models work correctly on those backends. Fall
-            // back to CPU on small-wave devices.
-            {
-                auto * d = (dx12_device *)dev->context;
-                if (d && d->wave_size <= 16) return false;
-            }
             return true;
         }
 
@@ -3897,7 +4129,19 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         memset(p.op_params, 0, sizeof(p.op_params));
         const uint32_t ncols = (uint32_t)tensor->src[0]->ne[0];
         const uint32_t K     = (uint32_t)tensor->ne[0];
-        if (ncols > 1024) {
+        const uint32_t kl    = dx12_topk_large_kl(ncols, K);
+        if (kl) {
+            // Fast partial-selection path (top_k_large.hlsl). The dispatch
+            // loop patches op3/op5/op6/op7 per pass; these are the FIRST pass.
+            p.op_params[1] = ncols;
+            p.op_params[2] = kl;
+            p.op_params[3] = 0u; // kind = FIRST
+            p.op_params[4] = K;
+            p.op_params[5] = ncols;
+            p.op_params[6] = 0u;
+            p.op_params[7] = 0u;
+            p.op_params[8] = dx12_topk_large_cap(ncols, kl); // cap
+        } else if (ncols > 1024) {
             uint32_t ncols_padded = 1;
             while (ncols_padded < ncols) ncols_padded <<= 1;
             if (ncols_padded < 256u) ncols_padded = 256u;
@@ -4112,6 +4356,15 @@ static uint64_t dx12_replay_signature(dx12_backend_context * bctx, const ggml_cg
             const int j = i + rel;
             return (rel != 0 && j >= 0 && j < cgraph->n_nodes) ? cgraph->nodes[j] : nullptr;
         };
+        // An absorbed RMS_NORM+MUL pair is skipped, so hash the un-normalized
+        // activation and the norm weight the fold host binds instead.
+        if (d.rms_fold_rel < 0) {
+            const int r = i + d.rms_fold_rel;
+            if (r >= 0 && r + 1 < cgraph->n_nodes) {
+                mix_res(cgraph->nodes[r]->src[0]);      // un-normalized activation
+                mix_res(cgraph->nodes[r + 1]->src[1]);  // norm weight
+            }
+        }
         switch (d.fusion_kind) {
             case DX12_FUSE_MMV_SET_ROWS:
                 if (const ggml_tensor * sr = node_at(d.mmv_set_rows_rel)) {
@@ -4148,6 +4401,28 @@ static uint64_t dx12_replay_signature(dx12_backend_context * bctx, const ggml_cg
                 if (v_sr)   { mix_res(v_sr); mix_res(v_sr->src[1]); }  // V cache, V indices
                 if (k_mm)   { mix_res(k_mm->src[0]); }              // Wk
                 if (k_sr)   { mix_res(k_sr); mix_res(k_sr->src[1]); }  // K cache, K indices
+                break;
+            }
+            case DX12_FUSE_MMV_QK_MERGE: {
+                // The merged dispatch writes Kcur through the shared destination
+                // resource; hash it (and Wk) so a reallocation invalidates the
+                // capture even though only Qcur is this node's dst.
+                if (const ggml_tensor * k_mm = node_at(d.qkv_k_matvec_rel)) {
+                    mix_res(k_mm);
+                    mix_res(k_mm->src[0]);
+                }
+                break;
+            }
+            case DX12_FUSE_QK_NORM_MERGE: {
+                // The merged dispatch binds the K-side activation, k_norm weight,
+                // KV cache and row indices as root descriptors the src0/src1/dst
+                // hashing above does not cover.
+                const int kn_rel = d.qkv_k_matvec_rel;
+                if (kn_rel > 0) {
+                    if (const ggml_tensor * kn = node_at(kn_rel))       mix_res(kn->src[0]);
+                    if (const ggml_tensor * km = node_at(kn_rel + 1))   mix_res(km->src[1]);
+                    if (const ggml_tensor * ks = node_at(kn_rel + 4)) { mix_res(ks); mix_res(ks->src[1]); }
+                }
                 break;
             }
             case DX12_FUSE_QK_ROPE_SCALE_SET_ROWS: {
@@ -4404,6 +4679,170 @@ static bool dx12_mmv_scatter_chain_exclusive(const ggml_cgraph * cgraph,
     return true;
 }
 
+// RMS_NORM+MUL fold into a following matvec (DX12_FUSE_RMS_MATVEC).
+// Walks back from the matvec at mm_idx to the (RMS_NORM, MUL) pair that produced
+// its activation and returns the RMS_NORM's node index, or -1 when the pattern
+// or the exclusivity requirements don't hold.
+//
+// Requirements: single-token F32 row, a full-width contiguous F32 norm weight,
+// nothing but view nodes between the MUL and the matvec (so the un-normalized
+// activation cannot have been overwritten), and the normalized result feeding
+// this matvec alone (anything else reading it would see a buffer the fused
+// matvec never writes).
+static int dx12_find_foldable_rms(const ggml_cgraph * cgraph, int mm_idx,
+                                  const ggml_tensor * also_ok0,
+                                  const ggml_tensor * also_ok1) {
+    const ggml_tensor * mm  = cgraph->nodes[mm_idx];
+    const ggml_tensor * act = mm->src[1];
+    if (!act || act->op != GGML_OP_MUL) {
+        return -1;
+    }
+    int mul_idx = -1;
+    const int lo = (mm_idx > 6) ? (mm_idx - 6) : 0;
+    for (int j = mm_idx - 1; j >= lo; --j) {
+        if (cgraph->nodes[j] == act) { mul_idx = j; break; }
+        const ggml_tensor * b = cgraph->nodes[j];
+        if (!(b->op == GGML_OP_RESHAPE || b->op == GGML_OP_VIEW ||
+              b->op == GGML_OP_PERMUTE || b->op == GGML_OP_TRANSPOSE)) {
+            return -1;  // a real dispatch sits between; x may no longer be live
+        }
+    }
+    if (mul_idx <= 0) {
+        return -1;
+    }
+    const ggml_tensor * rms = cgraph->nodes[mul_idx - 1];
+    const ggml_tensor * g   = act->src[1];
+    const ggml_tensor * x   = rms->src[0];
+    if (rms->op != GGML_OP_RMS_NORM || act->src[0] != rms || !g || !x) {
+        return -1;
+    }
+    if (rms->type != GGML_TYPE_F32 || act->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(g) || !ggml_is_contiguous(act)) {
+        return -1;
+    }
+    if (x->ne[1] * x->ne[2] * x->ne[3] != 1 || x->ne[0] != rms->ne[0]) {
+        return -1;
+    }
+    if (g->ne[0] != rms->ne[0] || g->ne[1] != 1 || g->ne[2] != 1 || g->ne[3] != 1) {
+        return -1;
+    }
+    // The RMS output is consumed only by the MUL, and the MUL output only by the
+    // matvec we are folding into (plus the sibling K/V projections it absorbs).
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == rms || n == act || n == mm || n == also_ok0 || n == also_ok1) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+            if (n->src[s] == rms || n->src[s] == act) {
+                return -1;
+            }
+        }
+    }
+    return mul_idx - 1;
+}
+
+// Replicated RMS fold: the same RMS_NORM+MUL absorbed independently by every
+// matvec that consumes it (the Q/K/V projections off one attn_norm).
+//
+// dx12_find_foldable_rms() only reaches the first consumer -- the siblings sit
+// behind real dispatches, so its backward walk bails out. Here the MUL is
+// located by identity instead, and each consumer folds on its own: the fold is
+// safe for any subset, and only when every consumer has folded do the norm
+// nodes become dead (the caller counts hits and retires them then).
+//
+// On success returns the RMS_NORM node index and fills `group` with the node
+// indices of every consumer, ascending.
+static int dx12_find_foldable_rms_group(const ggml_cgraph * cgraph, int mm_idx,
+                                        int * group, int * group_n, int group_max) {
+    const ggml_tensor * mm  = cgraph->nodes[mm_idx];
+    const ggml_tensor * act = mm->src[1];
+    if (!act || act->op != GGML_OP_MUL) {
+        return -1;
+    }
+    int mul_idx = -1;
+    const int lo = (mm_idx > 64) ? (mm_idx - 64) : 0;
+    for (int j = mm_idx - 1; j >= lo; --j) {
+        if (cgraph->nodes[j] == act) { mul_idx = j; break; }
+    }
+    if (mul_idx <= 0) {
+        return -1;
+    }
+    const ggml_tensor * rms = cgraph->nodes[mul_idx - 1];
+    const ggml_tensor * g   = act->src[1];
+    const ggml_tensor * x   = rms->src[0];
+    if (rms->op != GGML_OP_RMS_NORM || act->src[0] != rms || !g || !x) {
+        return -1;
+    }
+    if (rms->type != GGML_TYPE_F32 || act->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(g) || !ggml_is_contiguous(act)) {
+        return -1;
+    }
+    if (x->ne[1] * x->ne[2] * x->ne[3] != 1 || x->ne[0] != rms->ne[0]) {
+        return -1;
+    }
+    if (g->ne[0] != rms->ne[0] || g->ne[1] != 1 || g->ne[2] != 1 || g->ne[3] != 1) {
+        return -1;
+    }
+    // The RMS output feeds the MUL alone, and every MUL consumer must be a
+    // single-token matvec over the same weights layout, or the norm can never
+    // be retired.
+    int n = 0;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * nd = cgraph->nodes[j];
+        if (nd == rms || nd == act) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && nd->src[s]; ++s) {
+            if (nd->src[s] == rms) {
+                return -1;
+            }
+            if (nd->src[s] != act) {
+                continue;
+            }
+            if (nd->op != GGML_OP_MUL_MAT || s != 1 || nd->ne[1] != 1 ||
+                nd->src[0]->type != mm->src[0]->type || nd->type != mm->type) {
+                return -1;
+            }
+            if (n >= group_max) {
+                return -1;
+            }
+            group[n++] = j;
+            break;
+        }
+    }
+    if (n == 0) {
+        return -1;
+    }
+    // x must still hold the un-normalized activation when this consumer runs.
+    const uint8_t * x_lo = (const uint8_t *) x->data;
+    const uint8_t * x_hi = x_lo + ggml_nbytes(x);
+    for (int j = mul_idx + 1; j < mm_idx; ++j) {
+        const ggml_tensor * nd = cgraph->nodes[j];
+        if (nd->op == GGML_OP_NONE || nd->op == GGML_OP_RESHAPE ||
+            nd->op == GGML_OP_VIEW || nd->op == GGML_OP_PERMUTE ||
+            nd->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        const uint8_t * d_lo = (const uint8_t *) nd->data;
+        if (!d_lo || !x_lo) {
+            continue;
+        }
+        const uint8_t * d_hi = d_lo + ggml_nbytes(nd);
+        if (d_lo < x_hi && x_lo < d_hi) {
+            return -1;
+        }
+    }
+    *group_n = n;
+    return mul_idx - 1;
+}
+
 // Q/K projection ROPE matvec fusion (DX12_MMV_{Q,K}_ROPE_FUSION) alias guard.
 // The matvec at mm_idx would apply RoPE and write straight into the endpoint's
 // output (the ROPE result for Q, the KV cache for K), so the intermediate
@@ -4476,6 +4915,134 @@ static bool dx12_tensor_consumed_only_by(const ggml_cgraph * cgraph,
     return found;
 }
 
+// QK-Norm merge (fl=104): find the sibling K-side RMS_NORM+MUL+ROPE+VIEW+SET_ROWS
+// chain that the Q-side 3-way chain at `q_idx` can absorb into one dispatch.
+// Structural detection only. Both chains must normalize equal-width rows out of
+// the same activation resource with the same RoPE parameters, and the K chain
+// must be safe to hoist to the Q node's position: its input has to be live
+// already, and nothing in between may touch either its input or the KV-cache
+// slice it writes.
+static void dx12_try_fuse_qk_norm_merge(const ggml_cgraph  * cgraph,
+                                        int                  q_idx,
+                                        const ggml_tensor  * q_norm,
+                                        const ggml_tensor  * q_mul,
+                                        const ggml_tensor  * q_rope,
+                                        struct ggml_tensor *& out_k_norm,
+                                        struct ggml_tensor *& out_k_rope,
+                                        struct ggml_tensor *& out_k_set_rows,
+                                        int                 & out_k_idx,
+                                        const std::vector<char> & node_absorbed) {
+    const int WINDOW = 24;
+    if (!q_norm || !q_mul || !q_rope || !q_norm->src[0] || !q_mul->src[1]) {
+        return;
+    }
+    // Decode only: one group per head means a group's id is its head index.
+    if (q_norm->ne[2] != 1 || q_norm->ne[3] != 1) {
+        return;
+    }
+    if (q_norm->ne[1] + 1 >= 65535 || q_rope->type != GGML_TYPE_F32) {
+        return;
+    }
+    ID3D12Resource * act_res = dx12_get_resource(q_norm->src[0]);
+    ID3D12Resource * wt_res  = dx12_get_resource(q_mul->src[1]);
+    ID3D12Resource * qd_res  = dx12_get_resource(q_rope);
+    if (!act_res || !wt_res || !qd_res) {
+        return;
+    }
+    auto overlaps = [](const ggml_tensor * t, ID3D12Resource * res, uint64_t lo, uint64_t hi) {
+        if (!t || dx12_get_resource(t) != res) return false;
+        const uint64_t o = dx12_tensor_offset(t);
+        return o < hi && lo < o + (uint64_t)ggml_nbytes(t);
+    };
+
+    for (int k = q_idx + 1; k < cgraph->n_nodes - 4 && k <= q_idx + WINDOW; ++k) {
+        struct ggml_tensor * kn = cgraph->nodes[k];
+        if (!kn || kn->op != GGML_OP_RMS_NORM || !kn->src[0]) continue;
+        struct ggml_tensor * km = cgraph->nodes[k + 1];
+        struct ggml_tensor * kr = cgraph->nodes[k + 2];
+        struct ggml_tensor * kv = cgraph->nodes[k + 3];
+        struct ggml_tensor * ks = cgraph->nodes[k + 4];
+        if (!km || km->op != GGML_OP_MUL || km->src[0] != kn || !km->src[1]) continue;
+        if (!kr || kr->op != GGML_OP_ROPE || kr->src[0] != km || !kr->src[1]) continue;
+        if (!kv || kv->op != GGML_OP_VIEW || kv->src[0] != kr) continue;
+        if (!ks || ks->op != GGML_OP_SET_ROWS || ks->src[0] != kv || !ks->src[1]) continue;
+        if (ks->type != GGML_TYPE_F32 && ks->type != GGML_TYPE_F16) continue;
+        if (ks->src[1]->type != GGML_TYPE_I32 && ks->src[1]->type != GGML_TYPE_I64) continue;
+        if (!ggml_is_contiguous(km) || !ggml_is_contiguous(kr) || !ggml_is_contiguous(kv)) continue;
+        if (kv->ne[0] != kr->ne[0] * kr->ne[1]) continue;
+
+        // Same row geometry and strides so one parameter set covers both.
+        if (kn->ne[0] != q_norm->ne[0] || kn->ne[2] != 1 || kn->ne[3] != 1) continue;
+        if (kn->src[0]->nb[0] != q_norm->src[0]->nb[0]) continue;
+        if (kn->src[0]->nb[1] != q_norm->src[0]->nb[1]) continue;
+        if (kn->ne[1] + q_norm->ne[1] >= 65535) continue;
+        if (dx12_get_resource(kn->src[0]) != act_res) continue;
+        if (dx12_get_resource(km->src[1]) != wt_res) continue;
+        if (km->src[1]->type != q_mul->src[1]->type) continue;
+        if (km->src[1]->ne[0] != q_mul->src[1]->ne[0]) continue;
+        if (km->src[1]->nb[0] != q_mul->src[1]->nb[0]) continue;
+        // Identical RoPE: same parameters, same positions, same freq_factors.
+        if (memcmp(kr->op_params, q_rope->op_params, sizeof(kr->op_params)) != 0) continue;
+        if (kr->src[1] != q_rope->src[1]) continue;
+        if (kr->src[2] != q_rope->src[2]) continue;
+        // The KV cache is written through one root UAV with the layer offset
+        // baked in, so its rows must be plainly strided.
+        if ((uint64_t)ks->nb[0] != (uint64_t)ggml_type_size(ks->type)) continue;
+        if (ks->ne[2] != 1 || ks->ne[3] != 1) continue;
+
+        ID3D12Resource * kv_res = dx12_get_resource(ks);
+        if (!kv_res || kv_res == qd_res) continue;
+
+        const uint64_t x_lo = dx12_tensor_offset(kn->src[0]);
+        const uint64_t x_hi = x_lo + (uint64_t)ggml_nbytes(kn->src[0]);
+
+        // The K chain's input must already be live at the Q node's position.
+        // Nodes after q_idx count only when an earlier dispatch already absorbed
+        // them (the merged Q+K matvec produces Kcur ahead of its graph slot).
+        bool produced = false;
+        int  producer_idx = -1;
+        for (int p = k - 1; p >= 0 && p >= q_idx - WINDOW && !produced; --p) {
+            if (p > q_idx && (node_absorbed.empty() || !node_absorbed[p])) continue;
+            if (overlaps(cgraph->nodes[p], act_res, x_lo, x_hi)) {
+                produced     = true;
+                producer_idx = p;
+            }
+        }
+        if (!produced) continue;
+
+        // Nothing between may write the K input, and nothing may read or write
+        // the KV-cache slice we are about to fill early.
+        const uint64_t c_lo = dx12_tensor_offset(ks);
+        const uint64_t c_hi = c_lo + (uint64_t)ggml_nbytes(ks);
+        bool hazard = false;
+        for (int j = q_idx + 1; j < k && !hazard; ++j) {
+            struct ggml_tensor * mid = cgraph->nodes[j];
+            if (!mid) continue;
+            // Views alias their source without writing, and absorbed nodes have
+            // already run as part of an earlier dispatch.
+            const bool inert = j == producer_idx ||
+                               mid->op == GGML_OP_VIEW || mid->op == GGML_OP_RESHAPE ||
+                               mid->op == GGML_OP_PERMUTE || mid->op == GGML_OP_TRANSPOSE ||
+                               mid->op == GGML_OP_NONE ||
+                               (!node_absorbed.empty() && node_absorbed[j]);
+            if (!inert) {
+                hazard = overlaps(mid, act_res, x_lo, x_hi) ||
+                         overlaps(mid, kv_res, c_lo, c_hi);
+            }
+            for (int s = 0; s < GGML_MAX_SRC && !hazard; ++s) {
+                hazard = overlaps(mid->src[s], kv_res, c_lo, c_hi);
+            }
+        }
+        if (hazard) continue;
+
+        out_k_norm     = kn;
+        out_k_rope     = kr;
+        out_k_set_rows = ks;
+        out_k_idx      = k;
+        return;
+    }
+}
+
 static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * bctx = (dx12_backend_context *)backend->context;
     const bool phase_profile = DX12_GETENV("DX12_PHASE_PROFILE") != nullptr;
@@ -4502,6 +5069,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     static const int dx12_trace = (getenv("DX12_TRACE_GRAPH") != nullptr) ? atoi(getenv("DX12_TRACE_GRAPH")) : 0;
     static int dx12_trace_call = 0;
     int trace_call = ++dx12_trace_call;
+    dx12_pix_graph(trace_call);
     if (dx12_trace) {
         fprintf(stderr, "[DX12_TRACE] graph_compute #%d enter: n_nodes=%d\n", trace_call, cgraph->n_nodes);
         fflush(stderr);
@@ -4526,6 +5094,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     static const bool barrier_stats = (getenv("DX12_BARRIER_STATS") != nullptr);
     bctx->dbg_barrier_scoped = 0;
     bctx->dbg_barrier_global = 0;
+    bctx->dbg_barrier_reasons.clear();
+    bctx->dbg_trace_graph++;
 
     // DX12_FUSION_AUDIT: one-shot histogram of adjacent op pairs in the first
     // decode graph, printed sorted by frequency.  Decode graphs repeat
@@ -4612,6 +5182,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     if (tune_profile_active) do_profile = true;
     std::map<std::string, double> op_times;
     std::map<std::string, uint32_t> op_counts;
+    std::map<std::string, size_t> op_bytes;
 
     // GPU-side timestamp profiling — record per-dispatch start/end timestamps
     // into a query heap, then resolve and read after the graph completes. This
@@ -4622,6 +5193,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     uint32_t prof_capacity = 0;
     uint32_t prof_idx = 0;
     std::vector<std::string> prof_keys;   // one per dispatched node
+    std::vector<size_t>      prof_bytes;  // weight bytes read, parallel to prof_keys
     UINT64 prof_freq = 1;
     if (do_profile) {
         prof_capacity = (uint32_t)cgraph->n_nodes * 2 + 32;
@@ -4752,8 +5324,65 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // Enabled by default; disable via DX12_QKV_SHARED_DISPATCH=0.
     static const bool qkv_shared_dispatch = dx12_flag_default_on("DX12_QKV_SHARED_DISPATCH");
     static const bool qkv_q8_portable = dx12_flag_default_on("DX12_QKV_Q8_PORTABLE");
+    static const bool qkv_q8_dp4a = dx12_flag_default_on("DX12_QKV_Q8_DP4A");
     static const bool qkv_mixed_q5_q8 = dx12_flag_default_on("DX12_QKV_MIXED_Q5_Q8");
+    // Merge a Q4_K Q projection with the sibling K projection into one dispatch
+    // when the weights are contiguous and the outputs share a buffer. Unlike
+    // the combined Q/K/V path this absorbs no post-ops, so QK-norm models
+    // (Qwen3) qualify. Disable via DX12_MMV_QK_MERGE=0.
+    static const bool mmv_qk_merge = dx12_flag_default_on("DX12_MMV_QK_MERGE");
+    // Merge the Q-side and K-side QK-Norm chains (RMS_NORM+MUL+ROPE and
+    // RMS_NORM+MUL+ROPE+VIEW+SET_ROWS) into one dispatch. Both are one group per
+    // head at 256 threads for a 128-wide row, so each is dominated by its launch
+    // cost; a region-select shader covers both for the price of one.
+    static const bool qk_norm_merge = dx12_flag_default_on("DX12_QK_NORM_MERGE");
     static const bool rms_norm_mul_1024 = dx12_flag_default_on("DX12_RMS_NORM_MUL_1024");
+    static const int64_t rms_norm_mul_1024_min = []{
+        const char * v = DX12_GETENV("DX12_RMS_NORM_MUL_1024_MIN");
+        return (v && v[0]) ? (int64_t) atoi(v) : (int64_t) 2048;
+    }();
+    // Absorb an RMS_NORM+MUL into the matvec that consumes its output - the
+    // attention norm into the combined Q/K/V matvec (fl=88) and the FFN norm
+    // into the gate/up+SwiGLU matvec (fl=89). Removes two dispatches and two
+    // barriers per layer; see mul_mat_vec_qkv_f16_wave64.hlsl for the
+    // single-pass algebra.
+    //
+    // Default-on where it has been measured. Other vendors stay opt-in.
+    //   Intel Xe-HPG+ (B390 tg256, ABBA): f16 230.2 -> 242.9, Q4_K_M 353.0 ->
+    //     383.0, Q8_0 neutral at -0.5% (the wave gate declines the dp4a GLU
+    //     trade). f16 PPL identical folded; Q4_K_M 6.8162 -> 6.8224 vs CPU
+    //     6.8708.
+    //   NVIDIA Pascal+ (RTX 6000 Ada, SmolVLM2-256M tg): f16 +12.2%, Q8_0
+    //     +11.5%, Q4_K_M +11.3%. PPL SmolLM2-135M: f16 identical, Q8_0
+    //     18.8468 -> 18.8422 vs CPU 18.8798.
+    //   Intel UHD (wave8): f16 +5.4%. PPL SmolLM2-135M: f16 identical, Q4_K_M
+    //     19.5581 -> 19.5534 vs CPU 19.6282. Q8_0 does not fold here.
+    //   AMD RDNA (RX 6800 / RDNA2, SmolLM2-135M tg128): f16 +13.1%, Q8_0
+    //     +15.9%, Q4_K_M +8.5%. SmolVLM2-256M Q8_0 +9.7%. Phi-3-mini Q8_0
+    //     neutral -- it ships pre-fused qkv/gate_up tensors, so there are no
+    //     fold sites. PPL SmolLM2-135M -b 1 -ub 1: f16 identical, Q8_0
+    //     10.0345 -> 10.0433 vs CPU 10.0762. Measured on RDNA2 and applied to
+    //     the whole RDNA line (RDNA1 through RDNA4+); GCN/CDNA stay opt-in.
+    //
+    // Note when re-measuring PPL: the fold only rewrites the M=1 decode matvec,
+    // so a default-batch perplexity run never reaches it and reports an
+    // identical score. Pass -b 1 -ub 1 to route every token through it.
+    const char * fuse_rms_into_mm_env = DX12_GETENV("DX12_FUSE_RMS_MATVEC");
+    const bool fuse_rms_into_mm = fuse_rms_into_mm_env
+        ? fuse_rms_into_mm_env[0] != '0'
+        : (bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
+           bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
+           bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS ||
+           bctx->dev->arch_family == DX12_ARCH_AMD_RDNA);
+    // Replicated attn-norm fold (fl=102). Measured neutral on NVIDIA Ada for
+    // Qwen3-4B Q4_K_M: retiring 18 RMS_NORM dispatches (0.085 ms) is paid back
+    // almost exactly by the extra sum(x*x) pass and norm-weight read every
+    // consumer group repeats (+0.09 ms). Kept opt-in for devices where the
+    // per-dispatch tail is a larger share of the budget.
+    static const bool fuse_rms_qkv = [] {
+        const char * v = DX12_GETENV("DX12_FUSE_RMS_QKV");
+        return v && v[0] && v[0] != '0';
+    }();
     static const bool qk_rope_scale_fusion =
         dx12_flag_default_on("DX12_QK_ROPE_SCALE_FUSION");
     // Opt-in F16 rope-pair de-duplication (fl=63 only): a NORMAL-mode Q/K
@@ -4777,7 +5406,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // baked list stays correct across tokens.  dx12_replay_signature hashes the
     // absorbed nodes' bound resources so a buffer reallocation forces a re-record.
     const bool mmv_any_postop = mmv_set_rows_fusion || mmv_q_rope_fusion ||
-                                mmv_k_rope_fusion || qkv_shared_dispatch;
+                                mmv_k_rope_fusion || qkv_shared_dispatch ||
+                                qk_norm_merge;
     // Debug: per-fusion-type bypasses for bisecting correctness issues
     static bool no_fuse_add_rms_mul   = (getenv("DX12_NO_FUSE_ADD_RMS_MUL")   != nullptr);
     static bool env_no_fuse_rms_mul_rope5 = (getenv("DX12_NO_FUSE_RMS_MUL_ROPE5") != nullptr);
@@ -4797,11 +5427,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     const bool no_fuse_rms_mul_rope3 = env_no_fuse_rms_mul_rope3 || amd_rdna12_skip_rope_fusion;
     static bool no_fuse_rms_mul       = (getenv("DX12_NO_FUSE_RMS_MUL")       != nullptr);
     static bool no_fuse_rope_set_rows = (getenv("DX12_NO_FUSE_ROPE_SET_ROWS") != nullptr);
-    // Opt-in: DX12_RMSNORM_QUANT_FUSION=1 enables RMS_NORM_MUL + Q8_1
-    // pre-pass fusion (rms_norm_mul_quantize_q8_1.hlsl). Default OFF until
-    // bench shows a win on a target model; see plan.md "RMS_NORM + Q8_1
-    // fusion" section for the per-model A/B/A bench protocol.
-    static bool fuse_rms_quant_q8_1   = (getenv("DX12_RMSNORM_QUANT_FUSION") != nullptr);
+    // DX12_RMSNORM_QUANT_FUSION folds RMS_NORM_MUL and the Q8_1 activation
+    // pre-pass into one dispatch (rms_norm_mul_quantize_q8_1.hlsl). Default on
+    // for wave16 only: that path gives each wave a whole Q8_1 block, so the
+    // fold is a win there (+2.2% tg128 Q8_0 on B390) while it removes 60 of
+    // 122 quantize dispatches. wave32/64 stay opt-in pending a bench.
+    const char * rms_quant_env = DX12_GETENV("DX12_RMSNORM_QUANT_FUSION");
+    const bool fuse_rms_quant_q8_1 =
+        rms_quant_env ? rms_quant_env[0] != '0' : bctx->dev->wave_size == 16;
     // v3 pivot 1: when fusion is on AND we can prove ALL downstream consumers
     // of the rms_norm_mul output are dp4a matmuls that will hit the q8_1 cache
     // (no intermediate dispatch can invalidate), skip the F32 dst write to
@@ -4810,15 +5443,47 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     static bool fuse_rms_quant_q8_1_skip_f32 = (getenv("DX12_RMSNORM_QUANT_FUSION_SKIP_F32") != nullptr);
     const char * q50_subgroup_env = DX12_GETENV("DX12_Q50_SUBGROUP");
     const bool q50_subgroup_auto =
-        bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA3_PLUS;
+        dx12_subarch_is_rdna3_plus(bctx->dev->sub_family);
     // Default on across all vendors: the wave-portable Q5_0 subgroup shader is a
     // boost-or-neutral win on AMD / NVIDIA / Intel (dGPU + iGPU). Opt out with
     // DX12_Q50_SUBGROUP=0. (q50_subgroup_auto still selects the rows2 variant.)
     const bool q50_subgroup_active =
         q50_subgroup_env ? q50_subgroup_env[0] != '0' : true;
-    // Diagnostic-only: bypass the Qwen3 QK-Norm gate so the same binary can A/B
-    // fused vs gated. Do not commit a change that ships with this enabled.
-    static bool force_fuse_qk_norm = (getenv("DX12_FORCE_FUSE_QK_NORM") != nullptr);
+    // Whether a weight type actually takes the M=1 dp4a matvec route (and so
+    // consumes the Q8_1 scratch). This must mirror the per-type vendor gates
+    // in the matvec routing below: promoting an rms_norm_mul to the fused
+    // quantize variant for a type that never reads the scratch costs the
+    // quantize work and displaces the tuned norm shader for nothing.
+    const bool dp4a_nvidia = (bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA);
+    const bool dp4a_nv_igpu =
+        bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS && bctx->dev->is_igpu;
+    const char * dp4a_nv_q4k_env = DX12_GETENV("DX12_NV_Q4K_DP4A");
+    const char * dp4a_nv_q5k_env = DX12_GETENV("DX12_NV_Q5K_DP4A");
+    const char * dp4a_nv_q6k_env = DX12_GETENV("DX12_NV_Q6K_DP4A");
+    const bool dp4a_q4k_ok = !dp4a_nvidia ||
+        (dp4a_nv_q4k_env ? dp4a_nv_q4k_env[0] != '0' : dp4a_nv_igpu);
+    const bool dp4a_q5k_ok = !dp4a_nvidia ||
+        (dp4a_nv_q5k_env && dp4a_nv_q5k_env[0] != '0');
+    const bool dp4a_q6k_ok = !dp4a_nvidia ||
+        (!dp4a_nv_q6k_env || dp4a_nv_q6k_env[0] != '0');
+    auto is_dp4a_matvec_consumer = [&](ggml_type w) {
+        switch (w) {
+            case GGML_TYPE_Q4_K: return dp4a_q4k_ok;
+            case GGML_TYPE_Q5_K: return dp4a_q5k_ok;
+            case GGML_TYPE_Q6_K: return dp4a_q6k_ok;
+            case GGML_TYPE_Q3_K: return !dp4a_nvidia;
+            case GGML_TYPE_Q5_0: return q50_subgroup_active ? false : true;
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_1: return true;
+            // Q2_K always takes the block-level matvec, never the dp4a route.
+            default: return false;
+        }
+    };
+    // Escape hatch for the QK-Norm (ne[1] == n_head > 1) fused RMS+MUL+ROPE
+    // path; set to restore the old single-row-only gate.
+    static bool no_fuse_qk_norm = (getenv("DX12_NO_FUSE_QK_NORM") != nullptr);
 
     // Diagnostic: DX12_SYNC_PER_OP=1 closes + executes + waits after every
     // node's dispatches so that a TDR can be pinpointed to the exact op that
@@ -4896,14 +5561,22 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // sub-2-GFLOP decode graphs (SmolLM2-135M 0.22, Qwen3.5-0.8B 1.52): RX 6800
     // +12-14%/+7-9% and RTX 6000 Ada +7.3%/+7.9%/+2.8% from *disabling* replay,
     // and neutral above the threshold (Llama-3.2-1B 2.50, Phi-3-mini 7.54).
-    // Integrated GPUs show the opposite sign - an NVIDIA iGPU gains 4-14% *from*
-    // replay in the same band - so the gate is deliberately discrete-only.  Tune
-    // with DX12_REPLAY_MIN_GFLOP; 0 disables the gate entirely.
+    // Tune with DX12_REPLAY_MIN_GFLOP; 0 disables the gate entirely.
+    //
+    // The iGPU exemption below was measured on an NVIDIA iGPU (Tegra-class UMA),
+    // which gains 4-14% *from* replay in the same band, and on Intel Xe (B390:
+    // replay is worth +3.9% Q4_K_M and +1.3% f16, neutral on Q8_0).  AMD RDNA
+    // iGPUs do not follow that pattern - Strix Point 880M regresses on Q8_0 and
+    // f16 decode with replay on, like the discrete parts - so they take the FLOP
+    // gate rather than the blanket exemption.
     static const uint64_t cr_min_flops = [] {
         const char * env = DX12_GETENV("DX12_REPLAY_MIN_GFLOP");
         return (uint64_t)((env ? atof(env) : 2.0) * 1e9);
     }();
-    const bool cr_size_ok = bctx->dev->is_igpu || cr_min_flops == 0 ||
+    const bool cr_igpu_exempt =
+        bctx->dev->is_igpu &&
+        bctx->dev->adapter_desc.VendorId != dx12_vendor::AMD;
+    const bool cr_size_ok = cr_igpu_exempt || cr_min_flops == 0 ||
                             bctx->last_decode_flops >= cr_min_flops;
 
     const bool cr_eligible =
@@ -4962,6 +5635,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // the matvec node (always earlier in the graph) and skipped when the loop
     // reaches them, on both the record and replay passes.
     std::vector<char> node_absorbed(mmv_any_postop ? cgraph->n_nodes : 0, 0);
+
+    // Replicated RMS fold bookkeeping: how many consumers of the RMS_NORM at
+    // index r have folded it in. The norm pair is only retired once every
+    // consumer has, so a partial fold stays correct.
+    std::vector<uint8_t> rms_fold_hits(fuse_rms_qkv ? cgraph->n_nodes : 0, 0);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         uint64_t phase_detail_start_us = phase_profile ? dx12_qpc_us() : 0;
@@ -5035,6 +5713,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         struct ggml_tensor * fused_rms_node       = nullptr;
         struct ggml_tensor * fused_rope_after_rms = nullptr;
         struct ggml_tensor * fused_5way_set_rows  = nullptr;
+        // Merged Q/K QK-Norm dispatch (fl=104): the sibling K-side chain the Q
+        // node absorbs. Its MUL/ROPE/VIEW/SET_ROWS sit at fixed offsets +1..+4.
+        struct ggml_tensor * fused_qkn_k_norm     = nullptr;
+        struct ggml_tensor * fused_qkn_k_rope     = nullptr;
+        struct ggml_tensor * fused_qkn_k_set_rows = nullptr;
+        int                  fused_qkn_k_norm_idx = -1;
         struct ggml_tensor * fused_rope_set_rows  = nullptr;
         struct ggml_tensor * fused_rope_view      = nullptr;
         struct ggml_tensor * fused_bias_add       = nullptr;
@@ -5079,6 +5763,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         uint32_t fused_qkv_q_rows = 0;
         uint32_t fused_qkv_k_rows = 0;
         uint32_t fused_qkv_v_rows = 0;
+        // DX12_FUSE_MMV_QK_MERGE: the K projection matvec absorbed into this Q
+        // projection dispatch (post-op free, so QK-norm models qualify).
+        struct ggml_tensor * fused_qk_merge     = nullptr;
+        int                  fused_qk_merge_idx = -1;
+        // RMS_NORM+MUL folded into the combined Q/K/V matvec (fl=88): the RMS
+        // and MUL nodes are elided and the matvec recomputes the norm inline.
+        int                  fused_rms_idx = -1;
+        struct ggml_tensor * fused_rms_x   = nullptr;  // un-normalized activation
+        struct ggml_tensor * fused_rms_g   = nullptr;  // norm weight
+        float                fused_rms_eps = 0.0f;
+        // Replicated fold: other consumers of the same norm still need it.
+        bool                 fused_rms_defer_skip = false;
         // Packed-QKV post-op fusion: dispatch at Q ROPE, writing the following
         // SCALE output and the sibling K ROPE cache scatter.
         bool                 fused_qk_postop             = false;
@@ -5097,6 +5793,17 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         bool is_matvec_dispatch = false;
         bool use_dp4a           = false;
         bool use_dp4a_matvec    = false;
+        // Q8_0 wave64 rows2 (fl=67) is taken speculatively: the route only pays
+        // off when the node lands one of the fusions gated on it, which is not
+        // known until the fusion blocks below have run.  Remember what the
+        // scalar route had picked so the choice can be undone.
+        bool     q8_wave64_revertible = false;
+        uint32_t q8_wave64_prev_flags = 0;
+        bool     q8_wave64_prev_dp4a  = false;
+        // Same for the Q8_0 GLU: the dp4a shader (fl=62) reads pre-quantized
+        // Q8_1 activations and so has no fold host, while the scalar fl=35 does.
+        // Hold fl=35 until the fold is known to have landed.
+        bool     q80_glu_revertible = false;
         dx12_pipeline * pipeline = nullptr;
 
         if (replay) {
@@ -5138,6 +5845,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     fused_5way_set_rows  = cgraph->nodes[i + 4];
                     key.op               = GGML_OP_RMS_NORM;
                     break;
+                case DX12_FUSE_QK_NORM_MERGE: {
+                    fused_mul_node       = cgraph->nodes[i + 1];
+                    fused_rope_after_rms = cgraph->nodes[i + 2];
+                    key.op               = GGML_OP_RMS_NORM;
+                    const int kn_idx     = i + d.qkv_k_matvec_rel;
+                    if (d.qkv_k_matvec_rel > 0 && kn_idx + 4 < cgraph->n_nodes) {
+                        fused_qkn_k_norm     = cgraph->nodes[kn_idx];
+                        fused_qkn_k_rope     = cgraph->nodes[kn_idx + 2];
+                        fused_qkn_k_set_rows = cgraph->nodes[kn_idx + 4];
+                        fused_qkn_k_norm_idx = kn_idx;
+                    }
+                    break;
+                }
                 case DX12_FUSE_ROPE_SET_ROWS:
                     fused_rope_view     = cgraph->nodes[i + 1];
                     fused_rope_set_rows = cgraph->nodes[i + 2];
@@ -5225,6 +5945,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
                     break;
                 }
+                case DX12_FUSE_MMV_QK_MERGE: {
+                    const int k_idx = i + d.qkv_k_matvec_rel;
+                    if (d.qkv_k_matvec_rel > 0 && k_idx < cgraph->n_nodes &&
+                        cgraph->nodes[k_idx]->op == GGML_OP_MUL_MAT) {
+                        fused_qk_merge     = cgraph->nodes[k_idx];
+                        fused_qk_merge_idx = k_idx;
+                    }
+                    break;
+                }
                 case DX12_FUSE_QK_ROPE_SCALE_SET_ROWS: {
                     const int scale_idx = i + d.qk_scale_rel;
                     const int rope_idx  = i + d.qk_k_rope_rel;
@@ -5252,6 +5981,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 case DX12_FUSE_NONE:
                 default:
                     break;
+            }
+            // An absorbed RMS_NORM+MUL pair sits before this node; recover the
+            // un-normalized activation and the norm weight it binds directly.
+            if (d.rms_fold_rel < 0) {
+                const int r = i + d.rms_fold_rel;
+                if (r >= 0 && r + 1 < i &&
+                    cgraph->nodes[r]->op == GGML_OP_RMS_NORM &&
+                    cgraph->nodes[r + 1]->op == GGML_OP_MUL) {
+                    fused_rms_idx = r;
+                    fused_rms_x   = cgraph->nodes[r]->src[0];
+                    fused_rms_g   = cgraph->nodes[r + 1]->src[1];
+                    memcpy(&fused_rms_eps, cgraph->nodes[r]->op_params, sizeof(float));
+                }
             }
             // Bias-add fusion can co-occur with MUL_MAT(M=1).
             if (d.has_bias_add && i + 1 < cgraph->n_nodes) {
@@ -5284,6 +6026,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if ((node->op == GGML_OP_ARGSORT || node->op == GGML_OP_TOP_K) &&
             node->src[0] && node->src[0]->ne[0] > 1024) {
             key.flags = 50;
+        }
+
+        // TOP_K large-N fast path: a full bitonic sort is only needed for
+        // ARGSORT. When K is small enough, top_k_large reduces the row in a
+        // few passes instead of log2(N)*(log2(N)+1)/2 of them.
+        if (node->op == GGML_OP_TOP_K && key.flags == 50 &&
+            !getenv("DX12_NO_TOPK_FAST") &&
+            dx12_topk_large_kl((uint32_t)node->src[0]->ne[0], (uint32_t)node->ne[0])) {
+            key.flags = 51;
         }
 
         // SSM_SCAN d_state variant selection: the default ssm_scan shader is
@@ -5335,22 +6086,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // The fused RMS+MUL+ROPE shaders implement attn_factor,
                     // freq_factors, and YaRN ext_factor (corr_low/high are
                     // precomputed host-side and forwarded into the shader).
-                    // Gate fusion on `node->src[0]->ne[1] == 1` to disable
-                    // fused 3-way / 5-way for QK-Norm-style models
-                    // (Qwen3, AFMoE, etc.) where the RMS_NORM operates per
-                    // attention head (ne[1] == n_head > 1) on a broadcast
-                    // weight. Attempted to remove this gate after op_params
-                    // packing was centralized via dx12_pack_rope_op_params
-                    // (commit 80572dc): all isolated test-backend-ops cases
-                    // pass, prompt-eval + first decode token result_output is
-                    // bit-identical, but subsequent decode tokens diverge (
-                    // verified call3+ produces wrong logits on Qwen3-0.6B
-                    // Q4_K_M with seed 42). Root cause not yet found; gate
-                    // retained for runtime correctness.
+                    // QK-Norm models (Qwen3, AFMoE) norm per attention head, so
+                    // ne[1] == n_head > 1. That path was gated off for a decode
+                    // divergence whose root cause was later found elsewhere: the
+                    // fused shaders derived their cross-wave reduction geometry
+                    // from the compile-time WARP_SIZE, so on any multi-row
+                    // dispatch the groupshared slots mismatched the real wave
+                    // width (fixed in 5f59fb23e by switching to the runtime
+                    // WaveGetLaneCount).
                     if (rope->op == GGML_OP_ROPE && rope->src[0] == next &&
                         ggml_is_contiguous(next) && ggml_is_contiguous(rope) &&
                         next->ne[0] <= 1024 &&
-                        node->src[0] && (force_fuse_qk_norm || node->src[0]->ne[1] == 1) &&
+                        node->src[0] && (!no_fuse_qk_norm || node->src[0]->ne[1] == 1) &&
                         (mode == 0 || mode == 2) &&
                         rope_ext_compatible) {
                         // Check for 5-way: ROPE + VIEW + SET_ROWS
@@ -5380,17 +6127,35 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         }
                     }
                 }
+                // QK-Norm merge: the Q-side 3-way chain absorbs the sibling
+                // K-side 5-way chain so both heads' norms run in one dispatch.
+                // Both are one 256-thread group per head over a 128-wide row, so
+                // each is dominated by its launch cost rather than its work.
+                if (qk_norm_merge && key.flags == 7 && !no_fuse_rms_mul_rope5) {
+                    dx12_try_fuse_qk_norm_merge(cgraph, i, node, fused_mul_node,
+                                                fused_rope_after_rms,
+                                                fused_qkn_k_norm, fused_qkn_k_rope,
+                                                fused_qkn_k_set_rows,
+                                                fused_qkn_k_norm_idx,
+                                                node_absorbed);
+                    if (fused_qkn_k_norm) {
+                        key.flags = 104;
+                    }
+                }
                 // If triple fusion didn't trigger, use double fusion
                 if (!fused_rope_after_rms) {
                     fused_mul_node = next;
                     key.op = GGML_OP_RMS_NORM;
                     key.flags = 2;  // flags=2 means fused rms_norm_mul
-                    // Phi-3 decode has one 3072-element row per dispatch. A full
-                    // Ada workgroup reduces the single-row latency substantially.
+                    // A single-row decode norm is one threadgroup, so it is pure
+                    // latency: widening it to a full workgroup cuts the strided
+                    // passes over the row. Worth it once the row needs several
+                    // iterations at the default 256 threads.
                     if (rms_norm_mul_1024 &&
-                        bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA &&
-                        bctx->dev->wave_size == 32 &&
-                        node->ne[0] == 3072 && node->ne[1] == 1 &&
+                        ((bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA &&
+                          bctx->dev->wave_size == 32) ||
+                         bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS) &&
+                        node->ne[0] >= rms_norm_mul_1024_min && node->ne[1] == 1 &&
                         node->ne[2] == 1 && node->ne[3] == 1) {
                         key.flags = 85;
                     }
@@ -5409,13 +6174,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             if (!c) continue;
                             if (c->op == GGML_OP_MUL_MAT && c->src[1] == next && c->src[0]) {
                                 ggml_type w = c->src[0]->type;
-                                bool dp4a_consumer =
-                                    w == GGML_TYPE_Q4_K || w == GGML_TYPE_Q5_K ||
-                                    w == GGML_TYPE_Q6_K || w == GGML_TYPE_Q3_K ||
-                                    w == GGML_TYPE_Q8_0 || w == GGML_TYPE_Q4_0 ||
-                                    w == GGML_TYPE_Q4_1 ||
-                                    (w == GGML_TYPE_Q5_0 && !q50_subgroup_active) ||
-                                    w == GGML_TYPE_Q5_1 || w == GGML_TYPE_Q2_K;
+                                bool dp4a_consumer = is_dp4a_matvec_consumer(w);
                                 if (dp4a_consumer) {
                                     fused_rms_quant_consumer = c;
                                     key.flags = 12;
@@ -5441,13 +6200,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                                 if (d_n->src[si] == next) {
                                                     if (d_n->op == GGML_OP_MUL_MAT && si == 1 && d_n->src[0]) {
                                                         ggml_type dw = d_n->src[0]->type;
-                                                        bool dc =
-                                                            dw == GGML_TYPE_Q4_K || dw == GGML_TYPE_Q5_K ||
-                                                            dw == GGML_TYPE_Q6_K || dw == GGML_TYPE_Q3_K ||
-                                                            dw == GGML_TYPE_Q8_0 || dw == GGML_TYPE_Q4_0 ||
-                                                            dw == GGML_TYPE_Q4_1 ||
-                                                            (dw == GGML_TYPE_Q5_0 && !q50_subgroup_active) ||
-                                                            dw == GGML_TYPE_Q5_1 || dw == GGML_TYPE_Q2_K;
+                                                        bool dc = is_dp4a_matvec_consumer(dw);
                                                         // Also require src[1]->ne[1..3] == 1 so the
                                                         // matmul takes the dp4a M=1 path that uses
                                                         // the q8_1 scratch cache.
@@ -5503,8 +6256,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // to restore the standalone Q/K post-ops.
         if (!no_fusion && qk_rope_scale_fusion && node->op == GGML_OP_ROPE &&
             !fused_add_rms_node && i + 1 < cgraph->n_nodes &&
-            bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA &&
-            bctx->dev->wave_size == 32 &&
+            ((bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA &&
+              bctx->dev->wave_size == 32) ||
+             bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS) &&
             node->type == GGML_TYPE_F32 && node->src[0] &&
             node->src[0]->type == GGML_TYPE_F32 &&
             node->ne[0] == 96 && node->ne[1] == 32 &&
@@ -5686,7 +6440,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             bctx->dev->wave_size == 64) {
                             const char * f16_wave64_env = DX12_GETENV("DX12_F16_WAVE64");
                             const bool f16_wave64_auto =
-                                bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA3_PLUS;
+                                dx12_subarch_is_rdna3_plus(bctx->dev->sub_family);
                             const bool f16_wave64 =
                                 f16_wave64_env ? f16_wave64_env[0] != '0' : f16_wave64_auto;
                             if (f16_wave64) {
@@ -5747,16 +6501,23 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         key.flags = 20;
                     }
                 }
-                // Q3_K dp4a matvec (opt-in DX12_Q3K_DP4A=1): dot4add_i8packed
-                // against Q8_1 activations. Weight q = (qs_2bit | (hbit<<2))
-                // kept unsigned in [0,7]; the -4 centering is applied as a
-                // -4*sum(q8) bias at the end (mirrors the Q6_K -32 bias trick).
-                // Same gating as Q4_K/Q5_K/Q6_K dp4a (off NVIDIA per the
-                // cumulative-precision-drift policy); opt-in pending fleet perf
-                // validation. Overrides the scalar/blocked selection above.
+                // Q3_K dp4a matvec: dot4add_i8packed against Q8_1 activations.
+                // Weight q = (qs_2bit | (hbit<<2)) kept unsigned in [0,7]; the
+                // -4 centering is applied as a -4*sum(q8) bias at the end
+                // (mirrors the Q6_K -32 bias trick). Same gating as
+                // Q4_K/Q5_K/Q6_K dp4a (off NVIDIA per the
+                // cumulative-precision-drift policy). Default-on for AMD RDNA4,
+                // where it measured +22.5% on Qwen3-4B Q3_K_M (125.4 -> 153.6
+                // t/s) and +18.0% on Phi-3-mini-4k Q3_K_M (150.4 -> 177.5);
+                // SmolLM2-135M is dispatch-bound and neutral. Other vendors
+                // stay opt-in via DX12_Q3K_DP4A=1 pending fleet perf
+                // validation; =0 forces off. Overrides the scalar/blocked
+                // selection above.
                 if (t == GGML_TYPE_Q3_K) {
                     const char * q3k_dp4a_env = DX12_GETENV("DX12_Q3K_DP4A");
-                    bool q3k_dp4a = (q3k_dp4a_env != nullptr) && (q3k_dp4a_env[0] != '0');
+                    bool q3k_dp4a = q3k_dp4a_env
+                        ? q3k_dp4a_env[0] != '0'
+                        : bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS;
                     bool nvidia = (bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA);
                     if (q3k_dp4a && bctx->dev->dp4a_supported && allow_dp4a_wave &&
                         !nvidia &&
@@ -5811,14 +6572,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 // Q4_K: prefer dp4a matvec when supported. Vulkan uses dotPacked4x8EXT
                 // here and gets ~2x throughput on Intel for the dominant SmolVLM2 weight type.
-                // Gate off NVIDIA per GOTCHAS.md (cumulative precision drift on NVIDIA JIT).
+                // Gated off discrete NVIDIA per GOTCHAS.md (cumulative precision drift on the
+                // NVIDIA JIT, measured on RTX 6000 Ada). Re-enabled for the Pascal+ Tegra iGPU
+                // (GB20B): matvec-path perplexity is within noise of the scalar path (Phi-3 Q4_K
+                // 3.0523 vs 3.0495, dPPL ~0.09% << +/-0.18 stderr) for +9.3% decode. The original
+                // drift was in the batched GEMM path, not this M=1 matvec.
                 // Wave-portable since the shader's reduction was ported to use
                 // WaveGetLaneCount() + linear final sum (works on Intel UHD wave=8).
                 if (t == GGML_TYPE_Q4_K) {
                     key.flags = 9;
                     bool nvidia = (bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA);
+                    const bool nv_igpu = bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                                         bctx->dev->is_igpu;
+                    // DX12_NV_Q4K_DP4A=1 opts the discrete parts back in for A/B,
+                    // =0 forces off. Unset keeps the iGPU-only default.
+                    const char * nv_q4k_dp4a_env = DX12_GETENV("DX12_NV_Q4K_DP4A");
+                    const bool nv_q4k_dp4a =
+                        nv_q4k_dp4a_env ? (nv_q4k_dp4a_env[0] != '0') : nv_igpu;
                     if (bctx->dev->dp4a_supported && allow_dp4a_wave &&
-                        !nvidia &&
+                        (!nvidia || nv_q4k_dp4a) &&
                         node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
                         ggml_is_contiguous(node->src[1]) &&
                         (node->src[1]->ne[0] % 32) == 0) {
@@ -5843,8 +6615,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // Q5_K: same dp4a treatment as Q4_K (5th bit merged into nibble).
                 if (t == GGML_TYPE_Q5_K) {
                     bool nvidia = (bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA);
+                    // DX12_NV_Q5K_DP4A=1 opts NVIDIA in for A/B; off by default.
+                    const char * nv_q5k_dp4a_env = DX12_GETENV("DX12_NV_Q5K_DP4A");
+                    const bool nv_q5k_dp4a = nv_q5k_dp4a_env && nv_q5k_dp4a_env[0] != '0';
                     if (bctx->dev->dp4a_supported && allow_dp4a_wave &&
-                        !nvidia &&
+                        (!nvidia || nv_q5k_dp4a) &&
                         node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
                         ggml_is_contiguous(node->src[1]) &&
                         (node->src[1]->ne[0] % 32) == 0) {
@@ -5892,6 +6667,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     bool q6k_blocked;
                     if (q6k_blk_env != nullptr) {
                         q6k_blocked = (q6k_blk_env[0] != '0');
+                    } else if (bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS &&
+                               bctx->dev->dp4a_supported && allow_dp4a_wave) {
+                        // RDNA4 prefers the dp4a path (fl=23) over the block
+                        // decode: +8.2% on Phi-3-mini-4k Q6_K (140.3 -> 151.8
+                        // t/s) and +7.5% on Qwen3-4B Q6_K (128.0 -> 137.6),
+                        // perplexity unchanged (5.1432 -> 5.1453).
+                        q6k_blocked = false;
                     } else {
                         q6k_blocked = (bctx->dev->wave_size > 16);
                     }
@@ -5991,8 +6773,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // Gate is `wave_size == 32` to keep the win on validated NV/Intel
                 // wave32 paths and exclude AMD wave64 chips.
                 // Default-on for wave_size==32 && K<=2048; opt out via DX12_Q8_MR256=0.
-                // K threshold bumped 1024 → 2048 to catch SmolLM2-135M ffn_down
-                // (K=1536) and similar small-FFN-large-down shapes.
+                // K threshold bumped 1024 -> 2048 to catch SmolLM2-135M ffn_down
+                // (K=1536) and similar small-FFN-large-down shapes. Do NOT raise
+                // further: fl=44 is scalar, and measured -16.8% on Qwen3-4B Q8_0
+                // (K=2560) where the lost dp4a outweighs the dispatch savings.
                 if (t == GGML_TYPE_Q8_0 && key.flags == 17 &&
                     bctx->dev->wave_size == 32 &&
                     node->src[0]->ne[0] <= 2048) {
@@ -6086,6 +6870,34 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         }
                     }
                 }
+                // Q4_1: dp4a matvec — same structure as Q4_0 with the -8 bias
+                // correction replaced by Q4_1's additive minimum, also folded
+                // through the Q8_1 's' field. Before this, Q4_1 had no matvec
+                // shader at all and fell back to the scalar batch kernel
+                // (measured 3344us vs Vulkan 17.6us at m=4096/k=14336).
+                // Opt out via DX12_NO_Q4_1_DP4A=1.
+                if (t == GGML_TYPE_Q4_1) {
+                    bool small_wave = (bctx->dev->wave_size < 16);
+                    const char * no_q41_dp4a_env = DX12_GETENV("DX12_NO_Q4_1_DP4A");
+                    bool no_q41_dp4a = (no_q41_dp4a_env != nullptr) && (no_q41_dp4a_env[0] != '0');
+                    if (!no_q41_dp4a && bctx->dev->dp4a_supported && allow_dp4a_wave &&
+                        !small_wave &&
+                        node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(node->src[1]) &&
+                        (node->src[1]->ne[0] % 32) == 0) {
+                        key.flags = 100;         // Q4_1 dp4a multi-row matvec
+                        use_dp4a_matvec = true;  // triggers Q8_1 quantize pre-pass
+                    }
+                    // mr256 variant, mirroring the Q4_0 fl=56 gate.
+                    if (key.flags == 100 && bctx->dev->wave_size == 32 &&
+                        node->src[0]->ne[0] <= 2048) {
+                        const char * q41_mr256_env = DX12_GETENV("DX12_Q4_1_MR256");
+                        bool q41_mr256 = (q41_mr256_env == nullptr) || (q41_mr256_env[0] != '0');
+                        if (q41_mr256) {
+                            key.flags = 101;
+                        }
+                    }
+                }
                 // Q5_0 single-wave variant for AMD wave64. The default 32-thread
                 // dp4a shader leaves half the wave idle; mr64 (GROUP_SIZE=64,
                 // NUM_ROWS=4) fills one full AMD wave and amortizes activation
@@ -6127,8 +6939,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 if (t == GGML_TYPE_Q8_0) {
                     const char * q8_wave64_env = DX12_GETENV("DX12_Q8_WAVE64");
+                    // RDNA1/2 reaches the route through the same auto-default as
+                    // RDNA3+; the post-fusion check below drops nodes that gain
+                    // nothing from it back onto the scalar shader.
                     const bool q8_wave64_auto =
-                        bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA3_PLUS;
+                        dx12_subarch_is_rdna3_plus(bctx->dev->sub_family) ||
+                        bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA1_2;
                     const bool q8_wave64 =
                         q8_wave64_env ? q8_wave64_env[0] != '0' : q8_wave64_auto;
                     if (q8_wave64 &&
@@ -6137,6 +6953,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
                         node->src[1]->nb[0] == sizeof(float) &&
                         (node->src[0]->ne[0] % 32) == 0) {
+                        q8_wave64_prev_flags = key.flags;
+                        q8_wave64_prev_dp4a  = use_dp4a_matvec;
                         key.flags = 64;
                         use_dp4a_matvec = false;
                         const char * q8_wave64_rows2_env = DX12_GETENV("DX12_Q8_WAVE64_ROWS2");
@@ -6144,6 +6962,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             q8_wave64_rows2_env ? q8_wave64_rows2_env[0] != '0' : q8_wave64_auto;
                         if (q8_wave64_rows2) {
                             key.flags = 67;
+                            q8_wave64_revertible = true;
                         }
                     }
                 }
@@ -6469,19 +7288,68 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // LDS keeps the footprint at 4 KiB despite the larger
                     // output tile.
                     //
-                    // Default on for large AMD RDNA3+ GEMMs. SmolVLM2 CLIP
-                    // on the 880M improved 20% across the vision GEMMs and
-                    // 8-15% end-to-end with M=1024, while its M=64 projection
-                    // regressed by over 2x from reduced parallelism. Requiring
-                    // both output dimensions >=256 keeps the validated win and
-                    // avoids the small-M tail. Other vendors remain opt-in
-                    // pending equivalent validation. DX12_WMMA_FP16=0/1
-                    // explicitly disables/enables the path.
+                    // This originally defaulted on for large AMD RDNA3+ GEMMs,
+                    // where it beat the old 32x32 generic tile. The later 64x64
+                    // generic tile is 5-7% faster on the 880M, so RDNA3+ iGPUs
+                    // now fall through to that path. DX12_WMMA_FP16=1 still
+                    // explicitly selects this shader for A/B testing.
+                    //
+                    // Also default on for Intel Xe-HPG+. SmolLM2-135M f16
+                    // pp512 on the B390 (wave 16): the three GEMMs meeting
+                    // the >=256 threshold improve 9-12%, while the N=192 K/V
+                    // projection regresses 85% because a 64-wide output tile
+                    // leaves only 3 workgroups across N - the same
+                    // starvation the 880M hit, so the same threshold applies.
+                    //
+                    // Also default on for NVIDIA Pascal+ and Intel UHD, which
+                    // show the same shape. Phi-3 f16 pp512: RTX 6000 Ada 1204
+                    // -> 1704 t/s, Intel UHD 34.5 -> 52.8 t/s. SmolVLM2 f16
+                    // pp512 on the UHD also gains, 791 -> 950 t/s.
+                    //
+                    // NVIDIA additionally needs enough 64x64 tiles to fill its
+                    // SM array, which the >=256 dimension threshold alone does
+                    // not guarantee: SmolVLM2 f16 pp512 loses 15% on the Ada
+                    // because its 576- and 1536-wide projections emit only
+                    // 72-192 tiles, while Phi-3's smallest GEMM emits 384.
                     if (t == GGML_TYPE_F16 && bctx->dev->fp16_supported &&
                         node->ne[0] >= 64 && node->ne[1] >= 64) {
                         const char * wmma_fp16_env = DX12_GETENV("DX12_WMMA_FP16");
+                        const bool wmma_fp16_arch =
+                            dx12_subarch_is_rdna3_plus(bctx->dev->sub_family) ||
+                            bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
+                            bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
+                            bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS;
+                        const uint32_t wmma_fp16_tiles =
+                            dx12_ceil_div((uint32_t)node->ne[0], 64u) *
+                            dx12_ceil_div((uint32_t)node->ne[1], 64u) *
+                            (uint32_t)(node->ne[2] * node->ne[3]);
+                        // Integrated NVIDIA (Tegra-class, e.g. GB20B) has far
+                        // fewer SMs than discrete Ada, so the >=256 tile gate is
+                        // too strict: small-model projections (N=576/1536) emit
+                        // only 72-192 tiles at a full M=512 ubatch yet still gain
+                        // +8% from the 4x4 tile. Gate instead on M>=512 (a full
+                        // ubatch) — partial ubatches (M=64-384) regress -14 to
+                        // -44% from the 64x64 tile's low occupancy. Discrete NV
+                        // keeps the tile gate.
+                        const bool nv_igpu = bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                                             bctx->dev->is_igpu;
+                        const bool amd_rdna3_igpu =
+                            dx12_subarch_is_rdna3_plus(bctx->dev->sub_family) &&
+                            bctx->dev->is_igpu;
+                        // RDNA4 dGPUs fall through to the generic 64x64 tile
+                        // (fl=105) for the same reason the RDNA3+ iGPUs do
+                        // above - it is consistently ahead of this shader:
+                        // Qwen3-4B F16 pp2048 708->723, Phi-3 775->787,
+                        // SmolLM2-135M 5578->5832.
+                        const bool amd_rdna4 =
+                            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS;
+                        const bool wmma_fp16_occupancy =
+                            bctx->dev->arch_family != DX12_ARCH_NV_PASCAL_PLUS ||
+                            wmma_fp16_tiles >= 256 ||
+                            (nv_igpu && node->ne[1] >= 512);
                         const bool wmma_fp16_auto =
-                            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA3_PLUS &&
+                            wmma_fp16_arch && !amd_rdna3_igpu && !amd_rdna4 &&
+                            wmma_fp16_occupancy &&
                             node->ne[0] >= 256 && node->ne[1] >= 256;
                         const bool wmma_fp16 =
                             wmma_fp16_env ? wmma_fp16_env[0] != '0' : wmma_fp16_auto;
@@ -6525,6 +7393,29 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
             }
             skip_wmma_batch: ;
+            // The 32x32 / 2x2 mul_mat_wmma tile only reaches a 1:1 FMA-to-LDS
+            // -read ratio, which caps prefill well below the FP32 roofline.
+            // fl=105 is the same shader body at 64x64 / 4x4 (2:1). Requires
+            // enough output to fill the wider tile. DX12_NO_WMMA64=1 opts out.
+            if (key.flags == 4 && node->src[0] &&
+                (node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_F32) &&
+                node->ne[0] >= 128 && node->ne[1] >= 64) {
+                static const bool wmma64_off =
+                    ([]{ const char * e = DX12_GETENV("DX12_NO_WMMA64");
+                         return (e != nullptr && e[0] != '0'); })();
+                if (!wmma64_off) {
+                    key.flags = 105;
+                }
+            }
+            // Same 64x64 / 4x4 widening for the cooperative-LDS Q4_K tile.
+            if (key.flags == 30 && node->ne[0] >= 128 && node->ne[1] >= 64) {
+                static const bool q4k_lds64_off =
+                    ([]{ const char * e = DX12_GETENV("DX12_NO_Q4K_LDS64");
+                         return (e != nullptr && e[0] != '0'); })();
+                if (!q4k_lds64_off) {
+                    key.flags = 106;
+                }
+            }
         }
 
         // SOFT_MAX cached variant for ne00 <= 1024 (CLIP attention,
@@ -6570,10 +7461,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_IQ4_XS;
             const char * moe_coop_env = DX12_GETENV("DX12_MOE_COOP");
             const bool moe_coop = !moe_coop_env || moe_coop_env[0] != '0';
+            // The flat fallback gives one output element to one thread, so lanes
+            // stride nb01 apart and collapse to a few GFLOP/s once the token count
+            // grows; the coop kernel splits K instead and reads each expert row
+            // coalesced. Keep it within the per-dimension dispatch limit.
+            const char * moe_coop_tok_env = DX12_GETENV("DX12_MOE_COOP_MAXTOK");
+            const int64_t moe_coop_max_tok = moe_coop_tok_env ? atoll(moe_coop_tok_env) : INT64_MAX;
             if (moe_coop && coop_type && node->src[1] && node->src[2] &&
                 node->src[1]->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(node->src[1]) &&
-                node->src[2]->ne[1] <= 8 &&
+                node->src[2]->ne[1] <= moe_coop_max_tok &&
+                node->ne[1] <= 65535 &&
+                node->ne[2] * node->ne[3] <= 65535 &&
                 dx12_ceil_div((uint32_t)node->ne[0], 2) <= 65535) {
                 key.flags = 1;
             }
@@ -6708,10 +7607,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // with =0.
         constexpr UINT VENDOR_AMD_R9 = dx12_vendor::AMD;
         bool is_amd_r9 = (bctx->dev->adapter_desc.VendorId == VENDOR_AMD_R9);
+        // NVIDIA joins AMD as a default-on vendor for the Q4_K / Q5_K fused
+        // gate+up+SwiGLU matvec. Unlike Q8_0, the K-quant dp4a matvec is already
+        // gated off on NVIDIA (see the Q4_K/Q5_K precision-drift gate), so the
+        // fusion gives up no integer math and is pure dispatch savings.
+        // Measured on RTX 6000 Ada, Qwen3-4B Q4_K_M tg512 A/B/A:
+        // 189.5 / 199.9 / 188.0 t/s (+5.9%); SmolVLM2 and Phi-3 Q4_K_M neutral.
+        bool is_nv_glu = (bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA);
+        bool kquant_glu_auto = is_amd_r9 || is_nv_glu;
         const char * q4k_glu_env = DX12_GETENV("DX12_MMV_GLU_FUSION_Q4K");
-        bool enable_q4k_glu = (q4k_glu_env == nullptr) ? is_amd_r9 : (q4k_glu_env[0] != '0');
+        bool enable_q4k_glu = (q4k_glu_env == nullptr) ? kquant_glu_auto : (q4k_glu_env[0] != '0');
         const char * q5k_glu_env = DX12_GETENV("DX12_MMV_GLU_FUSION_Q5K");
-        bool enable_q5k_glu = (q5k_glu_env == nullptr) ? is_amd_r9 : (q5k_glu_env[0] != '0');
+        bool enable_q5k_glu = (q5k_glu_env == nullptr) ? kquant_glu_auto : (q5k_glu_env[0] != '0');
         // Q3_K R9 fusion: opt-in via DX12_MMV_GLU_FUSION_Q3K=1. Q3_K decode in
         // SmolLM2 Q3_K_M burns 30%+ of decode on separate gate/up matvecs on
         // Intel B390; the fused dispatch turns 60 dispatches gate+up + 30 GLU
@@ -6723,6 +7630,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // into 30 fused dispatches; on RTX 6000 Ada the dispatch reduction wins
         // net +3-9%. AMD wave64 is default-off: repeated tg512 A/B/A runs on
         // the 880M were neutral-to-slower for both models.
+        // The K<=1024 cap below is load-bearing: the fused Q8_0 path gives up
+        // dp4a, which is cheap at K=576 but measured -7.6% on Qwen3-4B Q8_0
+        // (K=2560). Q4_K/Q5_K can use a wider 4096 cap because their dp4a is
+        // already gated off on NVIDIA, so the fusion costs them nothing.
         // Force-enable on any vendor with =1, force-off with =0.
         constexpr UINT VENDOR_NVIDIA_Q80 = dx12_vendor::NVIDIA;
         bool nvidia_q80 = (bctx->dev->adapter_desc.VendorId == VENDOR_NVIDIA_Q80);
@@ -6735,11 +7646,21 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         const bool q80_glu_dp4a = q80_glu_dp4a_env ? q80_glu_dp4a_env[0] != '0' : true;
         const char * q80_glu_wave64_env = DX12_GETENV("DX12_Q80_GLU_WAVE64_ROWS2");
         const bool q80_glu_wave64_auto =
-            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA3_PLUS;
+            dx12_subarch_is_rdna3_plus(bctx->dev->sub_family);
         const bool q80_glu_wave64 =
             q80_glu_wave64_env ? q80_glu_wave64_env[0] != '0' : q80_glu_wave64_auto;
         bool enable_q80_glu = q80_glu_dp4a || q80_glu_wave64 ||
                               ((q80_glu_env == nullptr) ? nvidia_q80 : (q80_glu_env[0] != '0'));
+        // Wide Q8_0 layers only fuse on NVIDIA, where the K-aware fl=62 route
+        // below was measured (+0.6% on Qwen3-4B Q8_0, K=2560), and on AMD RDNA4,
+        // where the same route measured +1.6% on Qwen3-4B Q8_0 (472 -> 400
+        // dispatches) with Phi-3 and the SmolLM2/SmolVLM2 pair neutral. Other
+        // vendors keep the validated K<=1024 cap.
+        static const char * q80_glu_k_env = DX12_GETENV("DX12_Q80_GLU_K_MAX");
+        const bool q80_glu_wide =
+            nvidia_q80 || bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS;
+        const int64_t q80_glu_k_max =
+            q80_glu_k_env ? atoll(q80_glu_k_env) : (q80_glu_wide ? 4096 : 1024);
         if (!no_fusion && !no_mmv_glu && !fused_bias_add && is_matvec_dispatch &&
             i + 2 < cgraph->n_nodes &&
             node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
@@ -6751,7 +7672,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
               node->src[0]->ne[0] <= 4096) ||
              (enable_q3k_glu && node->src[0]->type == GGML_TYPE_Q3_K) ||
              (enable_q80_glu && node->src[0]->type == GGML_TYPE_Q8_0 &&
-              node->src[0]->ne[0] <= 1024)) &&
+              node->src[0]->ne[0] <= q80_glu_k_max)) &&
             node->ne[1] == 1) {
             struct ggml_tensor * mm_up = cgraph->nodes[i + 1];
             struct ggml_tensor * glu   = cgraph->nodes[i + 2];
@@ -6829,8 +7750,36 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         allow_dp4a_wave && node->src[1]->type == GGML_TYPE_F32 &&
                         ggml_is_contiguous(node->src[1]) &&
                         (node->src[0]->ne[0] % 32) == 0) {
-                        key.flags = 62;
-                        use_dp4a_matvec = true;
+                        // fl=98 always gives up dp4a to save the RMS_NORM
+                        // dispatch, so it only pays where dp4a is cheap to lose.
+                        // Measured: wave64 RDNA2 +9%, wave32 NVIDIA +6%, wave8
+                        // Intel UHD +5.9%, but wave16 B390 -2.6% (30 layers:
+                        // gate/up 0.680 -> 0.859 ms to save 0.107 ms of
+                        // RMS_NORM) - Xe-HPG+ dp4a is too strong to trade away.
+                        // UHD reads neutral until the combined Q/K/V dispatch
+                        // is also in play; with it the fold is worth +5.9% on
+                        // SmolLM2-135M and +5.7% on SmolVLM2-256M Q8_0 tg64.
+                        // DX12_Q80_GLU_RMS_FOLD forces the choice either way.
+                        static const char * q80_glu_rms_env =
+                            DX12_GETENV("DX12_Q80_GLU_RMS_FOLD");
+                        // Past K=1024 the dropped dp4a costs more than the saved
+                        // RMS_NORM dispatch (-7.6% on Qwen3-4B Q8_0 at K=2560),
+                        // so wide layers keep dp4a on fl=62 instead.
+                        static const char * q80_glu_fold_k_env =
+                            DX12_GETENV("DX12_Q80_GLU_FOLD_K_MAX");
+                        const int64_t q80_glu_fold_k_max =
+                            q80_glu_fold_k_env ? atoll(q80_glu_fold_k_env) : 1024;
+                        const bool q80_glu_rms_fold = (q80_glu_rms_env
+                            ? q80_glu_rms_env[0] != '0'
+                            : (bctx->dev->wave_size >= 32 ||
+                               bctx->dev->arch_family == DX12_ARCH_INTEL_UHD)) &&
+                            node->src[0]->ne[0] <= q80_glu_fold_k_max;
+                        if (fuse_rms_into_mm && !no_replay && key.flags == 35 &&
+                            q80_glu_rms_fold) {
+                            q80_glu_revertible = true;
+                        } else {
+                            key.flags = 62;
+                        }
                     }
                     // Existing R9 shaders read src1 as F32. Flag 62 is the
                     // exception and consumes the Q8_1 scratch buffer.
@@ -6859,19 +7808,50 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA &&
             bctx->dev->wave_size == 32 &&
             key.flags == 44;
+        // Intel UHD reports wave8, so Q8_0 never reaches the dp4a (fl=17) or
+        // mr256 (fl=44) routes and stays on the generic fl=9 matvec, leaving
+        // Q/K/V as three dispatches with no fold. The GROUP_SIZE=64 combined
+        // shader collapses them without changing group size: UHD wants 32-64
+        // threads per group (see default_mmv_group_size), and forcing the
+        // 256-thread mr256 base instead costs 18% on SmolLM2-135M Q8_0 tg64,
+        // more than the combined dispatch wins back.
+        const bool qkv_q8_uhd_route =
+            qkv_q8_portable &&
+            bctx->dev->arch_family == DX12_ARCH_INTEL_UHD &&
+            key.flags == 9;
+        // Intel Xe-HPG+ decodes Q8_0 through the dp4a matvec (fl=17), which the
+        // scalar combined shaders would trade away - the same losing trade the
+        // GLU RMS fold makes there. fl=99 keeps dp4a and still collapses the
+        // three projections into one dispatch, reading the Q8_1 scratch the
+        // quantize pre-pass already produces for fl=17.
+        // NVIDIA wave32 hits the same fl=17 dp4a route, and the shader is
+        // wave-portable (GROUP_SIZE=32 == wave size, so the groupshared
+        // reduction fallback compiles out). Opt-in via DX12_QKV_Q8_DP4A_NV=1.
+        const char * qkv_q8_dp4a_nv_env = DX12_GETENV("DX12_QKV_Q8_DP4A_NV");
+        const bool qkv_q8_dp4a_nv = qkv_q8_dp4a_nv_env && qkv_q8_dp4a_nv_env[0] != '0';
+        const bool qkv_q8_dp4a_route =
+            qkv_q8_dp4a &&
+            (bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
+             (qkv_q8_dp4a_nv &&
+              bctx->dev->adapter_desc.VendorId == dx12_vendor::NVIDIA &&
+              bctx->dev->wave_size == 32)) &&
+            use_dp4a_matvec && !use_dp4a &&
+            key.flags == 17;
         const int qkv_combined_flag =
             (qkv_wtype == GGML_TYPE_F16 && (key.flags == 11 || key.flags == 12 || key.flags == 63)) ? 75 :
-            (qkv_wtype == GGML_TYPE_Q8_0 && key.flags == 67) ? 76 :
+            (qkv_wtype == GGML_TYPE_Q8_0 && (key.flags == 67 || qkv_q8_uhd_route)) ? 76 :
             (qkv_wtype == GGML_TYPE_Q8_0 && qkv_q8_portable_route) ? 84 :
+            (qkv_wtype == GGML_TYPE_Q8_0 && qkv_q8_dp4a_route) ? 99 :
             (qkv_wtype == GGML_TYPE_Q5_0 && (key.flags == 60 || key.flags == 72)) ? 77 : 0;
         const bool qkv_type_ok =
             (qkv_combined_flag == 75 && qkv_wtype == GGML_TYPE_F16) ||
-            ((qkv_combined_flag == 76 || qkv_combined_flag == 84) &&
+            ((qkv_combined_flag == 76 || qkv_combined_flag == 84 ||
+              qkv_combined_flag == 99) &&
              qkv_wtype == GGML_TYPE_Q8_0) ||
             (qkv_combined_flag == 77 && qkv_wtype == GGML_TYPE_Q5_0);
         if (qkv_shared_dispatch && !no_fusion && is_matvec_dispatch &&
             !fused_bias_add && !fused_mmv_glu_up && !fused_mmv_set_rows &&
-            !use_dp4a && !use_dp4a_matvec &&
+            !use_dp4a && (!use_dp4a_matvec || qkv_combined_flag == 99) &&
             node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
             qkv_type_ok && node->type == GGML_TYPE_F32 &&
             node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
@@ -7025,6 +8005,128 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        // Merged Q+K projection dispatch (DX12_MMV_QK_MERGE): models with a
+        // QK-norm (Qwen3) put an RMS_NORM+MUL between each projection and its
+        // RoPE, so the combined Q/K/V path above (which absorbs the post-ops)
+        // never matches. The projections themselves still share the activation,
+        // and when Wq|Wk are contiguous in one buffer and Qcur/Kcur live in the
+        // same destination buffer at disjoint offsets, a single dispatch over
+        // q_rows+k_rows covers both with no post-op involvement at all. The V
+        // projection cannot join: ggml-alloc aliases Vcur onto Qcur's buffer
+        // (Q is dead by then in graph order, but not in a merged dispatch).
+        // Structural detection only.
+        if (mmv_qk_merge && !no_fusion && is_matvec_dispatch && !fused_qkv &&
+            !fused_bias_add && !fused_mmv_glu_up && !fused_mmv_set_rows &&
+            !use_dp4a && !use_dp4a_matvec && key.flags == 9 &&
+            node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+            node->src[0]->type == GGML_TYPE_Q4_K && node->type == GGML_TYPE_F32 &&
+            node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
+            (node->ne[0] % 2) == 0 &&
+            (uint32_t)node->nb[0] == (uint32_t)ggml_type_size(node->type)) {
+            const int WINDOW = 16;
+            struct ggml_tensor * activation = node->src[1];
+            ID3D12Resource * wq_res = dx12_get_resource(node->src[0]);
+            ID3D12Resource * dq_res = dx12_get_resource(node);
+            const uint64_t   wq_off = dx12_tensor_offset(node->src[0]);
+            const uint32_t   wnb1   = (uint32_t)node->src[0]->nb[1];
+            const uint64_t   q_rows = (uint64_t)node->ne[0];
+            auto overlaps = [&](const struct ggml_tensor * t, uint64_t lo, uint64_t hi) {
+                if (!t || dx12_get_resource(t) != dq_res) return false;
+                const uint64_t o = dx12_tensor_offset(t);
+                return o < hi && lo < o + (uint64_t)ggml_nbytes(t);
+            };
+            int k_idx = -1;
+            for (int k = i + 1; wq_res && dq_res && k < cgraph->n_nodes && k <= i + WINDOW; ++k) {
+                struct ggml_tensor * mm = cgraph->nodes[k];
+                if (!mm || mm->op != GGML_OP_MUL_MAT || mm->src[1] != activation) continue;
+                if (!mm->src[0] || mm->src[0]->type != GGML_TYPE_Q4_K) continue;
+                if (mm->type != GGML_TYPE_F32) continue;
+                if (mm->ne[1] != 1 || mm->ne[2] != 1 || mm->ne[3] != 1) continue;
+                if ((mm->ne[0] % 2) != 0) continue;
+                if (mm->src[0]->ne[0] != node->src[0]->ne[0]) continue;
+                if ((uint32_t)mm->src[0]->nb[1] != wnb1) continue;
+                if ((uint32_t)mm->nb[0] != (uint32_t)ggml_type_size(mm->type)) continue;
+                if (dx12_get_resource(mm->src[0]) != wq_res) continue;
+                if (dx12_tensor_offset(mm->src[0]) != wq_off + q_rows * wnb1) continue;
+                if (dx12_get_resource(mm) != dq_res) continue;
+                if (q_rows + (uint64_t)mm->ne[0] >= 65535) continue;
+                // Kcur must not overlap Qcur, and writing it early must not be
+                // observable by any node the K matvec currently follows.
+                const uint64_t k_lo = dx12_tensor_offset(mm);
+                const uint64_t k_hi = k_lo + (uint64_t)ggml_nbytes(mm);
+                if (overlaps(node, k_lo, k_hi)) continue;
+                bool hazard = false;
+                for (int j = i + 1; j < k && !hazard; ++j) {
+                    struct ggml_tensor * mid = cgraph->nodes[j];
+                    if (!mid) continue;
+                    hazard = overlaps(mid, k_lo, k_hi);
+                    for (int s = 0; s < GGML_MAX_SRC && !hazard; ++s) {
+                        hazard = overlaps(mid->src[s], k_lo, k_hi);
+                    }
+                }
+                if (hazard) continue;
+                // Do not steal a K matvec that would scatter into the KV cache
+                // on its own - that fusion removes a dispatch as well.
+                if (mmv_set_rows_fusion) {
+                    bool scatters = false;
+                    for (int s = k + 1; s < cgraph->n_nodes && s <= k + WINDOW; ++s) {
+                        struct ggml_tensor * c = cgraph->nodes[s];
+                        if (!c || c->op != GGML_OP_SET_ROWS) continue;
+                        struct ggml_tensor * t = c->src[0]; int hops = 0;
+                        while (t && t != mm && hops < 5 &&
+                               (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) { t = t->src[0]; ++hops; }
+                        if (t == mm) { scatters = true; break; }
+                    }
+                    if (scatters) continue;
+                }
+                k_idx = k;
+                break;
+            }
+            if (k_idx >= 0) {
+                fused_qk_merge     = cgraph->nodes[k_idx];
+                fused_qk_merge_idx = k_idx;
+                key.flags          = 103;
+            }
+            // DX12_QKV_MERGE_DIAG: report, for every layer, why the V matvec
+            // sharing this activation cannot join the merged Q+K dispatch.
+            // Each blocking condition is reported independently.  The scan
+            // deliberately reaches past WINDOW: V sits outside the range the
+            // detector above searches, so a WINDOW-sized scan finds nothing.
+            static const bool qkv_diag = getenv("DX12_QKV_MERGE_DIAG") != nullptr;
+            static int qkv_diag_left = 40;
+            if (qkv_diag && qkv_diag_left > 0 && k_idx >= 0) {
+                const uint64_t k_rows = (uint64_t)cgraph->nodes[k_idx]->ne[0];
+                const uint64_t vw_off = wq_off + (q_rows + k_rows) * wnb1;
+                const int      scan   = i + 4 * WINDOW;
+                for (int k = i + 1; k < cgraph->n_nodes && k <= scan; ++k) {
+                    struct ggml_tensor * mm = cgraph->nodes[k];
+                    if (!mm || mm->op != GGML_OP_MUL_MAT || k == k_idx) continue;
+                    if (mm->src[1] != activation) continue;
+                    if (--qkv_diag_left <= 0) break;
+                    const uint64_t v_lo = dx12_tensor_offset(mm);
+                    const uint64_t v_hi = v_lo + (uint64_t)ggml_nbytes(mm);
+                    char why[256] = "";
+                    auto add = [&](const char * s) {
+                        if (why[0]) strncat(why, " + ", sizeof(why) - strlen(why) - 1);
+                        strncat(why, s, sizeof(why) - strlen(why) - 1);
+                    };
+                    if (!mm->src[0] || mm->src[0]->type != GGML_TYPE_Q4_K)   add("type!=Q4_K");
+                    if (mm->src[0] && (uint32_t)mm->src[0]->nb[1] != wnb1)   add("stride");
+                    if (mm->src[0] && dx12_get_resource(mm->src[0]) != wq_res) add("w-resource");
+                    if (mm->src[0] && dx12_tensor_offset(mm->src[0]) != vw_off) add("w-noncontig");
+                    if (dx12_get_resource(mm) != dq_res)                     add("dst-resource");
+                    if (overlaps(node, v_lo, v_hi))                          add("ALIASES-Qcur");
+                    if (overlaps(cgraph->nodes[k_idx], v_lo, v_hi))          add("ALIASES-Kcur");
+                    fprintf(stderr, "[QKV_DIAG] Q=%d V=%d ne0=%lld s0=%-5s woff=%llu want=%llu : %s\n",
+                            i, k, (long long)mm->ne[0],
+                            mm->src[0] ? ggml_type_name(mm->src[0]->type) : "?",
+                            (unsigned long long)(mm->src[0] ? dx12_tensor_offset(mm->src[0]) : 0),
+                            (unsigned long long)vw_off, why[0] ? why : "WOULD MERGE");
+                }
+                fflush(stderr);
+            }
+        }
+
         // Q/K projection ROPE matvec fusion (DX12_MMV_{Q,K}_ROPE_FUSION): a
         // standalone M=1 Q/K matvec on a retained AMD decode shader (F16 fl=63,
         // Q8_0 fl=67, Q5_0 fl=72) applies RoPE to its output inline. Q writes
@@ -7138,12 +8240,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // SET_ROWS, so only the SET_ROWS node is absorbed (the RESHAPE/VIEW in
         // between are already view-skips).
         if (mmv_set_rows_fusion && !no_fusion && is_matvec_dispatch &&
-            !fused_bias_add && !fused_mmv_glu_up && !use_dp4a && !use_dp4a_matvec &&
+            !fused_bias_add && !fused_mmv_glu_up &&
+            ((!use_dp4a && !use_dp4a_matvec) || key.flags == 23) &&
             !fused_qkv && !fused_mmv_q_rope && !fused_mmv_k_set_rows &&
             node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
             node->type == GGML_TYPE_F32 &&
             node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
-            (key.flags == 63 || key.flags == 67 || key.flags == 72)) {
+            (key.flags == 63 || key.flags == 67 || key.flags == 72 ||
+             key.flags == 9 || key.flags == 23)) {
             const int WINDOW = 16;
             int sr_idx = -1;
             for (int k = i + 1; k < cgraph->n_nodes && k <= i + WINDOW; ++k) {
@@ -7181,6 +8285,187 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        // Fold an RMS_NORM+MUL into the matvec that consumes its output.  The
+        // fused variants read the un-normalized activation and the norm weight
+        // directly and derive the RMS scale in the same pass, so the separate
+        // norm dispatch (and its barrier) disappear.  Hosts: the combined F16
+        // Q/K/V matvec (fl=75 -> 88) and the F16 FFN gate/up+SwiGLU matvec
+        // (fl=24 -> 89).
+        if (fuse_rms_into_mm && !no_replay) {
+            uint32_t rms_flag = 0;
+            const ggml_tensor * ok0 = nullptr;
+            const ggml_tensor * ok1 = nullptr;
+            if (fused_qkv && key.flags == 75) {
+                rms_flag = 88;
+                ok0 = fused_qkv_k_matvec;
+                ok1 = fused_qkv_v_matvec;
+            } else if (fused_qkv && key.flags == 84) {
+                rms_flag = 90;
+                ok0 = fused_qkv_k_matvec;
+                ok1 = fused_qkv_v_matvec;
+            } else if (fused_qkv && key.flags == 76) {
+                rms_flag = 93;
+                ok0 = fused_qkv_k_matvec;
+                ok1 = fused_qkv_v_matvec;
+            } else if (fused_qkv && key.flags == 77) {
+                rms_flag = 94;
+                ok0 = fused_qkv_k_matvec;
+                ok1 = fused_qkv_v_matvec;
+            } else if (fused_qkv && key.flags == 79 &&
+                       fused_qkv_q_rope && fused_qkv_q_rope->src[2] == nullptr) {
+                // The mixed variant reads g from t4, which freq_factors would
+                // otherwise occupy (t6 already carries the Q8_0 Wv weights).
+                rms_flag = 97;
+                ok0 = fused_qkv_k_matvec;
+                ok1 = fused_qkv_v_matvec;
+            } else if (fused_mmv_glu_glu && key.flags == 24) {
+                rms_flag = 89;
+                ok0 = fused_mmv_glu_up;
+            } else if (fused_mmv_glu_glu && key.flags == 32) {
+                rms_flag = 91;
+                ok0 = fused_mmv_glu_up;
+            } else if (fused_mmv_glu_glu && key.flags == 66) {
+                rms_flag = 92;
+                ok0 = fused_mmv_glu_up;
+            } else if (fused_mmv_glu_glu && key.flags == 73) {
+                rms_flag = 95;
+                ok0 = fused_mmv_glu_up;
+            } else if (fused_mmv_glu_glu && key.flags == 74) {
+                rms_flag = 96;
+                ok0 = fused_mmv_glu_up;
+            } else if (fused_mmv_glu_glu && key.flags == 35) {
+                rms_flag = 98;
+                ok0 = fused_mmv_glu_up;
+            }
+            const int r = rms_flag ? dx12_find_foldable_rms(cgraph, i, ok0, ok1) : -1;
+            // The RMS node must be a plain RMS_NORM+MUL dispatch: the other
+            // RMS fusion kinds also absorb a residual ADD, a ROPE or a Q8_1
+            // quantize, whose outputs would be lost if the node were skipped.
+            bool kind_ok = (r >= 0) &&
+                           rcache.decisions[r].fusion_kind == DX12_FUSE_RMS_MUL;
+            // The fold binds the un-normalized activation as src1; the GLU host
+            // already rejects an activation aliasing its output, so re-check the
+            // tensor the fold actually reads.
+            bool alias_ok = true;
+            if (r >= 0 && fused_mmv_glu_glu) {
+                const ggml_tensor * x = cgraph->nodes[r]->src[0];
+                const uint8_t * x_lo = (const uint8_t *) x->data;
+                const uint8_t * x_hi = x_lo + ggml_nbytes(x);
+                const uint8_t * d_lo = (const uint8_t *) fused_mmv_glu_glu->data;
+                const uint8_t * d_hi = d_lo + ggml_nbytes(fused_mmv_glu_glu);
+                alias_ok = !(x_lo && d_lo && x_lo < d_hi && d_lo < x_hi);
+            }
+            if (r >= 0 && kind_ok && alias_ok) {
+                dx12_pipeline_key probe = key;
+                probe.flags = rms_flag;
+                dx12_pipeline * p_rms = bctx->dev->get_or_create_pipeline(probe);
+                if (p_rms && p_rms->pso) {
+                    key.flags     = rms_flag;
+                    fused_rms_idx = r;
+                    fused_rms_x   = cgraph->nodes[r]->src[0];
+                    fused_rms_g   = cgraph->nodes[r + 1]->src[1];
+                    memcpy(&fused_rms_eps, cgraph->nodes[r]->op_params, sizeof(float));
+                }
+            }
+            // Replicated fold: a Q4_K single-token matvec group (Q/K/V off one
+            // attn_norm) where each member recomputes sum(x*x) itself. Only
+            // attempted when the combined-QKV hosts above did not fire.
+            if (fused_rms_idx < 0 && key.flags == 9 && fuse_rms_qkv &&
+                !fused_mmv_set_rows &&
+                node->src[0]->type == GGML_TYPE_Q4_K) {
+                int grp[4];
+                int grp_n = 0;
+                const int rg = dx12_find_foldable_rms_group(cgraph, i, grp, &grp_n,
+                                                            (int) (sizeof(grp) / sizeof(grp[0])));
+                if (rg >= 0 &&
+                    rcache.decisions[rg].fusion_kind == DX12_FUSE_RMS_MUL) {
+                    dx12_pipeline_key probe = key;
+                    probe.flags = 102;
+                    dx12_pipeline * p_rms = bctx->dev->get_or_create_pipeline(probe);
+                    if (p_rms && p_rms->pso) {
+                        key.flags     = 102;
+                        fused_rms_idx = rg;
+                        fused_rms_x   = cgraph->nodes[rg]->src[0];
+                        fused_rms_g   = cgraph->nodes[rg + 1]->src[1];
+                        memcpy(&fused_rms_eps, cgraph->nodes[rg]->op_params, sizeof(float));
+                        // The norm pair stays live until every consumer folds.
+                        fused_rms_defer_skip = (++rms_fold_hits[rg] < grp_n);
+                    }
+                }
+            }
+            static const bool log_fold = []{
+                const char * v = DX12_GETENV("DX12_FUSE_RMS_LOG");
+                return v && v[0] && v[0] != '0';
+            }();
+
+            if (log_fold) {
+                static bool banner_done = false;
+                if (!banner_done) {
+                    banner_done = true;
+                    const char * sub = nullptr;
+                    switch (bctx->dev->sub_family) {
+                        case DX12_SUBARCH_AMD_RDNA1_2:     sub = "AMD-RDNA1/2";  break;
+                        case DX12_SUBARCH_AMD_RDNA3_X:     sub = "AMD-RDNA3.x";  break;
+                        case DX12_SUBARCH_AMD_RDNA4_PLUS:  sub = "AMD-RDNA4+";   break;
+                        case DX12_SUBARCH_AMD_GCN:         sub = "AMD-GCN";      break;
+                        case DX12_SUBARCH_AMD_CDNA:        sub = "AMD-CDNA";     break;
+                        default: break;
+                    }
+                    // Sub-family is only tabled for AMD; report the arch family
+                    // otherwise so the line is informative on every vendor.
+                    if (!sub) {
+                        sub = dx12_arch_family_str(bctx->dev->arch_family);
+                    }
+                    // The wave64 quant folds (93/95/96) are only reachable when the
+                    // routes feeding them are active; on AMD those auto-enable on
+                    // RDNA3+ only and otherwise need DX12_Q8_WAVE64 /
+                    // DX12_Q50_VULKAN_ROWS2 / DX12_Q50_GLU_VULKAN_ROWS2.
+                    fprintf(stderr,
+                            "[RMS_FOLD] device=%s (%s) vendor=0x%04X device_id=0x%04X "
+                            "wave=%u wave_min=%u sub=%s wave64_quant_routes=%d\n",
+                            bctx->dev->name.c_str(), bctx->dev->description.c_str(),
+                            (unsigned) bctx->dev->adapter_desc.VendorId,
+                            (unsigned) bctx->dev->adapter_desc.DeviceId,
+                            bctx->dev->wave_size, bctx->dev->wave_size_min, sub,
+                            (int) (dx12_subarch_is_rdna3_plus(bctx->dev->sub_family)));
+                }
+            }
+            if (log_fold && (node->op == GGML_OP_MUL_MAT) && node->ne[1] == 1) {
+                fprintf(stderr, "[RMS_FOLD] node=%-20s fl=%u qkv=%d glu=%d -> flag=%u r=%d kind_ok=%d alias_ok=%d fold=%d\n",
+                        node->name, (unsigned) key.flags, (int) (fused_qkv != false),
+                        (int) (fused_mmv_glu_glu != nullptr), rms_flag, r,
+                        (int) kind_ok, (int) alias_ok, (int) (fused_rms_idx >= 0));
+            }
+        }
+
+        // fl=67 is the gateway flag for the QKV merge, the Q/K ROPE fusion, the
+        // V SET_ROWS fusion and the RMS fold; the scalar shaders it displaces
+        // (fl=18/28) are excluded from all four by the {63,67,72} allow-list.
+        // When none of them fired the flag bought nothing, and the rows2 shader
+        // loses to the scalar one as the reduction length grows -- architectures
+        // with pre-packed QKV / gate_up weights expose no fusion site at all, so
+        // every wide node there would pay that cost.  Fall back in that case.
+        // Threshold via DX12_Q8_WAVE64_MAXK; 0 keeps fl=67 unconditionally.
+        if (q8_wave64_revertible && key.flags == 67 && !q8_wave64_prev_dp4a &&
+            !fused_qkv && !fused_mmv_q_rope && !fused_mmv_k_set_rows &&
+            !fused_mmv_set_rows && fused_rms_idx < 0) {
+            static const int64_t q8_wave64_max_k = []{
+                const char * v = DX12_GETENV("DX12_Q8_WAVE64_MAXK");
+                return v && v[0] ? (int64_t) atoll(v) : (int64_t) 1024;
+            }();
+            if (q8_wave64_max_k > 0 && node->src[0]->ne[0] > q8_wave64_max_k) {
+                key.flags       = q8_wave64_prev_flags;
+                use_dp4a_matvec = q8_wave64_prev_dp4a;
+            }
+        }
+
+        // The GLU fold did not land, so fl=35 bought nothing; restore the dp4a
+        // shader the route would otherwise have picked.
+        if (q80_glu_revertible && key.flags == 35) {
+            key.flags       = 62;
+            use_dp4a_matvec = true;
+        }
+
         // End of record-path decision block.  Look up pipeline and store the
         // decision into the replay cache so subsequent tokens can fast-path.
         if (g_dx12_flag_sink && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
@@ -7206,6 +8491,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             // filled in at their respective sites.
             if (fused_qk_postop)                   d.fusion_kind = DX12_FUSE_QK_ROPE_SCALE_SET_ROWS;
             else if (fused_add_rms_node)           d.fusion_kind = DX12_FUSE_ADD_RMS_MUL;
+            else if (fused_qkn_k_norm)             d.fusion_kind = DX12_FUSE_QK_NORM_MERGE;
             else if (fused_5way_set_rows)          d.fusion_kind = DX12_FUSE_RMS_MUL_ROPE5;
             else if (fused_rope_after_rms)         d.fusion_kind = DX12_FUSE_RMS_MUL_ROPE3;
             else if (fused_rms_quant_consumer)     d.fusion_kind = DX12_FUSE_RMS_MUL_QUANT_Q8_1;
@@ -7216,6 +8502,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             else if (fused_mmv_set_rows)           d.fusion_kind = DX12_FUSE_MMV_SET_ROWS;
             else if (fused_mmv_k_set_rows)         d.fusion_kind = DX12_FUSE_MMV_K_ROPE_SET_ROWS;
             else if (fused_mmv_q_rope)             d.fusion_kind = DX12_FUSE_MMV_Q_ROPE;
+            else if (fused_qk_merge)               d.fusion_kind = DX12_FUSE_MMV_QK_MERGE;
             else if (fused_ssm_bias)               d.fusion_kind = DX12_FUSE_SSM_CONV_BIAS_SILU;
             else if (fused_ssm_silu)               d.fusion_kind = DX12_FUSE_SSM_CONV_SILU;
             else                                    d.fusion_kind = DX12_FUSE_NONE;
@@ -7223,6 +8510,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             switch (d.fusion_kind) {
                 case DX12_FUSE_ADD_RMS_MUL:        d.skip_count = 2; break;
                 case DX12_FUSE_RMS_MUL_ROPE5:      d.skip_count = 4; break;
+                case DX12_FUSE_QK_NORM_MERGE:      d.skip_count = 2; break;  // Q chain adjacent; K chain via node_absorbed[]
                 case DX12_FUSE_RMS_MUL_ROPE3:      d.skip_count = 2; break;
                 case DX12_FUSE_RMS_MUL:            d.skip_count = 1; break;
                 case DX12_FUSE_RMS_MUL_QUANT_Q8_1: d.skip_count = 1; break;  // only MUL absorbed, consumer matmul stays
@@ -7257,10 +8545,31 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 d.qkv_k_rope_rel     = (int16_t)(fused_mmv_k_rope_idx     - i);
                 d.qkv_k_set_rows_rel = (int16_t)(fused_qkv_k_set_rows_idx - i);
             }
+            if (fused_qk_merge_idx >= 0) {
+                d.qkv_k_matvec_rel = (int16_t)(fused_qk_merge_idx - i);
+            }
+            if (fused_qkn_k_norm_idx >= 0) {
+                d.qkv_k_matvec_rel = (int16_t)(fused_qkn_k_norm_idx - i);
+            }
             if (fused_qk_postop) {
                 d.qk_scale_rel      = (int16_t)(fused_qk_scale_idx      - i);
                 d.qk_k_rope_rel     = (int16_t)(fused_qk_k_rope_idx     - i);
                 d.qk_k_set_rows_rel = (int16_t)(fused_qk_k_set_rows_idx - i);
+            }
+            // The folded RMS_NORM+MUL sit *before* this node, so node_absorbed[]
+            // (forward-only) cannot elide them. They already ran on this record
+            // pass (harmless: nothing reads their output any more); retire both
+            // decisions to SKIP so every replay token bypasses them.
+            if (fused_rms_idx >= 0) {
+                d.rms_fold_rel = (int16_t)(fused_rms_idx - i);
+                if (!fused_rms_defer_skip) {
+                    rcache.decisions[fused_rms_idx].kind            = DX12_DEC_SKIP;
+                    rcache.decisions[fused_rms_idx].skip_count      = 0;
+                    rcache.decisions[fused_rms_idx].fusion_kind     = DX12_FUSE_NONE;
+                    rcache.decisions[fused_rms_idx + 1].kind        = DX12_DEC_SKIP;
+                    rcache.decisions[fused_rms_idx + 1].skip_count  = 0;
+                    rcache.decisions[fused_rms_idx + 1].fusion_kind = DX12_FUSE_NONE;
+                }
             }
             d.fusion_skip_f32 = fused_rms_quant_skip_f32;
             if (fused_bias_add) {
@@ -7275,6 +8584,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (fused_mmv_set_rows_idx >= 0 && mmv_set_rows_fusion &&
             fused_mmv_set_rows_idx < cgraph->n_nodes) {
             node_absorbed[fused_mmv_set_rows_idx] = 1;
+        }
+        // The merged Q+K dispatch produces Kcur, so the K matvec is elided.
+        if (fused_qk_merge_idx >= 0 && fused_qk_merge_idx < cgraph->n_nodes) {
+            node_absorbed[fused_qk_merge_idx] = 1;
+        }
+        // The merged QK-Norm dispatch covers the whole K-side chain
+        // (RMS_NORM, MUL, ROPE, VIEW, SET_ROWS) at +0..+4.
+        if (fused_qkn_k_norm_idx >= 0 && mmv_any_postop) {
+            for (int a = 0; a < 5; ++a) {
+                const int idx = fused_qkn_k_norm_idx + a;
+                if (idx < cgraph->n_nodes) node_absorbed[idx] = 1;
+            }
         }
         // Mark the absorbed ROPE (Q and K) and SET_ROWS (K) so their dispatches
         // are skipped when reached. Skipping the ROPE also stops the standalone
@@ -7400,6 +8721,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                             : dx12_rope_pack_kind::FUSED_RMS_MUL_ROPE3,
                         eps, params);
                 }
+                if (key.flags == 104 && fused_qkn_k_norm && fused_qkn_k_set_rows) {
+                    // Region select over Q heads then K heads. The KV cache, the
+                    // K activation, the k_norm weight, the positions, the row
+                    // indices and freq_factors all ride root descriptors with
+                    // their byte offsets baked in, so only the split point and
+                    // the cache row geometry need op slots.
+                    const uint32_t q_rows = (uint32_t)fused_rope_after_rms->ne[1];
+                    const uint32_t k_rows = (uint32_t)fused_qkn_k_norm->ne[1];
+                    params.op_params[8]  = q_rows | ((q_rows + k_rows) << 16);
+                    params.op_params[9]  = (uint32_t)fused_qkn_k_set_rows->nb[1];
+                    params.op_params[10] = (uint32_t)ggml_type_size(fused_qkn_k_set_rows->type);
+                }
             } else {
                 // Override dst with MUL's output
                 params.ne0 = (uint32_t)fused_mul_node->ne[0]; params.ne1 = (uint32_t)fused_mul_node->ne[1];
@@ -7495,6 +8828,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (fused_mmv_glu_glu) {
             params.op_params[1] = (uint32_t)dx12_tensor_offset(fused_mmv_glu_up->src[0]);
             params.dst_offset   = (uint32_t)dx12_tensor_offset(fused_mmv_glu_glu);
+            // fl=89 folds the FFN-norm in: src1 becomes the un-normalized
+            // activation, the norm weight rides src6 and op14 carries eps.
+            if (fused_rms_idx >= 0) {
+                memcpy(&params.op_params[14], &fused_rms_eps, sizeof(float));
+                params.src1_offset = (uint32_t)dx12_tensor_offset(fused_rms_x);
+            }
+        }
+
+        // fl=102 replicated RMS fold: src1 becomes the un-normalized activation,
+        // the norm weight rides src6 and op14 carries eps.
+        if (key.flags == 102 && fused_rms_idx >= 0) {
+            memcpy(&params.op_params[14], &fused_rms_eps, sizeof(float));
+            params.src1_offset = (uint32_t)dx12_tensor_offset(fused_rms_x);
         }
 
         // Fused V-cache SET_ROWS matvec: the matvec writes its output row
@@ -7584,12 +8930,27 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.op_params[13] = (uint32_t)dx12_tensor_offset(k_sr);    // K cache base byte offset
             params.op_params[14] = (uint32_t)dx12_tensor_offset(v_sr);    // V cache base byte offset
             params.op_params[15] = (uint32_t)k_sr->nb[1];           // KV cache row stride (nb1)
-            if (key.flags == 79) {
+            if (key.flags == 79 || key.flags == 97) {
                 params.nb02 = (uint32_t)fused_qkv_v_matvec->src[0]->nb[1];
             }
             params.ne0        = q_rows + k_rows + v_rows;           // total rows (dispatch guard)
             params.dst_offset = (uint32_t)dx12_tensor_offset(q_out);      // Q output base (u0 at res base)
             params.dst_esize  = (uint32_t)ggml_type_size(q_out->type);
+            if (fused_rms_idx >= 0) {
+                // The fused-norm variant reads x (src1) and g (src6) directly and
+                // needs eps; op11 (has_ff) moves into bit 31 of op10 (head_dim).
+                params.op_params[10] |= (params.op_params[11] & 1u) << 31;
+                memcpy(&params.op_params[11], &fused_rms_eps, sizeof(float));
+                params.src1_offset = (uint32_t)dx12_tensor_offset(fused_rms_x);
+            }
+        }
+        // Merged Q+K projection (fl=103): the dispatch spans both regions, so
+        // ne0 becomes the combined row count and the K destination base rides
+        // op3 (the shader picks the base per row against op2 = q_rows).
+        if (fused_qk_merge) {
+            params.op_params[2] = (uint32_t)node->ne[0];
+            params.op_params[3] = (uint32_t)dx12_tensor_offset(fused_qk_merge);
+            params.ne0          = (uint32_t)(node->ne[0] + fused_qk_merge->ne[0]);
         }
         static constexpr uint32_t BASE_PARAMS = 30;  // ne/nb/offsets/esizes = 30 DWORDs
         bool needs_op_params = (node->op == GGML_OP_SOFT_MAX || 
@@ -7663,6 +9024,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             src1_res = dx12_get_resource(node->src[1]);
         } else if (fused_mul_node) {
             src1_res = dx12_get_resource(fused_mul_node->src[1]);
+        } else if (fused_rms_idx >= 0) {
+            // Fused-norm matvec: src1 is the un-normalized activation.
+            src1_res = dx12_get_resource(fused_rms_x);
         } else {
             src1_res = dx12_get_resource(node->src[1]);
         }
@@ -7793,7 +9157,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (kv_res) {
                 bctx->cmd_list->SetComputeRootUnorderedAccessView(6, kv_res->GetGPUVirtualAddress());
             }
-            if (key.flags == 79 && fused_qkv_v_matvec && fused_qkv_v_matvec->src[0]) {
+            if ((key.flags == 79 || key.flags == 97) &&
+                fused_qkv_v_matvec && fused_qkv_v_matvec->src[0]) {
                 const struct ggml_tensor * v_weights = fused_qkv_v_matvec->src[0];
                 ID3D12Resource * vw_res = dx12_get_resource(v_weights);
                 if (vw_res) {
@@ -7930,6 +9295,36 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        // Merged QK-Norm dispatch (fl=104): the K side rides root descriptors
+        // whose byte offsets are baked into the VA, so the shader addresses them
+        // from zero and the op-param budget stays untouched.
+        if (key.flags == 104 && fused_qkn_k_norm && fused_qkn_k_rope && fused_qkn_k_set_rows) {
+            auto bind_srv = [&](uint32_t slot, const struct ggml_tensor * t,
+                                D3D12_GPU_VIRTUAL_ADDRESS & cache) {
+                ID3D12Resource * res = dx12_get_resource(t);
+                D3D12_GPU_VIRTUAL_ADDRESS va = res
+                    ? (res->GetGPUVirtualAddress() + dx12_tensor_offset(t))
+                    : src0_res->GetGPUVirtualAddress();
+                if (va != cache) {
+                    bctx->cmd_list->SetComputeRootShaderResourceView(slot, va);
+                    cache = va;
+                }
+            };
+            bind_srv(4, fused_qkn_k_rope->src[1], bctx->last_src2_va);              // ROPE positions
+            bind_srv(5, fused_qkn_k_set_rows->src[1], bctx->last_src3_va);          // SET_ROWS row indices
+            if (fused_qkn_k_rope->src[2]) {
+                bind_srv(7, fused_qkn_k_rope->src[2], bctx->last_src4_va);          // freq_factors
+            } else {
+                bind_srv(7, fused_qkn_k_rope->src[1], bctx->last_src4_va);          // unused; keep t4 resident
+            }
+            bind_srv(8, cgraph->nodes[fused_qkn_k_norm_idx + 1]->src[1], bctx->last_src5_va);  // k_norm weight
+            bind_srv(9, fused_qkn_k_norm->src[0], bctx->last_src6_va);              // K activations
+            if (ID3D12Resource * kv_res = dx12_get_resource(fused_qkn_k_set_rows)) {
+                bctx->cmd_list->SetComputeRootUnorderedAccessView(
+                    6, kv_res->GetGPUVirtualAddress() + dx12_tensor_offset(fused_qkn_k_set_rows));
+            }
+        }
+
         // 5-way RMS+MUL+ROPE+VIEW+SET_ROWS freq_factors: bind to src4/t4
         // (src3 is occupied by SET_ROWS row indices in this fusion.)
         if (fused_5way_set_rows && fused_rope_after_rms && fused_rope_after_rms->src[2]) {
@@ -8008,9 +9403,26 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 bctx->last_src6_va = src6_va;
             }
         }
-
-
-
+        if (fused_rms_idx >= 0) {
+            // Norm weight g (per-tensor offset baked into the VA).  Normally t6;
+            // the mixed Q5_0/Q8_0 QKV variant has t6 taken by the Q8_0 Wv weights
+            // and reads g from t4 instead (only folded when freq_factors, the
+            // other t4 user, are absent).
+            ID3D12Resource * g_res = dx12_get_resource(fused_rms_g);
+            if (g_res) {
+                D3D12_GPU_VIRTUAL_ADDRESS g_va =
+                    g_res->GetGPUVirtualAddress() + dx12_tensor_offset(fused_rms_g);
+                if (key.flags == 97) {
+                    if (g_va != bctx->last_src4_va) {
+                        bctx->cmd_list->SetComputeRootShaderResourceView(7, g_va);
+                        bctx->last_src4_va = g_va;
+                    }
+                } else if (g_va != bctx->last_src6_va) {
+                    bctx->cmd_list->SetComputeRootShaderResourceView(9, g_va);
+                    bctx->last_src6_va = g_va;
+                }
+            }
+        }
         // Calculate dispatch dimensions
         uint32_t groups_x = 1, groups_y = 1, groups_z = 1;
         uint32_t matvec_row_groups = 0;
@@ -8035,7 +9447,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // params.ne0 carries; the plain matvec uses the single output
                     // width node->ne[0].
                     uint32_t N = (key.flags == 75 || key.flags == 76 ||
-                                  key.flags == 77 || key.flags == 79 || key.flags == 84)
+                                  key.flags == 77 || key.flags == 79 || key.flags == 84 ||
+                                  key.flags == 88 || key.flags == 90 ||
+                                  key.flags == 93 || key.flags == 94 || key.flags == 97 ||
+                                  key.flags == 99 || key.flags == 103)
                                      ? params.ne0 : (uint32_t)node->ne[0];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
                     if (key.flags == 9 || key.flags == 10 || key.flags == 11 ||
@@ -8054,8 +9469,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         key.flags == 61 || key.flags == 67 || key.flags == 72 ||
                         key.flags == 73 || key.flags == 74 ||
                         key.flags == 76 || key.flags == 77 || key.flags == 79 || key.flags == 84 ||
+                        key.flags == 90 ||
+                        key.flags == 93 || key.flags == 94 || key.flags == 95 ||
+                        key.flags == 96 || key.flags == 97 || key.flags == 98 ||
+                        key.flags == 99 ||
                         key.flags == 82 ||
-                        key.flags == 78) {
+                        key.flags == 89 || key.flags == 91 ||
+                        key.flags == 78 || key.flags == 100 || key.flags == 101 ||
+                        key.flags == 102 || key.flags == 103) {
                         // Multi-row: 2 rows per group (NC2/4/8 variants produce 2 rows x NUM_COLS cols)
                         // (55/56/57 = IQ4_NL / Q4_0 / Q5_0 mr256 variants on this branch)
                         // (76/77/79/84 = combined Q/K/V Q8_0/Q5_0/mixed rows2 dispatch)
@@ -8082,16 +9503,20 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
                     groups_z = batches;
                 } else if (key.flags == 4 || key.flags == 30 || key.flags == 54 ||
-                           key.flags == 58 || key.flags == 59) {
-                    // Register-blocked tiled dispatch (32×32 tile) [numthreads(16,16,1)]
+                           key.flags == 58 || key.flags == 59 ||
+                           key.flags == 105 || key.flags == 106) {
+                    // Register-blocked tiled dispatch [numthreads(16,16,1)]
                     // fl=30 = Q4_K wmma cooperative-LDS variant (same dispatch)
                     // fl=54 = tiny-K wmma_kfull (same 32x32 tile)
-                    // fl=58 = Q8_1 tiled integer-dot GEMM (same dispatch)
+                    // fl=58 = Q8_1 tiled integer-dot GEMM
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t M = (uint32_t)node->ne[1];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
-                    groups_x = (N + 31) / 32;
-                    groups_y = (M + 31) / 32;
+                    // fl=105/106 are the 64x64 (4x4 per thread) tiles; rest 32x32.
+                    const uint32_t tile =
+                        (key.flags == 105 || key.flags == 106) ? 64u : 32u;
+                    groups_x = (N + tile - 1) / tile;
+                    groups_y = (M + tile - 1) / tile;
                     groups_z = batches;
                 } else if (key.flags == 53) {
                     // FP16 wmma 64x64 tile [numthreads(16,16,1)] for F16xF16 GEMM
@@ -8184,6 +9609,39 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
+                if (key.flags == 51) {
+                    // TOP_K fast path: FIRST pass covers the whole source row,
+                    // one block per BLOCK_SIZE candidates. Later passes issue
+                    // their own Dispatch calls below.
+                    const uint32_t ncols = params.op_params[1];
+                    const uint32_t cap   = params.op_params[8];
+                    uint32_t nrows = (uint32_t)(node->src[0]->ne[1] *
+                                                node->src[0]->ne[2] *
+                                                node->src[0]->ne[3]);
+                    groups_x = dx12_ceil_div(ncols, DX12_TOPK_BLOCK);
+                    groups_y = nrows;
+                    groups_z = 1;
+
+                    // Two ping-pong regions of `cap` pairs per row.
+                    size_t needed = (size_t)nrows * 2u * (size_t)cap * 8u;
+                    if (needed > bctx->dev->argsort_scratch_size) {
+                        if (bctx->dev->argsort_scratch) {
+                            bctx->dev->argsort_scratch_retired.push_back(
+                                bctx->dev->argsort_scratch);
+                        }
+                        bctx->dev->argsort_scratch.Reset();
+                        size_t alloc = needed * 4u;
+                        if (alloc > (64u << 20)) alloc = std::max(needed, (size_t)(64u << 20));
+                        bctx->dev->argsort_scratch = dx12_create_buffer(bctx->dev, alloc);
+                        bctx->dev->argsort_scratch_size =
+                            bctx->dev->argsort_scratch ? alloc : 0;
+                    }
+                    if (bctx->dev->argsort_scratch) {
+                        bctx->cmd_list->SetComputeRootUnorderedAccessView(
+                            6, bctx->dev->argsort_scratch->GetGPUVirtualAddress());
+                    }
+                    break;
+                }
                 if (key.flags == 50) {
                     // Large-N multi-pass shader: BLOCK_SIZE=256, dispatch geometry
                     // is set to cover the INIT phase (one thread per padded slot).
@@ -8287,11 +9745,21 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // 19-30% PP on RX 6800 (135M Q8_0 8887->11526, 135M F16
                 // 6218->7378, SmolVLM2-256M Q8_0 8850->11242) while at D=96 it
                 // is 2x ahead (Phi-3 Q8_0 1024 vs 466), so gate on head width.
+                // Intel Xe-HPG+ inverts the D=64 result - staging K/V still wins
+                // there (B390 PP512: Q8_0 5063->5572, Q4_K_M 4960->5453, f16
+                // 3449->3660) - so it keeps D=64 on the tiled path.
+                // RDNA4 also inverts it, but only once Br is pinned to 8: at the
+                // default 16 rows D=64 does lose (135M 2505->1835), which is what
+                // the RX 6800 result above measured. With 8 rows it wins big
+                // (SmolVLM2-2.2B pp6144 233->788, @d6144 69->313; 135M @d6144
+                // 770->887), so RDNA4 joins Xe-HPG+ here and pins Br below.
                 // Override with DX12_FA_TILED_MIND.
-                static const uint32_t fa_tiled_min_d = [] {
-                    const char * env = DX12_GETENV("DX12_FA_TILED_MIND");
-                    return env ? (uint32_t)std::max(1, atoi(env)) : 72u;
-                }();
+                const char * fa_tiled_min_d_env = DX12_GETENV("DX12_FA_TILED_MIND");
+                const bool fa_rdna4 = bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS;
+                const uint32_t fa_tiled_min_d = fa_tiled_min_d_env
+                    ? (uint32_t)std::max(1, atoi(fa_tiled_min_d_env))
+                    : ((bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
+                        fa_rdna4) ? 64u : 72u);
                 // Each workgroup re-streams the whole K/V for its head, so 16 rows
                 // halves that traffic and wins on long KV. Short KV stays cache
                 // resident, where the larger tile's LDS/occupancy cost dominates
@@ -8301,17 +9769,82 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     return env ? (uint32_t)std::max(1, atoi(env)) : 2048u;
                 }();
                 const char * fa_tiled_br_env = DX12_GETENV("DX12_FA_TILED_BR");
+                const uint32_t head_dim = (uint32_t)node->src[0]->ne[0];
+                // RDNA4 pins 8 rows at both ends of the head-width range: the
+                // extra rows cost more occupancy (LDS + per-row accumulators)
+                // than the K/V traffic they save. Qwen3-4B D=128 pp6144
+                // 347->406 and @d6144 127->162; SmolVLM2-2.2B D=64 233->788.
+                // D=96 still prefers 16 (Phi-3 514 vs 468), so the middle band
+                // keeps the N_kv rule below.
+                const bool fa_br8_rdna4 = fa_rdna4 && (head_dim <= 64 || head_dim >= 128);
                 const uint32_t fa_tiled_br = fa_tiled_br_env
                     ? (atoi(fa_tiled_br_env) == 16 ? 16u : 8u)
-                    : (bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
-                       N_kv >= fa_tiled_br16_min_kv ? 16u : 8u);
-                const uint32_t head_dim = (uint32_t)node->src[0]->ne[0];
+                    : (fa_br8_rdna4 ? 8u
+                       : (bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
+                          N_kv >= fa_tiled_br16_min_kv ? 16u : 8u));
                 const uint32_t value_dim = (uint32_t)node->src[2]->ne[0];
                 auto fa_tiled_type = [](ggml_type t) {
                     return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
                 };
                 bool fa_tiled = false;
-                if (fa_tiled_enabled && key.flags == 0 &&
+                uint32_t fa_tile_br = fa_tiled_br;
+                // Prefill FA: flash_attn_tiled is shaped for short prompts - 128
+                // threads, a runtime head dim, and a PV pass that only keeps D_v
+                // threads busy. At long KV that leaves the machine mostly idle
+                // (measured 1.6 TFLOPS of 91 on RTX 6000 Ada, 94% of prompt
+                // time). flash_attn_pf_<D> specialises on the head dim, runs 256
+                // threads at full utilisation in both passes, and doubles the KV
+                // tile at D=64. Measured faster from N_kv 64 up on both NVIDIA
+                // (pp512 +58%, pp6144 +223%) and Intel UHD (pp512 +38%,
+                // pp2048 +110%), so the gate only excludes decode-shaped work.
+                // Override with DX12_FA_PF=0/1 and DX12_FA_PF_MINKV.
+                static const bool fa_pf_enabled = dx12_flag_default_on("DX12_FA_PF");
+                static const uint32_t fa_pf_min_kv = [] {
+                    const char * env = DX12_GETENV("DX12_FA_PF_MINKV");
+                    return env ? (uint32_t)std::max(1, atoi(env)) : 64u;
+                }();
+                if (fa_pf_enabled && key.flags == 0 &&
+                    N_queries >= fa_tiled_min_q && N_kv >= fa_pf_min_kv &&
+                    head_dim == value_dim &&
+                    (head_dim == 64 || head_dim == 96 || head_dim == 128) &&
+                    n_heads > 0 && n_kv_heads > 0 && (n_heads % n_kv_heads) == 0 &&
+                    node->src[0]->type == GGML_TYPE_F32 && node->src[0]->nb[0] == 4 &&
+                    fa_tiled_type(node->src[1]->type) &&
+                    fa_tiled_type(node->src[2]->type) &&
+                    node->src[1]->nb[0] == ggml_type_size(node->src[1]->type) &&
+                    node->src[2]->nb[0] == ggml_type_size(node->src[2]->type) &&
+                    dx12_ceil_div(N_queries, 8u) <= 65535) {
+                    dx12_pipeline_key pf_key = key;
+                    // Small-wave iGPUs and NVIDIA want opposite tile shapes:
+                    // Intel measured 373/476/522 t/s at BR 8/16/32 (pp6144),
+                    // NVIDIA 14191/12560 at BR 8/16.
+                    //
+                    // br MUST equal FA_PF_BR in the paired shader. It sets
+                    // query_groups, so a stale value silently under-dispatches
+                    // and leaves query rows uncomputed -- which looks like a
+                    // large speedup in llama-bench. Keep the two adjacent and
+                    // always run test-backend-ops after changing either.
+                    struct fa_pf_variant { uint32_t flags; uint32_t br; };
+                    const bool fa_pf_small_wave =
+                        head_dim == 64 && bctx->dev->wave_size < 32;
+                    const fa_pf_variant pf_var =
+                        fa_pf_small_wave ? fa_pf_variant{ 110u, 32u }  // flash_attn_pf_64_wide.hlsl
+                      : head_dim == 64   ? fa_pf_variant{ 107u,  8u }  // flash_attn_pf_64.hlsl
+                      : head_dim == 96   ? fa_pf_variant{ 108u, 16u }  // flash_attn_pf_96.hlsl
+                                         : fa_pf_variant{ 109u, 16u }; // flash_attn_pf_128.hlsl
+                    pf_key.flags = pf_var.flags;
+                    dx12_pipeline * pf_pl = bctx->dev->get_or_create_pipeline(pf_key);
+                    if (pf_pl && pf_pl->pso) {
+                        bctx->cmd_list->SetPipelineState(pf_pl->pso.Get());
+                        bctx->last_pso = pf_pl->pso.Get();
+                        pipeline = pf_pl;
+                        key.flags = pf_key.flags;
+                        fa_tiled = true;
+                        fa_tile_br = pf_var.br;
+                    }
+                }
+                if (!fa_tiled &&
+                    fa_tiled_enabled && key.flags == 0 &&
                     N_queries >= fa_tiled_min_q &&
                     head_dim == value_dim && head_dim >= fa_tiled_min_d && head_dim <= 128 &&
                     (head_dim % 4) == 0 &&
@@ -8492,8 +10025,22 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // same fine-split budget as the small-D variants they replace.
                 bool fa_fine = fa_is_small_d || fa_coop;
                 uint32_t min_kv_per_split = fa_fine ? 16u : 32u;
+                // DX12_FA_MIN_KV overrides the minimum KV columns per split.
+                // For few-head models below N_kv 512 this clamp - not the
+                // target-group count - is what caps n_splits: SmolLM2 (9 heads,
+                // N_kv 256) gets 16 splits, where 32 measures 13% faster on the
+                // profiled FA op (0.406 -> 0.353 ms, 3% of the decode graph).
+                // End-to-end that is inside the noise floor on Arc B390 (the
+                // sign flips with thermal state), so the default is unchanged;
+                // the knob is here to retest on parts with more EUs. No effect
+                // at N_kv >= 512 or on many-head models, where the 32-split cap
+                // or the target-derived count already binds first.
+                if (const char * fa_minkv_env = DX12_GETENV("DX12_FA_MIN_KV")) {
+                    const uint32_t v = (uint32_t) atoi(fa_minkv_env);
+                    if (v >= 1) min_kv_per_split = v;
+                }
                 uint32_t query_groups = fa_tiled
-                    ? dx12_ceil_div(N_queries, fa_tiled_br)
+                    ? dx12_ceil_div(N_queries, fa_tile_br)
                     : N_queries;
                 uint32_t total_groups_no_split = query_groups * dispatch_heads * batch;
                 uint32_t target_groups = fa_tiled ? 0u : (fa_fine ? 512u : 256u);
@@ -8638,7 +10185,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 const uint32_t head_dim = (uint32_t)src0->ne[1];
                 const uint32_t n_head   = (uint32_t)src1->ne[1];
                 const uint32_t n_seq    = (uint32_t)src1->ne[3];
-                const uint32_t wave     = bctx->dev->wave_size ? bctx->dev->wave_size : 32u;
+                // The shader derives NUM_WAVES from its compiled WARP_SIZE, so
+                // the group decomposition here has to use the wave the blob was
+                // built for. Using the device-reported wave desynced the two on
+                // Intel (reports 8, runs the w16 blob) and left half the
+                // (head, head_off) locations uncomputed.
+                const uint32_t wave     = bctx->dev->blob_wave_size ? bctx->dev->blob_wave_size : 32u;
                 const uint32_t num_subgroups = d_state / wave;
                 groups_x = (n_head * head_dim + num_subgroups - 1) / num_subgroups;
                 groups_y = n_seq;
@@ -8750,6 +10302,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             groups_x = total_rows;
             groups_y = 1;
             groups_z = 1;
+            if (fused_qkn_k_norm) {
+                groups_x += (uint32_t)fused_qkn_k_norm->ne[1];
+            }
         }
 
         if (do_profile && prof_idx + 2 <= prof_capacity) {
@@ -8779,8 +10334,20 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                           (fused_qkv ? fused_qkv_q_rope :
                                           (fused_mmv_k_set_rows ? fused_mmv_k_set_rows : node)))))))))));
 
+        // PIX markers: label each node's barrier + dispatch so a capture can be
+        // read as a graph rather than an unnamed dispatch list.
+        static const bool pix_markers = (getenv("DX12_PIX_CAPTURE") != nullptr) ||
+                                        (getenv("DX12_PIX_MARKERS") != nullptr);
+        if (pix_markers) {
+            char label[128];
+            snprintf(label, sizeof(label), "%d %s fl=%u %s", i, ggml_op_name(node->op),
+                     (unsigned)key.flags, dst_tensor->name);
+            bctx->cmd_list->BeginEvent(1 /* ANSI */, label, (UINT)(strlen(label) + 1));
+        }
+
         // Dependency-tracked UAV barriers
         // Only insert when the current dispatch reads a tensor written by a previous unsynced dispatch.
+        const char * barrier_reason = "none";
         {
             bool need_barrier = false;
 
@@ -8791,10 +10358,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             // precise byte-range RAW/WAW detection across ALL tensors with the
             // resource-scoped emit path below, so a hazard on one resource no
             // longer drains every in-flight dispatch (the Vulkan barrier model,
-            // ggml-vulkan.cpp:14714).  Opt-in while validated across the
-            // multi-vendor fleet; promote to default after a sweep (as with the
-            // subgroup / GLU flags).  DX12_SCOPED_UAV_BARRIERS remains a
-            // back-compat alias that enables only the scoped emit path.
+            // ggml-vulkan.cpp:14714).  Validated correct on NVIDIA (RTX 6000
+            // Ada) and Intel (UHD) across the F16/Q4_K_M text and image test
+            // cases, but measured performance-neutral (+/-1%, 5 interleaved
+            // reps): ggml-alloc packs all decode intermediates into one
+            // resource, so a full-resource buffer barrier covers the same
+            // memory as a global one.  Kept opt-in for that reason -- it can
+            // only pay off alongside resource partitioning.
+            // DX12_SCOPED_UAV_BARRIERS remains a back-compat alias that
+            // enables only the scoped emit path.
             // Default OFF; enable with =1.  Robust to =0 (both `set X=` and
             // `set X=0` disable it), matching the other DX12_* flag idioms.
             static const bool barrier_elision = []{
@@ -8803,6 +10375,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }();
             if (force_barrier) {
                 need_barrier = true;
+                barrier_reason = "forced";
             } else
             // Conservative KV barriers are OFF by default now that precise
             // byte-range dependency tracking (DX12_PRECISE_KV_BARRIERS, enabled
@@ -8820,11 +10393,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                           fused_qk_postop);
             if (!relaxed_kv && !precise_kv && conservative_kv) {
                 need_barrier = true;
+                barrier_reason = "kv-blanket";
             } else {
                 // Check if current dispatch reads from any unsynced written tensor
                 for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
                     if (unsynced_writes.count((uintptr_t)node->src[s])) {
                         need_barrier = true;
+                        barrier_reason = "raw-src";
                         break;
                     }
                 }
@@ -8832,6 +10407,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     for (int s = 0; s < GGML_MAX_SRC && fused_mul_node->src[s]; s++) {
                         if (unsynced_writes.count((uintptr_t)fused_mul_node->src[s])) {
                             need_barrier = true;
+                            barrier_reason = "raw-fused-mul";
                             break;
                         }
                     }
@@ -8840,10 +10416,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     if (unsynced_writes.count((uintptr_t)fused_qk_k_rope->src[0]) ||
                         unsynced_writes.count((uintptr_t)fused_qk_k_set_rows->src[1])) {
                         need_barrier = true;
+                        barrier_reason = "raw-fused-qk";
                     }
                 }
                 if (unsynced_writes.count((uintptr_t)dst_tensor)) {
                     need_barrier = true;
+                    barrier_reason = "waw-dst";
                 }
                 // DX12_PRECISE_KV_BARRIERS: replace the conservative KV blanket
                 // with a byte-range RAW/WAW test.  FA reads K(src1)/V(src2) and
@@ -8863,12 +10441,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         return false;
                     };
                     if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                        if (overlaps_write(node->src[1]) || overlaps_write(node->src[2])) need_barrier = true;
+                        if (overlaps_write(node->src[1]) || overlaps_write(node->src[2])) { need_barrier = true; barrier_reason = "kv-precise-fa"; }
                     } else if (fused_qk_postop) {
                         if (overlaps_write(fused_qk_k_set_rows) ||
-                            overlaps_write(dst_tensor)) need_barrier = true;
+                            overlaps_write(dst_tensor)) { need_barrier = true; barrier_reason = "kv-precise-qk"; }
                     } else {
-                        if (overlaps_write(dst_tensor)) need_barrier = true;
+                        if (overlaps_write(dst_tensor)) { need_barrier = true; barrier_reason = "kv-precise-dst"; }
                     }
                 }
             }
@@ -8901,15 +10479,16 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     return false;
                 };
                 for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
-                    if (range_hits_write(node->src[s], false)) { need_barrier = true; break; }
+                    if (range_hits_write(node->src[s], false)) { need_barrier = true; barrier_reason = "elision-raw"; break; }
                 }
                 if (!need_barrier && fused_qk_postop) {
                     if (range_hits_write(fused_qk_k_rope->src[0], false) ||
                         range_hits_write(fused_qk_k_set_rows->src[1], false)) {
                         need_barrier = true;
+                        barrier_reason = "elision-raw-qk";
                     }
                 }
-                if (!need_barrier && range_hits_write(dst_tensor, true)) need_barrier = true;
+                if (!need_barrier && range_hits_write(dst_tensor, true)) { need_barrier = true; barrier_reason = "elision-waw"; }
             }
 
             // Write-after-read: this dispatch writes a memory region that a
@@ -8931,12 +10510,35 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 for (const auto & r : unsynced_reads) {
                     if (r.res == dres && dlo < r.hi && r.lo < dhi && r.root != droot) {
                         need_barrier = true;
+                        barrier_reason = "war-alias";
                         break;
                     }
                 }
             }
 
+            // Diagnostic-only counterpart to DX12_FORCE_BARRIER: drop every UAV
+            // barrier to measure how much of the frame is dispatch
+            // serialization. Produces incorrect results; never enable in a
+            // shipping path.
+            static const bool no_barrier_diag = (getenv("DX12_NO_BARRIER_DIAG") != nullptr);
+            if (no_barrier_diag) {
+                need_barrier = false;
+            }
+
+            // DX12_DISPATCH_TRACE: one graph's worth of dispatch order, with
+            // the barrier decision before each node.  Shows which dispatches
+            // are actually separated by a drain, which is what determines
+            // whether merging two of them can win anything.
+            static const bool dispatch_trace = (getenv("DX12_DISPATCH_TRACE") != nullptr);
+            if (dispatch_trace && bctx->dbg_trace_graph == 3) {
+                fprintf(stderr, "[DX12_DISPATCH] i=%-4d %-16s fl=%-4u ne0=%-7lld barrier=%d %s\n",
+                        i, ggml_op_name(node->op), (unsigned)key.flags,
+                        (long long)dst_tensor->ne[0], need_barrier ? 1 : 0,
+                        need_barrier ? barrier_reason : "");
+            }
+
             if (need_barrier) {
+                if (barrier_stats) bctx->dbg_barrier_reasons[barrier_reason]++;
                 // barriers for only the resources implicated in the hazard instead
                 // of one global (pResource=nullptr) barrier that drains all
                 // in-flight UAV work.  A global drain serializes every dispatch;
@@ -9325,6 +10927,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        if (dx12_shader_audit_enabled() && pipeline) {
+            pipeline->dispatches++;
+        }
         if (is_matvec_dispatch && matvec_row_groups > 32768) {
             // Large vocab logits can exceed D3D12 dispatch/TDR-friendly sizes
             // as one kernel; split by output row-group.  Each chunk is presented
@@ -9346,7 +10951,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                              key.flags == 55 || key.flags == 56 || key.flags == 57 ||
                                             key.flags == 61 || key.flags == 67 || key.flags == 72 ||
                                             key.flags == 73 || key.flags == 74 || key.flags == 78 ||
-                                            key.flags == 82) ? 2 :
+                                            key.flags == 82 || key.flags == 89 ||
+                                            key.flags == 91 ||
+                                            key.flags == 95 || key.flags == 96 ||
+                                            key.flags == 98 ||
+                                            key.flags == 100 || key.flags == 101 ||
+                                            key.flags == 102) ? 2 :
                                             (key.flags == 28 || key.flags == 29 || key.flags == 45 ||
                                              key.flags == 46) ? 4 : 1;
             const uint32_t full_ne0 = params.ne0;
@@ -9365,7 +10975,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     params.op_params[1] = bias_offset_base + base_row * sizeof(float);
                 } else if (key.flags == 24 || key.flags == 31 || key.flags == 32 ||
                            key.flags == 33 || key.flags == 35 || key.flags == 62 ||
-                           key.flags == 73 || key.flags == 74) {
+                           key.flags == 73 || key.flags == 74 || key.flags == 89 ||
+                           key.flags == 91 || key.flags == 95 || key.flags == 96 ||
+                           key.flags == 98) {
                     params.op_params[1] = src2_offset_base + base_row * params.nb01;
                 }
                 params.op_params[15] = 0;
@@ -9422,6 +11034,24 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         } else {
             bctx->cmd_list->Dispatch(groups_x, groups_y, groups_z);
+            // DX12_DISPATCH_TAX=<n>: re-issue a plain matvec with a single
+            // group n extra times.  Group 0 recomputes the same rows from the
+            // same inputs, so the result is unchanged and only the launch cost
+            // is added.  The slope of token time against n is that cost, and
+            // DX12_DISPATCH_TAX_BARRIER separates the extra dispatches with a
+            // UAV barrier to price serialization rather than launch.
+            //
+            // These land between this node's start and end timestamp queries,
+            // so they inflate the per-dispatch ms of DX12_PROFILE.  Use the
+            // two separately.
+            static const int disp_tax = getenv("DX12_DISPATCH_TAX") ? atoi(getenv("DX12_DISPATCH_TAX")) : 0;
+            static const bool disp_tax_bar = getenv("DX12_DISPATCH_TAX_BARRIER") != nullptr;
+            if (disp_tax > 0 && node->op == GGML_OP_MUL_MAT && key.flags == 9) {
+                for (int t = 0; t < disp_tax; ++t) {
+                    if (disp_tax_bar) bctx->emit_uav_barrier_buffer(dx12_get_resource(node));
+                    bctx->cmd_list->Dispatch(1, groups_y, groups_z);
+                }
+            }
         }
         // RMS_NORM_MUL + Q8_1 fused: emit UAV barrier on q8_1_scratch and
         // pre-populate the q8_1 reuse cache so the downstream dp4a matmul
@@ -9455,6 +11085,38 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // dispatch, with a UAV barrier between dispatches to serialize scratch
         // writes.  Finally issue the WRITEOUT (kind=2 for ARGSORT, kind=3 for
         // TOP_K).  This shader reuses the same pipeline for all phases.
+        if (node->op == GGML_OP_TOP_K && key.flags == 51) {
+            const uint32_t ncols = params.op_params[1];
+            const uint32_t KL    = params.op_params[2];
+            const uint32_t nrows = groups_y;
+
+            D3D12_RESOURCE_BARRIER uav_barrier = {};
+            uav_barrier.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav_barrier.UAV.pResource = bctx->dev->argsort_scratch.Get();
+
+            // The FIRST pass was already dispatched above (kind=0, writing
+            // region 0). Keep reducing until a single block remains, then run
+            // the FINAL pass that writes dst.
+            uint32_t n_in    = dx12_ceil_div(ncols, DX12_TOPK_BLOCK) * KL;
+            uint32_t in_reg  = 0u;
+            uint32_t out_reg = 1u;
+
+            while (true) {
+                const uint32_t nb = dx12_ceil_div(n_in, DX12_TOPK_BLOCK);
+                bctx->cmd_list->ResourceBarrier(1, &uav_barrier);
+                params.op_params[5] = n_in;
+                params.op_params[6] = in_reg;
+                params.op_params[7] = out_reg;
+                params.op_params[3] = (nb == 1u) ? 2u : 1u;
+                bctx->set_shader_params(params, (uint32_t)(sizeof(params) / 4));
+                bctx->cmd_list->Dispatch(nb, nrows, 1);
+                if (nb == 1u) break;
+                n_in    = nb * KL;
+                in_reg  = out_reg;
+                out_reg ^= 1u;
+            }
+        }
+
         if ((node->op == GGML_OP_ARGSORT || node->op == GGML_OP_TOP_K) &&
             key.flags == 50) {
             const uint32_t ncols        = params.op_params[1];
@@ -9528,6 +11190,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         // Track this dispatch's output as unsynced
+        const size_t trace_w0 = unsynced_write_ranges.size();
+        const size_t trace_r0 = unsynced_reads.size();
         unsynced_writes.insert((uintptr_t)dst_tensor);
 
         // Byte-range companion (DX12_PRECISE_KV_BARRIERS): record the memory
@@ -9581,6 +11245,59 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (fused_qk_postop) {
             unsynced_writes.insert((uintptr_t)fused_qk_k_set_rows);
             track_write_range(fused_qk_k_set_rows);
+        }
+        // The merged Q+K dispatch writes Kcur as well as Qcur (tracked above as
+        // dst_tensor); record it so downstream readers still get a barrier.
+        if (fused_qk_merge) {
+            unsynced_writes.insert((uintptr_t)fused_qk_merge);
+            track_write_range(fused_qk_merge);
+        }
+
+        // The merged QK-Norm dispatch scatters into the KV cache on top of
+        // writing Qcur; register the absorbed chain's endpoints so downstream
+        // readers of either still barrier.
+        if (fused_qkn_k_set_rows) {
+            unsynced_writes.insert((uintptr_t)fused_qkn_k_norm);
+            unsynced_writes.insert((uintptr_t)fused_qkn_k_rope);
+            unsynced_writes.insert((uintptr_t)fused_qkn_k_set_rows);
+            track_write_range(fused_qkn_k_set_rows);
+        }
+
+        if (pix_markers) {
+            bctx->cmd_list->EndEvent();
+        }
+
+        // DX12_BARRIER_TRACE=<file>: Phase 1 attribution.  One JSON line per
+        // dispatch with the barrier decision + its cause, and the byte ranges
+        // this dispatch read and wrote.  The ranges let an offline pass rebuild
+        // the true dependency DAG and compute the clustering headroom (minimum
+        // barriers achievable under any legal reordering).  Diagnostic only.
+        {
+            static FILE * trace_fp = []() -> FILE * {
+                const char * s = getenv("DX12_BARRIER_TRACE");
+                if (!s || !s[0]) return nullptr;
+                return fopen(s, "w");
+            }();
+            if (trace_fp) {
+                fprintf(trace_fp,
+                        "{\"g\":%llu,\"i\":%d,\"op\":\"%s\",\"name\":\"%s\",\"bar\":%d,\"why\":\"%s\",\"w\":[",
+                        (unsigned long long) bctx->dbg_trace_graph, i, ggml_op_name(node->op),
+                        dst_tensor->name, strcmp(barrier_reason, "none") ? 1 : 0, barrier_reason);
+                for (size_t k = trace_w0; k < unsynced_write_ranges.size(); k++) {
+                    const auto & w = unsynced_write_ranges[k];
+                    fprintf(trace_fp, "%s[%llu,%llu,%llu]", k > trace_w0 ? "," : "",
+                            (unsigned long long) (uintptr_t) w.res,
+                            (unsigned long long) w.lo, (unsigned long long) w.hi);
+                }
+                fprintf(trace_fp, "],\"r\":[");
+                for (size_t k = trace_r0; k < unsynced_reads.size(); k++) {
+                    const auto & r = unsynced_reads[k];
+                    fprintf(trace_fp, "%s[%llu,%llu,%llu]", k > trace_r0 ? "," : "",
+                            (unsigned long long) (uintptr_t) r.res,
+                            (unsigned long long) r.lo, (unsigned long long) r.hi);
+                }
+                fprintf(trace_fp, "]}\n");
+            }
         }
 
         // DX12_SYNC_PER_OP: close+execute+timed-wait after every node so a TDR
@@ -9727,6 +11444,30 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                          ggml_op_name(node->op), src0t, key.flags, K, N, M, groups_x);
             }
             prof_keys.emplace_back(keybuf);
+            // Weight bytes actually read, so the summary can report achieved
+            // bandwidth.  Fused variants read a second weight matrix that is
+            // not node->src[0], so count those explicitly or the resulting
+            // GB/s is understated.
+            {
+                size_t wb = 0;
+                if (node->op == GGML_OP_MUL_MAT && node->src[0] &&
+                    ggml_is_quantized(node->src[0]->type)) {
+                    wb = ggml_nbytes(node->src[0]);
+                    if (fused_qk_merge && fused_qk_merge->src[0]) {
+                        wb += ggml_nbytes(fused_qk_merge->src[0]);
+                    }
+                    if (fused_qkv_k_matvec && fused_qkv_k_matvec->src[0]) {
+                        wb += ggml_nbytes(fused_qkv_k_matvec->src[0]);
+                    }
+                    if (fused_qkv_v_matvec && fused_qkv_v_matvec->src[0]) {
+                        wb += ggml_nbytes(fused_qkv_v_matvec->src[0]);
+                    }
+                    if (fused_mmv_glu_up && fused_mmv_glu_up->src[0]) {
+                        wb += ggml_nbytes(fused_mmv_glu_up->src[0]);
+                    }
+                }
+                prof_bytes.push_back(wb);
+            }
             prof_idx += 2;
             (void)t0; (void)t1; (void)freq;
         }
@@ -9871,11 +11612,29 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // ELISION on, a higher scoped:global ratio means less cross-dispatch
     // serialization; compare against a baseline run to gauge the win.
     if (barrier_stats) {
+        std::vector<const void *> dbg_res, dbg_dst_res;
+        auto dbg_add = [](std::vector<const void *> & v, const void * p) {
+            if (!p) return;
+            for (const void * q : v) { if (q == p) return; }
+            v.push_back(p);
+        };
+        for (int n = 0; n < cgraph->n_nodes; n++) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t->buffer) { dbg_add(dbg_res, dx12_get_resource(t)); dbg_add(dbg_dst_res, dx12_get_resource(t)); }
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
+                if (t->src[s]->buffer) dbg_add(dbg_res, dx12_get_resource(t->src[s]));
+            }
+        }
         fprintf(stderr,
-            "[DX12_BARRIER_STATS] nodes=%d barriers_scoped=%llu barriers_global=%llu\n",
+            "[DX12_BARRIER_STATS] nodes=%d barriers_scoped=%llu barriers_global=%llu distinct_res=%zu distinct_dst_res=%zu\n",
             cgraph->n_nodes,
             (unsigned long long)bctx->dbg_barrier_scoped,
-            (unsigned long long)bctx->dbg_barrier_global);
+            (unsigned long long)bctx->dbg_barrier_global,
+            dbg_res.size(), dbg_dst_res.size());
+        for (const auto & kv : bctx->dbg_barrier_reasons) {
+            fprintf(stderr, "[DX12_BARRIER_REASON] %-18s %llu\n",
+                    kv.first, (unsigned long long)kv.second);
+        }
         fflush(stderr);
     }
     // here so the ring-list keep-open / profiling / dump tails are skipped (none
@@ -9930,6 +11689,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 double ms = (double)(t_end - t_start) * 1000.0 / (double)prof_freq;
                 op_times[prof_keys[k]] += ms;
                 op_counts[prof_keys[k]] += 1;
+                if (k < prof_bytes.size()) op_bytes[prof_keys[k]] += prof_bytes[k];
                 if (t_start < lo) lo = t_start;
                 if (t_end   > hi) hi = t_end;
                 sum_ticks += (double)(t_end - t_start);
@@ -9975,11 +11735,16 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         double total = 0;
         for (auto & kv : op_times) { sorted.push_back({kv.second, kv.first}); total += kv.second; }
         std::sort(sorted.rbegin(), sorted.rend());
-        fprintf(stderr, "  %8s  %5s %5s  %s\n", "ms", "%", "n", "op");
+        fprintf(stderr, "  %8s  %5s %5s %8s  %s\n", "ms", "%", "n", "GB/s", "op");
         for (auto & p : sorted) {
             if (p.first > 0.01) {
                 uint32_t n = op_counts[p.second];
-                fprintf(stderr, "  %8.3f  %5.1f  %4u  %s\n", p.first, p.first/total*100, n, p.second.c_str());
+                const size_t wb = op_bytes[p.second];
+                char bw[16] = "       -";
+                if (wb > 0) {
+                    snprintf(bw, sizeof(bw), "%8.1f", (double)wb / (p.first * 1e6));
+                }
+                fprintf(stderr, "  %8.3f  %5.1f  %4u %s  %s\n", p.first, p.first/total*100, n, bw, p.second.c_str());
             }
         }
         fprintf(stderr, "  %8.3f  TOTAL\n", total);
@@ -10823,6 +12588,9 @@ static const char * dx12_backend_get_name(ggml_backend_t backend) {
 
 static void dx12_backend_free(ggml_backend_t backend) {
     auto * ctx = (dx12_backend_context *)backend->context;
+    if (ctx->dev) {
+        dx12_shader_audit_report(*ctx->dev);
+    }
     delete ctx; // RAII destructor handles fence wait + event close
 }
 
@@ -11440,7 +13208,7 @@ static const ggml_backend_reg_i dx12_reg_interface = {
 
 #ifdef GGML_DX12_SHADERS_COMPILED
 // Macro to select wave-size-specific blob at init time
-#define WB_INNER(name, ws) { g_##name##_w##ws##_dxil, sizeof(g_##name##_w##ws##_dxil) }
+#define WB_INNER(name, ws) { g_##name##_w##ws##_dxil, sizeof(g_##name##_w##ws##_dxil), #name }
 #define WB(name, ws) WB_INNER(name, ws)
 
 // FP16-aware variant: picks the `_fp16_dxil` blob when the device supports
@@ -11452,13 +13220,30 @@ static const ggml_backend_reg_i dx12_reg_interface = {
 // Intel Arc B390. Kept as opt-in for diagnostic A/B and future tuning.
 // Evaluated at init time so the per-dispatch path is unchanged.
 #define WB_FP16_INNER(name, ws) (this->fp16_supported && getenv("DX12_ENABLE_FP16") \
-    ? dx12_shader_blob{ g_##name##_w##ws##_fp16_dxil, sizeof(g_##name##_w##ws##_fp16_dxil) } \
-    : dx12_shader_blob{ g_##name##_w##ws##_dxil,      sizeof(g_##name##_w##ws##_dxil) })
+    ? dx12_shader_blob{ g_##name##_w##ws##_fp16_dxil, sizeof(g_##name##_w##ws##_fp16_dxil), #name } \
+    : dx12_shader_blob{ g_##name##_w##ws##_dxil,      sizeof(g_##name##_w##ws##_dxil),      #name })
 #define WB_FP16(name, ws) WB_FP16_INNER(name, ws)
 
 void dx12_device::init_shader_blobs() {
     // Round wave_size to nearest compiled variant: 16, 32, or 64
     uint32_t ws = wave_size <= 16 ? 16 : (wave_size <= 32 ? 32 : 64);
+
+    // Intel reports a wave of 8 here but picks the SIMD width per shader and
+    // runs Vulkan at subgroup 32 on the same silicon, so the reported size is
+    // a floor rather than the width we have to use. [WaveSize(N)] is driver
+    // enforced (PSO creation fails if N is unsupported), so overriding is safe
+    // to probe. DX12_WAVE_BLOB=16|32|64 forces a variant.
+    if (const char * env = DX12_GETENV("DX12_WAVE_BLOB")) {
+        uint32_t forced = (uint32_t)atoi(env);
+        if (forced == 16 || forced == 32 || forced == 64) {
+            ws = forced;
+        }
+    }
+
+    // Single source of truth for "what wave were the loaded blobs compiled
+    // for". Host dispatch math for a shader whose WARP_SIZE drives its group
+    // decomposition (ssm_scan) must agree with this, not with wave_size.
+    blob_wave_size = ws;
 
     // Helper lambdas that return the right blob for each compiled wave size
     // This runs once at init — zero per-dispatch overhead
@@ -11566,7 +13351,11 @@ void dx12_device::init_shader_blobs() {
     DX12_LOG_INFO("Shader blobs: using wave=%u variant (device wave=%u)\n", ws, wave_size);
 }
 #else
-void dx12_device::init_shader_blobs() {}
+void dx12_device::init_shader_blobs() {
+    // No precompiled blobs in this build, but keep blob_wave_size consistent
+    // with the rounding rule so dispatch math that depends on it stays valid.
+    blob_wave_size = wave_size <= 16 ? 16 : (wave_size <= 32 ? 32 : 64);
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -11593,12 +13382,13 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     dx12_shader_blob selected_blob_storage = {};
 
     // Wave-size blob selection helper — returns the right compiled variant
-    auto wblob = [this](const void* d16, size_t s16, const void* d32, size_t s32, const void* d64, size_t s64) -> dx12_shader_blob {
-        if (wave_size <= 16) return { d16, s16 };
-        if (wave_size <= 32) return { d32, s32 };
-        return { d64, s64 };
+    auto wblob = [this](const char * nm, const void* d16, size_t s16, const void* d32, size_t s32, const void* d64, size_t s64) -> dx12_shader_blob {
+        if (blob_wave_size <= 16) return { d16, s16, nm };
+        if (blob_wave_size <= 32) return { d32, s32, nm };
+        return { d64, s64, nm };
     };
     #define WBLOB(name) wblob( \
+        #name, \
         g_##name##_w16_dxil, sizeof(g_##name##_w16_dxil), \
         g_##name##_w32_dxil, sizeof(g_##name##_w32_dxil), \
         g_##name##_w64_dxil, sizeof(g_##name##_w64_dxil))
@@ -11610,14 +13400,45 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     // no-op on bandwidth-bound matvec on the GPUs measured so far.
     static const bool enable_fp16 = (getenv("DX12_ENABLE_FP16") != nullptr);
     auto wblob_fp16_pick = [this](
+        const char * nm,
         const void* d16, size_t s16, const void* d32, size_t s32, const void* d64, size_t s64,
         const void* d16_fp16, size_t s16_fp16, const void* d32_fp16, size_t s32_fp16, const void* d64_fp16, size_t s64_fp16) -> dx12_shader_blob {
         const bool use_fp16 = fp16_supported && enable_fp16;
-        if (wave_size <= 16) return use_fp16 ? dx12_shader_blob{ d16_fp16, s16_fp16 } : dx12_shader_blob{ d16, s16 };
-        if (wave_size <= 32) return use_fp16 ? dx12_shader_blob{ d32_fp16, s32_fp16 } : dx12_shader_blob{ d32, s32 };
-        return use_fp16 ? dx12_shader_blob{ d64_fp16, s64_fp16 } : dx12_shader_blob{ d64, s64 };
+        if (blob_wave_size <= 16) return use_fp16 ? dx12_shader_blob{ d16_fp16, s16_fp16, nm } : dx12_shader_blob{ d16, s16, nm };
+        if (blob_wave_size <= 32) return use_fp16 ? dx12_shader_blob{ d32_fp16, s32_fp16, nm } : dx12_shader_blob{ d32, s32, nm };
+        return use_fp16 ? dx12_shader_blob{ d64_fp16, s64_fp16, nm } : dx12_shader_blob{ d64, s64, nm };
     };
     #define WBLOB_FP16(name) wblob_fp16_pick( \
+        #name, \
+        g_##name##_w16_dxil,      sizeof(g_##name##_w16_dxil), \
+        g_##name##_w32_dxil,      sizeof(g_##name##_w32_dxil), \
+        g_##name##_w64_dxil,      sizeof(g_##name##_w64_dxil), \
+        g_##name##_w16_fp16_dxil, sizeof(g_##name##_w16_fp16_dxil), \
+        g_##name##_w32_fp16_dxil, sizeof(g_##name##_w32_fp16_dxil), \
+        g_##name##_w64_fp16_dxil, sizeof(g_##name##_w64_fp16_dxil))
+
+    // Tiled flash-attention selector: the fp16 blob stages Q/K/V as half4 and
+    // widens the KV tile to the wave width. Unlike WBLOB_FP16 this is not an
+    // opt-in diagnostic -- it is the tuned default wherever the device reports
+    // native 16-bit ops, and the f32 blob keeps devices that don't on the
+    // tiled path rather than dropping them to the much slower untiled kernel.
+    // DX12_FA_TILED_FP16=0 forces the f32 blob on a device that supports fp16,
+    // so the fallback stays testable on hardware that would never pick it.
+    static const bool fa_tiled_fp16 = [] {
+        const char * env = getenv("DX12_FA_TILED_FP16");
+        return env ? env[0] != '0' : true;
+    }();
+    auto wblob_fa16_pick = [this](
+        const char * nm,
+        const void* d16, size_t s16, const void* d32, size_t s32, const void* d64, size_t s64,
+        const void* d16_fp16, size_t s16_fp16, const void* d32_fp16, size_t s32_fp16, const void* d64_fp16, size_t s64_fp16) -> dx12_shader_blob {
+        const bool use_fp16 = fp16_supported && fa_tiled_fp16;
+        if (blob_wave_size <= 16) return use_fp16 ? dx12_shader_blob{ d16_fp16, s16_fp16, nm } : dx12_shader_blob{ d16, s16, nm };
+        if (blob_wave_size <= 32) return use_fp16 ? dx12_shader_blob{ d32_fp16, s32_fp16, nm } : dx12_shader_blob{ d32, s32, nm };
+        return use_fp16 ? dx12_shader_blob{ d64_fp16, s64_fp16, nm } : dx12_shader_blob{ d64, s64, nm };
+    };
+    #define WBLOB_FA16(name) wblob_fa16_pick( \
+        #name, \
         g_##name##_w16_dxil,      sizeof(g_##name##_w16_dxil), \
         g_##name##_w32_dxil,      sizeof(g_##name##_w32_dxil), \
         g_##name##_w64_dxil,      sizeof(g_##name##_w64_dxil), \
@@ -11668,6 +13489,55 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         mmv_group_size == 512 ? WBLOB(name##_g512) : \
         WBLOB(name))
 
+    // Q4_K _mr family threadgroup size. These shaders split a row's K/256
+    // blocks across GROUP_SIZE/16 lanes, so a group wider than the block count
+    // leaves lanes idle for the whole dispatch: at K=2560 (10 blocks) the
+    // 256-thread default runs 10 of 16 lanes and measures 522 GB/s, while the
+    // 64-thread GLU shader on the same weights reaches 771 GB/s.
+    static const int q4k_mmv_gs_env = [] {
+        const char * e = getenv("DX12_Q4K_MMV_GS");
+        if (!e) return 0;
+        int v = atoi(e);
+        return (v == 16 || v == 32 || v == 64 || v == 128 || v == 256 || v == 512) ? v : 0;
+    }();
+    const int q4k_mmv_gs = q4k_mmv_gs_env ? q4k_mmv_gs_env :
+        ((arch_family == DX12_ARCH_NV_PASCAL_PLUS && wave_size <= 32) ? 32 : 256);
+    #define WBLOB_Q4K(name) ( \
+        q4k_mmv_gs == 16  ? WBLOB(name##_g16)  : \
+        q4k_mmv_gs == 32  ? WBLOB(name##_g32)  : \
+        q4k_mmv_gs == 64  ? WBLOB(name##_g64)  : \
+        q4k_mmv_gs == 128 ? WBLOB(name##_g128) : \
+        q4k_mmv_gs == 512 ? WBLOB(name##_g512) : \
+        WBLOB(name))
+
+    // Same knob for the two remaining heavy decode shaders: the Q6_K dp4a
+    // matvec (fl=23) and the fused gate+up GLU (fl=32/91). Defaults keep each
+    // shader's own compiled-in size until a device is swept. Xe-HPG+ is swept:
+    // 256 threads spread K/256 blocks over 16 lanes, but the shapes that reach
+    // fl=23 only have 6-12 blocks, so most lanes idle and the dispatch stalls
+    // at 84-90 GB/s; 32 threads saturate the 110 GB/s the part can sustain.
+    auto gs_env = [](const char * name, int fallback) {
+        const char * e = getenv(name);
+        if (!e) return fallback;
+        int v = atoi(e);
+        return (v == 16 || v == 32 || v == 64 || v == 128 || v == 256 || v == 512) ? v : fallback;
+    };
+    // The arch default is applied per call, not folded into the static: the
+    // static is initialised by whichever device reaches here first and would
+    // otherwise leak one adapter's group size onto every other adapter.
+    static const int q6k_mmv_gs_env = gs_env("DX12_Q6K_MMV_GS", 0);
+    const int q6k_mmv_gs = q6k_mmv_gs_env ? q6k_mmv_gs_env :
+        (arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ? 32 : 256);
+    static const int glu_q4k_gs = gs_env("DX12_GLU_Q4K_GS", 64);
+    #define WBLOB_TUNE(name, gs) ( \
+        (gs) == 16  ? WBLOB(name##_g16)  : \
+        (gs) == 32  ? WBLOB(name##_g32)  : \
+        (gs) == 64  ? WBLOB(name##_g64)  : \
+        (gs) == 128 ? WBLOB(name##_g128) : \
+        (gs) == 256 ? WBLOB(name##_g256) : \
+        (gs) == 512 ? WBLOB(name##_g512) : \
+        WBLOB(name))
+
     auto set_selected_blob = [&](dx12_shader_blob selected) {
         selected_blob_storage = selected;
         blob = &selected_blob_storage;
@@ -11710,7 +13580,7 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 8:  return pick(WBLOB(mul_mat_q8_0_q8_1));
             case 9:
                 switch (key.src0_type) {
-                    case GGML_TYPE_Q4_K: return pick(WBLOB(mul_mat_vec_q4k_mr));
+                    case GGML_TYPE_Q4_K: return pick(WBLOB_Q4K(mul_mat_vec_q4k_mr));
                     case GGML_TYPE_Q5_K: return pick(WBLOB(mul_mat_vec_q5k_mr));
                     case GGML_TYPE_Q6_K: return pick(WBLOB(mul_mat_vec_q6k_mr));
                     case GGML_TYPE_Q8_0: return pick(WBLOB(mul_mat_vec_q8_0_mr));
@@ -11744,7 +13614,7 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 20: return pick(WBLOB(mul_mat_vec_q3k_mr));
             case 21: return pick(WBLOB(mul_mat_vec_q5_0_dp4a));
             case 22: return pick(WBLOB(mul_mat_vec_q5_1_dp4a));
-            case 23: return pick(WBLOB(mul_mat_vec_q6k_dp4a));
+            case 23: return pick(WBLOB_TUNE(mul_mat_vec_q6k_dp4a, q6k_mmv_gs));
             case 24: return pick(WBLOB_FP16(mul_mat_vec_glu));
             case 25: return pick(WBLOB(mul_mat_vec_q6k_mr_blocked));
             case 26: return pick(WBLOB(mul_mat_vec_q3k_mr_blocked));
@@ -11753,7 +13623,7 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 29: return pick(WBLOB(mul_mat_vec_q5_0_mr64));
             case 30: return pick(WBLOB(mul_mat_q4k_wmma_lds));
             case 31: return pick(WBLOB(mul_mat_vec_glu_q5_0));
-            case 32: return pick(WBLOB(mul_mat_vec_glu_q4_k));
+            case 32: return pick(WBLOB_TUNE(mul_mat_vec_glu_q4_k, glu_q4k_gs));
             case 33: return pick(WBLOB(mul_mat_vec_glu_q5_k));
             case 34: return pick(WBLOB(mul_mat_vec_q5_0_mr_lds));
             case 35: return pick(WBLOB(mul_mat_vec_glu_q8_0));
@@ -11761,6 +13631,12 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 37: return pick(WBLOB(mul_mat_vec_iq2_xxs_mr));
             case 38: return pick(WBLOB(mul_mat_vec_q4_0_dp4a));
             case 39: return pick(WBLOB(mul_mat_vec_glu_q3_k));
+            case 100: return pick(WBLOB(mul_mat_vec_q4_1_dp4a));
+            case 101: return pick(WBLOB(mul_mat_vec_q4_1_dp4a_mr256));
+            case 102: return pick(WBLOB_Q4K(mul_mat_vec_q4k_mr_rms));
+            case 103: return pick(WBLOB_Q4K(mul_mat_vec_q4k_qk));
+            case 105: return pick(WBLOB(mul_mat_wmma64));
+            case 106: return pick(WBLOB(mul_mat_q4k_wmma_lds64));
             case 43:
                 switch (key.src0_type) {
                     case GGML_TYPE_IQ2_XXS: return pick(WBLOB(mul_mat_iq2_xxs_quant));
@@ -11815,6 +13691,18 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 82: return pick(WBLOB(mul_mat_vec_q6k_subgroup));
             case 83: return pick(WBLOB(mul_mat_vec_q5_0_nc8));
             case 84: return pick(WBLOB(mul_mat_vec_qkv_q8_0_mr256));
+            case 88: return pick(WBLOB_FP16(mul_mat_vec_qkv_f16_wave64_rms));
+            case 89: return pick(WBLOB_FP16(mul_mat_vec_glu_rms));
+            case 90: return pick(WBLOB(mul_mat_vec_qkv_q8_0_mr256_rms));
+            case 91: return pick(WBLOB_TUNE(mul_mat_vec_glu_q4_k_rms, glu_q4k_gs));
+            case 92: return pick(WBLOB_GS(mul_mat_vec_glu_q5_0_subgroup_rms));
+            case 93: return pick(WBLOB(mul_mat_vec_qkv_q8_0_wave64_rms));
+            case 94: return pick(WBLOB(mul_mat_vec_qkv_q5_0_vulkan_rows2_rms));
+            case 95: return pick(WBLOB(mul_mat_vec_glu_q5_0_vulkan_rows2_rms));
+            case 96: return pick(WBLOB(mul_mat_vec_glu_q8_0_wave64_rms));
+            case 97: return pick(WBLOB(mul_mat_vec_qkv_q5_0_q8_0_rows2_rms));
+            case 98: return pick(WBLOB(mul_mat_vec_glu_q8_0_rms));
+            case 99: return pick(WBLOB(mul_mat_vec_qkv_q8_0_dp4a));
             default: break;
         }
 
@@ -11958,6 +13846,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             set_selected_blob(WBLOB(cpy_quant_block));
         } else if ((key.op == GGML_OP_ARGSORT || key.op == GGML_OP_TOP_K) && key.flags == 50) {
             set_selected_blob(WBLOB(argsort_large));
+        } else if (key.op == GGML_OP_TOP_K && key.flags == 51) {
+            set_selected_blob(WBLOB(top_k_large));
         } else if (key.op == GGML_OP_GATED_DELTA_NET && key.flags == 16) {
             set_selected_blob(WBLOB(gated_delta_net_sv16));
         } else if (key.op == GGML_OP_GATED_DELTA_NET && key.flags == 32) {
@@ -11990,6 +13880,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             set_selected_blob(WBLOB(rms_norm_mul_rope));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 8) {
             set_selected_blob(WBLOB(rms_norm_mul_rope_set_rows));
+        } else if (key.op == GGML_OP_RMS_NORM && key.flags == 104) {
+            set_selected_blob(WBLOB(rms_norm_mul_rope_qk));
         } else if (key.op == GGML_OP_ROPE && key.flags == 6) {
             set_selected_blob(WBLOB(rope_set_rows));
         } else if (key.op == GGML_OP_ROPE && key.flags == 87) {
@@ -12004,7 +13896,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             set_selected_blob(WBLOB(flash_attn_128));
         } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 8) {
             set_selected_blob(WBLOB(flash_attn_reduce));
-        } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags >= 20 && key.flags <= 33) {
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT &&
+                   ((key.flags >= 20 && key.flags <= 33) || (key.flags >= 107 && key.flags <= 110))) {
             switch (key.flags) {
                 case 20: set_selected_blob(WBLOB(flash_attn_q4_0));    break;
                 case 21: set_selected_blob(WBLOB(flash_attn_q4_1));    break;
@@ -12014,12 +13907,16 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                 case 25: set_selected_blob(WBLOB(flash_attn_iq4_nl));  break;
                 case 26: set_selected_blob(WBLOB(flash_attn_cd_64));   break;
                 case 27: set_selected_blob(WBLOB(flash_attn_cd_128));  break;
-                case 28: set_selected_blob(WBLOB(flash_attn_tiled));   break;
-                case 29: set_selected_blob(WBLOB(flash_attn_tiled16)); break;
+                case 28: set_selected_blob(WBLOB_FA16(flash_attn_tiled));   break;
+                case 29: set_selected_blob(WBLOB_FA16(flash_attn_tiled16)); break;
                 case 30: set_selected_blob(WBLOB(flash_attn_cd_96));   break;
                 case 31: set_selected_blob(WBLOB(flash_attn_cd_q8_0_64));  break;
                 case 32: set_selected_blob(WBLOB(flash_attn_cd_q8_0_96));  break;
                 case 33: set_selected_blob(WBLOB(flash_attn_cd_q8_0_128)); break;
+                case 107: set_selected_blob(WBLOB(flash_attn_pf_64));  break;
+                case 108: set_selected_blob(WBLOB(flash_attn_pf_96));  break;
+                case 109: set_selected_blob(WBLOB(flash_attn_pf_128)); break;
+                case 110: set_selected_blob(WBLOB(flash_attn_pf_64_wide)); break;
                 default: break;
             }
         } else if (key.op == GGML_OP_SOFT_MAX && key.flags == 1) {
@@ -12029,10 +13926,12 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         }
     }
 
+    bool from_generic_blob = false;
     if (!blob) {
         auto sit = shader_blobs.find((int)key.op);
         if (sit != shader_blobs.end()) {
             blob = &sit->second;
+            from_generic_blob = true;
         }
     }
 
@@ -12050,7 +13949,33 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     pso_desc.CS.pShaderBytecode = blob->data;
     pso_desc.CS.BytecodeLength  = blob->size;
 
+    // DX12_PSO_TRACE reports when each PSO is built and what it cost. Every
+    // pipeline a model needs is built during the first prefill and the first
+    // decode token, so the cost is a one-time startup charge, not a per-token
+    // one. A persisted D3D12_CACHED_PIPELINE_STATE blob was measured here and
+    // changed nothing on either NVIDIA or Intel - both drivers already keep
+    // their own shader cache, and the residual cost is runtime object
+    // creation, which a cached blob cannot avoid.
+    static const bool pso_trace = DX12_GETENV("DX12_PSO_TRACE") != nullptr;
+    static std::chrono::steady_clock::time_point pso_t0 = std::chrono::steady_clock::now();
+    static int    pso_n     = 0;
+    static double pso_total = 0.0;
+    const auto pso_ta = std::chrono::steady_clock::now();
+
     HRESULT hr = device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pipeline.pso));
+
+    if (pso_trace) {
+        const auto pso_tb = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(pso_tb - pso_ta).count();
+        const double at = std::chrono::duration<double, std::milli>(pso_ta - pso_t0).count();
+        pso_n++;
+        pso_total += ms;
+        fprintf(stderr, "[PSO] #%d at=%.1fms cost=%.3fms total=%.1fms op=%d flags=%u src0=%d shader=%s\n",
+                pso_n, at, ms, pso_total,
+                (int)key.op, key.flags, (int)key.src0_type,
+                blob->name ? blob->name : "?");
+    }
+
     if (FAILED(hr)) {
         DX12_LOG_ERROR("Failed to create PSO for op %d (%s, flags=%u) (HRESULT 0x%08X)\n",
                        key.op, ggml_op_name((enum ggml_op)key.op), (unsigned)key.flags, (unsigned)hr);
@@ -12059,6 +13984,11 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     }
 
     pipeline.root_sig = common_root_sig;
+    pipeline.shader      = blob->name ? blob->name : "?";
+    pipeline.audit_op    = (uint32_t)key.op;
+    pipeline.audit_flags = key.flags;
+    pipeline.audit_src0  = (int)key.src0_type;
+    pipeline.generic     = from_generic_blob;
     pipeline_cache[key] = std::move(pipeline);
     last_pipeline_key = key;
     last_pipeline_ptr = &pipeline_cache[key];
@@ -12092,6 +14022,92 @@ ggml_backend_t ggml_backend_dx12_init(size_t dev_num) {
 
     ggml_backend_dev_t dev = dx12_reg_get_device(nullptr, dev_num);
     return dx12_dev_init_backend(dev, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Shader-path audit report (DX12_SHADER_AUDIT)
+// ---------------------------------------------------------------------------
+// Dumps every pipeline the run actually dispatched, sorted by dispatch count,
+// naming the exact HLSL variant behind it. Pipelines marked GENERIC fell
+// through the specialized selector in get_or_create_pipeline() onto the per-op
+// default blob -- that is the "slow fallback" case worth investigating.
+static void dx12_shader_audit_report(dx12_device & dev) {
+    if (!dx12_shader_audit_enabled()) {
+        return;
+    }
+
+    struct row {
+        const char * shader;
+        uint32_t     op;
+        uint32_t     flags;
+        int          src0;
+        bool         generic;
+        bool         missed;
+        uint64_t     n;
+    };
+    std::vector<row> rows;
+    uint64_t total = 0, generic_total = 0, missed_total = 0;
+    // Ops where landing on the per-op generic blob is a genuine performance
+    // cliff: the generic kernel is the naive fallback and a specialized
+    // variant is the expected path. Other ops ship only a generic shader, or
+    // their "specializations" are fusion variants -- the plain shader is then
+    // the correct choice for the unfused node and not a finding.
+    auto op_expects_specialization = [](uint32_t op) {
+        switch ((enum ggml_op)op) {
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_FLASH_ATTN_EXT:
+                return true;
+            default:
+                return false;
+        }
+    };
+    for (const auto & kv : dev.pipeline_cache) {
+        const dx12_pipeline & p = kv.second;
+        if (p.dispatches == 0) {
+            continue;
+        }
+        const bool missed = p.generic && op_expects_specialization(p.audit_op);
+        rows.push_back({ p.shader ? p.shader : "?", p.audit_op, p.audit_flags,
+                         p.audit_src0, p.generic, missed, p.dispatches });
+        total += p.dispatches;
+        if (p.generic) {
+            generic_total += p.dispatches;
+        }
+        if (missed) {
+            missed_total += p.dispatches;
+        }
+    }
+    if (rows.empty()) {
+        return;
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const row & a, const row & b) { return a.n > b.n; });
+
+    fprintf(stderr, "\n[DX12_SHADER_AUDIT] device %s (%s) arch=%s wave=%u\n",
+            dev.name.c_str(), dev.description.c_str(),
+            dx12_arch_family_str(dev.arch_family), (unsigned)dev.wave_size);
+    fprintf(stderr, "[DX12_SHADER_AUDIT] %12s  %-4s  %-22s  %5s  %-9s  %s\n",
+            "dispatches", "path", "op", "flags", "src0", "shader");
+    for (const auto & r : rows) {
+        fprintf(stderr, "[DX12_SHADER_AUDIT] %12llu  %-4s  %-22s  %5u  %-9s  %s\n",
+                (unsigned long long)r.n,
+                r.missed ? "MISS" : (r.generic ? "gen" : ""),
+                ggml_op_name((enum ggml_op)r.op),
+                (unsigned)r.flags,
+                ggml_type_name((enum ggml_type)r.src0),
+                r.shader);
+    }
+    fprintf(stderr, "[DX12_SHADER_AUDIT] total=%llu  generic-shader-op=%llu (%.2f%%)  MISSED-specialization=%llu (%.2f%%)\n",
+            (unsigned long long)total,
+            (unsigned long long)(generic_total - missed_total),
+            total ? 100.0 * (double)(generic_total - missed_total) / (double)total : 0.0,
+            (unsigned long long)missed_total,
+            total ? 100.0 * (double)missed_total / (double)total : 0.0);
+    if (missed_total) {
+        fprintf(stderr, "[DX12_SHADER_AUDIT] MISS = naive fallback kernel on an op that expects a specialized variant.\n");
+    }
+    fflush(stderr);
 }
 
 bool ggml_backend_is_dx12(ggml_backend_t backend) {

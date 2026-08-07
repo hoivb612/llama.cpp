@@ -1,4 +1,9 @@
 // Two fused Q8_0 gate/up output rows per wave64, sharing activation loads.
+//
+// RMS_FUSED variant (mul_mat_vec_glu_q8_0_wave64_rms.hlsl): folds the preceding
+// RMS_NORM+MUL into this matvec. src1 carries the pre-norm activation x and src6
+// the norm weight g; one pass accumulates the dots against x*g plus sum(x*x) and
+// applies 1/rms once at the end. op14 = eps (float bits).
 
 #include "ggml_common.hlsli"
 
@@ -66,11 +71,19 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     float gate1 = 0.0f;
     float up0 = 0.0f;
     float up1 = 0.0f;
+#if RMS_FUSED
+    precise float acc_ss = 0.0f;
+#endif
     for (uint k = local_id * VALUES_PER_LANE; k < ne00; k += GROUP_SIZE * VALUES_PER_LANE) {
         uint block = k / QK8_0;
         uint element = k & (QK8_0 - 1u);
         float4 x0 = asfloat(src1.Load4(src1_base + k * 4u));
         float4 x1 = asfloat(src1.Load4(src1_base + (k + 4u) * 4u));
+#if RMS_FUSED
+        acc_ss += dot(x0, x0) + dot(x1, x1);
+        x0 *= asfloat(src6.Load4(k * 4u));
+        x1 *= asfloat(src6.Load4((k + 4u) * 4u));
+#endif
 
         gate0 += q8_dot(src0, gate_row0, block, element, x0, x1);
         up0 += q8_dot(src2, up_row0, block, element, x0, x1);
@@ -84,6 +97,13 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     gate1 = WaveActiveSum(gate1);
     up0 = WaveActiveSum(up0);
     up1 = WaveActiveSum(up1);
+#if RMS_FUSED
+    float rms_scale = 1.0f / sqrt(WaveActiveSum(acc_ss) / (float)ne00 + asfloat(op14));
+    gate0 *= rms_scale;
+    gate1 *= rms_scale;
+    up0   *= rms_scale;
+    up1   *= rms_scale;
+#endif
     if (local_id == 0u) {
         float result0 = (gate0 / (1.0f + exp(-gate0))) * up0;
         uint dst_row0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);

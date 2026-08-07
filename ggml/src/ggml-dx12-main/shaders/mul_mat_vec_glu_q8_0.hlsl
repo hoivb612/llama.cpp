@@ -2,6 +2,12 @@
 //
 // Same fusion as mul_mat_vec_glu_q5_0.hlsl but for Q8_0 weights.
 //
+// RMS_FUSED variant (mul_mat_vec_glu_q8_0_rms.hlsl): folds the preceding
+// RMS_NORM+MUL into this matvec. src1 carries the pre-norm activation x and
+// src6 the norm weight g; the K loop accumulates sum(x*x) alongside the dots
+// against x*g, and 1/rms is applied to the gate and up sums before the SwiGLU
+// (which is non-linear, so it cannot be applied to the result). op14 = eps.
+//
 // Bindings:
 //   src0 (t0): W_gate weights, Q8_0, ne00=K, ne01=N
 //   src1 (t1): x       activation, F32, contiguous, ne10=K
@@ -111,6 +117,9 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     precise float acc_g1 = 0.0f;
     precise float acc_u0 = 0.0f;
     precise float acc_u1 = 0.0f;
+#if RMS_FUSED
+    precise float acc_ss = 0.0f;
+#endif
 
     for (uint block = 0; block < num_blocks; block += BLOCKS_PER_ITER) {
         uint b = block + sub_block;
@@ -120,6 +129,10 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
 
         uint k = b * QK8_0 + elem;
         float x = asfloat(src1.Load(src1_base + k * 4));
+#if RMS_FUSED
+        acc_ss += x * x;
+        x *= asfloat(src6.Load(k * 4));
+#endif
 
         uint blk_g0 = gate_row0 + b * Q8_0_BSIZE;
         uint blk_g1 = gate_row1 + b * Q8_0_BSIZE;
@@ -147,6 +160,9 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     float wave_g1 = WaveActiveSum(acc_g1);
     float wave_u0 = WaveActiveSum(acc_u0);
     float wave_u1 = WaveActiveSum(acc_u1);
+#if RMS_FUSED
+    float wave_ss = WaveActiveSum(acc_ss);
+#endif
 
     uint wave_id   = local_id / WARP_SIZE;
     uint num_waves = (GROUP_SIZE + WARP_SIZE - 1) / WARP_SIZE;
@@ -156,6 +172,9 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         shared_acc[num_waves     + wave_id]  = wave_u0;
         shared_acc[num_waves * 2 + wave_id]  = wave_g1;
         shared_acc[num_waves * 3 + wave_id]  = wave_u1;
+#if RMS_FUSED
+        shared_acc[num_waves * 4 + wave_id]  = wave_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -165,13 +184,23 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
             shared_acc[num_waves     + local_id]  += shared_acc[num_waves     + local_id + s];
             shared_acc[num_waves * 2 + local_id]  += shared_acc[num_waves * 2 + local_id + s];
             shared_acc[num_waves * 3 + local_id]  += shared_acc[num_waves * 3 + local_id + s];
+#if RMS_FUSED
+            shared_acc[num_waves * 4 + local_id]  += shared_acc[num_waves * 4 + local_id + s];
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
     if (local_id == 0) {
+#if RMS_FUSED
+        float rms_scale = 1.0f / sqrt(shared_acc[num_waves * 4] / (float)K + asfloat(op14));
+#endif
         float gate0 = shared_acc[0];
         float up0   = shared_acc[num_waves];
+#if RMS_FUSED
+        gate0 *= rms_scale;
+        up0   *= rms_scale;
+#endif
         float result0 = (gate0 / (1.0f + exp(-gate0))) * up0;
         uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
@@ -179,6 +208,10 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         if (row0 + 1 < ne0) {
             float gate1 = shared_acc[num_waves * 2];
             float up1   = shared_acc[num_waves * 3];
+#if RMS_FUSED
+            gate1 *= rms_scale;
+            up1   *= rms_scale;
+#endif
             float result1 = (gate1 / (1.0f + exp(-gate1))) * up1;
             uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

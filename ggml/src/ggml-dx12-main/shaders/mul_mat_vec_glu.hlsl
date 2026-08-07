@@ -24,6 +24,15 @@
 // op_params:
 //   op1 = W_up base byte offset (within src2)
 //
+// RMS_FUSED variant (mul_mat_vec_glu_rms.hlsl):
+//   Folds the preceding RMS_NORM + MUL(norm_weight) into this dispatch.
+//   src1 carries the pre-norm activation x and src6 the norm weight g, so
+//   the fused output is silu(dot(Wg, x*g)/rms) * (dot(Wu, x*g)/rms) with
+//   rms = sqrt(sum(x*x)/K + eps).  The scale is a scalar over the row, so
+//   one pass accumulates both the dot products and sum(x*x).
+//   src6 (t6): g, F32, K elements, tensor byte offset baked into the VA
+//   op14 = eps (float bits)
+//
 // Only SWIGLU is supported; that is the activation used by every
 // LLaMA-class FFN we currently care about.  Other GLU variants would
 // require a per-variant shader; defer until we have a workload.
@@ -38,7 +47,7 @@
 #define GROUP_SIZE 256
 #define NUM_ROWS   2
 
-groupshared float shared_acc[128];
+groupshared float shared_acc[160];
 
 #if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
 [WaveSize(WAVE_SIZE)]
@@ -74,6 +83,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     precise float acc_up0   = 0.0f;
     precise float acc_gate1 = 0.0f;
     precise float acc_up1   = 0.0f;
+#if RMS_FUSED
+    precise float acc_ss = 0.0f;
+#endif
 
     if (x_contiguous && gate_pair_aligned && up_pair_aligned) {
         // F16 weights + contiguous F32 input — process two rows per group
@@ -84,6 +96,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             uint4 x4 = src1.Load4(x_base + k * 4);
             float x0 = asfloat(x4.x); float x1 = asfloat(x4.y);
             float x2 = asfloat(x4.z); float x3 = asfloat(x4.w);
+#if RMS_FUSED
+            uint4 g4 = src6.Load4(k * 4);
+            acc_ss = mad(x0, x0, mad(x1, x1, mad(x2, x2, mad(x3, x3, acc_ss))));
+            x0 *= asfloat(g4.x); x1 *= asfloat(g4.y);
+            x2 *= asfloat(g4.z); x3 *= asfloat(g4.w);
+#endif
 
 #if NATIVE_FP16
             vector<float16_t,4> wg0 = src0.Load<vector<float16_t,4> >(gate0_base + k * 2);
@@ -121,6 +139,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         }
         for (; k < K; k++) {
             float x = asfloat(src1.Load(x_base + k * 4));
+#if RMS_FUSED
+            acc_ss = mad(x, x, acc_ss);
+            x *= asfloat(src6.Load(k * 4));
+#endif
             acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, 2), x, acc_gate0);
             acc_up0   = mad(load_auto(src2, up0_base   + k * 2, 2), x, acc_up0);
             acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, 2), x, acc_gate1);
@@ -131,6 +153,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // weight base (rare for FFN projections but kept for safety).
         for (uint k = tid; k < K; k += GROUP_SIZE) {
             float x = load_auto(src1, x_base + k * nb10, src1_esize);
+#if RMS_FUSED
+            acc_ss = mad(x, x, acc_ss);
+            x *= asfloat(src6.Load(k * 4));
+#endif
             acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, 2), x, acc_gate0);
             acc_up0   = mad(load_auto(src2, up0_base   + k * 2, 2), x, acc_up0);
             acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, 2), x, acc_gate1);
@@ -142,6 +168,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     float wave_up0   = WaveActiveSum(acc_up0);
     float wave_gate1 = WaveActiveSum(acc_gate1);
     float wave_up1   = WaveActiveSum(acc_up1);
+#if RMS_FUSED
+    float wave_ss = WaveActiveSum(acc_ss);
+#endif
 
     uint wave_id   = tid / WaveGetLaneCount();
     uint num_waves = (GROUP_SIZE + WaveGetLaneCount() - 1) / WaveGetLaneCount();
@@ -151,6 +180,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         shared_acc[32 + wave_id] = wave_up0;
         shared_acc[64 + wave_id] = wave_gate1;
         shared_acc[96 + wave_id] = wave_up1;
+#if RMS_FUSED
+        shared_acc[128 + wave_id] = wave_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -160,6 +192,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             shared_acc[32 + tid] += shared_acc[32 + tid + s];
             shared_acc[64 + tid] += shared_acc[64 + tid + s];
             shared_acc[96 + tid] += shared_acc[96 + tid + s];
+#if RMS_FUSED
+            shared_acc[128 + tid] += shared_acc[128 + tid + s];
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -167,6 +202,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (tid == 0) {
         float gate0 = shared_acc[0];
         float up0   = shared_acc[32];
+#if RMS_FUSED
+        float rms_scale = 1.0f / sqrt(shared_acc[128] / (float)K + asfloat(op14));
+        gate0 *= rms_scale;
+        up0   *= rms_scale;
+#endif
         float result0 = (gate0 / (1.0f + exp(-gate0))) * up0;
         uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
@@ -174,6 +214,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (row0 + 1 < ne0) {
             float gate1 = shared_acc[64];
             float up1   = shared_acc[96];
+#if RMS_FUSED
+            gate1 *= rms_scale;
+            up1   *= rms_scale;
+#endif
             float result1 = (gate1 / (1.0f + exp(-gate1))) * up1;
             uint off_d1 = offset_4d(row1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

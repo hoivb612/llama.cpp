@@ -37,6 +37,10 @@ static void rope_yarn(float theta_extrap, float freq_scale, float corr_low, floa
 // rope_set_rows.hlsl exactly (including partial-rotation passthrough and YaRN).
 // pair_in_head is the rotation pair index within the head. Position rides
 // src2.Load(0) (single-token M=1 decode); freq_factors ride src4.
+#ifndef MMV_ROPE_HAS_FF
+#define MMV_ROPE_HAS_FF op11
+#endif
+
 void mmv_rope_pair(uint pair_in_head, float sum0, float sum1,
                    out float out0, out float out1) {
     uint  n_dims      = op1;
@@ -46,7 +50,7 @@ void mmv_rope_pair(uint pair_in_head, float sum0, float sum1,
     float attn_factor = asfloat(op6);
     float corr_low    = asfloat(op8);
     float corr_high   = asfloat(op9);
-    uint  has_ff      = op11;
+    uint  has_ff      = MMV_ROPE_HAS_FF;
 
     if (pair_in_head >= n_dims / 2u) {
         // Partial-rotation passthrough: elements beyond n_dims copy unchanged.

@@ -21,33 +21,59 @@
 //   op15 KV cache row stride (nb1)
 //   src0/t0 Wq|Wk|Wv   src1/t1 activation   src3/t3 K indices   src5/t5 V indices
 //   dst/u0 Q rope output   temp/u1 KV cache
+//
+// RMS_FUSED variant (mul_mat_vec_qkv_f16_wave64_rms.hlsl, fl=88): the preceding
+// RMS_NORM+MUL dispatch is absorbed. src1 then carries the *un-normalized*
+// activation x and src6/t6 the norm weight g. Because the RMS scale is a scalar
+// over the row, dot(w, (x/rms)*g) == (1/rms) * sum_k(w_k * g_k * x_k), so the
+// single existing pass accumulates sum(x^2) alongside the projection and applies
+// the scale once at the end. Only this variant references src6 -- the production
+// shader's binding manifest is deliberately left unchanged.
+//   op10 bit31 carries has_ff (see MMV_ROPE_HAS_FF)   op11 rms eps (float bits)
 
 #include "ggml_common.hlsli"
+
+#if RMS_FUSED
+// op11 is repurposed to carry eps, so has_ff moves to the top bit of op10.
+#define MMV_ROPE_HAS_FF (op10 >> 31u)
+#endif
+
 #include "rope_yarn.hlsli"
 
 #define GROUP_SIZE 64
 
-#if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
-groupshared float wave_sums[2][GROUP_SIZE / WAVE_SIZE];
+#if RMS_FUSED
+#define QKV_HEAD_DIM (op10 & 0x7fffffffu)
+#define QKV_ACC_SLOTS 3
+#else
+#define QKV_HEAD_DIM op10
+#define QKV_ACC_SLOTS 2
 #endif
 
-void accumulate4(uint weight_offset, uint activation_offset, inout float acc) {
+#if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
+groupshared float wave_sums[QKV_ACC_SLOTS][GROUP_SIZE / WAVE_SIZE];
+#endif
+
+// Weight-side dot step against a pre-loaded activation quad.
+void accumulate4_x(uint weight_offset, float4 x, inout float acc) {
 #if NATIVE_FP16
     vector<float16_t, 4> w = src0.Load<vector<float16_t, 4> >(weight_offset);
-    float4 x = asfloat(src1.Load4(activation_offset));
     acc = mad((float)w.x, x.x,
           mad((float)w.y, x.y,
           mad((float)w.z, x.z,
           mad((float)w.w, x.w, acc))));
 #else
     uint2 packed_w = src0.Load2(weight_offset);
-    float4 x = asfloat(src1.Load4(activation_offset));
     float w0 = f16_to_f32(packed_w.x & 0xffffu);
     float w1 = f16_to_f32(packed_w.x >> 16);
     float w2 = f16_to_f32(packed_w.y & 0xffffu);
     float w3 = f16_to_f32(packed_w.y >> 16);
     acc = mad(w0, x.x, mad(w1, x.y, mad(w2, x.z, mad(w3, x.w, acc))));
 #endif
+}
+
+void accumulate4(uint weight_offset, uint activation_offset, inout float acc) {
+    accumulate4_x(weight_offset, asfloat(src1.Load4(activation_offset)), acc);
 }
 
 float load_f16_scalar(uint byte_offset) {
@@ -81,9 +107,31 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
 
     float acc   = 0.0f;
     float acc_p = 0.0f;
+    float ss    = 0.0f;
     uint k = local_id * 4u;
     const uint stride = GROUP_SIZE * 4u;
 
+#if RMS_FUSED
+    for (; k + 3u < ne00; k += stride) {
+        float4 x  = asfloat(src1.Load4(src1_row + k * 4u));
+        float4 g  = asfloat(src6.Load4(k * 4u));
+        ss = mad(x.x, x.x, mad(x.y, x.y, mad(x.z, x.z, mad(x.w, x.w, ss))));
+        float4 xg = x * g;
+        accumulate4_x(src0_row + k * 2u, xg, acc);
+        if (rope) {
+            accumulate4_x(src0_row_p + k * 2u, xg, acc_p);
+        }
+    }
+    for (; k < ne00; ++k) {
+        float x  = asfloat(src1.Load(src1_row + k * 4u));
+        float xg = x * asfloat(src6.Load(k * 4u));
+        ss = mad(x, x, ss);
+        acc = mad(load_f16_scalar(src0_row + k * 2u), xg, acc);
+        if (rope) {
+            acc_p = mad(load_f16_scalar(src0_row_p + k * 2u), xg, acc_p);
+        }
+    }
+#else
     for (; k + 3u < ne00; k += stride) {
         accumulate4(src0_row + k * 2u, src1_row + k * 4u, acc);
         if (rope) {
@@ -97,26 +145,39 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
             acc_p = mad(load_f16_scalar(src0_row_p + k * 2u), x, acc_p);
         }
     }
+#endif
 
     float sum   = WaveActiveSum(acc);
     float sum_p = 0.0f;
     if (rope) {
         sum_p = WaveActiveSum(acc_p);
     }
+#if RMS_FUSED
+    float sum_ss = WaveActiveSum(ss);
+#endif
 
 #if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
     if (WaveIsFirstLane()) {
         wave_sums[0][local_id / WAVE_SIZE] = sum;
         wave_sums[1][local_id / WAVE_SIZE] = sum_p;
+#if RMS_FUSED
+        wave_sums[2][local_id / WAVE_SIZE] = sum_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
     if (local_id == 0u) {
         sum   = 0.0f;
         sum_p = 0.0f;
+#if RMS_FUSED
+        sum_ss = 0.0f;
+#endif
         [unroll]
         for (uint wave = 0; wave < GROUP_SIZE / WAVE_SIZE; ++wave) {
             sum   += wave_sums[0][wave];
             sum_p += wave_sums[1][wave];
+#if RMS_FUSED
+            sum_ss += wave_sums[2][wave];
+#endif
         }
     }
 #endif
@@ -124,11 +185,16 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     if (local_id == 0u) {
         uint cache_esize = op7;
         uint cache_nb1   = op15;
+#if RMS_FUSED
+        float scale = 1.0f / sqrt(sum_ss / (float)ne00 + asfloat(op11));
+        sum   *= scale;
+        sum_p *= scale;
+#endif
         if (rope) {
             uint row0 = row & ~1u;
             float sum0 = (row == row0) ? sum   : sum_p;
             float sum1 = (row == row0) ? sum_p : sum;
-            uint pair_in_head = (row0 % op10) / 2u;
+            uint pair_in_head = (row0 % QKV_HEAD_DIM) / 2u;
             float out0, out1;
             mmv_rope_pair(pair_in_head, sum0, sum1, out0, out1);
             float outv = (row == row0) ? out0 : out1;

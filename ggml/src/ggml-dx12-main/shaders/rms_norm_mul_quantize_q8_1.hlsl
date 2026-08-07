@@ -47,9 +47,10 @@
 
 groupshared float wave_sums[32];
 
-#if !defined(WAVE_SIZE) || (WAVE_SIZE < 32)
-// Shared-memory fallback for wave=16: each 32-lane Q8_1 block spans 2 waves,
-// so WaveReadLaneAt cannot reach across. Use shared-memory butterfly.
+#if !defined(WAVE_SIZE) || (WAVE_SIZE < 32 && WAVE_SIZE != 16)
+// Shared-memory fallback for sub-32 waves not covered by the wave16 path
+// below: a 32-lane Q8_1 block spans several waves, so WaveReadLaneAt cannot
+// reach across it.
 groupshared uint  gs_amax_bits[256];
 groupshared int   gs_qsum[256];
 #endif
@@ -105,6 +106,70 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     // NO group syncs. For wave<32, fall back to shared-memory reduction.
     // --------------------------------------------------------------------
     uint num_blocks     = ne00 / 32;
+
+#if defined(WAVE_SIZE) && (WAVE_SIZE == 16)
+    // wave16 (Intel Xe): give each wave one whole Q8_1 block, 16 lanes x 2
+    // elements, so both per-block reductions stay inside a single wave. The
+    // shared-memory butterfly used by the generic sub-32 path needs 10
+    // GroupMemoryBarrierWithGroupSync per chunk, which dominates the shader
+    // on this hardware.
+    uint w_id   = local_id / 16u;   // wave index == block within chunk
+    uint w_lane = local_id & 15u;   // == WaveGetLaneIndex() for 256/16 groups
+
+    for (uint chunk_start = 0; chunk_start < num_blocks; chunk_start += 16u) {
+        uint block_idx = chunk_start + w_id;
+        bool in_range = (block_idx < num_blocks);
+
+        float n0 = 0.0f;
+        float n1 = 0.0f;
+        if (in_range) {
+            uint i0 = block_idx * 32u + w_lane * 2u;
+            [unroll] for (uint e = 0u; e < 2u; ++e) {
+                uint off_src = offset_4d(i0 + e, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
+                uint off_wt  = offset_4d((i0 + e) % ne10, i1 % ne11, i2 % ne12, i3 % ne13,
+                                          nb10, nb11, nb12, nb13, src1_offset);
+                float val = load_auto(src0, off_src, src0_esize);
+                float wt  = load_auto(src1, off_wt, src1_esize);
+                float nv  = val * scale_val * wt;
+                if (e == 0u) { n0 = nv; } else { n1 = nv; }
+                if (skip_f32_dst == 0u) {
+                    uint off_dst = offset_4d(i0 + e, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+                    store_auto(dst, off_dst, nv, dst_esize);
+                }
+            }
+        }
+
+        float amax      = WaveActiveMax(max(abs(n0), abs(n1)));
+        float d_scale   = amax / 127.0f;
+        float inv_scale = (d_scale > 0.0f) ? (127.0f / amax) : 0.0f;
+        int q0 = clamp((int)round(n0 * inv_scale), -128, 127);
+        int q1 = clamp((int)round(n1 * inv_scale), -128, 127);
+        if (!in_range) { q0 = 0; q1 = 0; }
+        int qsum = WaveActiveSum(q0 + q1);
+
+        uint global_block = row * num_blocks + block_idx;
+        uint q8_off = global_block * 36u;
+
+        if (in_range && w_lane == 0u) {
+            uint d_bits = f32tof16(d_scale);
+            uint s_bits = f32tof16(d_scale * float(qsum));
+            temp.Store(q8_off, d_bits | (s_bits << 16));
+        }
+
+        // Pack 4 quants per word: lanes (2L, 2L+1) supply word L. WaveReadLaneAt
+        // must be reached from wave-uniform control flow, so evaluate it on
+        // every lane and gate only the store.
+        int p0 = WaveReadLaneAt(q0, (w_lane + 1u) & 15u);
+        int p1 = WaveReadLaneAt(q1, (w_lane + 1u) & 15u);
+        if (in_range && (w_lane & 1u) == 0u) {
+            uint packed = (((uint)q0 & 0xFFu))       |
+                          (((uint)q1 & 0xFFu) <<  8) |
+                          (((uint)p0 & 0xFFu) << 16) |
+                          (((uint)p1 & 0xFFu) << 24);
+            temp.Store(q8_off + 4u + (w_lane >> 1) * 4u, packed);
+        }
+    }
+#else
     uint block_in_chunk = local_id / 32;   // 0..7
     uint lane_in_block  = local_id & 31;   // 0..31
 #if !defined(WAVE_SIZE) || (WAVE_SIZE < 32)
@@ -240,4 +305,5 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
         GroupMemoryBarrierWithGroupSync();
 #endif
     }
+#endif  // WAVE_SIZE == 16
 }

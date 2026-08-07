@@ -26,19 +26,48 @@
 //   dst/u0 Q rope output   temp/u1 KV cache
 // op15 rides the KV cache row stride here, so the group index comes from
 // group_id.x directly (group_x_2d would fold op15 into the row).
+//
+// RMS_FUSED variant (mul_mat_vec_qkv_q8_0_mr256_rms.hlsl):
+//   Folds the preceding RMS_NORM + MUL(norm_weight) into this dispatch. src1
+//   carries the pre-norm activation x, src6 the norm weight g, and op11 is
+//   repurposed for eps (has_ff moves into bit 31 of op10). The RMS scale is a
+//   scalar over the row, so one pass accumulates both the dot products and
+//   sum(x*x); rope is linear in (sum0, sum1) so scaling before it is exact.
+//
+// QKV_DP4A variant (mul_mat_vec_qkv_q8_0_dp4a.hlsl):
+//   src1 is the Q8_1 scratch from the quantize pre-pass instead of the F32
+//   activation, and the dot products use dot4add_i8packed. Mutually exclusive
+//   with RMS_FUSED, which needs the un-normalized F32 activation.
 
 #include "ggml_common.hlsli"
+#if RMS_FUSED
+#define MMV_ROPE_HAS_FF (op10 >> 31u)
+#endif
 #include "rope_yarn.hlsli"
+
+#if RMS_FUSED
+#define QKV_HEAD_DIM  (op10 & 0x7fffffffu)
+#define QKV_ACC_SLOTS 3
+#else
+#define QKV_HEAD_DIM  op10
+#define QKV_ACC_SLOTS 2
+#endif
 
 #ifndef GROUP_SIZE
 #define GROUP_SIZE       64
 #endif
 #define QK8_0            32
 #define Q8_0_BSIZE       34
+#define Q8_1_BSIZE       36
 #define VALUES_PER_LANE   8
+#if QKV_DP4A
+// 8 lanes cooperate on one Q8_0 block, so a group covers this many blocks
+// per iteration.
+#define BLOCKS_PER_ITER  (GROUP_SIZE / 8)
+#endif
 
 #if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
-groupshared float wave_sums[2][GROUP_SIZE / WAVE_SIZE];
+groupshared float wave_sums[QKV_ACC_SLOTS][GROUP_SIZE / WAVE_SIZE];
 #endif
 
 uint read_u32_unaligned(uint byte_offset) {
@@ -92,8 +121,49 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     uint src0_row1 = src0_offset + row1 * nb01;
     uint src1_row  = src1_offset;
 
+#if QKV_DP4A
+    // Match the precise accumulation of the fl=17 matvec this replaces, so the
+    // fused result stays bit-identical to the three separate dispatches.
+    precise float acc0 = 0.0f;
+    precise float acc1 = 0.0f;
+#else
     float acc0 = 0.0f;
     float acc1 = 0.0f;
+#endif
+#if RMS_FUSED
+    float acc_ss = 0.0f;
+#endif
+#if QKV_DP4A
+    // src1 is the Q8_1 scratch produced by the quantize pre-pass, so the
+    // activation is read once as packed int8 and consumed by dot4add.
+    // M=1, so the flat row base is src1_offset.
+    uint num_blocks = ne00 / QK8_0;
+    uint sub  = local_id / 8u;
+    uint lane = local_id % 8u;
+    uint l0   = lane * 4u;
+    for (uint block_idx = sub; block_idx < num_blocks;
+         block_idx += BLOCKS_PER_ITER) {
+        uint q8_off = src1_row + block_idx * Q8_1_BSIZE;
+        float a_d = f16_to_f32(src1.Load(q8_off) & 0xffffu);
+        uint a_packed = src1.Load(q8_off + 4u + l0);
+
+        uint w_off0 = src0_row0 + block_idx * Q8_0_BSIZE;
+        float d0 = read_f16_unaligned(w_off0);
+        uint w_packed0 = read_u32_unaligned(w_off0 + 2u + l0);
+        int isum0 = 0;
+        isum0 = dot4add_i8packed(w_packed0, a_packed, isum0);
+        acc0 += d0 * a_d * float(isum0);
+
+        if (has_row1) {
+            uint w_off1 = src0_row1 + block_idx * Q8_0_BSIZE;
+            float d1 = read_f16_unaligned(w_off1);
+            uint w_packed1 = read_u32_unaligned(w_off1 + 2u + l0);
+            int isum1 = 0;
+            isum1 = dot4add_i8packed(w_packed1, a_packed, isum1);
+            acc1 += d1 * a_d * float(isum1);
+        }
+    }
+#else
     for (uint k = local_id * VALUES_PER_LANE; k < ne00;
          k += GROUP_SIZE * VALUES_PER_LANE) {
         uint block = k / QK8_0;
@@ -102,6 +172,11 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         uint block_offset1 = src0_row1 + block * Q8_0_BSIZE;
         float4 x0 = asfloat(src1.Load4(src1_row + k * 4u));
         float4 x1 = asfloat(src1.Load4(src1_row + (k + 4u) * 4u));
+#if RMS_FUSED
+        acc_ss += dot(x0, x0) + dot(x1, x1);
+        x0 *= asfloat(src6.Load4(k * 4u));
+        x1 *= asfloat(src6.Load4((k + 4u) * 4u));
+#endif
 
         float d0 = read_f16_unaligned(block_offset0);
         uint packed00 = read_u32_unaligned(block_offset0 + 2u + element);
@@ -115,25 +190,46 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
             acc1 += d1 * (dot_q8_0(packed10, x0) + dot_q8_0(packed11, x1));
         }
     }
+#endif
 
     float sum0 = WaveActiveSum(acc0);
     float sum1 = WaveActiveSum(acc1);
+#if RMS_FUSED
+    float sum_ss = WaveActiveSum(acc_ss);
+#endif
 
 #if defined(WAVE_SIZE) && WAVE_SIZE < GROUP_SIZE
     if (WaveIsFirstLane()) {
         uint wave = local_id / WAVE_SIZE;
         wave_sums[0][wave] = sum0;
         wave_sums[1][wave] = sum1;
+#if RMS_FUSED
+        wave_sums[2][wave] = sum_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
     if (local_id == 0u) {
         sum0 = 0.0f;
         sum1 = 0.0f;
+#if RMS_FUSED
+        sum_ss = 0.0f;
+#endif
         [unroll]
         for (uint wave = 0; wave < GROUP_SIZE / WAVE_SIZE; ++wave) {
             sum0 += wave_sums[0][wave];
             sum1 += wave_sums[1][wave];
+#if RMS_FUSED
+            sum_ss += wave_sums[2][wave];
+#endif
         }
+    }
+#endif
+
+#if RMS_FUSED
+    {
+        float rms_scale = 1.0f / sqrt(sum_ss / (float)ne00 + asfloat(op11));
+        sum0 *= rms_scale;
+        sum1 *= rms_scale;
     }
 #endif
 
@@ -142,7 +238,7 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         uint cache_nb1   = op15;
         uint local_row0  = row0 - region_base;
         if (rope) {
-            uint pair_in_head = (row0 % op10) / 2u;
+            uint pair_in_head = (row0 % QKV_HEAD_DIM) / 2u;
             float out0, out1;
             mmv_rope_pair(pair_in_head, sum0, sum1, out0, out1);
             if (region == 0u) {

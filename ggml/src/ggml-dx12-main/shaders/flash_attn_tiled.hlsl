@@ -9,24 +9,47 @@
 #ifndef FA_BR
 #define FA_BR 8
 #endif
+// One KV column per lane. Tying the column count to the wave width makes each
+// query row's 32/64 scores wave-local, so the online-softmax row reductions
+// become WaveActiveMax/WaveActiveSum instead of a serial scan over the tile on
+// FA_BR threads while the rest of the group waits at a barrier.
+// Without native fp16 the tile stays f32, so keep the original 32-column tile:
+// a wave64 device would otherwise double an f32 K/V tile and lose occupancy.
+#if defined(WAVE_SIZE) && defined(NATIVE_FP16)
+#define FA_BC WAVE_SIZE
+#else
 #define FA_BC 32
+#endif
 #define FA_MAX_D 128
 #define FA_DVEC (FA_MAX_D / 4)
 #define FA_THREADS 128
-#define FA_ROW_SETS (FA_BR / 4)
+#define FA_ROW_GROUPS (FA_THREADS / FA_BC)
+#define FA_ROW_SETS (FA_BR / FA_ROW_GROUPS)
 
-groupshared float4 s_q[FA_BR][FA_DVEC];
-// Pad the K/V tile stride by one float4. The QK inner loop reads s_kv[c][dv]
-// with c = tid & 31 and dv loop-invariant; an unpadded stride of FA_DVEC
-// float4s puts every lane on the same LDS bank (32-way conflict). Padding
-// makes the bank rotate with c, leaving only the 4-way conflict inherent to
-// float4 accesses.
-groupshared float4 s_kv[FA_BC][FA_DVEC + 1];
+// Q/K/V tiles are staged as half4 when the device has native 16-bit ops. K/V
+// arrive as f16 in the common case, so this is lossless for them, and it keeps
+// the wider FA_BC tile within the same LDS budget the f32 tile used at
+// FA_BC=32. Devices without native fp16 keep the f32 tile: they use the
+// narrower FA_BC that their smaller wave implies, so the LDS budget still fits.
+#if defined(NATIVE_FP16)
+typedef float16_t4 fa_vec4;
+#else
+typedef float4 fa_vec4;
+#endif
+
+groupshared fa_vec4 s_q[FA_BR][FA_DVEC];
+// Pad the K/V tile stride by one half4. The QK inner loop reads s_kv[c][dv]
+// with c = tid & (FA_BC-1) and dv loop-invariant; an unpadded stride of
+// FA_DVEC puts every lane on the same LDS bank (32-way conflict). Padding
+// makes the bank rotate with c.
+groupshared fa_vec4 s_kv[FA_BC][FA_DVEC + 1];
 groupshared float  s_scores[FA_BR][FA_BC];
+groupshared float  s_tile_max[FA_BR];
 groupshared float  s_global_max[FA_BR];
 groupshared float  s_global_sum[FA_BR];
 groupshared float  s_correction[FA_BR];
 groupshared uint   s_tile_active[FA_BR];
+groupshared uint   s_tile_any;
 
 float4 fa_load4(ByteAddressBuffer buf, uint byte_offset, uint elem_size) {
     if (elem_size == 4) {
@@ -67,11 +90,21 @@ float4 fa_load4(ByteAddressBuffer buf, uint byte_offset, uint elem_size) {
         f16_to_f32(v3));
 }
 
-float fa_lane(float4 v, uint lane) {
-    if (lane == 0) return v.x;
-    if (lane == 1) return v.y;
-    if (lane == 2) return v.z;
-    return v.w;
+// Half-rate multiply with f32 accumulate (v_dot2_f32_f16) where available.
+float fa_dot4(fa_vec4 q, fa_vec4 k, float acc) {
+#if defined(NATIVE_FP16)
+    float a = dot2add(q.xy, k.xy, acc);
+    return dot2add(q.zw, k.zw, a);
+#else
+    return acc + dot(q, k);
+#endif
+}
+
+float fa_lane(fa_vec4 v, uint lane) {
+    if (lane == 0) return (float)v.x;
+    if (lane == 1) return (float)v.y;
+    if (lane == 2) return (float)v.z;
+    return (float)v.w;
 }
 
 WAVE_SIZE_ATTR
@@ -142,13 +175,29 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             uint q_base = src0_offset + query_idx * nb01 + head_idx * nb02 + batch_idx * nb03;
             qv = asfloat(src0.Load4(q_base + dv * 16u));
         }
-        s_q[r][dv] = qv;
+        s_q[r][dv] = (fa_vec4)qv;
     }
 
     if (tid < FA_BR) {
         s_global_max[tid] = neg_max;
         s_global_sum[tid] = 0.0f;
     }
+
+    // The PV pass gives each thread one output element, so D_v threads are busy
+    // and the rest idle. When D_v is only half the group, split the KV columns
+    // across two sub-groups instead and fold the partials in at the end. The
+    // online-softmax correction is a scalar multiply applied to both sub-groups
+    // every tile, so the split stays exact. The fold reuses s_scores, which is
+    // dead by then, so this costs no extra LDS - important, because another
+    // 2 KB drops the group from 3 to 2 per CU and more than undoes the gain.
+#if FA_BC * 2 >= FA_THREADS
+    const uint pv_split = (D_v * 2u <= FA_THREADS) ? 2u : 1u;
+#else
+    const uint pv_split = 1u;
+#endif
+    const uint pv_threads = D_v * pv_split;
+    const uint pv_sub     = pv_split == 1u ? 0u : tid / D_v;
+    const uint pv_shift   = pv_split == 1u ? 0u : 1u;
 
     precise float acc[FA_BR];
     [unroll]
@@ -159,6 +208,46 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     for (uint tile_start = 0; tile_start < N_kv; tile_start += FA_BC) {
         uint tile_size = min((uint)FA_BC, N_kv - tile_start);
+
+        // A causal or sliding-window mask leaves whole KV tiles fully masked.
+        // Scanning the tile's mask first is far cheaper than staging K/V and
+        // running the QK, softmax and PV passes only to discard them. Skipping
+        // is exact: a fully masked tile leaves acc and the online-softmax state
+        // untouched.
+        if (has_mask != 0u) {
+            if (tid == 0) {
+                s_tile_any = 0u;
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            uint any_local = 0u;
+            uint mhb = (head_idx % mask_ne2) * mask_nb2
+                     + (batch_idx % mask_ne3) * mask_nb3;
+            for (uint midx = tid; midx < FA_BR * FA_BC; midx += FA_THREADS) {
+                uint mr = midx / FA_BC;
+                uint mc = midx % FA_BC;
+                uint mq = q_start + mr;
+                float mv = 0.0f;
+                if (mq < N_queries && mc < tile_size) {
+                    mv = load_auto(
+                        src3, mask_off + mq * mask_nb1 + mhb + (tile_start + mc) * mask_nb0,
+                        mask_es);
+                    if (!isinf(mv)) {
+                        any_local = 1u;
+                    }
+                }
+                // Cache for the QK pass so a kept tile reads the mask once.
+                s_scores[mr][mc] = mv;
+            }
+            if (any_local != 0u) {
+                InterlockedOr(s_tile_any, 1u);
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            if (s_tile_any == 0u) {
+                continue;
+            }
+        }
 
         // Stage K once, shared by all query rows.
         const uint kv_vec_count = FA_BC * dvecs;
@@ -171,13 +260,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 uint k_base = src1_offset + kv * nb11 + kv_head * nb12 + batch_idx * nb13;
                 kval = fa_load4(src1, k_base + dv * 4u * nb10, src1_esize);
             }
-            s_kv[c][dv] = kval;
+            s_kv[c][dv] = (fa_vec4)kval;
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // Four 32-thread rows cover query rows 0..3. Each thread handles the
-        // corresponding row in every 4-row set, reusing one K vector across
-        // 2 rows for FA_BR=8 or 4 rows for FA_BR=16.
+        // FA_ROW_GROUPS waves of FA_BC lanes cover query rows 0..FA_ROW_GROUPS-1.
+        // Each thread handles the corresponding row in every row set, reusing one
+        // K vector across FA_ROW_SETS rows. Lanes within a wave differ only in c,
+        // so a row's scores are wave-local and reduce without LDS or barriers.
         uint c = tid & (FA_BC - 1u);
         uint base_r = tid / FA_BC;
         precise float qk_local[FA_ROW_SETS];
@@ -194,19 +284,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
 
         if (c < tile_size) {
-            uint mask_head_batch = (head_idx % mask_ne2) * mask_nb2
-                                 + (batch_idx % mask_ne3) * mask_nb3;
             [unroll]
             for (uint rr = 0; rr < FA_ROW_SETS; ++rr) {
-                uint r = base_r + rr * 4u;
+                uint r = base_r + rr * FA_ROW_GROUPS;
                 uint query_idx = q_start + r;
                 if (query_idx < N_queries) {
                     active_local[rr] = 1u;
                 }
                 if (has_mask != 0u && active_local[rr] != 0u) {
-                    uint mask_base = mask_off + query_idx * mask_nb1 + mask_head_batch;
-                    mask_local[rr] = load_auto(
-                        src3, mask_base + (tile_start + c) * mask_nb0, mask_es) * slope;
+                    mask_local[rr] = s_scores[r][c] * slope;
                     if (isinf(mask_local[rr])) {
                         active_local[rr] = 0u;
                     }
@@ -214,12 +300,12 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
 
             for (uint dv = 0; dv < dvecs; ++dv) {
-                float4 kval = s_kv[c][dv];
+                fa_vec4 kval = s_kv[c][dv];
                 [unroll]
                 for (uint rr = 0; rr < FA_ROW_SETS; ++rr) {
                     if (active_local[rr] != 0u) {
-                        uint r = base_r + rr * 4u;
-                        qk_local[rr] += dot(s_q[r][dv], kval);
+                        uint r = base_r + rr * FA_ROW_GROUPS;
+                        qk_local[rr] = fa_dot4(s_q[r][dv], kval, qk_local[rr]);
                     }
                 }
             }
@@ -238,8 +324,23 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
         [unroll]
         for (uint rr = 0; rr < FA_ROW_SETS; ++rr) {
-            uint r = base_r + rr * 4u;
+            uint r = base_r + rr * FA_ROW_GROUPS;
             s_scores[r][c] = score_local[rr];
+        }
+
+        // Row maximum. When the runtime wave matches FA_BC every lane of a wave
+        // holds a distinct column of the same row, so this is a pure wave
+        // reduction. The LDS scan is kept for drivers that widen the wave past
+        // the requested [WaveSize(N)].
+        const bool wave_exact = (WaveGetLaneCount() == FA_BC);
+        if (wave_exact) {
+            [unroll]
+            for (uint rr = 0; rr < FA_ROW_SETS; ++rr) {
+                float m = WaveActiveMax(score_local[rr]);
+                if (WaveIsFirstLane()) {
+                    s_tile_max[base_r + rr * FA_ROW_GROUPS] = m;
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
 
@@ -247,8 +348,12 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         if (tid < FA_BR) {
             uint r = tid;
             float tile_max = neg_max;
-            for (uint c = 0; c < tile_size; ++c) {
-                tile_max = max(tile_max, s_scores[r][c]);
+            if (wave_exact) {
+                tile_max = s_tile_max[r];
+            } else {
+                for (uint c = 0; c < tile_size; ++c) {
+                    tile_max = max(tile_max, s_scores[r][c]);
+                }
             }
 
             uint active = (q_start + r < N_queries && tile_max != neg_max) ? 1u : 0u;
@@ -266,7 +371,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < D_v) {
+        if (tid < pv_threads) {
             [unroll]
             for (uint r = 0; r < FA_BR; ++r) {
                 acc[r] *= s_correction[r];
@@ -275,23 +380,31 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
         [unroll]
         for (uint rr = 0; rr < FA_ROW_SETS; ++rr) {
-            uint r = base_r + rr * 4u;
+            uint r = base_r + rr * FA_ROW_GROUPS;
             float p = 0.0f;
             if (c < tile_size && s_tile_active[r] != 0u && score_local[rr] != neg_max) {
                 p = exp(score_local[rr] - s_global_max[r]);
             }
             s_scores[r][c] = p;
+            if (wave_exact) {
+                float row_sum = WaveActiveSum(p);
+                if (WaveIsFirstLane() && s_tile_active[r] != 0u) {
+                    s_global_sum[r] += row_sum;
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < FA_BR && s_tile_active[tid] != 0u) {
-            float tile_sum = 0.0f;
-            for (uint c = 0; c < tile_size; ++c) {
-                tile_sum += s_scores[tid][c];
+        if (!wave_exact) {
+            if (tid < FA_BR && s_tile_active[tid] != 0u) {
+                float tile_sum = 0.0f;
+                for (uint c = 0; c < tile_size; ++c) {
+                    tile_sum += s_scores[tid][c];
+                }
+                s_global_sum[tid] += tile_sum;
             }
-            s_global_sum[tid] += tile_sum;
+            GroupMemoryBarrierWithGroupSync();
         }
-        GroupMemoryBarrierWithGroupSync();
 
         // Reuse the shared K tile for V, then update all query-row outputs.
         const uint v_vec_count = FA_BC * (D_v / 4);
@@ -304,14 +417,17 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 uint v_base = src2_off + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
                 vval = fa_load4(src2, v_base + dv * 4u * src2_nb0, src2_es);
             }
-            s_kv[c][dv] = vval;
+            s_kv[c][dv] = (fa_vec4)vval;
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < D_v) {
-            uint dv = tid / 4;
+        if (tid < pv_threads) {
+            uint dv = (tid - pv_sub * D_v) / 4;
             uint lane = tid & 3u;
-            for (uint vc = 0; vc < tile_size; ++vc) {
+            // Contiguous column range per sub-group, so the loop keeps a stride
+            // of one and collapses to the original loop when pv_split == 1.
+            uint vc_end = (tile_size * (pv_sub + 1u)) >> pv_shift;
+            for (uint vc = (tile_size * pv_sub) >> pv_shift; vc < vc_end; ++vc) {
                 float vval = fa_lane(s_kv[vc][dv], lane);
                 [unroll]
                 for (uint r = 0; r < FA_BR; ++r) {
@@ -322,6 +438,23 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             }
         }
         GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Fold the second KV-column sub-group's partials into sub-group 0.
+    if (pv_split > 1u) {
+        if (tid >= D_v && tid < pv_threads) {
+            [unroll]
+            for (uint r = 0; r < FA_BR; ++r) {
+                s_scores[r][tid - D_v] = acc[r];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < D_v) {
+            [unroll]
+            for (uint r = 0; r < FA_BR; ++r) {
+                acc[r] += s_scores[r][tid];
+            }
+        }
     }
 
     if (has_sinks != 0u) {
