@@ -108,4 +108,17 @@ if (WIN32)
         NOMINMAX
     )
     target_link_libraries(usampler_c PRIVATE dbghelp winmm)
+
+    # -----------------------------------------------------------------------
+    # cpuid_diag - AVX-512 / AVX512-FP16 CPUID diagnostic. Self-contained C,
+    # no extra libraries (uses <intrin.h> __cpuid/__cpuidex/_xgetbv).
+    # -----------------------------------------------------------------------
+    add_executable(cpuid_diag cpuid_diag.c)
+    install(TARGETS cpuid_diag RUNTIME)
+    target_compile_definitions(cpuid_diag PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
 endif()
