@@ -37,7 +37,7 @@
 /* ---- types --------------------------------------------------------------- */
 typedef struct { DWORD64 base; DWORD64 size; char name[64]; char path[MAX_PATH]; } ModInfo;
 typedef struct { DWORD64 addr; unsigned int count; } Hit;         /* count==0 => empty */
-typedef struct { char name[256]; ULONGLONG count; } NameCount;
+typedef struct { char name[256]; ULONG64 count; } NameCount;
 
 /* ---- globals ------------------------------------------------------------- */
 static FILE*    g_out    = NULL;
@@ -157,7 +157,7 @@ static void hits_add(DWORD64 a) {
 }
 
 /* ---- name -> count aggregation ------------------------------------------- */
-static void nc_add(NameCount** arr, size_t* n, size_t* cap, const char* name, ULONGLONG add) {
+static void nc_add(NameCount** arr, size_t* n, size_t* cap, const char* name, ULONG64 add) {
     size_t i;
     for (i = 0; i < *n; i++) {
         if (strcmp((*arr)[i].name, name) == 0) { (*arr)[i].count += add; return; }
@@ -323,12 +323,42 @@ static void dumpNC(NameCount* arr, size_t n, double denom, int skipIdle,
     size_t i, shown = 0;
     qsort(arr, n, sizeof(NameCount), nc_cmp);
     emit("\n%s\n", title);
+
+    double cum_percent = 0.0;
     for (i = 0; i < n && shown < topN; i++) {
         if (skipIdle && isIdle(arr[i].name)) {
             continue;
         }
-        emit("  %6.2f%%  %8llu  %s\n", 100.0 * (double)arr[i].count / denom,
-             (unsigned long long)arr[i].count, arr[i].name);
+
+        double percent = 100.0 * (double)arr[i].count / denom;
+        cum_percent += percent;
+
+        //
+        // Look for module name suffix of either ".dll" or ".exe".
+        //
+
+        char * type = strstr(arr[i].name, ".dll!");
+        if (!type) {
+            type = strstr(arr[i].name, ".exe!");
+        }
+
+        //
+        // If no file type, then use full name. Otherwise, trim out the type to
+        // save line space.
+        //
+
+        if (!type) {
+            emit("%6.2f%% %6.2f%% %8llu %s\n", percent, cum_percent,
+                 (ULONG64)arr[i].count, arr[i].name);
+
+        } else {
+            *type = '\0';
+            emit("%6.2f%% %6.2f%% %8llu %s%s\n", percent, cum_percent,
+                 (ULONG64)arr[i].count, arr[i].name, type + 4);
+
+            *type = '.';
+        }
+
         shown++;
     }
 }
@@ -345,7 +375,7 @@ int main(int argc, char** argv) {
     char symbuf[sizeof(SYMBOL_INFO) + 1024];
     NameCount* byFunc = NULL; size_t nFunc = 0, capFunc = 0;
     NameCount* byMod  = NULL; size_t nMod  = 0, capMod  = 0;
-    ULONGLONG total = 0, skipped = 0, idleSamples = 0, computeSamples = 0;
+    ULONG64 total = 0, skipped = 0, idleSamples = 0, computeSamples = 0;
     int warmupDone;
     double lastModMs, lastThrMs;
     int timerPeriodActive = 0;
@@ -488,7 +518,7 @@ int main(int argc, char** argv) {
     if (timerPeriodActive) endTimerPeriod(1);
 
     emit("[usampler] child exited. total samples = %llu (warmup-skipped = %llu) across %zu modules.\n",
-         (unsigned long long)total, (unsigned long long)skipped, g_mn);
+         (ULONG64)total, (ULONG64)skipped, g_mn);
     if (total == 0) { 
         emit("[usampler] no samples collected.\n"); if (g_out) fclose(g_out); return 0; 
     }
@@ -547,7 +577,7 @@ int main(int argc, char** argv) {
             }
         } else {
             _snprintf(fn, sizeof(fn), "%s+0x%llx", modName,
-                      (unsigned long long)(mi >= 0 ? (a - g_mods[mi].base) : a));
+                      (ULONG64)(mi >= 0 ? (a - g_mods[mi].base) : a));
         }
         fn[sizeof(fn) - 1] = 0;
         nc_add(&byFunc, &nFunc, &capFunc, fn, c);
@@ -562,15 +592,15 @@ int main(int argc, char** argv) {
     computeSamples = total - idleSamples;
 
     emit("\n================ PROFILE (total samples = %llu) ================\n",
-         (unsigned long long)total);
+         (ULONG64)total);
     emit("  idle/scheduler = %6.2f%% (%llu)   compute = %6.2f%% (%llu)\n",
-         100.0 * (double)idleSamples / (double)total,    (unsigned long long)idleSamples,
-         100.0 * (double)computeSamples / (double)total, (unsigned long long)computeSamples);
+         100.0 * (double)idleSamples / (double)total,    (ULONG64)idleSamples,
+         100.0 * (double)computeSamples / (double)total, (ULONG64)computeSamples);
 
-    dumpNC(byMod,  nMod,  (double)total, 0, "-- top modules by self-samples (all) --", 15);
+    dumpNC(byMod, nMod, (double)total, 0, "-- top modules by self-samples (all) --", 15);
     dumpNC(byFunc, nFunc, (double)total, 0, "-- top 45 functions by self-samples (all, incl. idle) --", 45);
     dumpNC(byFunc, nFunc, computeSamples ? (double)computeSamples : 1.0, 1,
-           "-- top 45 COMPUTE functions (idle excluded, % of compute) --", 45);
+           "-- top 45 COMPUTE functions (idle excluded, % of compute + cumulative %) --", 45);
 
     SymCleanup(hCur);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
