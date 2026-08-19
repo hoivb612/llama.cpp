@@ -99,7 +99,7 @@ if (WIN32)
     )
     target_link_libraries(usampler PRIVATE dbghelp winmm)
 
-    add_executable(usampler_c usampler.c)
+   add_executable(usampler_c usampler.c)
     install(TARGETS usampler_c RUNTIME)
     target_compile_definitions(usampler_c PRIVATE
         _WIN32_WINNT=0x0601
@@ -109,7 +109,18 @@ if (WIN32)
     )
     target_link_libraries(usampler_c PRIVATE dbghelp winmm)
 
-    # -----------------------------------------------------------------------
+    add_executable(usampler_so usampler_so2001.c)
+    install(TARGETS usampler_so RUNTIME)
+    target_compile_features(usampler_so PRIVATE cxx_std_17)
+    target_compile_definitions(usampler_so PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(usampler_so PRIVATE dbghelp)
+
+     # -----------------------------------------------------------------------
     # cpuid_diag - AVX-512 / AVX512-FP16 CPUID diagnostic. Self-contained C,
     # no extra libraries (uses <intrin.h> __cpuid/__cpuidex/_xgetbv).
     # -----------------------------------------------------------------------
