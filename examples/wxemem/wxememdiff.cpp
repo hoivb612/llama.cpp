@@ -120,6 +120,7 @@ struct Proc {
     i64 pid = 0;
     std::string name;
     i64 ws = 0, pws = 0, priv = 0, pagefile = 0;
+    bool pws_fallback = false;  // true if pws was substituted from ws_bytes
     std::vector<std::string> services;
 };
 
@@ -163,6 +164,12 @@ struct Snapshot {
 
     bool has_pool_tags = false;
     std::map<std::string, PoolTagInfo> pool_tags;  // keyed by tag_hex
+
+    // Private-WS availability tracking. Older wxemem captures don't emit
+    // "private_ws_bytes"; when absent we fall back to ws_bytes so the diff
+    // still conveys the shape of the change (see pws_fallback below).
+    int proc_count = 0;          // number of process records parsed
+    int pws_missing_count = 0;   // records lacking private_ws_bytes (fell back to ws)
 };
 
 static i64 jget(const json& j, const char* key, i64 def = 0) {
@@ -224,9 +231,20 @@ static bool loadSnapshot(const std::string& path, Snapshot& s, std::string& err)
             p.pid      = jget(pj, "pid");
             p.name     = jstr(pj, "name");
             p.ws       = jget(pj, "ws_bytes");
-            p.pws      = jget(pj, "private_ws_bytes");
             p.priv     = jget(pj, "private_bytes");
             p.pagefile = jget(pj, "pagefile_bytes");
+            // PrivateWS is the resident-private metric this tool attributes on.
+            // Older captures omit it entirely; fall back to WorkingSet so the
+            // comparison still reflects change direction/magnitude (less
+            // accurate: WS includes shared resident pages).
+            if (pj.contains("private_ws_bytes") && pj["private_ws_bytes"].is_number()) {
+                p.pws = jget(pj, "private_ws_bytes");
+            } else {
+                p.pws = p.ws;
+                p.pws_fallback = true;
+                s.pws_missing_count++;
+            }
+            s.proc_count++;
             if (pj.contains("services") && pj["services"].is_array()) {
                 for (const json& sv : pj["services"])
                     p.services.push_back(jstr(sv, "name"));
@@ -328,13 +346,22 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
       << ")\n";
     o << rule() << "\n\n";
 
+    // -- Metric selection (symmetric) --------------------------------------
+    // Default attribution metric is PrivateWS (resident & private). If EITHER
+    // capture is missing private_ws_bytes for any process, both sides fall
+    // back to WorkingSet so the comparison stays apples-to-apples (both then
+    // include shared resident pages). We never mix metrics across sides.
+    const bool useWS = (A.pws_missing_count > 0 || B.pws_missing_count > 0);
+    auto M = [useWS](const ProcAgg& a) -> i64 { return useWS ? a.ws : a.pws; };
+    const char* metricName = useWS ? "WorkingSet" : "private WS";
+
     // -- Attribution: user vs kernel vs other ------------------------------
     i64 userDelta = 0;
     {
-        // Sum of per-process private working set (resident & private).
+        // Sum of per-process working-set metric (PrivateWS, or WS on fallback).
         i64 aPWS = 0, bPWS = 0;
-        for (const auto& kv : A.procByName) aPWS += kv.second.pws;
-        for (const auto& kv : B.procByName) bPWS += kv.second.pws;
+        for (const auto& kv : A.procByName) aPWS += M(kv.second);
+        for (const auto& kv : B.procByName) bPWS += M(kv.second);
         userDelta = bPWS - aPWS;
     }
     i64 kNonPaged = B.kern.non_paged_pool      - A.kern.non_paged_pool;
@@ -350,7 +377,8 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
           << "\n";
     };
     attrRow("User-mode processes", userDelta,
-            "sum of process private working set");
+            useWS ? "sum of process working set (PrivateWS unavailable)"
+                  : "sum of process private working set");
     attrRow("Kernel (subtotal)", kernDelta, "non-paged + paged(res) + drv + cache");
     attrRow("  non-paged pool", kNonPaged, "fully resident kernel pool");
     attrRow("  paged pool (resident)", kPagedRes, "resident portion of paged pool");
@@ -365,8 +393,37 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
 
     // -- User-mode process attribution -------------------------------------
     o << rule() << "\n";
-    o << " User-mode processes (aggregated by image name, metric = private WS)\n";
+    o << " User-mode processes (aggregated by image name, metric = " << metricName
+      << ")\n";
     o << rule() << "\n";
+
+    // When either capture lacks private_ws_bytes we fall back to WorkingSet
+    // for BOTH sides (symmetric) so deltas stay apples-to-apples. WS includes
+    // shared resident pages, so magnitudes are larger than PrivateWS would be.
+    auto pwsNote = [&](const char* tag, const Snapshot& s) {
+        if (s.pws_missing_count == 0) {
+            o << "   [ ] " << tag << ": has private_ws_bytes "
+                 "(using WorkingSet anyway for symmetry)\n";
+            return;
+        }
+        o << "   [!] " << tag << " (" << s.label << "):\n";
+        if (s.pws_missing_count == s.proc_count) {
+            o << "       no 'private_ws_bytes' in capture (old wxemem build)\n";
+        } else {
+            o << "       " << s.pws_missing_count << " of " << s.proc_count
+              << " processes lack 'private_ws_bytes'\n";
+        }
+    };
+    if (useWS) {
+        o << "   WARNING: PrivateWS unavailable in at least one capture; BOTH "
+             "sides fell\n";
+        o << "   back to WorkingSet (less accurate: WS includes shared resident "
+             "pages;\n";
+        o << "   figures below are indicative only).\n";
+        pwsNote("A", A);
+        pwsNote("B", B);
+        o << "\n";
+    }
 
     // Build union of names.
     std::vector<NamedDelta> procDeltas;
@@ -375,13 +432,13 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
         for (const auto& kv : A.procByName) {
             NamedDelta& d = m[kv.first];
             d.name = kv.first;
-            d.a = kv.second.pws;
+            d.a = M(kv.second);
             d.countA = kv.second.count;
         }
         for (const auto& kv : B.procByName) {
             NamedDelta& d = m[kv.first];
             d.name = kv.first;
-            d.b = kv.second.pws;
+            d.b = M(kv.second);
             d.countB = kv.second.count;
         }
         for (auto& kv : m) {
@@ -397,7 +454,10 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
             if (d.countA == 0 && d.countB > 0) news.push_back(d);
         std::sort(news.begin(), news.end(),
                   [](const NamedDelta& x, const NamedDelta& y) { return x.b > y.b; });
-        o << "\n NEW processes (in B, not in A):\n";
+        i64 totBytes = 0, totProcs = 0;
+        for (const auto& d : news) { totBytes += d.b; totProcs += d.countB; }
+        o << "\n NEW processes (in B, not in A): " << news.size() << " images, "
+          << totProcs << " procs, +" << humanBytes(totBytes) << " total\n";
         if (news.empty()) o << "   (none)\n";
         for (const auto& d : news)
             o << "   " << padL("+" + humanBytes(d.b), 14) << "   "
@@ -411,7 +471,10 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
             if (d.countB == 0 && d.countA > 0) gone.push_back(d);
         std::sort(gone.begin(), gone.end(),
                   [](const NamedDelta& x, const NamedDelta& y) { return x.a > y.a; });
-        o << "\n GONE processes (in A, not in B):\n";
+        i64 totBytes = 0, totProcs = 0;
+        for (const auto& d : gone) { totBytes += d.a; totProcs += d.countA; }
+        o << "\n GONE processes (in A, not in B): " << gone.size() << " images, "
+          << totProcs << " procs, -" << humanBytes(totBytes) << " total\n";
         if (gone.empty()) o << "   (none)\n";
         for (const auto& d : gone)
             o << "   " << padL("-" + humanBytes(d.a), 14) << "   "
@@ -427,7 +490,14 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
                   [](const NamedDelta& x, const NamedDelta& y) {
                       return x.delta > y.delta;
                   });
-        o << "\n TOP GROWERS (present in both, by private-WS delta):\n";
+        i64 totGrow = 0, totShrink = 0;
+        int nGrew = 0, nShrank = 0;
+        for (const auto& d : both) {
+            if (d.delta > 0) { totGrow += d.delta; ++nGrew; }
+            else if (d.delta < 0) { totShrink += d.delta; ++nShrank; }
+        }
+        o << "\n TOP GROWERS (present in both, by " << metricName << " delta): "
+          << nGrew << " grew, +" << humanBytes(totGrow) << " total\n";
         o << "   " << padL("delta", 14) << "   " << padL("A", 12) << padL("B", 12)
           << "   name\n";
         int shown = 0;
@@ -440,7 +510,8 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
         }
         if (shown == 0) o << "   (no processes grew)\n";
 
-        o << "\n TOP SHRINKERS (present in both, by private-WS delta):\n";
+        o << "\n TOP SHRINKERS (present in both, by " << metricName << " delta): "
+          << nShrank << " shrank, -" << humanBytes(-totShrink) << " total\n";
         shown = 0;
         for (auto it = both.rbegin(); it != both.rend(); ++it) {
             if (it->delta >= 0) break;
@@ -475,31 +546,27 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
         svRow("kernel_driver", sv(sa, "kernel_driver"), sv(sb, "kernel_driver"));
     }
 
-    o << "\n NEW services (in B, not in A):\n";
     {
-        int n = 0;
-        for (const auto& kv : B.services) {
-            if (A.services.find(kv.first) == A.services.end()) {
-                const Svc& s = kv.second;
-                o << "   " << padR(s.name, 28) << " [" << padR(s.kind, 6)
-                  << " " << padR(s.start, 12) << "] " << s.display << "\n";
-                ++n;
-            }
-        }
-        if (n == 0) o << "   (none)\n";
+        std::vector<const Svc*> v;
+        for (const auto& kv : B.services)
+            if (A.services.find(kv.first) == A.services.end())
+                v.push_back(&kv.second);
+        o << "\n NEW services (in B, not in A): " << v.size() << " total\n";
+        if (v.empty()) o << "   (none)\n";
+        for (const Svc* s : v)
+            o << "   " << padR(s->name, 28) << " [" << padR(s->kind, 6)
+              << " " << padR(s->start, 12) << "] " << s->display << "\n";
     }
-    o << "\n REMOVED services (in A, not in B):\n";
     {
-        int n = 0;
-        for (const auto& kv : A.services) {
-            if (B.services.find(kv.first) == B.services.end()) {
-                const Svc& s = kv.second;
-                o << "   " << padR(s.name, 28) << " [" << padR(s.kind, 6)
-                  << " " << padR(s.start, 12) << "] " << s.display << "\n";
-                ++n;
-            }
-        }
-        if (n == 0) o << "   (none)\n";
+        std::vector<const Svc*> v;
+        for (const auto& kv : A.services)
+            if (B.services.find(kv.first) == B.services.end())
+                v.push_back(&kv.second);
+        o << "\n REMOVED services (in A, not in B): " << v.size() << " total\n";
+        if (v.empty()) o << "   (none)\n";
+        for (const Svc* s : v)
+            o << "   " << padR(s->name, 28) << " [" << padR(s->kind, 6)
+              << " " << padR(s->start, 12) << "] " << s->display << "\n";
     }
     o << "\n";
 
@@ -511,7 +578,6 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
     o << " 'driver code (resident)' line in the attribution section above.)\n";
     o << rule() << "\n";
 
-    o << "\n NEW drivers (loaded in B, absent in A) [+ = mapped image size]:\n";
     {
         std::vector<Drv> v;
         for (const auto& kv : B.drivers)
@@ -519,12 +585,15 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
                 v.push_back({kv.first, kv.second});
         std::sort(v.begin(), v.end(),
                   [](const Drv& x, const Drv& y) { return x.size > y.size; });
+        i64 tot = 0;
+        for (const auto& d : v) tot += d.size;
+        o << "\n NEW drivers (loaded in B, absent in A) [+ = mapped image size]: "
+          << v.size() << " total, +" << humanBytes(tot) << "\n";
         if (v.empty()) o << "   (none)\n";
         for (const auto& d : v)
             o << "   " << padL("+" + humanBytes(d.size), 14) << "   " << d.name
               << "\n";
     }
-    o << "\n REMOVED drivers (loaded in A, absent in B) [- = mapped image size]:\n";
     {
         std::vector<Drv> v;
         for (const auto& kv : A.drivers)
@@ -532,12 +601,15 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
                 v.push_back({kv.first, kv.second});
         std::sort(v.begin(), v.end(),
                   [](const Drv& x, const Drv& y) { return x.size > y.size; });
+        i64 tot = 0;
+        for (const auto& d : v) tot += d.size;
+        o << "\n REMOVED drivers (loaded in A, absent in B) [- = mapped image size]: "
+          << v.size() << " total, -" << humanBytes(tot) << "\n";
         if (v.empty()) o << "   (none)\n";
         for (const auto& d : v)
             o << "   " << padL("-" + humanBytes(d.size), 14) << "   " << d.name
               << "\n";
     }
-    o << "\n RESIZED drivers (loaded in both, mapped image size changed):\n";
     {
         std::vector<NamedDelta> v;
         for (const auto& kv : B.drivers) {
@@ -555,6 +627,10 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
                   [](const NamedDelta& x, const NamedDelta& y) {
                       return std::llabs(x.delta) > std::llabs(y.delta);
                   });
+        i64 net = 0;
+        for (const auto& d : v) net += d.delta;
+        o << "\n RESIZED drivers (loaded in both, mapped image size changed): "
+          << v.size() << " changed, net " << signedBytes(net) << "\n";
         if (v.empty()) o << "   (none)\n";
         for (const auto& d : v)
             o << "   " << padL(signedBytes(d.delta), 14) << "   " << padR(d.name, 30)

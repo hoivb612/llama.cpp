@@ -220,6 +220,10 @@ struct SYSTEM_PROCESS_INFORMATION_WXE {
 
 [[maybe_unused]] static std::string g_program = "wxemem";
 
+// Bump on any change to output columns, JSON schema, or metric semantics so
+// captures can be traced back to the producing build.
+#define WXEMEM_VERSION "1.1.0"
+
 static std::string format_bytes(uint64_t bytes, int width = 0) {
     static const char * units[] = {"B", "KB", "MB", "GB", "TB"};
     double v = (double)bytes;
@@ -1159,9 +1163,9 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
 
     if (!opts.processes_only) {
 #if defined(_WIN32)
-        printf("WXEmem -- Windows memory snapshot\n");
+        printf("WXEmem v%s -- Windows memory snapshot\n", WXEMEM_VERSION);
 #else
-        printf("WXEmem -- Linux memory snapshot\n");
+        printf("WXEmem v%s -- Linux memory snapshot\n", WXEMEM_VERSION);
 #endif
         line();
         printf(" Physical RAM\n");
@@ -1584,6 +1588,7 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
                        const std::vector<PoolTag> & pooltags,
                        const Options & opts, bool admin) {
     printf("{\n");
+    printf("  \"wxemem_version\": \"%s\",\n", WXEMEM_VERSION);
     printf("  \"admin\": %s,\n", admin ? "true" : "false");
     printf("  \"physical\": {\n");
     printf("    \"total_bytes\": %llu,\n",     (unsigned long long)p.total);
