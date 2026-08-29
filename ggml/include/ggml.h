@@ -370,6 +370,8 @@ extern "C" {
     typedef uint16_t ggml_fp16_t;
     GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t);
     GGML_API ggml_fp16_t ggml_fp32_to_fp16(float);
+    // B612
+    GGML_API void        ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t *, float *, int64_t);
     GGML_API void        ggml_fp16_to_fp32_row(const ggml_fp16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
 

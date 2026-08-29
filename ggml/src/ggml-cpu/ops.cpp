@@ -8317,6 +8317,35 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// B612 - goes from 20tps -> 27tps for Phi-3 Q4_K_M
+static inline bool ggml_b612_fa_use_f16_dot() {
+    static int use_f16_dot = -1;
+    if (use_f16_dot == -1) {
+        use_f16_dot = getenv("GGML_B612_FA_DOT_F16") ? 1 : 0;
+    }
+    return use_f16_dot != 0;
+}
+
+// B612 - goes from 20tps -> 27tps for Phi-3 Q4_K_M
+static inline bool ggml_b612_fa_use_v_f32_accum() {
+    static int use_v_f32_accum = -1;
+    if (use_v_f32_accum == -1) {
+        // Default ON: FP32 accumulation for F16 V in FA is significantly faster on this branch.
+        // Overrides:
+        // - GGML_B612_FA_V_F32=1 forces FP32 accumulation
+        // - GGML_B612_FA_V_F16=1 forces legacy F16 accumulation
+        if (getenv("GGML_B612_FA_V_F16")) {
+            use_v_f32_accum = 0;
+        } else {
+            use_v_f32_accum = 1;
+        }
+        if (getenv("GGML_B612_FA_V_F32")) {
+            use_v_f32_accum = 1;
+        }
+    }
+    return use_v_f32_accum != 0;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8418,7 +8447,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        // B612
+        const bool fa_v_f32_accum = ggml_b612_fa_use_v_f32_accum();
+        if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -8450,7 +8481,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            // B612
+            if (ggml_b612_fa_use_f16_dot() && k->type == GGML_TYPE_F16) {
+                ggml_vec_dot_f16(DK, &s, 0, (ggml_fp16_t *) k_data, 0, Q_q, 0, 1);
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8467,7 +8503,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            // B612
+            if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -8496,7 +8533,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                // B612
+                if (v->type == GGML_TYPE_F16) {
+                    // B612: this goes from 27tps to 35tps for Phi-3 Q4_K_M decode
+                    ggml_fp16_to_fp32_row_cpu((const ggml_fp16_t *) v_data, V32, DV);
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
@@ -8508,7 +8550,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        // B612
+        if (v->type == GGML_TYPE_F16 && !fa_v_f32_accum) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -8793,7 +8836,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
                 if (kv_type == GGML_TYPE_F16) {
-                    ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+                    // B612: not as critical as the one instance in one_chunk
+                    ggml_fp16_to_fp32_row_cpu((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
                 } else {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
                 }

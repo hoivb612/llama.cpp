@@ -4519,6 +4519,11 @@ void ggml_cpu_fp32_to_fp16(const float * x, ggml_fp16_t * y, int64_t n) {
     }
 }
 
+// B612 compat export used by ops.cpp b612 FA path
+void ggml_fp16_to_fp32_row_cpu(const ggml_fp16_t * x, float * y, int64_t n) {
+    ggml_cpu_fp16_to_fp32(x, y, n);
+}
+
 void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
     int64_t i = 0;
 #if defined(__F16C__)
