@@ -8535,9 +8535,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 // V += v*expf(s - M)
                 // B612
                 if (v->type == GGML_TYPE_F16) {
+#if 0
                     // B612: this goes from 27tps to 35tps for Phi-3 Q4_K_M decode
                     ggml_fp16_to_fp32_row_cpu((const ggml_fp16_t *) v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+#else
+                    // B612: fused f16->f32 mad avoids the separate conversion pass + V32 round-trip
+                    ggml_vec_mad_f16_f32(DV, VKQ32, (const ggml_fp16_t *) v_data, vs);
+#endif // 0
                 } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
