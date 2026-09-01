@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 // MoE expert-level streaming (Vulkan UMA weight-budget path).
 //
 // Phase A (milestone 2): expert-level streaming with a residency split. The big
