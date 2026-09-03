@@ -12,6 +12,20 @@
 #define QK_K 256
 #define Q4K_BSIZE 144
 
+// 4 consecutive activations. Contiguous F32 is the common MoE case and folds
+// into one Load4; anything else falls back to the generic per-element path.
+float4 load4_act(uint base_byte) {
+    if (src1_esize == 4u && nb10 == 4u) {
+        return asfloat(src1.Load4(base_byte));
+    }
+    float4 r;
+    r.x = load_auto(src1, base_byte, src1_esize);
+    r.y = load_auto(src1, base_byte + nb10, src1_esize);
+    r.z = load_auto(src1, base_byte + 2u * nb10, src1_esize);
+    r.w = load_auto(src1, base_byte + 3u * nb10, src1_esize);
+    return r;
+}
+
 [numthreads(256, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     uint idx = flat_idx_2d(group_id, local_id);
@@ -73,20 +87,20 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
             float dmb_lo = dmin * mb[is_lo];
             float dsc_hi = dall * sc[is_hi];
             float dmb_hi = dmin * mb[is_hi];
-            // 32 qs bytes per il = 8 uint32 words. Load aligned, unpack
-            // 4 bytes manually, then process 4 elements per word.
-            for (uint w = 0; w < 8; w++) {
-                uint qs_word = src0.Load(il_qs_off + w * 4);
-                [unroll] for (uint sub = 0; sub < 4; sub++) {
-                    uint qs_byte = (qs_word >> (sub * 8u)) & 0xFFu;
-                    float w_lo = dsc_lo * (float)(qs_byte & 0x0Fu) - dmb_lo;
-                    float w_hi = dsc_hi * (float)(qs_byte >> 4)    - dmb_hi;
-                    uint elem_in_half = w * 4 + sub;
-                    uint k_lo = k0 + il * 64 + elem_in_half;
-                    uint k_hi = k_lo + 32;
-                    float x_lo = load_auto(src1, src1_row + k_lo * nb10, src1_esize);
-                    float x_hi = load_auto(src1, src1_row + k_hi * nb10, src1_esize);
-                    acc += w_lo * x_lo + w_hi * x_hi;
+            // 32 qs bytes per il = 8 uint32 words, fetched as 2x Load4.
+            [unroll] for (uint h = 0; h < 2; h++) {
+                uint4 qw = src0.Load4(il_qs_off + h * 16);
+                [unroll] for (uint w4 = 0; w4 < 4; w4++) {
+                    uint qs_word = qw[w4];
+                    uint k_lo = k0 + il * 64 + (h * 4 + w4) * 4;
+                    float4 x_lo = load4_act(src1_row + k_lo * nb10);
+                    float4 x_hi = load4_act(src1_row + (k_lo + 32) * nb10);
+                    [unroll] for (uint sub = 0; sub < 4; sub++) {
+                        uint qs_byte = (qs_word >> (sub * 8u)) & 0xFFu;
+                        float w_lo = dsc_lo * (float)(qs_byte & 0x0Fu) - dmb_lo;
+                        float w_hi = dsc_hi * (float)(qs_byte >> 4)    - dmb_hi;
+                        acc += w_lo * x_lo[sub] + w_hi * x_hi[sub];
+                    }
                 }
             }
         }

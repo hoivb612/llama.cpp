@@ -58,18 +58,19 @@ float4 fa_load4(ByteAddressBuffer buf, uint byte_offset, uint elem_size) {
 
     // Half rows/views may begin at a 2-byte offset. Reconstruct two packed
     // words from aligned loads instead of issuing an undefined misaligned Load2.
+    // The third word is only meaningful for a 2-byte-shifted start, but it is
+    // addressed unconditionally: a load guarded by `shift != 0` can still be
+    // speculated by the compiler, and these buffers are bound as root SRVs,
+    // which D3D12 does not bounds check. Reading aligned+8 for an already
+    // aligned offset walks off the end of the last tensor in an allocation
+    // (the final layer's V cache) and faults the device.
     uint aligned = byte_offset & ~3u;
     uint shift = (byte_offset & 2u) * 8u;
     uint w0 = buf.Load(aligned);
     uint w1 = buf.Load(aligned + 4u);
+    uint w2 = buf.Load(aligned + (shift == 0u ? 4u : 8u));
     uint packed0 = shift == 0u ? w0 : ((w0 >> 16) | (w1 << 16));
-    uint packed1;
-    if (shift == 0u) {
-        packed1 = w1;
-    } else {
-        uint w2 = buf.Load(aligned + 8u);
-        packed1 = (w1 >> 16) | (w2 << 16);
-    }
+    uint packed1 = shift == 0u ? w1 : ((w1 >> 16) | (w2 << 16));
     uint v0 =  packed0        & 0xFFFFu;
     uint v1 = (packed0 >> 16) & 0xFFFFu;
     uint v2 =  packed1        & 0xFFFFu;

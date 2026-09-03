@@ -31,16 +31,38 @@
 groupshared float shared_acc0[64];
 groupshared float shared_acc1[64];
 
-// Unaligned 4-byte load: Q6_K block stride is 210 bytes so block_off
-// may not be 4-byte aligned. Always issues 2 aligned loads; relies on
-// L1 cache to amortize when adjacent calls touch the same word.
-uint load_u32_u(ByteAddressBuffer buf, uint byte_off) {
-    uint align_off = byte_off & ~3u;
+// Q6_K blocks are 210 bytes, so block_off can be 2-byte misaligned and
+// ql/qh fetches are 16 bytes wide. Doing this as four independent
+// load_u32_u calls costs 8 loads on the misaligned path and re-reads each
+// boundary word twice; an aligned Load4 (fast path) or 5 aligned word loads
+// (slow path) halves the load instructions in the inner loop. Same helper as
+// mul_mat_vec_q6k_mr_blocked.hlsl.
+//
+// Load4 requires 4-byte alignment: desktop AMD GCN/RDNA tolerates 2-byte
+// alignment, but some AMD console HW (Xbox GDKX) silently masks the low bits
+// and returns the wrong 16 bytes, hence the explicit reconstruction.
+uint4 load4_u_q6k(uint byte_off) {
     uint shift = (byte_off & 3u) * 8u;
-    uint w0 = buf.Load(align_off);
-    if (shift == 0) return w0;
-    uint w1 = buf.Load(align_off + 4);
-    return (w0 >> shift) | (w1 << (32u - shift));
+    if (shift == 0u) {
+        return src0.Load4(byte_off);
+    }
+    uint base = byte_off & ~3u;
+    uint w0 = src0.Load(base);
+    uint w1 = src0.Load(base + 4);
+    uint w2 = src0.Load(base + 8);
+    uint w3 = src0.Load(base + 12);
+    // Addressed defensively: this load sits after an early return, but the
+    // compiler may still speculate it, and src0 is bound as a root SRV, which
+    // D3D12 does not bounds check. base+16 for an aligned offset would read
+    // past the end of the last tensor in the allocation.
+    uint w4 = src0.Load(base + (shift == 0u ? 12u : 16u));
+    uint isr = 32u - shift;
+    uint4 r;
+    r.x = (w0 >> shift) | (w1 << isr);
+    r.y = (w1 >> shift) | (w2 << isr);
+    r.z = (w2 >> shift) | (w3 << isr);
+    r.w = (w3 >> shift) | (w4 << isr);
+    return r;
 }
 
 uint read_byte_q6(ByteAddressBuffer buf, uint byte_off) {
@@ -75,15 +97,17 @@ void decode_q6k_row(uint block_off, uint t,
     bool high_nib = (sub >= 4u);
 
     // 4 dp4a chunks, each 4 bytes wide
-    uint ql_w0 = load_u32_u(src0, block_off + ql_base_in_block + 0);
-    uint ql_w1 = load_u32_u(src0, block_off + ql_base_in_block + 4);
-    uint ql_w2 = load_u32_u(src0, block_off + ql_base_in_block + 8);
-    uint ql_w3 = load_u32_u(src0, block_off + ql_base_in_block + 12);
+    uint4 ql4 = load4_u_q6k(block_off + ql_base_in_block);
+    uint ql_w0 = ql4.x;
+    uint ql_w1 = ql4.y;
+    uint ql_w2 = ql4.z;
+    uint ql_w3 = ql4.w;
 
-    uint qh_w0 = load_u32_u(src0, block_off + qh_base_in_block + 0);
-    uint qh_w1 = load_u32_u(src0, block_off + qh_base_in_block + 4);
-    uint qh_w2 = load_u32_u(src0, block_off + qh_base_in_block + 8);
-    uint qh_w3 = load_u32_u(src0, block_off + qh_base_in_block + 12);
+    uint4 qh4 = load4_u_q6k(block_off + qh_base_in_block);
+    uint qh_w0 = qh4.x;
+    uint qh_w1 = qh4.y;
+    uint qh_w2 = qh4.z;
+    uint qh_w3 = qh4.w;
 
     if (high_nib) {
         ql_w0 = (ql_w0 >> 4) & 0x0F0F0F0Fu;

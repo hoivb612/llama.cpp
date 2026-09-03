@@ -14,9 +14,9 @@
 // node[i+1] (its W is bound as src2 with op1 = byte offset).
 //
 // Bindings:
-//   src0 (t0): W_gate weights, F16, ne00=K, ne01=N
+//   src0 (t0): W_gate weights, F16 or BF16, ne00=K, ne01=N
 //   src1 (t1): x       activation, F32, contiguous, ne10=K
-//   src2 (t2): W_up    weights, F16, same shape and stride as W_gate.
+//   src2 (t2): W_up    weights, F16 or BF16, same shape and stride as W_gate.
 //              Bound at the resource base; W_up's tensor byte offset
 //              is passed in op1.
 //   dst  (u0): y       fused output, F32, ne0=N (= GLU split-mode output width)
@@ -88,7 +88,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 #endif
 
     if (x_contiguous && gate_pair_aligned && up_pair_aligned) {
-        // F16 weights + contiguous F32 input — process two rows per group
+        // Packed 16-bit weights + contiguous F32 input - process two rows per group
         // and four K values per participating lane, matching the standalone
         // MR shader's geometry while sharing activation loads across gate/up.
         uint k = tid * 4;
@@ -97,45 +97,71 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             float x0 = asfloat(x4.x); float x1 = asfloat(x4.y);
             float x2 = asfloat(x4.z); float x3 = asfloat(x4.w);
 #if RMS_FUSED
-            uint4 g4 = src6.Load4(k * 4);
             acc_ss = mad(x0, x0, mad(x1, x1, mad(x2, x2, mad(x3, x3, acc_ss))));
+            uint4 g4 = src6.Load4(k * 4);
             x0 *= asfloat(g4.x); x1 *= asfloat(g4.y);
             x2 *= asfloat(g4.z); x3 *= asfloat(g4.w);
 #endif
 
+            if (src0_esize == 3) {
+                uint2 wg0 = src0.Load2(gate0_base + k * 2);
+                acc_gate0 = mad(asfloat((wg0.x & 0xFFFFu) << 16), x0,
+                           mad(asfloat(wg0.x & 0xFFFF0000u), x1,
+                           mad(asfloat((wg0.y & 0xFFFFu) << 16), x2,
+                           mad(asfloat(wg0.y & 0xFFFF0000u), x3, acc_gate0))));
+
+                uint2 wu0 = src2.Load2(up0_base + k * 2);
+                acc_up0 = mad(asfloat((wu0.x & 0xFFFFu) << 16), x0,
+                         mad(asfloat(wu0.x & 0xFFFF0000u), x1,
+                         mad(asfloat((wu0.y & 0xFFFFu) << 16), x2,
+                         mad(asfloat(wu0.y & 0xFFFF0000u), x3, acc_up0))));
+
+                uint2 wg1 = src0.Load2(gate1_base + k * 2);
+                acc_gate1 = mad(asfloat((wg1.x & 0xFFFFu) << 16), x0,
+                           mad(asfloat(wg1.x & 0xFFFF0000u), x1,
+                           mad(asfloat((wg1.y & 0xFFFFu) << 16), x2,
+                           mad(asfloat(wg1.y & 0xFFFF0000u), x3, acc_gate1))));
+
+                uint2 wu1 = src2.Load2(up1_base + k * 2);
+                acc_up1 = mad(asfloat((wu1.x & 0xFFFFu) << 16), x0,
+                         mad(asfloat(wu1.x & 0xFFFF0000u), x1,
+                         mad(asfloat((wu1.y & 0xFFFFu) << 16), x2,
+                         mad(asfloat(wu1.y & 0xFFFF0000u), x3, acc_up1))));
+            } else {
 #if NATIVE_FP16
-            vector<float16_t,4> wg0 = src0.Load<vector<float16_t,4> >(gate0_base + k * 2);
-            acc_gate0 = mad((float)wg0.x, x0, mad((float)wg0.y, x1,
-                       mad((float)wg0.z, x2, mad((float)wg0.w, x3, acc_gate0))));
+                vector<float16_t,4> wg0 = src0.Load<vector<float16_t,4> >(gate0_base + k * 2);
+                acc_gate0 = mad((float)wg0.x, x0, mad((float)wg0.y, x1,
+                           mad((float)wg0.z, x2, mad((float)wg0.w, x3, acc_gate0))));
 
-            vector<float16_t,4> wu0 = src2.Load<vector<float16_t,4> >(up0_base + k * 2);
-            acc_up0 = mad((float)wu0.x, x0, mad((float)wu0.y, x1,
-                    mad((float)wu0.z, x2, mad((float)wu0.w, x3, acc_up0))));
+                vector<float16_t,4> wu0 = src2.Load<vector<float16_t,4> >(up0_base + k * 2);
+                acc_up0 = mad((float)wu0.x, x0, mad((float)wu0.y, x1,
+                        mad((float)wu0.z, x2, mad((float)wu0.w, x3, acc_up0))));
 
-            vector<float16_t,4> wg1 = src0.Load<vector<float16_t,4> >(gate1_base + k * 2);
-            acc_gate1 = mad((float)wg1.x, x0, mad((float)wg1.y, x1,
-                       mad((float)wg1.z, x2, mad((float)wg1.w, x3, acc_gate1))));
+                vector<float16_t,4> wg1 = src0.Load<vector<float16_t,4> >(gate1_base + k * 2);
+                acc_gate1 = mad((float)wg1.x, x0, mad((float)wg1.y, x1,
+                           mad((float)wg1.z, x2, mad((float)wg1.w, x3, acc_gate1))));
 
-            vector<float16_t,4> wu1 = src2.Load<vector<float16_t,4> >(up1_base + k * 2);
-            acc_up1 = mad((float)wu1.x, x0, mad((float)wu1.y, x1,
-                    mad((float)wu1.z, x2, mad((float)wu1.w, x3, acc_up1))));
+                vector<float16_t,4> wu1 = src2.Load<vector<float16_t,4> >(up1_base + k * 2);
+                acc_up1 = mad((float)wu1.x, x0, mad((float)wu1.y, x1,
+                        mad((float)wu1.z, x2, mad((float)wu1.w, x3, acc_up1))));
 #else
-            uint2 wg0 = src0.Load2(gate0_base + k * 2);
-            acc_gate0 = mad(f16tof32(wg0.x & 0xFFFFu), x0, mad(f16tof32(wg0.x >> 16), x1,
-                       mad(f16tof32(wg0.y & 0xFFFFu), x2, mad(f16tof32(wg0.y >> 16), x3, acc_gate0))));
+                uint2 wg0 = src0.Load2(gate0_base + k * 2);
+                acc_gate0 = mad(f16tof32(wg0.x & 0xFFFFu), x0, mad(f16tof32(wg0.x >> 16), x1,
+                           mad(f16tof32(wg0.y & 0xFFFFu), x2, mad(f16tof32(wg0.y >> 16), x3, acc_gate0))));
 
-            uint2 wu0 = src2.Load2(up0_base + k * 2);
-            acc_up0 = mad(f16tof32(wu0.x & 0xFFFFu), x0, mad(f16tof32(wu0.x >> 16), x1,
-                    mad(f16tof32(wu0.y & 0xFFFFu), x2, mad(f16tof32(wu0.y >> 16), x3, acc_up0))));
+                uint2 wu0 = src2.Load2(up0_base + k * 2);
+                acc_up0 = mad(f16tof32(wu0.x & 0xFFFFu), x0, mad(f16tof32(wu0.x >> 16), x1,
+                        mad(f16tof32(wu0.y & 0xFFFFu), x2, mad(f16tof32(wu0.y >> 16), x3, acc_up0))));
 
-            uint2 wg1 = src0.Load2(gate1_base + k * 2);
-            acc_gate1 = mad(f16tof32(wg1.x & 0xFFFFu), x0, mad(f16tof32(wg1.x >> 16), x1,
-                       mad(f16tof32(wg1.y & 0xFFFFu), x2, mad(f16tof32(wg1.y >> 16), x3, acc_gate1))));
+                uint2 wg1 = src0.Load2(gate1_base + k * 2);
+                acc_gate1 = mad(f16tof32(wg1.x & 0xFFFFu), x0, mad(f16tof32(wg1.x >> 16), x1,
+                           mad(f16tof32(wg1.y & 0xFFFFu), x2, mad(f16tof32(wg1.y >> 16), x3, acc_gate1))));
 
-            uint2 wu1 = src2.Load2(up1_base + k * 2);
-            acc_up1 = mad(f16tof32(wu1.x & 0xFFFFu), x0, mad(f16tof32(wu1.x >> 16), x1,
-                    mad(f16tof32(wu1.y & 0xFFFFu), x2, mad(f16tof32(wu1.y >> 16), x3, acc_up1))));
+                uint2 wu1 = src2.Load2(up1_base + k * 2);
+                acc_up1 = mad(f16tof32(wu1.x & 0xFFFFu), x0, mad(f16tof32(wu1.x >> 16), x1,
+                        mad(f16tof32(wu1.y & 0xFFFFu), x2, mad(f16tof32(wu1.y >> 16), x3, acc_up1))));
 #endif
+            }
         }
         for (; k < K; k++) {
             float x = asfloat(src1.Load(x_base + k * 4));
@@ -143,10 +169,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             acc_ss = mad(x, x, acc_ss);
             x *= asfloat(src6.Load(k * 4));
 #endif
-            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, 2), x, acc_gate0);
-            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, 2), x, acc_up0);
-            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, 2), x, acc_gate1);
-            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, 2), x, acc_up1);
+            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, src0_esize), x, acc_gate0);
+            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, src0_esize), x, acc_up0);
+            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, src0_esize), x, acc_gate1);
+            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, src0_esize), x, acc_up1);
         }
     } else {
         // Generic path — handles non-contiguous activation or unaligned
@@ -157,10 +183,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             acc_ss = mad(x, x, acc_ss);
             x *= asfloat(src6.Load(k * 4));
 #endif
-            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, 2), x, acc_gate0);
-            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, 2), x, acc_up0);
-            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, 2), x, acc_gate1);
-            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, 2), x, acc_up1);
+            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, src0_esize), x, acc_gate0);
+            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, src0_esize), x, acc_up0);
+            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, src0_esize), x, acc_gate1);
+            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, src0_esize), x, acc_up1);
         }
     }
 

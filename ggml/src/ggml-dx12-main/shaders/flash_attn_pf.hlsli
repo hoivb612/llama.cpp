@@ -7,9 +7,13 @@
 // on a 91 TFLOPS part, and 94% of prompt time.
 //
 // This variant specializes on HEAD_DIM so every loop bound is a constant, runs
-// 256 threads, keeps both the QK and PV passes at full occupancy, and reads V
-// from LDS as plain floats. K/V share one LDS tile, so the per-tile cost is one
-// extra barrier rather than a third of the LDS budget.
+// 256 threads, and keeps both the QK and PV passes at full occupancy. Without
+// NATIVE_FP16 K and V share one f32 LDS tile, so the per-tile cost is one extra
+// barrier rather than a third of the LDS budget. Under NATIVE_FP16 K and V get
+// separate half tiles, which both stages them in one pass (dropping that extra
+// barrier) and costs less LDS than the single f32 tile did; the QK inner loop
+// then folds into dot2add. Scores, PV accumulators and the softmax state stay
+// f32 throughout.
 //
 // Thread mapping (D=64, BR=16, BC=64, 256 threads):
 //   QK  idx = tid + j*256 -> r = idx/BC, c = idx%BC   (4 scores/thread)
@@ -46,6 +50,69 @@
 #define FA_PF_STRIDE (FA_D + 1)
 #define FA_PF_DVEC   (FA_D / 4)
 
+// QK-only fp16: Q and K are staged as half4 and the inner loop folds into
+// dot2add, so the dot product runs at half rate with an f32 accumulator. V is
+// staged as half too, which is what makes the fp16 path a net LDS *saving*
+// rather than an addition: at D=128 the f32 V tile alone was 16512 B of a
+// 32768 B budget, capping residency at one group. Scores, the online-softmax
+// state and every accumulator stay f32.
+#if defined(NATIVE_FP16)
+typedef float16_t4 fa_pf_vec4;
+// Same padding rationale as FA_PF_STRIDE: an 8-byte element makes the bank
+// step 2*(FA_PF_DVEC+1), so one half4 of padding rotates c off a single bank.
+#define FA_PF_HSTRIDE (FA_PF_DVEC + 1)
+// V is read one scalar per thread in the PV pass, so it is stored flat rather
+// than as half4 to keep that a plain index. Two halves of padding rotate the
+// bank the same way the f32 tile's single float does.
+#define FA_PF_VSTRIDE (FA_D + 2)
+
+float fa_pf_dot4(fa_pf_vec4 q, fa_pf_vec4 k, float acc) {
+    float a = dot2add(q.xy, k.xy, acc);
+    return dot2add(q.zw, k.zw, a);
+}
+#endif
+
+// The QK scores and the PV accumulators are the only carriers of the online
+// softmax rescale, so they are `precise` by default: reassociation there moves
+// the rescale relative to the running max. FA_PF_RELAXED_ACC lifts that on
+// those two arrays only, to measure what the qualifier costs.
+#if defined(FA_PF_RELAXED_ACC)
+#define FA_PF_PRECISE
+#else
+#define FA_PF_PRECISE precise
+#endif
+
+// Mask tile classification, layered on the prescan. The prescan already reads
+// this group's whole mask rectangle, so the same reads can also record two bits
+// per KV tile and let the tile loop drop work the bounds alone cannot:
+//   FA_PF_MC_FINITE  some element of the tile is finite
+//   FA_PF_MC_LOAD    some element is inf, or is a finite non-zero bias
+// A tile with no finite element is fully masked and is skipped without staging
+// K/V. A tile that is finite everywhere with no bias to add (FINITE only) needs
+// no mask read at all in the QK pass: the bias is exactly zero for every row,
+// and slope * 0 is zero for any ALiBi slope. Everything else keeps the normal
+// per-score load, so a tile that mixes zeros with -inf - the causal diagonal -
+// is still read element by element. Bits are only ever set, so 0 (a tile no
+// thread scanned, unreachable while every tile lies in some scanned row) also
+// falls back to the load.
+#if defined(FA_PF_MASK_CLASS)
+#if !defined(FA_PF_PRESCAN)
+#error "FA_PF_MASK_CLASS requires FA_PF_PRESCAN"
+#endif
+#if (FA_PF_BC % 4) != 0
+#error "FA_PF_MASK_CLASS assumes a float4 mask chunk stays inside one KV tile"
+#endif
+#define FA_PF_MC_FINITE 1u
+#define FA_PF_MC_LOAD   2u
+// 16 tiles per uint. 128 words = 512 B covers 2048 tiles, i.e. 65536 KV
+// elements at FA_PF_BC=32. Larger launches keep the prescan but disable tile
+// classification.
+#define FA_PF_MCLASS_PER_WORD 16u
+#define FA_PF_MCLASS_WORDS    128u
+#define FA_PF_MCLASS_TILES    (FA_PF_MCLASS_WORDS * FA_PF_MCLASS_PER_WORD)
+#define FA_PF_MCLASS_MAX_KV   (FA_PF_MCLASS_TILES * FA_PF_BC)
+#endif
+
 // QK: rows covered per thread, and the row group it starts from.
 #define FA_PF_CGROUPS (FA_PF_THREADS / FA_PF_BC)
 #define FA_PF_QK_PER  (FA_PF_BR / FA_PF_CGROUPS)
@@ -71,15 +138,67 @@
 #error "FA_PF_THREADS must be a multiple of FA_PF_BR"
 #endif
 
+// LDS budget, bytes (must stay under the 32768 Intel/D3D12 threadgroup limit).
+// fp16 stages Q, K and V as half, so it both shrinks Q and replaces the f32 V
+// tile. Residency matters as much as the limit: at 32516 B only one group fits
+// a 64 KB SLM, and D=128 was sitting there.
+//   f32:  s_q + s_kv + s_scores + s_red + scalars
+//   fp16: s_qh + s_kh + s_vh + s_scores + s_red + scalars
+//   D=64  BR=8  BC=64: 1088 +  8704 +  8448 + 2048 + 1024 + 132 = 21444
+//   D=64  BR=32 BC=32: 4352 +  4352 +  4224 + 4096 + 1024 + 516 = 18564
+//   D=96  BR=16 BC=32: 3200 +  6400 +  6272 + 2048 + 1024 + 260 = 19204
+//   D=128 BR=16 BC=32: 4224 +  8448 +  8320 + 2048 + 1024 + 260 = 24324
+// FA_PF_MASK_CLASS adds 512 B of tile classes.
+#if defined(NATIVE_FP16)
+groupshared fa_pf_vec4 s_qh[FA_PF_BR][FA_PF_HSTRIDE];
+groupshared fa_pf_vec4 s_kh[FA_PF_BC][FA_PF_HSTRIDE];
+groupshared float16_t  s_vh[FA_PF_BC][FA_PF_VSTRIDE];
+#else
 groupshared float s_q[FA_PF_BR][FA_PF_STRIDE];
 groupshared float s_kv[FA_PF_BC][FA_PF_STRIDE];
+#endif
 groupshared float s_scores[FA_PF_BR][FA_PF_BC];
 groupshared float s_red[FA_PF_BR][FA_PF_RSPLIT];
 groupshared float s_max[FA_PF_BR];
 groupshared float s_sum[FA_PF_BR];
 groupshared float s_corr[FA_PF_BR];
 groupshared uint  s_active[FA_PF_BR];
+#if defined(FA_PF_PRESCAN)
+groupshared uint  s_kv_lo;
+groupshared uint  s_kv_hi;
+#else
 groupshared uint  s_tile_any;
+#endif
+#if defined(FA_PF_MASK_CLASS)
+groupshared uint  s_mclass[FA_PF_MCLASS_WORDS];
+
+uint fa_pf_mclass_bits(float m) {
+    if (isinf(m)) {
+        return FA_PF_MC_LOAD;
+    }
+    return (m != 0.0f) ? (FA_PF_MC_FINITE | FA_PF_MC_LOAD) : FA_PF_MC_FINITE;
+}
+
+// One atomic per word rather than per element: bits only ever get set, so a
+// word already holding them needs no store at all.
+void fa_pf_mclass_flush(uint wi, uint word) {
+    if (word != 0u && (s_mclass[wi] & word) != word) {
+        InterlockedOr(s_mclass[wi], word);
+    }
+}
+
+// Tiles arrive in non-decreasing order per thread, so keeping one word live in
+// a register costs one flush per 16 tiles.
+void fa_pf_mclass_add(uint tile, uint bits, inout uint wi, inout uint word) {
+    uint w = tile / FA_PF_MCLASS_PER_WORD;
+    if (w != wi) {
+        fa_pf_mclass_flush(wi, word);
+        wi   = w;
+        word = 0u;
+    }
+    word |= bits << ((tile % FA_PF_MCLASS_PER_WORD) * 2u);
+}
+#endif
 
 float4 fa_pf_load4(ByteAddressBuffer buf, uint byte_offset, uint elem_size) {
     if (elem_size == 4) {
@@ -88,18 +207,19 @@ float4 fa_pf_load4(ByteAddressBuffer buf, uint byte_offset, uint elem_size) {
 
     // Half rows/views may begin at a 2-byte offset. Reconstruct two packed
     // words from aligned loads instead of issuing an undefined misaligned Load2.
+    // The third word is only meaningful for a 2-byte-shifted start, but it is
+    // addressed unconditionally: a load guarded by `shift != 0` can still be
+    // speculated by the compiler, and these buffers are bound as root SRVs,
+    // which D3D12 does not bounds check. Reading aligned+8 for an already
+    // aligned offset walks off the end of the last tensor in an allocation
+    // (the final layer's V cache) and faults the device.
     uint aligned = byte_offset & ~3u;
     uint shift = (byte_offset & 2u) * 8u;
     uint w0 = buf.Load(aligned);
     uint w1 = buf.Load(aligned + 4u);
+    uint w2 = buf.Load(aligned + (shift == 0u ? 4u : 8u));
     uint packed0 = shift == 0u ? w0 : ((w0 >> 16) | (w1 << 16));
-    uint packed1;
-    if (shift == 0u) {
-        packed1 = w1;
-    } else {
-        uint w2 = buf.Load(aligned + 8u);
-        packed1 = (w1 >> 16) | (w2 << 16);
-    }
+    uint packed1 = shift == 0u ? w1 : ((w1 >> 16) | (w2 << 16));
     uint v0 =  packed0        & 0xFFFFu;
     uint v1 = (packed0 >> 16) & 0xFFFFu;
     uint v2 =  packed1        & 0xFFFFu;
@@ -143,7 +263,11 @@ WAVE_SIZE_ATTR
 [numthreads(FA_PF_THREADS, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint tid       = gtid.x;
-    const uint q_start   = gid.x * FA_PF_BR;
+    // Under a causal mask the KV range a group covers grows with q_start, so
+    // the last group does the most work while being dispatched last, leaving a
+    // long tail. Walking the groups backwards launches the heavy ones first.
+    const uint n_qgroups = (ne01 + FA_PF_BR - 1u) / FA_PF_BR;
+    const uint q_start   = (n_qgroups - 1u - gid.x) * FA_PF_BR;
     const uint head_idx  = gid.y;
     const uint batch_idx = gid.z;
 
@@ -204,16 +328,40 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             uint q_base = src0_offset + query_idx * nb01 + head_idx * nb02 + batch_idx * nb03;
             qv = asfloat(src0.Load4(q_base + dv * 16u));
         }
+#if defined(NATIVE_FP16)
+        s_qh[r][dv] = (fa_pf_vec4)qv;
+#else
         s_q[r][dv * 4u + 0u] = qv.x;
         s_q[r][dv * 4u + 1u] = qv.y;
         s_q[r][dv * 4u + 2u] = qv.z;
         s_q[r][dv * 4u + 3u] = qv.w;
+#endif
     }
 
     if (tid < FA_PF_BR) {
         s_max[tid] = neg_max;
         s_sum[tid] = 0.0f;
     }
+#if defined(FA_PF_PRESCAN)
+    if (tid == 0) {
+        s_kv_lo = N_kv;
+        s_kv_hi = 0u;
+    }
+#endif
+#if defined(FA_PF_MASK_CLASS)
+    // A stale dispatch can outgrow the class table (the replay path rebinds a
+    // baked flash-attention dispatch when only N_kv changed), so the table is
+    // opt-in per launch and the tile loop keeps the normal mask-load behaviour without
+    // it. Zeroing only the words the tile count uses rides the barrier below.
+    const uint n_tiles   = (N_kv + FA_PF_BC - 1u) / FA_PF_BC;
+    const bool use_class = has_mask != 0u && n_tiles <= FA_PF_MCLASS_TILES;
+    if (use_class) {
+        for (uint mw = tid; mw < (n_tiles + FA_PF_MCLASS_PER_WORD - 1u) / FA_PF_MCLASS_PER_WORD;
+             mw += FA_PF_THREADS) {
+            s_mclass[mw] = 0u;
+        }
+    }
+#endif
 
     // QK ownership: FA_PF_QK_PER (r, c) pairs, c fast-varying.
     const uint qk_c  = tid % FA_PF_BC;
@@ -228,16 +376,120 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint red_r = tid / FA_PF_RSPLIT;
     const uint red_s = tid % FA_PF_RSPLIT;
 
-    precise float acc[FA_PF_ACC];
+    FA_PF_PRECISE float acc[FA_PF_ACC];
     [unroll]
     for (uint ai = 0; ai < FA_PF_ACC; ++ai) {
         acc[ai] = 0.0f;
     }
+#if defined(FA_PF_PRESCAN)
+    uint mhb = 0u;
+    if (has_mask != 0u) {
+        mhb = (head_idx % mask_ne2) * mask_nb2
+            + (batch_idx % mask_ne3) * mask_nb3;
+    }
+#endif
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint tile_start = 0; tile_start < N_kv; tile_start += FA_PF_BC) {
+#if defined(FA_PF_PRESCAN)
+    uint kv_first = 0u;
+    uint kv_end   = N_kv;
+
+    // Mask prescan. One pass over this group's whole mask rectangle - the valid
+    // query rows by [0, N_kv) - reduced to the union of the first and last KV
+    // column that is finite on any of those rows. Every tile outside that range
+    // is fully masked for every row this group owns, which is exactly the set
+    // the per-tile scan below would have skipped, so the tile loop can start
+    // and stop there instead of paying two barriers and an LDS round trip per
+    // tile. Interior all-masked tiles stay in range and are simply computed.
+    if (has_mask != 0u) {
+        uint loc_lo = N_kv;
+        uint loc_hi = 0u;
+#if defined(FA_PF_MASK_CLASS)
+        uint cls_wi   = 0u;
+        uint cls_word = 0u;
+#endif
+        if (q_start + red_r < N_queries) {
+            uint mrow = mask_off + (q_start + red_r) * mask_nb1 + mhb;
+            // float4 needs the row contiguous at its element size. BF16 reports
+            // es=3 against a 2-byte stride, so the equality also excludes it.
+            if (mask_nb0 == mask_es && (mask_es == 2u || mask_es == 4u)) {
+                uint nvec = N_kv / 4u;
+                for (uint v = red_s; v < nvec; v += FA_PF_RSPLIT) {
+                    uint c0 = v * 4u;
+                    float4 m4 = fa_pf_load4(src3, mrow + c0 * mask_nb0, mask_es);
+                    if (!isinf(m4.x)) { loc_lo = min(loc_lo, c0);      loc_hi = max(loc_hi, c0);      }
+                    if (!isinf(m4.y)) { loc_lo = min(loc_lo, c0 + 1u); loc_hi = max(loc_hi, c0 + 1u); }
+                    if (!isinf(m4.z)) { loc_lo = min(loc_lo, c0 + 2u); loc_hi = max(loc_hi, c0 + 2u); }
+                    if (!isinf(m4.w)) { loc_lo = min(loc_lo, c0 + 3u); loc_hi = max(loc_hi, c0 + 3u); }
+#if defined(FA_PF_MASK_CLASS)
+                    if (use_class) {
+                        fa_pf_mclass_add(c0 / FA_PF_BC,
+                            fa_pf_mclass_bits(m4.x) | fa_pf_mclass_bits(m4.y) |
+                            fa_pf_mclass_bits(m4.z) | fa_pf_mclass_bits(m4.w),
+                            cls_wi, cls_word);
+                    }
+#endif
+                }
+                for (uint ct = nvec * 4u + red_s; ct < N_kv; ct += FA_PF_RSPLIT) {
+                    float mt = load_auto(src3, mrow + ct * mask_nb0, mask_es);
+                    if (!isinf(mt)) { loc_lo = min(loc_lo, ct); loc_hi = max(loc_hi, ct); }
+#if defined(FA_PF_MASK_CLASS)
+                    if (use_class) {
+                        fa_pf_mclass_add(ct / FA_PF_BC, fa_pf_mclass_bits(mt), cls_wi, cls_word);
+                    }
+#endif
+                }
+            } else {
+                for (uint cs = red_s; cs < N_kv; cs += FA_PF_RSPLIT) {
+                    float ms = load_auto(src3, mrow + cs * mask_nb0, mask_es);
+                    if (!isinf(ms)) { loc_lo = min(loc_lo, cs); loc_hi = max(loc_hi, cs); }
+#if defined(FA_PF_MASK_CLASS)
+                    if (use_class) {
+                        fa_pf_mclass_add(cs / FA_PF_BC, fa_pf_mclass_bits(ms), cls_wi, cls_word);
+                    }
+#endif
+                }
+            }
+        }
+#if defined(FA_PF_MASK_CLASS)
+        fa_pf_mclass_flush(cls_wi, cls_word);
+#endif
+        if (loc_lo < N_kv) {
+            InterlockedMin(s_kv_lo, loc_lo);
+            InterlockedMax(s_kv_hi, loc_hi);
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (s_kv_lo > s_kv_hi) {
+            kv_end = 0u;
+        } else {
+            kv_first = (s_kv_lo / FA_PF_BC) * FA_PF_BC;
+            kv_end   = min((s_kv_hi / FA_PF_BC + 1u) * FA_PF_BC, N_kv);
+        }
+    }
+#else
+    const uint kv_first = 0u;
+    const uint kv_end   = N_kv;
+#endif
+
+    for (uint tile_start = kv_first; tile_start < kv_end; tile_start += FA_PF_BC) {
         uint tile_size = min((uint)FA_PF_BC, N_kv - tile_start);
 
+#if defined(FA_PF_MASK_CLASS)
+        // Group-uniform: tile_start and the class word are the same on every
+        // thread, so the skip below leaves the barriers in uniform flow. Only
+        // the two positive classes act; anything else keeps the normal path.
+        uint tcls = FA_PF_MC_FINITE | FA_PF_MC_LOAD;
+        if (use_class) {
+            uint ti = tile_start / FA_PF_BC;
+            tcls = (s_mclass[ti / FA_PF_MCLASS_PER_WORD] >> ((ti % FA_PF_MCLASS_PER_WORD) * 2u)) & 3u;
+            if (tcls == FA_PF_MC_LOAD) {
+                continue;
+            }
+        }
+#endif
+
+#if !defined(FA_PF_PRESCAN)
         // A causal or sliding-window mask leaves whole KV tiles fully masked.
         // Scanning the mask first is cheaper than staging K/V and running QK,
         // softmax and PV only to discard them. Skipping is exact: a fully
@@ -275,28 +527,46 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 continue;
             }
         }
+#endif
 
-        // Stage K, shared by every query row.
+        // Stage K, shared by every query row. The fp16 path has a separate K
+        // tile, so stage V at the same time and share one synchronization.
         for (uint kidx = tid; kidx < FA_PF_BC * FA_PF_DVEC; kidx += FA_PF_THREADS) {
             uint c  = kidx / FA_PF_DVEC;
             uint dv = kidx % FA_PF_DVEC;
             float4 kval = float4(0.0f, 0.0f, 0.0f, 0.0f);
+#if defined(NATIVE_FP16)
+            float4 vval = float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
             if (c < tile_size) {
                 uint k_base = src1_offset + (tile_start + c) * nb11
                             + kv_head * nb12 + batch_idx * nb13;
                 kval = fa_pf_load4(src1, k_base + dv * 4u * nb10, src1_esize);
+#if defined(NATIVE_FP16)
+                uint v_base = src2_off + (tile_start + c) * src2_nb1
+                            + kv_head * src2_nb2 + batch_idx * src2_nb3;
+                vval = fa_pf_load4(src2, v_base + dv * 4u * src2_nb0, src2_es);
+#endif
             }
+#if defined(NATIVE_FP16)
+            s_kh[c][dv] = (fa_pf_vec4)kval;
+            s_vh[c][dv * 4u + 0u] = (float16_t)vval.x;
+            s_vh[c][dv * 4u + 1u] = (float16_t)vval.y;
+            s_vh[c][dv * 4u + 2u] = (float16_t)vval.z;
+            s_vh[c][dv * 4u + 3u] = (float16_t)vval.w;
+#else
             s_kv[c][dv * 4u + 0u] = kval.x;
             s_kv[c][dv * 4u + 1u] = kval.y;
             s_kv[c][dv * 4u + 2u] = kval.z;
             s_kv[c][dv * 4u + 3u] = kval.w;
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
 
         // QK. Every thread computes FA_PF_QK_PER full-length dot products.
         // The K element is the loop-carried value so it is fetched once per d
         // and shared across the rows; s_q reads are wave-uniform broadcasts.
-        precise float sc[FA_PF_QK_PER];
+        FA_PF_PRECISE float sc[FA_PF_QK_PER];
         float mask_local[FA_PF_QK_PER];
         uint  live_local[FA_PF_QK_PER];
         [unroll]
@@ -306,13 +576,41 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             mask_local[j0] = 0.0f;
             live_local[j0] = (q_start + r < N_queries && qk_c < tile_size) ? 1u : 0u;
             if (has_mask != 0u && live_local[j0] != 0u) {
+#if defined(FA_PF_MASK_CLASS)
+                // Class FINITE only: every element of this tile is finite and
+                // exactly zero, so the bias it would add is zero for every row
+                // and the read is dropped. Any other class reads as before.
+                if (tcls != FA_PF_MC_FINITE) {
+                    mask_local[j0] = load_auto(
+                        src3,
+                        mask_off + (q_start + r) * mask_nb1 + mhb + (tile_start + qk_c) * mask_nb0,
+                        mask_es) * slope;
+                }
+#elif defined(FA_PF_PRESCAN)
+                // The prescan only bounded the tile range, so each QK owner
+                // reads its own mask element here instead of via s_scores.
+                mask_local[j0] = load_auto(
+                    src3,
+                    mask_off + (q_start + r) * mask_nb1 + mhb + (tile_start + qk_c) * mask_nb0,
+                    mask_es) * slope;
+#else
                 mask_local[j0] = s_scores[r][qk_c] * slope;
+#endif
                 if (isinf(mask_local[j0])) {
                     live_local[j0] = 0u;
                 }
             }
         }
 
+#if defined(NATIVE_FP16)
+        for (uint dv2 = 0; dv2 < FA_PF_DVEC; ++dv2) {
+            fa_pf_vec4 kvec = s_kh[qk_c][dv2];
+            [unroll]
+            for (uint j1 = 0; j1 < FA_PF_QK_PER; ++j1) {
+                sc[j1] = fa_pf_dot4(s_qh[qk_r0 + j1 * FA_PF_CGROUPS][dv2], kvec, sc[j1]);
+            }
+        }
+#else
         for (uint d = 0; d < FA_D; ++d) {
             float kval = s_kv[qk_c][d];
             [unroll]
@@ -320,6 +618,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 sc[j1] += s_q[qk_r0 + j1 * FA_PF_CGROUPS][d] * kval;
             }
         }
+#endif
 
         [unroll]
         for (uint j = 0; j < FA_PF_QK_PER; ++j) {
@@ -370,7 +669,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             uint r = qk_r0 + j2 * FA_PF_CGROUPS;
             float p = 0.0f;
             if (s_active[r] != 0u && sc[j2] != neg_max && qk_c < tile_size) {
+#if defined(NATIVE_FP16)
+                p = (float)exp((float16_t)(sc[j2] - s_max[r]));
+#else
                 p = exp(sc[j2] - s_max[r]);
+#endif
             }
             s_scores[r][qk_c] = p;
         }
@@ -400,6 +703,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             s_sum[tid] += tile_sum;
         }
 
+#if !defined(NATIVE_FP16)
         // Reuse the K tile slot for V. The K reads finished at the QK barrier,
         // so no extra sync is needed before overwriting it.
         for (uint vidx = tid; vidx < FA_PF_BC * FA_PF_DVEC; vidx += FA_PF_THREADS) {
@@ -417,11 +721,16 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             s_kv[c][dv * 4u + 3u] = vval.w;
         }
         GroupMemoryBarrierWithGroupSync();
+#endif
 
         // PV. One LDS V read feeds FA_PF_ACC accumulators.
         if (pv_live) {
             for (uint vc = 0; vc < tile_size; ++vc) {
+#if defined(NATIVE_FP16)
+                float vval = (float)s_vh[vc][pv_d];
+#else
                 float vval = s_kv[vc][pv_d];
+#endif
                 [unroll]
                 for (uint ai2 = 0; ai2 < FA_PF_ACC; ++ai2) {
                     acc[ai2] += s_scores[pv_r0 + ai2 * FA_PF_DG][vc] * vval;

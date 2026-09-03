@@ -1,8 +1,9 @@
-// mul_mat_vec_mr.hlsl - Multi-row F16/F32 matvec (M=1)
+// mul_mat_vec_mr.hlsl - Multi-row F16/BF16/F32 matvec (M=1)
 //
 // Processes 2 output rows per workgroup, sharing activation loads.
 // Uses Load4 for vectorized F16 weight reads and F32 activation reads.
-// Supports F16 (src0_esize=2) and F32 (src0_esize=4) weights.
+// Supports F16 (src0_esize=2), BF16 (src0_esize=3), and F32
+// (src0_esize=4) weights.
 //
 // Dispatch: groups_x = (N+1)/2, groups_y = 1, groups_z = batch*ne2*ne3
 
@@ -43,7 +44,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // Load4/Load2 reads stay aligned. Permuted-view callers — typically the
     // V·softmax(QK^T) matmul under -fa 0, where V is permuted so its
     // KV-position axis is the K axis — hit the strided fallback below.
-    bool k_contig = (nb00 == src0_esize) && (nb10 == 4u);
+    uint src0_stride = src0_esize == 3 ? 2u : src0_esize;
+    bool k_contig = (nb00 == src0_stride) && (nb10 == 4u);
 
     if (src0_esize == 2 && k_contig) {
         // F16 weights: Load4 = 2×uint32 = 4 F16 values per iteration
@@ -82,6 +84,31 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             float x = asfloat(src1.Load(src1_base + k * 4));
             acc0 = mad(load_auto(src0, src0_row0 + k * 2, 2), x, acc0);
             acc1 = mad(load_auto(src0, src0_row1 + k * 2, 2), x, acc1);
+        }
+    } else if (src0_esize == 3 && k_contig) {
+        // BF16 weights: packed 16-bit loads, expanded directly to F32.
+        uint k = tid * 4;
+        for (; k + 3 < K; k += GROUP_SIZE * 4) {
+            uint4 x4 = src1.Load4(src1_base + k * 4);
+            float x0 = asfloat(x4.x); float x1 = asfloat(x4.y);
+            float x2 = asfloat(x4.z); float x3 = asfloat(x4.w);
+
+            uint2 w0 = src0.Load2(src0_row0 + k * 2);
+            acc0 = mad(asfloat((w0.x & 0xFFFFu) << 16), x0,
+                   mad(asfloat(w0.x & 0xFFFF0000u), x1,
+                   mad(asfloat((w0.y & 0xFFFFu) << 16), x2,
+                   mad(asfloat(w0.y & 0xFFFF0000u), x3, acc0))));
+
+            uint2 w1 = src0.Load2(src0_row1 + k * 2);
+            acc1 = mad(asfloat((w1.x & 0xFFFFu) << 16), x0,
+                   mad(asfloat(w1.x & 0xFFFF0000u), x1,
+                   mad(asfloat((w1.y & 0xFFFFu) << 16), x2,
+                   mad(asfloat(w1.y & 0xFFFF0000u), x3, acc1))));
+        }
+        for (; k < K; k++) {
+            float x = asfloat(src1.Load(src1_base + k * 4));
+            acc0 = mad(load_auto(src0, src0_row0 + k * 2, 3), x, acc0);
+            acc1 = mad(load_auto(src0, src0_row1 + k * 2, 3), x, acc1);
         }
     } else if (src0_esize == 4 && k_contig) {
         // F32 weights: Load4 = 4 floats per iteration, mad() chains

@@ -38,8 +38,10 @@ uint read_u32_fast(ByteAddressBuffer buf, uint byte_off) {
     uint aligned = byte_off & ~3u;
     uint shift = (byte_off & 3u) * 8u;
     uint lo = buf.Load(aligned);
-    if (shift == 0u) return lo;
-    uint hi = buf.Load(aligned + 4u);
+    uint hi = buf.Load(aligned + (shift == 0u ? 0u : 4u));
+    if (shift == 0u) {
+        return lo;
+    }
     return (lo >> shift) | (hi << (32u - shift));
 }
 

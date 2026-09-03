@@ -15,24 +15,30 @@ uint read_u32_unaligned(ByteAddressBuffer buf, uint byte_offset) {
     uint aligned = byte_offset & ~3u;
     uint shift = (byte_offset & 3u) * 8u;
     uint lo = buf.Load(aligned);
+    uint hi = buf.Load(aligned + (shift == 0u ? 0u : 4u));
     if (shift == 0u) {
         return lo;
     }
-    uint hi = buf.Load(aligned + 4u);
     return (lo >> shift) | (hi << (32u - shift));
 }
 
 void read_u32x2_unaligned(ByteAddressBuffer buf, uint byte_offset, out uint lo, out uint hi) {
+    // The third word is only meaningful for a misaligned start, but it is
+    // addressed unconditionally: a load guarded by `shift != 0` can still be
+    // speculated by the compiler, and these buffers are bound as root SRVs,
+    // which D3D12 does not bounds check. Reading aligned+8 for an already
+    // aligned offset walks off the end of the last tensor in an allocation
+    // and faults the device.
     uint aligned = byte_offset & ~3u;
     uint shift = (byte_offset & 3u) * 8u;
     uint w0 = buf.Load(aligned);
     uint w1 = buf.Load(aligned + 4u);
+    uint w2 = buf.Load(aligned + (shift == 0u ? 4u : 8u));
     if (shift == 0u) {
         lo = w0;
         hi = w1;
         return;
     }
-    uint w2 = buf.Load(aligned + 8u);
     lo = (w0 >> shift) | (w1 << (32u - shift));
     hi = (w1 >> shift) | (w2 << (32u - shift));
 }

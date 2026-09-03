@@ -58,6 +58,7 @@ if (DXC_EXECUTABLE)
         relu
         tanh_
         sigmoid
+        mul_sigmoid_gate
         abs
         neg
         sgn
@@ -75,9 +76,13 @@ if (DXC_EXECUTABLE)
         group_norm
         soft_max
         soft_max_cached
+        argsort_top_k_small
+        get_rows_moe_norm
         mul_mat
         mul_mat_id
         mul_mat_id_coop
+        mul_mat_id_coop_wide
+        moe_expert_bucket
         mul_mat_id_q4_0
         mul_mat_id_q4_0_coop
         mul_mat_id_q4_1
@@ -87,6 +92,8 @@ if (DXC_EXECUTABLE)
         mul_mat_id_q5_1
         mul_mat_id_q5_1_coop
         mul_mat_id_q8_0
+        mul_mat_id_q8_0_coop
+        moe_sum
         mul_mat_id_q4k
         mul_mat_id_q4k_coop
         mul_mat_id_q4k_block
@@ -94,6 +101,7 @@ if (DXC_EXECUTABLE)
         mul_mat_id_q5k_coop
         mul_mat_id_q6k
         mul_mat_id_q6k_coop
+        mul_mat_id_q6k_coop_wide
         mul_mat_id_iq4_nl
         mul_mat_id_iq4_nl_coop
         mul_mat_id_iq4_xs
@@ -117,6 +125,27 @@ if (DXC_EXECUTABLE)
         mul_mat_iq1_s_quant
         mul_mat_iq1_m_quant
         mul_mat_iq4_xs_quant
+        mul_mat_id_mxfp4
+        mul_mat_id_mxfp4_coop
+        mul_mat_id_nvfp4
+        mul_mat_id_nvfp4_coop
+        mul_mat_id_q1_0
+        mul_mat_id_q1_0_coop
+        mul_mat_mxfp4_quant
+        mul_mat_nvfp4_quant
+        mul_mat_q1_0_quant
+        mul_mat_q2_0_quant
+        mul_mat_tq1_0_quant
+        mul_mat_tq2_0_quant
+        mul_mat_vec_q2_0
+        mul_mat_vec_tq1_0
+        mul_mat_vec_tq2_0
+        mul_mat_id_q2_0
+        mul_mat_id_q2_0_coop
+        mul_mat_id_tq1_0
+        mul_mat_id_tq1_0_coop
+        mul_mat_id_tq2_0
+        mul_mat_id_tq2_0_coop
         cpy
         get_rows
         diag_mask_inf
@@ -171,8 +200,11 @@ if (DXC_EXECUTABLE)
         flash_attn_128
         flash_attn_pf_64
         flash_attn_pf_64_wide
+        flash_attn_pf_64_wide_prescan_relaxed_maskclass
         flash_attn_pf_96
         flash_attn_pf_128
+        flash_attn_pf_96_prescan
+        flash_attn_pf_128_prescan
         flash_attn_gqa
         flash_attn_reduce
         flash_attn_q4_0
@@ -240,12 +272,27 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_glu_q8_0_wave64_rms
         mul_mat_vec_q8_0_dp4a_mr64
         mul_mat_vec_q4k_dp4a_mr4
+        mul_mat_vec_q6k_dp4a_mr4
         mul_mat_vec_q4k_dp4a_nc2
         mul_mat_vec_q4k_dp4a_nc4
         mul_mat_vec_q4k_dp4a_nc8
+        mul_mat_vec_q4k_dp4a_nc16
+        mul_mat_vec_q4k_dp4a_nc32
         mul_mat_vec_q5k_dp4a_nc2
+        mul_mat_vec_q5k_dp4a_nc4
+        mul_mat_vec_q5k_dp4a_nc8
+        mul_mat_vec_q5k_dp4a_nc16
+        mul_mat_vec_q5k_dp4a_nc32
         mul_mat_vec_q6k_dp4a_nc2
+        mul_mat_vec_q6k_dp4a_nc4
+        mul_mat_vec_q6k_dp4a_nc8
+        mul_mat_vec_q6k_dp4a_nc16
+        mul_mat_vec_q6k_dp4a_nc32
         mul_mat_vec_q8_0_dp4a_nc2
+        mul_mat_vec_q8_0_dp4a_nc4
+        mul_mat_vec_q8_0_dp4a_nc8
+        mul_mat_vec_q8_0_dp4a_nc16
+        mul_mat_vec_q8_0_dp4a_nc32
         mul_mat_vec_q5_0_mr64
         mul_mat_vec_q5_0_mr
         mul_mat_vec_q5_0_nc8
@@ -300,6 +347,21 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_iq4_nl_mr
         mul_mat_vec_iq4_nl_mr256
         get_rows_iq4_nl
+        get_rows_iq1_m
+        get_rows_iq1_s
+        get_rows_iq2_s
+        get_rows_iq2_xs
+        get_rows_iq2_xxs
+        get_rows_iq3_s
+        get_rows_iq3_xxs
+        get_rows_iq4_xs
+        get_rows_mxfp4
+        get_rows_nvfp4
+        get_rows_q1_0
+        get_rows_q2_0
+        get_rows_tq1_0
+        get_rows_tq2_0
+        mul_mat_vec_mxfp4
         mul_mat_vec_iq2_xxs
         mul_mat_vec_iq2_xxs_mr
         mul_mat_vec_iq4_xs
@@ -329,9 +391,16 @@ if (DXC_EXECUTABLE)
         mul_mat_q8_0_q8_1_tiled
         mul_mat_q8_0_q8_1_tiled_intel
         mul_mat_q4k_q8_1_tiled
+        mul_mat_q4k_q8_1_tiled_64
         mul_mat_q5k_q8_1_tiled
         mul_mat_q5_0_q8_1_tiled
+        mul_mat_q5_0_q8_1_tiled_64
         mul_mat_q6k_q8_1_tiled
+        mul_mat_q6k_q8_1_tiled_64
+        mul_mat_q8_0_q8_1_mmq
+        mul_mat_q4k_q8_1_mmq
+        mul_mat_q5k_q8_1_mmq
+        mul_mat_q6k_q8_1_mmq
         mul_mat_vec_q4k_dp4a
         mul_mat_vec_q4k_dp4a_32
         mul_mat_vec_q5k_dp4a
@@ -340,6 +409,8 @@ if (DXC_EXECUTABLE)
         mul_mat_vec_q3k_dp4a
         mul_mat_vec_q8_0_dp4a
         mul_mat_id_q8_0_dp4a
+        mul_mat_id_q8_0_dp4a_g64
+        mul_mat_id_q4k_dp4a
         mul_mat_vec_q4_0_dp4a
         mul_mat_vec_q4_0_dp4a_mr256
         mul_mat_vec_q4_1_dp4a
@@ -365,6 +436,13 @@ if (DXC_EXECUTABLE)
         flash_attn_gqa
         flash_attn_tiled
         flash_attn_tiled16
+        flash_attn_pf_64
+        flash_attn_pf_64_wide
+        flash_attn_pf_64_wide_prescan_relaxed_maskclass
+        flash_attn_pf_96
+        flash_attn_pf_128
+        flash_attn_pf_96_prescan
+        flash_attn_pf_128_prescan
     )
 
     # Shaders that REQUIRE native 16-bit shader ops (compiled with
@@ -389,6 +467,71 @@ if (DXC_EXECUTABLE)
         set_rows_iq4_nl
         cpy_quant_block
         mul_mat_wmma_fp16
+        mul_mat_id_gemm
+        mul_mat_id_gemm_q4_0
+        mul_mat_id_gemm_q4_1
+        mul_mat_id_gemm_q5_0
+        mul_mat_id_gemm_q5_1
+        mul_mat_id_gemm_q8_0
+        mul_mat_id_gemm_q2k
+        mul_mat_id_gemm_q3k
+        mul_mat_id_gemm_q4k
+        mul_mat_id_gemm_q5k
+        mul_mat_id_gemm_q6k
+        mul_mat_id_gemm_iq4_nl
+        mul_mat_id_gemm_iq4_xs
+        mul_mat_id_gemm_mxfp4
+        mul_mat_id_gemm_nvfp4
+        mul_mat_id_gemm_q1_0
+        mul_mat_id_gemm_q2_0
+        mul_mat_id_gemm_tq1_0
+        mul_mat_id_gemm_tq2_0
+        mul_mat_id_gemm_iq2_xxs
+        mul_mat_id_gemm_iq2_xs
+        mul_mat_id_gemm_iq2_s
+        mul_mat_id_gemm_iq3_xxs
+        mul_mat_id_gemm_iq3_s
+        mul_mat_id_gemm_iq1_s
+        mul_mat_id_gemm_iq1_m
+        mul_mat_id_gemm_tall_iq1_m
+        mul_mat_id_gemm_tall_iq1_s
+        mul_mat_id_gemm_tall_iq2_s
+        mul_mat_id_gemm_tall_iq2_xs
+        mul_mat_id_gemm_tall_iq2_xxs
+        mul_mat_id_gemm_tall_iq3_s
+        mul_mat_id_gemm_tall_iq3_xxs
+        mul_mat_id_gemm_tall_iq4_nl
+        mul_mat_id_gemm_tall_iq4_xs
+        mul_mat_id_gemm_tall_mxfp4
+        mul_mat_id_gemm_tall_nvfp4
+        mul_mat_id_gemm_tall_q1_0
+        mul_mat_id_gemm_tall_q2_0
+        mul_mat_id_gemm_tall_q2k
+        mul_mat_id_gemm_tall_q3k
+        mul_mat_id_gemm_tall_q4_0
+        mul_mat_id_gemm_tall_q4_1
+        mul_mat_id_gemm_tall_q4k
+        mul_mat_id_gemm_tall_q5_0
+        mul_mat_id_gemm_tall_q5_1
+        mul_mat_id_gemm_tall_q5k
+        mul_mat_id_gemm_tall_q6k
+        mul_mat_id_gemm_tall_q8_0
+        mul_mat_id_gemm_tall_tq1_0
+        mul_mat_id_gemm_tall_tq2_0
+        mul_mat_gemm_iq2_xxs
+        mul_mat_gemm_iq2_xs
+        mul_mat_gemm_iq2_s
+        mul_mat_gemm_iq3_xxs
+        mul_mat_gemm_iq3_s
+        mul_mat_gemm_iq1_s
+        mul_mat_gemm_iq1_m
+        mul_mat_gemm_iq4_xs
+        mul_mat_gemm_q2_0
+        mul_mat_gemm_tq1_0
+        mul_mat_gemm_tq2_0
+        mul_mat_gemm_mxfp4
+        mul_mat_gemm_nvfp4
+        mul_mat_gemm_q1_0
     )
 
     set(DX12_SHADER_HEADERS "")
@@ -406,8 +549,11 @@ if (DXC_EXECUTABLE)
         flash_attn_tiled16
         flash_attn_pf_64
         flash_attn_pf_64_wide
+        flash_attn_pf_64_wide_prescan_relaxed_maskclass
         flash_attn_pf_96
         flash_attn_pf_128
+        flash_attn_pf_96_prescan
+        flash_attn_pf_128_prescan
         flash_attn_gqa
         flash_attn_reduce
         flash_attn_q4_0
@@ -454,9 +600,17 @@ if (DXC_EXECUTABLE)
     # Add to DEPENDS so changes trigger rebuilds of dependent shaders.
     set(SHADER_INCLUDE_DEPS
         ${SHADER_INPUT_DIR}/ggml_common.hlsli
+        ${SHADER_INPUT_DIR}/get_rows_quant.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_gemm_quant.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_id_gemm.hlsli
         ${SHADER_INPUT_DIR}/mul_mat_id_quant.hlsli
         ${SHADER_INPUT_DIR}/mul_mat_id_quant_coop.hlsli
         ${SHADER_INPUT_DIR}/mul_mat_quant.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_vec_quant.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_vec_q8_0_dp4a_nc.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_vec_q4k_dp4a_nc.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_vec_q5k_dp4a_nc.hlsli
+        ${SHADER_INPUT_DIR}/mul_mat_vec_q6k_dp4a_nc.hlsli
         ${SHADER_INPUT_DIR}/quant_dequant.hlsli
         ${SHADER_INPUT_DIR}/rope_yarn.hlsli
         ${SHADER_INPUT_DIR}/flash_attn.hlsl

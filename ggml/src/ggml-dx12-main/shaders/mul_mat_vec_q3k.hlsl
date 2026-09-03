@@ -31,7 +31,7 @@ uint load_u32_q3k(ByteAddressBuffer buf, uint addr) {
     uint shift = (addr & 3u) * 8u;
     uint w0 = buf.Load(a);
     if (shift == 0u) return w0;
-    uint w1 = buf.Load(a + 4u);
+    uint w1 = buf.Load(a + (shift == 0u ? 0u : 4u));
     return (w0 >> shift) | (w1 << (32u - shift));
 }
 

@@ -56,7 +56,8 @@ float4 cd_load_kv4(ByteAddressBuffer buf, uint row_base, uint vidx) {
     const uint a  = qo & ~3u;
     const uint sh = (qo & 3u) * 8u;
     const uint w0 = buf.Load(a);
-    const uint w  = (sh == 0u) ? w0 : ((w0 >> sh) | (buf.Load(a + 4u) << (32u - sh)));
+    const uint w1 = buf.Load(a + (sh == 0u ? 0u : 4u));
+    const uint w  = (sh == 0u) ? w0 : ((w0 >> sh) | (w1 << (32u - sh)));
 
     return float4((float)((int)(w << 24) >> 24),
                   (float)((int)(w << 16) >> 24),

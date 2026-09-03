@@ -11,10 +11,10 @@ uint read_u32_q50_nc8(uint byte_off) {
     uint aligned = byte_off & ~3u;
     uint shift = (byte_off & 3u) * 8u;
     uint lo = src0.Load(aligned);
+    uint hi = src0.Load(aligned + (shift == 0u ? 0u : 4u));
     if (shift == 0u) {
         return lo;
     }
-    uint hi = src0.Load(aligned + 4u);
     return (lo >> shift) | (hi << (32u - shift));
 }
 

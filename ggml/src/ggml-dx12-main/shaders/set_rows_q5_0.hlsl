@@ -41,7 +41,7 @@ void main(uint3 gid : SV_GroupID, uint local_id : SV_GroupThreadID) {
     float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
 
     uint dst_block_off = dst_offset + bi0 * 22u + (uint)row_idx * nb1 + i2 * nb2 + i3 * nb3;
-    dst.Store<uint16_t>(dst_block_off, (uint16_t)f32tof16(d));
+    dst.Store<uint16_t>(dst_block_off, asuint16((float16_t)d));
 
     uint qh = 0u;
     // Compute all 16 packed qs bytes + qh bits.  Two consecutive bytes are

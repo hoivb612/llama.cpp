@@ -95,5 +95,5 @@ void main(uint3 gid : SV_GroupID, uint local_id : SV_GroupThreadID) {
               +  w1_lo * lut1_lo * lut1_lo + w1_hi * lut1_hi * lut1_hi;
     }
     float d_refined = (sumq2 > 0.0f) ? (sumqx / sumq2) : d;
-    dst.Store<uint16_t>(dst_block_off, (uint16_t)f32tof16(d_refined));
+    dst.Store<uint16_t>(dst_block_off, asuint16((float16_t)d_refined));
 }

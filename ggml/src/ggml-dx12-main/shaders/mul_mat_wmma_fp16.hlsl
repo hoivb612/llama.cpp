@@ -27,6 +27,15 @@
 // Falls back to mul_mat_wmma.hlsl for F32 weights or F16 activations.
 #include "ggml_common.hlsli"
 
+// Unpack 4 consecutive F16 halves from 2 dwords. Native 16-bit types make this
+// a bitcast, so the f16->f32->f16 round trip in load_auto() disappears.
+void unpack_f16x4(uint2 w, out float16_t v[4]) {
+    v[0] = asfloat16((uint16_t)(w.x & 0xFFFFu));
+    v[1] = asfloat16((uint16_t)(w.x >> 16));
+    v[2] = asfloat16((uint16_t)(w.y & 0xFFFFu));
+    v[3] = asfloat16((uint16_t)(w.y >> 16));
+}
+
 #define BM 64
 #define BN 64
 #define BK 16
@@ -70,41 +79,68 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     for (uint kt = 0; kt < num_k_tiles; kt++) {
         uint k_start = kt * BK;
 
-        // tile_a: BM x BK halves (1024). 4 per thread.
+        // tile_a: BM x BK halves (1024). 4 per thread, 4 consecutive K.
         {
             uint base = flat_id * LDS_PER_THREAD;
-            [unroll] for (uint e = 0; e < LDS_PER_THREAD; e++) {
-                uint idx = base + e;
-                uint m = idx / BK;
-                uint k = idx % BK;
-                uint global_m = row_block * BM + m;
-                uint global_k = k_start + k;
-                float16_t val = (float16_t)0;
-                if (global_m < ne11 && global_k < K) {
-                    uint off = offset_4d(global_k, global_m, i2, i3,
-                                         nb10, nb11, nb12, nb13, src1_offset);
-                    val = (float16_t)load_auto(src1, off, src1_esize);
+            uint m = base / BK;
+            uint k0 = base % BK;
+            uint global_m = row_block * BM + m;
+            uint global_k0 = k_start + k0;
+            bool in_range = global_m < ne11 && (global_k0 + LDS_PER_THREAD - 1) < K;
+            uint off0 = offset_4d(global_k0, global_m, i2, i3,
+                                  nb10, nb11, nb12, nb13, src1_offset);
+            if (in_range && src1_esize == 2 && nb10 == 2 && (off0 & 3u) == 0u) {
+                float16_t v[4];
+                unpack_f16x4(src1.Load2(off0), v);
+                [unroll] for (uint e = 0; e < LDS_PER_THREAD; e++) {
+                    tile_a[m][k0 + e] = v[e];
                 }
-                tile_a[m][k] = val;
+            } else {
+                [unroll] for (uint e = 0; e < LDS_PER_THREAD; e++) {
+                    uint k = k0 + e;
+                    uint global_k = k_start + k;
+                    float16_t val = (float16_t)0;
+                    if (global_m < ne11 && global_k < K) {
+                        uint off = offset_4d(global_k, global_m, i2, i3,
+                                             nb10, nb11, nb12, nb13, src1_offset);
+                        val = (float16_t)load_auto(src1, off, src1_esize);
+                    }
+                    tile_a[m][k] = val;
+                }
             }
         }
 
         // tile_b: BK x BN halves (1024). 4 per thread.
+        // Walk K (the contiguous src0 axis) within a thread so each group of
+        // BK/LDS_PER_THREAD threads covers one weight row back to back; mapping
+        // the fast axis to N instead strides every load by nb01.
         {
             uint base = flat_id * LDS_PER_THREAD;
-            [unroll] for (uint e = 0; e < LDS_PER_THREAD; e++) {
-                uint idx = base + e;
-                uint k = idx / BN;
-                uint n = idx % BN;
-                uint global_k = k_start + k;
-                uint global_n = col_block * BN + n;
-                float16_t val = (float16_t)0;
-                if (global_k < K && global_n < ne01) {
-                    uint off = offset_4d(global_k, global_n, i2_src0, i3_src0,
-                                         nb00, nb01, nb02, nb03, src0_offset);
-                    val = (float16_t)load_auto(src0, off, src0_esize);
+            uint n = base / BK;
+            uint k0 = base % BK;
+            uint global_n = col_block * BN + n;
+            uint global_k0 = k_start + k0;
+            bool in_range = global_n < ne01 && (global_k0 + LDS_PER_THREAD - 1) < K;
+            uint off0 = offset_4d(global_k0, global_n, i2_src0, i3_src0,
+                                  nb00, nb01, nb02, nb03, src0_offset);
+            if (in_range && src0_esize == 2 && nb00 == 2 && (off0 & 3u) == 0u) {
+                float16_t v[4];
+                unpack_f16x4(src0.Load2(off0), v);
+                [unroll] for (uint e = 0; e < LDS_PER_THREAD; e++) {
+                    tile_b[k0 + e][n] = v[e];
                 }
-                tile_b[k][n] = val;
+            } else {
+                [unroll] for (uint e = 0; e < LDS_PER_THREAD; e++) {
+                    uint k = k0 + e;
+                    uint global_k = k_start + k;
+                    float16_t val = (float16_t)0;
+                    if (global_n < ne01 && global_k < K) {
+                        uint off = offset_4d(global_k, global_n, i2_src0, i3_src0,
+                                             nb00, nb01, nb02, nb03, src0_offset);
+                        val = (float16_t)load_auto(src0, off, src0_esize);
+                    }
+                    tile_b[k][n] = val;
+                }
             }
         }
 

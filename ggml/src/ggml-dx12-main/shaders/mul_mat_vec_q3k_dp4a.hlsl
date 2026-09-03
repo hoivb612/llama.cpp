@@ -40,8 +40,40 @@ uint load_u32_u(ByteAddressBuffer buf, uint byte_off) {
     uint shift = (byte_off & 3u) * 8u;
     uint w0 = buf.Load(align_off);
     if (shift == 0) return w0;
-    uint w1 = buf.Load(align_off + 4);
+    uint w1 = buf.Load(align_off + (shift == 0u ? 0u : 4u));
     return (w0 >> shift) | (w1 << (32u - shift));
+}
+
+// 16-byte fetch at a possibly-misaligned offset. Four separate load_u32_u
+// calls cost 8 loads on the misaligned path and re-read each boundary word
+// twice; this is 1 Load4 when aligned and 5 word loads when not. Same helper
+// as mul_mat_vec_q3k_mr_blocked.hlsl.
+//
+// Load4 requires 4-byte alignment: desktop AMD GCN/RDNA tolerates 2-byte
+// alignment, but some AMD console HW (Xbox GDKX) silently masks the low bits
+// and returns the wrong 16 bytes, hence the explicit reconstruction.
+uint4 load4_u_q3k(uint byte_off) {
+    uint shift = (byte_off & 3u) * 8u;
+    if (shift == 0u) {
+        return src0.Load4(byte_off);
+    }
+    uint base = byte_off & ~3u;
+    uint w0 = src0.Load(base);
+    uint w1 = src0.Load(base + 4);
+    uint w2 = src0.Load(base + 8);
+    uint w3 = src0.Load(base + 12);
+    // Addressed defensively: this load sits after an early return, but the
+    // compiler may still speculate it, and src0 is bound as a root SRV, which
+    // D3D12 does not bounds check. base+16 for an aligned offset would read
+    // past the end of the last tensor in the allocation.
+    uint w4 = src0.Load(base + (shift == 0u ? 12u : 16u));
+    uint isr = 32u - shift;
+    uint4 r;
+    r.x = (w0 >> shift) | (w1 << isr);
+    r.y = (w1 >> shift) | (w2 << isr);
+    r.z = (w2 >> shift) | (w3 << isr);
+    r.w = (w3 >> shift) | (w4 << isr);
+    return r;
 }
 
 // Decode Q3_K data for one row's superblock for thread `t` (subblock 0..15).
@@ -78,16 +110,18 @@ void decode_q3k_row(uint block_off, uint t,
 
     // 16 qs bytes (low 2 bits) and 16 hmask bytes (high bit) for this subblock.
     uint qs_block_off = block_off + 32u + qs_off;
-    uint qw0 = load_u32_u(src0, qs_block_off + 0);
-    uint qw1 = load_u32_u(src0, qs_block_off + 4);
-    uint qw2 = load_u32_u(src0, qs_block_off + 8);
-    uint qw3 = load_u32_u(src0, qs_block_off + 12);
+    uint4 qw = load4_u_q3k(qs_block_off);
+    uint qw0 = qw.x;
+    uint qw1 = qw.y;
+    uint qw2 = qw.z;
+    uint qw3 = qw.w;
 
     uint hm_block_off = block_off + 0u + hm_off;
-    uint hw0 = load_u32_u(src0, hm_block_off + 0);
-    uint hw1 = load_u32_u(src0, hm_block_off + 4);
-    uint hw2 = load_u32_u(src0, hm_block_off + 8);
-    uint hw3 = load_u32_u(src0, hm_block_off + 12);
+    uint4 hw = load4_u_q3k(hm_block_off);
+    uint hw0 = hw.x;
+    uint hw1 = hw.y;
+    uint hw2 = hw.z;
+    uint hw3 = hw.w;
 
     uint qp0 = (qw0 >> shift) & 0x03030303u;
     uint qp1 = (qw1 >> shift) & 0x03030303u;

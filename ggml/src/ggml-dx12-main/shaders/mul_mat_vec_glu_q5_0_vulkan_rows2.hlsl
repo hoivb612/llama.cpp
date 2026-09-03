@@ -15,10 +15,10 @@ uint read_u32_unaligned(ByteAddressBuffer buf, uint byte_offset) {
     uint aligned = byte_offset & ~3u;
     uint shift = (byte_offset & 3u) * 8u;
     uint lo = buf.Load(aligned);
+    uint hi = buf.Load(aligned + (shift == 0u ? 0u : 4u));
     if (shift == 0u) {
         return lo;
     }
-    uint hi = buf.Load(aligned + 4u);
     return (lo >> shift) | (hi << (32u - shift));
 }
 

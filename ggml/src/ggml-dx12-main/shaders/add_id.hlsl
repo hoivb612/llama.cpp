@@ -32,7 +32,18 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint base_src1 = src1_offset + i11 * nb11;
     uint base_dst  = dst_offset  + i3 * nb3  + i2 * nb2  + i1 * nb1;
 
-    for (uint i0 = gtid.x; i0 < ne0; i0 += 256) {
+    bool wide = nb00 == 4 && nb10 == 4 && nb0 == 4 &&
+                ((base_src0 | base_src1 | base_dst) & 15u) == 0;
+    if (wide) {
+        for (uint i0 = gtid.x * 4; i0 + 3 < ne0; i0 += 1024) {
+            uint4 av = src0.Load4(base_src0 + i0 * 4);
+            uint4 bv = src1.Load4(base_src1 + i0 * 4);
+            dst.Store4(base_dst + i0 * 4, asuint(asfloat(av) + asfloat(bv)));
+        }
+    }
+
+    uint tail = wide ? (ne0 & ~3u) : 0;
+    for (uint i0 = tail + gtid.x; i0 < ne0; i0 += 256) {
         float a = asfloat(src0.Load(base_src0 + i0 * nb00));
         float b = asfloat(src1.Load(base_src1 + i0 * nb10));
         dst.Store(base_dst + i0 * nb0, asuint(a + b));

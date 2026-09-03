@@ -1,4 +1,4 @@
-// mul_mat_vec_iq1_s.hlsl - Matrix-vector multiply for IQ1_S weights (M=1)
+// mul_mat_vec_iq1_s.hlsl - Cooperative matrix-vector/matrix multiply for IQ1_S weights
 //
 // IQ1_S block (50 bytes, QK_K=256 elements):
 //   offset 0..1   : d (fp16)
@@ -49,8 +49,10 @@ float read_f16_iq(ByteAddressBuffer buf, uint byte_off) {
 #endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
-    uint i0 = group_x_2d(group_id);
+    uint i0 = group_id.x;
     if (i0 >= ne0) return;
+    uint i1 = group_id.y;
+    if (i1 >= ne1) return;
     uint flat_batch = group_id.z;
     uint i2 = flat_batch % ne2;
     uint i3 = flat_batch / ne2;
@@ -62,7 +64,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint num_blocks = K / QK_K;
 
     uint src0_row  = src0_offset + i0 * nb01 + i2_src0 * nb02 + i3_src0 * nb03;
-    uint src1_base = src1_offset + i2 * nb12 + i3 * nb13;
+    uint src1_base = src1_offset + i1 * nb11 + i2 * nb12 + i3 * nb13;
 
     uint ib32 = tid >> 2;
     uint l    = tid & 3u;
@@ -123,7 +125,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     if (tid == 0) {
         float result = shared_acc[0];
         result += load_fused_bias(i0, i2, i3);
-        uint off_d = offset_4d(i0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+        uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d, result, dst_esize);
     }
 }

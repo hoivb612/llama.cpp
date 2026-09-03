@@ -67,8 +67,11 @@ void main(uint3 gid : SV_GroupID, uint local_id : SV_GroupThreadID) {
     // and 34 are all even (host gates ne00 % 32 == 0).
     uint dst_block_off = dst_offset + bi0 * 34u + (uint)row_idx * nb1 + i2 * nb2 + i3 * nb3;
 
-    // Write d as a native 16-bit value (2-aligned).
-    dst.Store<uint16_t>(dst_block_off, (uint16_t)f32tof16(d));
+    // Write d as a native 16-bit value (2-aligned). The native cast is an
+    // IEEE fptrunc (round-to-nearest-even), matching GGML_FP32_TO_FP16 on the
+    // CPU; the legacy f32tof16 intrinsic truncates instead and leaves a
+    // systematic ~1 f16 ulp bias in every block scale.
+    dst.Store<uint16_t>(dst_block_off, asuint16((float16_t)d));
 
     // Pass 2: quantize the 32 elements and pack 2 int8s per uint16_t store
     // (16 stores at offsets dst_block_off + 2 + 0,2,4,...,30).

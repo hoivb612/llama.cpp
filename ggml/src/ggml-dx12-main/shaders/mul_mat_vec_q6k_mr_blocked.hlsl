@@ -40,7 +40,11 @@ uint4 load4_u_q6k(uint byte_off) {
     uint w1 = src0.Load(base + 4);
     uint w2 = src0.Load(base + 8);
     uint w3 = src0.Load(base + 12);
-    uint w4 = src0.Load(base + 16);
+    // Addressed defensively: this load sits after an early return, but the
+    // compiler may still speculate it, and src0 is bound as a root SRV, which
+    // D3D12 does not bounds check. base+16 for an aligned offset would read
+    // past the end of the last tensor in the allocation.
+    uint w4 = src0.Load(base + (shift == 0u ? 12u : 16u));
     uint isr = 32u - shift;
     uint4 r;
     r.x = (w0 >> shift) | (w1 << isr);

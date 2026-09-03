@@ -206,6 +206,125 @@ float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
     uint q = (elem < 16) ? (qs & 0x0Fu) : ((qs >> 4) & 0x0Fu);
     return d * (float)mmid_kvalues_iq4nl(q);
 }
+#elif defined(MMID_MXFP4)
+#define MMID_QK 32
+#define MMID_BLOCK_SIZE 17
+// kvalues_fp4 in ggml-common.h holds 2x the E2M1 values, so the scale folds
+// in a factor of 0.5 (GGML_E8M0_TO_FP32_HALF).
+int mmid_kvalues_fp4(uint idx) {
+    static const uint packed[4] = {
+        0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu
+    };
+    uint w = packed[idx >> 2];
+    uint b = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    return (int)(b << 24) >> 24;
+}
+float mmid_e8m0_half(uint e) {
+    return asfloat((e < 2u) ? (0x00200000u << e) : ((e - 1u) << 23));
+}
+float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
+    uint block_off = row_off + (k / MMID_QK) * MMID_BLOCK_SIZE;
+    uint elem = k % MMID_QK;
+    float d = mmid_e8m0_half(mmid_read_byte(buf, block_off));
+    uint qs = mmid_read_byte(buf, block_off + 1 + (elem % 16));
+    uint q = (elem < 16) ? (qs & 0x0Fu) : ((qs >> 4) & 0x0Fu);
+    return d * (float)mmid_kvalues_fp4(q);
+}
+#elif defined(MMID_NVFP4)
+#define MMID_QK 64
+#define MMID_BLOCK_SIZE 36
+// 4 UE4M3 scales (one per 16-element sub-block) then 32 nibble bytes. Within
+// a sub-block the low/high split matches Q4_0: byte j holds element j and
+// element j+8. kvalues_mxfp4 is 2x the E2M1 values and ggml_ue4m3_to_fp32
+// folds in the matching 0.5.
+int mmid_kvalues_fp4(uint idx) {
+    static const uint packed[4] = {
+        0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu
+    };
+    uint w = packed[idx >> 2];
+    uint b = (w >> ((idx & 3u) * 8u)) & 0xFFu;
+    return (int)(b << 24) >> 24;
+}
+float mmid_ue4m3(uint x) {
+    uint e = (x >> 3) & 0xFu;
+    uint m = x & 0x7u;
+    // raw * 0.5: exp 0 is subnormal m*2^-10, otherwise (1+m/8)*2^(e-8).
+    float v = (e == 0u) ? ((float)m * 0.0009765625f)
+                        : asfloat(((e + 119u) << 23) | (m << 20));
+    return (x == 0x7Fu) ? 0.0f : v;
+}
+float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
+    uint block_off = row_off + (k / MMID_QK) * MMID_BLOCK_SIZE;
+    uint elem = k % MMID_QK;
+    uint sub  = elem >> 4;
+    uint e    = elem & 15u;
+    float d = mmid_ue4m3(mmid_read_byte(buf, block_off + sub));
+    uint qs = mmid_read_byte(buf, block_off + 4 + sub * 8 + (e & 7u));
+    uint q  = (e < 8u) ? (qs & 0x0Fu) : ((qs >> 4) & 0x0Fu);
+    return d * (float)mmid_kvalues_fp4(q);
+}
+#elif defined(MMID_Q1_0)
+#define MMID_QK 128
+#define MMID_BLOCK_SIZE 18
+float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
+    uint block_off = row_off + (k / MMID_QK) * MMID_BLOCK_SIZE;
+    uint elem = k % MMID_QK;
+    float d = mmid_read_f16(buf, block_off);
+    uint b  = mmid_read_byte(buf, block_off + 2 + (elem >> 3));
+    return ((b >> (elem & 7u)) & 1u) != 0u ? d : -d;
+}
+#elif defined(MMID_Q2_0)
+#define MMID_QK 64
+#define MMID_BLOCK_SIZE 18
+float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
+    uint block_off = row_off + (k / MMID_QK) * MMID_BLOCK_SIZE;
+    uint elem = k % MMID_QK;
+    float d = mmid_read_f16(buf, block_off);
+    uint b = mmid_read_byte(buf, block_off + 2 + (elem >> 2));
+    uint q = (b >> ((elem & 3u) * 2u)) & 3u;
+    return ((float)q - 1.0f) * d;
+}
+#elif defined(MMID_TQ1_0)
+#define MMID_QK 256
+#define MMID_BLOCK_SIZE 54
+float mmid_tq1_value(uint q, uint n) {
+    static const uint pow3[5] = { 1u, 3u, 9u, 27u, 81u };
+    uint trit = (((q * pow3[n]) & 0xFFu) * 3u) >> 8;
+    return (float)((int)trit - 1);
+}
+float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
+    uint block_off = row_off + (k / MMID_QK) * MMID_BLOCK_SIZE;
+    uint elem = k % MMID_QK;
+    uint q;
+    uint n;
+    if (elem < 160u) {
+        q = mmid_read_byte(buf, block_off + (elem & 31u));
+        n = elem >> 5;
+    } else if (elem < 240u) {
+        uint tail = elem - 160u;
+        q = mmid_read_byte(buf, block_off + 32u + (tail & 15u));
+        n = tail >> 4;
+    } else {
+        uint high = elem - 240u;
+        q = mmid_read_byte(buf, block_off + 48u + (high & 3u));
+        n = high >> 2;
+    }
+    float d = mmid_read_f16(buf, block_off + 52u);
+    return mmid_tq1_value(q, n) * d;
+}
+#elif defined(MMID_TQ2_0)
+#define MMID_QK 256
+#define MMID_BLOCK_SIZE 66
+float mmid_dequant(ByteAddressBuffer buf, uint row_off, uint k) {
+    uint block_off = row_off + (k / MMID_QK) * MMID_BLOCK_SIZE;
+    uint elem = k % MMID_QK;
+    uint group = elem >> 7;
+    uint within = elem & 127u;
+    uint b = mmid_read_byte(buf, block_off + group * 32u + (within & 31u));
+    uint q = (b >> ((within >> 5) * 2u)) & 3u;
+    float d = mmid_read_f16(buf, block_off + 64u);
+    return ((float)q - 1.0f) * d;
+}
 #elif defined(MMID_Q2_K)
 #define MMID_QK 256
 #define MMID_BLOCK_SIZE 84

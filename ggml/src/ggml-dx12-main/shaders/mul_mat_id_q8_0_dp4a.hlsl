@@ -5,7 +5,9 @@
 // across both rows and consecutive expert projections.
 #include "ggml_common.hlsli"
 
+#ifndef GROUP_SIZE
 #define GROUP_SIZE  32
+#endif
 #define QK8_0       32
 #define Q8_0_BSIZE  34
 #define Q8_1_BSIZE  36
@@ -18,8 +20,10 @@ uint read_u32_q80(ByteAddressBuffer buf, uint byte_off) {
     uint aligned = byte_off & ~3u;
     uint shift = (byte_off & 3u) * 8u;
     uint lo = buf.Load(aligned);
-    if (shift == 0u) return lo;
-    uint hi = buf.Load(aligned + 4u);
+    uint hi = buf.Load(aligned + (shift == 0u ? 0u : 4u));
+    if (shift == 0u) {
+        return lo;
+    }
     return (lo >> shift) | (hi << (32u - shift));
 }
 
