@@ -25,6 +25,7 @@
 #else
 #include <unistd.h>
 #include <dirent.h>
+#include <elf.h>
 #include <strings.h>
 #endif
 
@@ -222,7 +223,7 @@ struct SYSTEM_PROCESS_INFORMATION_WXE {
 
 // Bump on any change to output columns, JSON schema, or metric semantics so
 // captures can be traced back to the producing build.
-#define WXEMEM_VERSION "1.1.0"
+#define WXEMEM_VERSION "1.2.0"
 
 static std::string format_bytes(uint64_t bytes, int width = 0) {
     static const char * units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -276,6 +277,45 @@ static std::string ws_to_utf8(const wchar_t * w) {
     std::string s(n - 1, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
     return s;
+}
+
+static bool is_x86_32_process(HANDLE process) {
+    using IsWow64Process2Fn = BOOL (WINAPI *)(HANDLE, USHORT *, USHORT *);
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    auto is_wow64_process2 = kernel32
+        ? reinterpret_cast<IsWow64Process2Fn>(GetProcAddress(kernel32, "IsWow64Process2"))
+        : nullptr;
+    if (is_wow64_process2) {
+        USHORT process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+        USHORT native_machine  = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (is_wow64_process2(process, &process_machine, &native_machine)) {
+            return process_machine == IMAGE_FILE_MACHINE_I386 ||
+                   (process_machine == IMAGE_FILE_MACHINE_UNKNOWN &&
+                    native_machine == IMAGE_FILE_MACHINE_I386);
+        }
+    }
+
+    BOOL wow64 = FALSE;
+    if (IsWow64Process(process, &wow64) && wow64) return true;
+
+    SYSTEM_INFO si{};
+    GetNativeSystemInfo(&si);
+    return si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL;
+}
+#else
+static bool is_x86_32_process(long pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/exe", pid);
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+
+    Elf32_Ehdr header{};
+    const size_t got = fread(&header, 1, sizeof(header), f);
+    fclose(f);
+    return got == sizeof(header) &&
+           memcmp(header.e_ident, ELFMAG, SELFMAG) == 0 &&
+           header.e_ident[EI_CLASS] == ELFCLASS32 &&
+           header.e_machine == EM_386;
 }
 #endif
 
@@ -354,6 +394,7 @@ struct PoolTag {
 struct ProcInfo {
     DWORD       pid          = 0;
     std::string name;
+    bool        x86_32       = false;
     uint64_t    ws           = 0;  // working set (resident: private + shared)
     uint64_t    peak_ws      = 0;
     uint64_t    private_bytes = 0; // PrivateUsage on PROCESS_MEMORY_COUNTERS_EX (committed)
@@ -598,6 +639,7 @@ static std::vector<ProcInfo> collect_processes() {
 
         ProcInfo pi{};
         pi.pid = pid;
+        pi.x86_32 = is_x86_32_process(h);
 
         // Name (image base name).
         wchar_t name[MAX_PATH] = L"";
@@ -962,6 +1004,7 @@ static std::vector<ProcInfo> collect_processes() {
 
         ProcInfo pi{};
         pi.pid = (DWORD)pid;
+        pi.x86_32 = is_x86_32_process(pid);
 
         std::string comm;
         snprintf(path, sizeof(path), "/proc/%ld/comm", pid);
@@ -1370,16 +1413,18 @@ static void print_human(const PhysicalMem & p, const KernelMem & k,
         for (size_t i = 0; i < to_show; ++i) top_ws_total += procs_sorted[i].ws;
         printf(" Top %zu processes by working set (of %zu total): %s\n",
                to_show, procs_sorted.size(), format_bytes(top_ws_total).c_str());
-        printf("    %6s  %15s  %15s  %15s  %15s   %s\n",
-               "PID", "WorkingSet", "Private", "PrivWS(res)", "SharWS(res)", "Image / [services]");
+        printf("    %6s  %15s  %15s  %15s  %15s  %6s   %s\n",
+               "PID", "WorkingSet", "Private", "PrivWS(res)", "SharWS(res)",
+               "Type", "Image / [services]");
         for (size_t i = 0; i < to_show; ++i) {
             const ProcInfo & pi = procs_sorted[i];
-            printf("    %6lu  %15s  %15s  %15s  %15s   %s",
+            printf("    %6lu  %15s  %15s  %15s  %15s  %6s   %s",
                    (unsigned long)pi.pid,
                    format_bytes(pi.ws,            12).c_str(),
                    format_bytes(pi.private_bytes, 12).c_str(),
                    format_bytes(pi.private_ws,    12).c_str(),
                    format_bytes(pi.shared_ws,     12).c_str(),
+                   pi.x86_32 ? "x86-32" : "",
                    pi.name.c_str());
             auto it = services_by_pid.find(pi.pid);
             if (it != services_by_pid.end() && !it->second.empty()) {
@@ -1722,9 +1767,10 @@ static void print_json(const PhysicalMem & p, const KernelMem & k,
     printf("  \"processes\": [\n");
     for (size_t i = 0; i < to_show; ++i) {
         const auto & pi = procs_sorted[i];
-        printf("    {\"pid\": %lu, \"name\": \"%s\", \"ws_bytes\": %llu, \"private_bytes\": %llu, \"private_ws_bytes\": %llu, \"shared_ws_bytes\": %llu, \"pagefile_bytes\": %llu",
+        printf("    {\"pid\": %lu, \"name\": \"%s\", \"process_type\": \"%s\", \"ws_bytes\": %llu, \"private_bytes\": %llu, \"private_ws_bytes\": %llu, \"shared_ws_bytes\": %llu, \"pagefile_bytes\": %llu",
                (unsigned long)pi.pid,
                json_escape(pi.name).c_str(),
+               pi.x86_32 ? "x86-32" : "",
                (unsigned long long)pi.ws,
                (unsigned long long)pi.private_bytes,
                (unsigned long long)pi.private_ws,
