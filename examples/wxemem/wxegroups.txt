@@ -1,0 +1,25 @@
+Group1: Asus
+Asus
+ArmouryCrate
+
+Group2: XboxShell
+Xbox
+Gaming
+GameBar
+GameInput
+
+Group3: Utilities
+taskmgr
+sshd
+wxemem
+telnet
+MicrosoftEdgeUpdate
+SystemUWPLauncher
+MoUsoCoreWorker
+AmdPpkgSvc
+MsMpEng
+Defender
+
+Group4: Steam
+steam
+

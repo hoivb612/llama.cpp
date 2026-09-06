@@ -17,16 +17,18 @@
 // over time.
 //
 // Usage:
-//   wxememdiff <jsonA> <jsonB> [--top N] [--out FILE]
+//   wxememdiff <jsonA> <jsonB> [--top N] [--groups FILE] [--out FILE]
 //
 //     <jsonA>    baseline snapshot (the "before")
 //     <jsonB>    comparison snapshot (the "after")
 //     --top N    number of rows to show in top-N tables (default 15)
+//     --groups F process-name groups to compare
 //     --out FILE also write the report to FILE (in addition to stdout)
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -307,8 +309,89 @@ struct NamedDelta {
     int countA = 0, countB = 0;
 };
 
+struct ProcessGroup {
+    std::string name;
+    std::vector<std::string> patterns;
+};
+
+static std::string trim(const std::string& s) {
+    size_t first = 0;
+    while (first < s.size() && std::isspace(static_cast<unsigned char>(s[first]))) {
+        ++first;
+    }
+    size_t last = s.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(s[last - 1]))) {
+        --last;
+    }
+    return s.substr(first, last - first);
+}
+
+static std::string lowerAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static bool loadProcessGroups(const std::string& path,
+                              std::vector<ProcessGroup>& groups,
+                              std::string& err) {
+    std::ifstream in(path);
+    if (!in) {
+        err = "cannot open groups file: " + path;
+        return false;
+    }
+
+    ProcessGroup* current = nullptr;
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(in, line)) {
+        ++lineNo;
+        if (lineNo == 1 && line.size() >= 3 &&
+            static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        const size_t colon = line.find(':');
+        const std::string prefix = lowerAscii(trim(line.substr(0, colon)));
+        if (colon != std::string::npos && prefix.rfind("group", 0) == 0) {
+            std::string name = trim(line.substr(colon + 1));
+            if (name.empty()) {
+                err = "empty group name at " + path + ":" + std::to_string(lineNo);
+                return false;
+            }
+            groups.push_back({name, {}});
+            current = &groups.back();
+            continue;
+        }
+
+        if (!current) {
+            err = "pattern before first group at " + path + ":" +
+                  std::to_string(lineNo);
+            return false;
+        }
+        current->patterns.push_back(lowerAscii(line));
+    }
+
+    if (groups.empty()) {
+        err = "no groups found in file: " + path;
+        return false;
+    }
+    for (const auto& group : groups) {
+        if (group.patterns.empty()) {
+            err = "group has no patterns: " + group.name;
+            return false;
+        }
+    }
+    return true;
+}
+
 static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
-                        int topN) {
+                        int topN, const std::vector<ProcessGroup>& groups) {
     o << "WXEmem diff -- memory growth attribution\n";
     o << rule() << "\n";
     o << " A (baseline): " << A.label << "\n";
@@ -748,6 +831,137 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
         }
     }
     o << "\n";
+
+    // -- Named process groups ---------------------------------------------
+    if (!groups.empty()) {
+        struct GroupImageDelta {
+            std::string name;
+            int countA = 0, countB = 0;
+            i64 wsA = 0, wsB = 0;
+            i64 pwsA = 0, pwsB = 0;
+        };
+        struct GroupResult {
+            const ProcessGroup* definition = nullptr;
+            std::vector<GroupImageDelta> images;
+            int procsA = 0, procsB = 0;
+            i64 wsA = 0, wsB = 0;
+            i64 pwsA = 0, pwsB = 0;
+        };
+
+        auto matchesGroup = [](const std::string& image,
+                               const ProcessGroup& group) {
+            const std::string lowerImage = lowerAscii(image);
+            for (const auto& pattern : group.patterns) {
+                if (lowerImage.find(pattern) != std::string::npos) return true;
+            }
+            return false;
+        };
+
+        std::vector<GroupResult> results;
+        for (const auto& group : groups) {
+            GroupResult result;
+            result.definition = &group;
+            std::map<std::string, GroupImageDelta> images;
+            for (const auto& kv : A.procByName) {
+                if (!matchesGroup(kv.first, group)) continue;
+                auto& image = images[kv.first];
+                image.name = kv.first;
+                image.countA = kv.second.count;
+                image.wsA = kv.second.ws;
+                image.pwsA = useWS ? kv.second.ws : kv.second.pws;
+            }
+            for (const auto& kv : B.procByName) {
+                if (!matchesGroup(kv.first, group)) continue;
+                auto& image = images[kv.first];
+                image.name = kv.first;
+                image.countB = kv.second.count;
+                image.wsB = kv.second.ws;
+                image.pwsB = useWS ? kv.second.ws : kv.second.pws;
+            }
+            for (auto& kv : images) {
+                auto& image = kv.second;
+                result.procsA += image.countA;
+                result.procsB += image.countB;
+                result.wsA += image.wsA;
+                result.wsB += image.wsB;
+                result.pwsA += image.pwsA;
+                result.pwsB += image.pwsB;
+                result.images.push_back(std::move(image));
+            }
+            std::sort(result.images.begin(), result.images.end(),
+                      [](const GroupImageDelta& x, const GroupImageDelta& y) {
+                          return std::max(x.wsA, x.wsB) > std::max(y.wsA, y.wsB);
+                      });
+            results.push_back(std::move(result));
+        }
+
+        o << rule() << "\n";
+        o << " Named process groups (case-insensitive substring matching)\n";
+        o << rule() << "\n";
+        o << "   " << padR("group", 20) << padR("presence", 10)
+          << padL("procs A", 9) << padL("procs B", 9)
+          << padL("WS A", 13) << padL("WS B", 13) << padL("WS delta", 14)
+          << "\n";
+        for (const auto& result : results) {
+            const char* presence =
+                result.procsA > 0 && result.procsB > 0 ? "A + B" :
+                result.procsA > 0 ? "A only" :
+                result.procsB > 0 ? "B only" : "absent";
+            o << "   " << padR(result.definition->name, 20)
+              << padR(presence, 10)
+              << padL(std::to_string(result.procsA), 9)
+              << padL(std::to_string(result.procsB), 9)
+              << padL(humanBytes(result.wsA), 13)
+              << padL(humanBytes(result.wsB), 13)
+              << padL(signedBytes(result.wsB - result.wsA), 14) << "\n";
+            o << "   " << padR("  private WS", 20) << padR("", 10)
+              << padL("", 9) << padL("", 9)
+              << padL(humanBytes(result.pwsA), 13)
+              << padL(humanBytes(result.pwsB), 13)
+              << padL(signedBytes(result.pwsB - result.pwsA), 14) << "\n";
+        }
+        o << "\n   NOTE: Groups are independent; an image matching multiple groups is "
+             "counted in each.\n";
+        if (A.pws_missing_count > 0 || B.pws_missing_count > 0) {
+            o << "   NOTE: PrivateWS was unavailable in at least one capture; "
+                 "WorkingSet is shown\n"
+                 "         for both sides in the private-WS rows.\n";
+        }
+
+        for (const auto& result : results) {
+            o << "\n " << result.definition->name << ": "
+              << result.images.size() << " matching images, "
+              << result.procsA << " -> " << result.procsB << " processes\n";
+            o << "   patterns: ";
+            for (size_t i = 0; i < result.definition->patterns.size(); ++i) {
+                if (i) o << ", ";
+                o << result.definition->patterns[i];
+            }
+            o << "\n";
+            if (result.images.empty()) {
+                o << "   (not present in either snapshot)\n";
+                continue;
+            }
+            o << "   " << padR("image", 28) << padL("cnt A", 7) << padL("cnt B", 7)
+              << padL("WS A", 12) << padL("WS B", 12) << padL("WS delta", 13)
+              << padL("PWS A", 12) << padL("PWS B", 12) << padL("PWS delta", 13)
+              << "\n";
+            for (const auto& image : result.images) {
+                o << "   " << padR(image.name, 28)
+                  << padL(std::to_string(image.countA), 7)
+                  << padL(std::to_string(image.countB), 7)
+                  << padL(humanBytes(image.wsA), 12)
+                  << padL(humanBytes(image.wsB), 12)
+                  << padL(signedBytes(image.wsB - image.wsA), 13)
+                  << padL(humanBytes(image.pwsA), 12)
+                  << padL(humanBytes(image.pwsB), 12)
+                  << padL(signedBytes(image.pwsB - image.pwsA), 13)
+                  << "\n";
+            }
+        }
+        o << "\n";
+    }
+
     o << rule() << "\n";
     o << " End of report.\n";
 }
@@ -758,15 +972,16 @@ static void writeReport(std::ostream& o, const Snapshot& A, const Snapshot& B,
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog
-              << " <jsonA> <jsonB> [--top N] [--out FILE]\n"
+              << " <jsonA> <jsonB> [--top N] [--groups FILE] [--out FILE]\n"
                  "  <jsonA>   baseline snapshot (before)\n"
                  "  <jsonB>   comparison snapshot (after)\n"
                  "  --top N   rows in top-N tables (default 15)\n"
+                 "  --groups F compare process-name groups defined in file F\n"
                  "  --out F   also write the report to file F\n";
 }
 
 int main(int argc, char** argv) {
-    std::string pathA, pathB, outPath;
+    std::string pathA, pathB, groupsPath, outPath;
     int topN = 15;
 
     std::vector<std::string> pos;
@@ -775,6 +990,8 @@ int main(int argc, char** argv) {
         if (a == "--top" && i + 1 < argc) {
             topN = std::atoi(argv[++i]);
             if (topN <= 0) topN = 15;
+        } else if (a == "--groups" && i + 1 < argc) {
+            groupsPath = argv[++i];
         } else if (a == "--out" && i + 1 < argc) {
             outPath = argv[++i];
         } else if (a == "-h" || a == "--help") {
@@ -803,8 +1020,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    std::vector<ProcessGroup> groups;
+    if (!groupsPath.empty() && !loadProcessGroups(groupsPath, groups, err)) {
+        std::cerr << "error: " << err << "\n";
+        return 1;
+    }
+
     std::ostringstream report;
-    writeReport(report, A, B, topN);
+    writeReport(report, A, B, topN, groups);
 
     std::cout << report.str();
 
