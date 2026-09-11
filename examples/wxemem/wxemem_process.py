@@ -15,7 +15,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
-from compare import MIB, infer_label, short_text, unique_object
+from wxemem_compare import MIB, infer_label, short_text, unique_object
 
 TOP = 5
 WS_CAUTION = "CAUTION: Summed WS can double-count shared pages; it is not unique physical RAM or a reconciliation of Used RAM."

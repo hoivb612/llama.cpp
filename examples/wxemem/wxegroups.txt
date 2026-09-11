@@ -8,7 +8,7 @@ Gaming
 GameBar
 GameInput
 
-Group3: Utilities
+Group3: Tools
 taskmgr
 sshd
 wxemem

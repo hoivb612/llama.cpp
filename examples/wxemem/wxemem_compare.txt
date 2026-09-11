@@ -1,0 +1,28 @@
+c:\Users\hoiv\.copilot\skills\wxemem-compare\.venv\scripts\python.exe ..\examples\wxemem\wxemem_compare.py --a d:\llama.cpp\WXE_daily\29658.1000.260827-1700\Kennan\WXE\postpnp\wxemem_29658.1000.260827-1700_json_kennan_postpnp.txt --b d:\llama.cpp\WXE_daily\29660.1001.260830-1700\Kennan\WXE\postpnp\wxemem_29660.1001.260830-1700_json_kennan_postpnp.txt --output c:\temp\0827-0830.pptx
+Created: C:\temp\0827-0830.pptx
+A: 29658.1000.260827-1700 | Kennan / WXE / postpnp | Used 3,348.50 MiB
+B: 29660.1001.260830-1700 | Kennan / WXE / postpnp | Used 2,792.00 MiB
+A - B: +556.50 MiB
+
+c:\Users\hoiv\.copilot\skills\wxemem-compare\.venv\scripts\python.exe ..\examples\wxemem\wxemem_process.py --a d:\llama.cpp\WXE_daily\29658.1000.260827-1700\Kennan\WXE\postpnp\wxemem_29658.1000.260827-1700_json_kennan_postpnp.txt --b d:\llama.cpp\WXE_daily\29660.1001.260830-1700\Kennan\WXE\postpnp\wxemem_29660.1001.260830-1700_json_kennan_postpnp.txt --output c:\temp\0827-0830-processs.pptx
+CAUTION: Summed WS can double-count shared pages; it is not unique physical RAM or a reconciliation of Used RAM.
+Created: C:\temp\0827-0830-process.pptx
+Metric: Total WS; Delta = B - A
+Sum of captured process Total WS: A=2,658.76 MiB; B=2,453.89 MiB; B-A=-204.87 MiB
+NEW processes: 0 images, 0 procs | total (all): +0.00 MiB | shown 0
+GONE processes: 3 images, 3 procs | total (all): -286.57 MiB | shown 3
+TOP GROWERS: 30 images | total (all): +113.88 MiB | shown 5
+TOP SHRINKERS: 19 images | total (all): -32.18 MiB | shown 5
+
+c:\Users\hoiv\.copilot\skills\wxemem-compare\.venv\scripts\python.exe ..\examples\wxemem\wxemem_process_groups.py --a d:\llama.cpp\WXE_daily\29658.1000.260827-1700\Kennan\WXE\postpnp\wxemem_29658.1000.260827-1700_json_kennan_postpnp.txt --b d:\llama.cpp\WXE_daily\29660.1001.260830-1700\Kennan\WXE\postpnp\wxemem_29660.1001.260830-1700_json_kennan_postpnp.txt --groups ..\examples\wxemem\wxegroups.txt --output c:\temp\0827-0830-process-groups.pptx
+CAUTION: Summed total WS can double-count shared pages; this is not total OS physical RAM.
+Created: C:\temp\0827-0830-process-groups.pptx
+Groups: D:\llama.cpp\b612_061426\examples\wxemem\wxegroups.txt
+Metric: Total WS; Delta = B - A
+Asus: A=283.90 MiB; B=287.34 MiB; delta=+3.44 MiB
+XboxShell: A=534.86 MiB; B=516.05 MiB; delta=-18.81 MiB
+Tools: A=436.68 MiB; B=162.78 MiB; delta=-273.91 MiB
+Steam: A=0.00 MiB; B=0.00 MiB; delta=+0.00 MiB
+Unclassified: A=1,293.67 MiB; B=1,378.15 MiB; delta=+84.48 MiB
+Unknown images: A=109.65 MiB; B=109.57 MiB; delta=-0.07 MiB
+Ambiguous matches: A=0.00 MiB; B=0.00 MiB; delta=+0.00 MiB
