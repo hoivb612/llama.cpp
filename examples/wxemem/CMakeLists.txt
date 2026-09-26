@@ -43,6 +43,14 @@ endif()
 #   membw  - memory bandwidth test
 # ---------------------------------------------------------------------------
 if (WIN32)
+    add_executable(wxeapiset wxeapiset.cpp)
+    install(TARGETS wxeapiset RUNTIME)
+    target_compile_features(wxeapiset PRIVATE cxx_std_17)
+    if (MSVC)
+        set_property(TARGET wxeapiset PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
     add_executable(topo topo.c)
     install(TARGETS topo RUNTIME)
     target_compile_definitions(topo PRIVATE

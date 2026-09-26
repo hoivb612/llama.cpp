@@ -1,0 +1,54 @@
+C:\Windows\SysWOW64>d:\wxeapiset-x86.exe --closure schtasks.exe
+wxeapiset: closure using x86 process PEB, schema 7.0; CWD then PATH.
+Normal imports only; excludes delay dependencies. Excludes dynamic loads/export forwarders;
+does not reproduce KnownDLLs/SxS/Windows loader policy or verify exports/loadability.
+V7 default hosts only; importer-specific overrides are not evaluated.
+C:\Windows\SysWOW64\combase.dll
+C:\Windows\SysWOW64\kernel32legacy.dll
+C:\Windows\SysWOW64\kernelbase.dll
+C:\Windows\SysWOW64\msvcp_win.dll
+C:\Windows\SysWOW64\msvcrt.dll
+C:\Windows\SysWOW64\ntdll.dll
+C:\Windows\SysWOW64\oleaut32.dll
+C:\Windows\SysWOW64\rpcrt4.dll
+C:\Windows\SysWOW64\ucrtbase.dll
+Closure complete for the stated import/search model: 9 dependency files (root excluded), 0 missing/unresolved edges, 0 u
+navailable contracts, 0 errors.
+
+C:\Windows\SysWOW64>d:\wxeapiset-x86.exe api-ms-win-gdi-internal-uap-l1-1-0
+Source: current process PEB.ApiSetMap | Architecture: x86 | Schema: 7.0
+Resolver: ntdll!ApiSetGetImplementationHost (default host)
+api-ms-win-gdi-internal-uap-l1-1-0 -> [no host resolved]
+Schema availability: not hosted (0x000000F2)
+
+C:\Windows\SysWOW64>cd ..\system32
+
+C:\Windows\System32>d:\wxeapiset.exe api-ms-win-gdi-internal-uap-l1-1-0
+Source: current process PEB.ApiSetMap | Architecture: x64 | Schema: 7.0
+Resolver: ntdll!ApiSetGetImplementationHost (default host)
+api-ms-win-gdi-internal-uap-l1-1-0 -> [no host resolved]
+Schema availability: not hosted (0x000000F2)
+
+C:\Windows\System32>d:\wxeapiset.exe --closure whoami.exe
+wxeapiset: closure using x64 process PEB, schema 7.0; CWD then PATH.
+Normal imports only; excludes delay dependencies. Excludes dynamic loads/export forwarders;
+does not reproduce KnownDLLs/SxS/Windows loader policy or verify exports/loadability.
+V7 default hosts only; importer-specific overrides are not evaluated.
+MISSING [normal] ADVAPI32.dll (import ADVAPI32.dll) <- C:\Windows\System32\whoami.exe
+MISSING [normal] KERNEL32.dll (import KERNEL32.dll) <- C:\Windows\System32\whoami.exe
+MISSING [normal] USER32.dll (import USER32.dll) <- C:\Windows\System32\whoami.exe
+MISSING [normal] VERSION.dll (import VERSION.dll) <- C:\Windows\System32\whoami.exe
+C:\Windows\System32\authz.dll
+C:\Windows\System32\kernel32legacy.dll
+C:\Windows\System32\KernelBase.dll
+C:\Windows\System32\msvcrt.dll
+C:\Windows\System32\netutils.dll
+C:\Windows\System32\ntdll.dll
+C:\Windows\System32\rpcrt4.dll
+C:\Windows\System32\sspicli.dll
+C:\Windows\System32\ucrtbase.dll
+C:\Windows\System32\wkscli.dll
+C:\Windows\System32\ws2_32.dll
+Closure INCOMPLETE: 11 dependency files (root excluded), 4 missing/unresolved edges, 0 unavailable contracts, 0 errors.
+
+C:\Windows\System32>
