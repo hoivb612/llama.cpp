@@ -19,7 +19,12 @@ discovery depends on the agent host's configuration.
 - Only versioned build folders matching `major.minor.yyMMdd-HHmm` under `daily`.
 - If supplied, use `-BuildList` to restrict the report to the listed build IDs.
   Without it, include all versioned builds.
-- Only `Kennan\WXE`, not other devices or operating systems.
+- Only `Kennan\WXE` and `Kennan\WXE_LAB`, treated as equivalent directory
+  names for all three stages, not other devices or operating systems.
+  If both directories exist, search both per stage. Multiple eligible captures
+  for the same build and stage remain an error, including across these aliases.
+  Do not silently prefer one directory. CSV source paths retain the actual name;
+  coverage metadata records `wxe_directory_names`.
 - `beforepnp`, `prepnp*` (including `prepnpxboxapp`), and historical `nopnp`
   are equivalent baseline stages; Xbox app is installed by default.
 - Overlay a second line for `postpnp*` (including `postpnpxboxapp` and

@@ -17,7 +17,8 @@ if (-not $PSBoundParameters.ContainsKey('DailyRoot')) {
 if (-not $PSBoundParameters.ContainsKey('OutputDirectory')) {
     $OutputDirectory = Join-Path $PSScriptRoot 'output'
 }
-$GeneratorVersion = '1.4.1'
+$GeneratorVersion = '1.5.0'
+$WxeDirectoryNames = @('WXE', 'WXE_LAB')
 $BaselineStagePatterns = @('beforepnp', 'prepnp*', 'nopnp')
 $PostPnpStagePatterns = @('afterpnp', 'postpnp*', 'pnp')
 $SignInStagePatterns = @('xboxappsignin', 'signin', 'postsignin')
@@ -79,9 +80,9 @@ function Read-Capture([string]$Path) {
     }
 }
 
-function Get-StageData([string]$Wxe, [string]$Build, [string[]]$Patterns, [string]$Label) {
+function Get-StageData([string[]]$Wxe, [string]$Build, [string[]]$Patterns, [string]$Label) {
     $result = [ordered]@{
-        status = 'missing Kennan\WXE'
+        status = 'missing Kennan\WXE or Kennan\WXE_LAB'
         used_bytes = $null
         used_gib = $null
         total_bytes = $null
@@ -90,8 +91,9 @@ function Get-StageData([string]$Wxe, [string]$Build, [string[]]$Patterns, [strin
         source = ''
     }
     $candidates = @()
-    if (Test-Path -LiteralPath $Wxe -PathType Container) {
-        $stages = @(Get-ChildItem -LiteralPath $Wxe -Directory |
+    $roots = @($Wxe | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+    if ($roots.Count -gt 0) {
+        $stages = @(Get-ChildItem -LiteralPath $roots -Directory |
             Where-Object {
                 $stage = $_
                 $Patterns.Where({ $stage.Name -like $_ }).Count -gt 0
@@ -144,7 +146,9 @@ function Get-TrendData([string]$Root, [string[]]$SelectedBuilds) {
         $stamp = [datetime]::ParseExact(
             "20$($Matches[1])", 'yyyyMMdd-HHmm',
             [Globalization.CultureInfo]::InvariantCulture)
-        $wxe = Join-Path $build.FullName 'Kennan\WXE'
+        $wxe = @($WxeDirectoryNames | ForEach-Object {
+            Join-Path (Join-Path $build.FullName 'Kennan') $_
+        })
         $pre = Get-StageData $wxe $build.Name $BaselineStagePatterns 'before-PnP'
         $post = Get-StageData $wxe $build.Name $PostPnpStagePatterns 'post-PnP'
         $signin = Get-StageData $wxe $build.Name $SignInStagePatterns 'sign-in'
@@ -220,7 +224,7 @@ function Write-Presentation($Rows, [string]$Path) {
         $deck.PageSetup.SlideHeight = 648
         $slide = $deck.Slides.Add(1, 12)
         $null = Add-Text $slide 'Trending memory usage' 36 18 1080 52 32 $navy
-        $null = Add-Text $slide 'Kennan | WXE | Before-PnP / post-PnP / sign-in | physical.used_bytes' 38 72 1080 32 17 $gray
+        $null = Add-Text $slide 'Kennan | WXE / WXE_LAB | Before-PnP / post-PnP / sign-in | physical.used_bytes' 38 72 1080 32 17 $gray
         $null = Add-Text $slide (Get-SeriesSummary $Rows '' 'Before-PnP') 38 109 1080 24 14 $blue
         $null = Add-Text $slide (Get-SeriesSummary $Rows 'postpnp_' 'Post-PnP') 38 132 1080 24 14 $orange
         $null = Add-Text $slide (Get-SeriesSummary $Rows 'signin_' 'Sign-in') 38 155 1080 24 14 $green
@@ -297,6 +301,7 @@ function Write-Presentation($Rows, [string]$Path) {
         $null = Add-Text $slide 'Sign-in: xboxappsignin / signin / postsignin. Direct JSON only; missing captures are gaps, not zero.' 38 600 1080 24 11 $gray
         $notes = @(
             "Generator version: $GeneratorVersion"
+            "Equivalent directories under Kennan: $($WxeDirectoryNames -join ', '). Source paths are retained per capture."
             'Metric: physical.used_bytes / 1073741824. Equal category spacing, not elapsed time. Dates are build dates, not capture dates.'
             'See memory-trend.csv for all build IDs, exact bytes, versions, and source paths.'
             'Each series summary uses its own eligible captures; these may cover different build dates.'
@@ -346,6 +351,7 @@ $coverage = [ordered]@{
     generator_version = $GeneratorVersion
     generated_at = [datetime]::Now.ToString('o')
     daily_root = $root
+    wxe_directory_names = $WxeDirectoryNames
     build_list_file = $buildListPath
     selected_builds = $selectedBuilds
     metric = 'physical.used_bytes'

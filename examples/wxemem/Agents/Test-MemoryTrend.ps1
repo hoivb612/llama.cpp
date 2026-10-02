@@ -64,6 +64,38 @@ try {
     Assert-True ($coverage.included_builds -eq 3 -and $coverage.postpnp_included_builds -eq 3) 'Incorrect stage coverage.'
     Assert-True ($coverage.signin_included_builds -eq 4 -and $coverage.signin_missing_builds.Count -eq 1) 'Incorrect sign-in coverage.'
 
+    # Renaming the OS directory must preserve all stage values and gaps.
+    $originalRows = $rows
+    foreach ($build in @($b1, $b2, $b3, $b4, $b5)) {
+        Rename-Item -LiteralPath (Join-Path $daily "$build\Kennan\WXE") -NewName 'WXE_LAB'
+    }
+    $null = & $generator -DailyRoot $daily -OutputDirectory $output -DataOnly -WarningAction SilentlyContinue
+    $labRows = @(Import-Csv (Join-Path $output 'memory-trend.csv'))
+    Assert-True ($labRows.Count -eq $originalRows.Count) 'WXE_LAB changed build count.'
+    for ($i = 0; $i -lt $labRows.Count; $i++) {
+        foreach ($prefix in @('', 'postpnp_', 'signin_')) {
+            Assert-True ($labRows[$i]."${prefix}used_bytes" -eq $originalRows[$i]."${prefix}used_bytes") 'WXE_LAB metric mismatch.'
+            Assert-True ($labRows[$i]."${prefix}status" -eq $originalRows[$i]."${prefix}status") 'WXE_LAB status mismatch.'
+            if ($labRows[$i]."${prefix}status" -eq 'included') {
+                Assert-True ($labRows[$i]."${prefix}source" -like '*\WXE_LAB\*') 'WXE_LAB provenance lost.'
+            }
+        }
+    }
+    foreach ($build in @($b1, $b2, $b3, $b4, $b5)) {
+        Rename-Item -LiteralPath (Join-Path $daily "$build\Kennan\WXE_LAB") -NewName 'WXE'
+    }
+    $labRoot = Join-Path $daily "$b1\Kennan\WXE_LAB"
+    $null = New-Item -ItemType Directory -Path $labRoot
+    Move-Item -LiteralPath (Join-Path $daily "$b1\Kennan\WXE\signin") -Destination $labRoot
+    $null = & $generator -DailyRoot $daily -OutputDirectory $output -DataOnly -WarningAction SilentlyContinue
+    $mixedRows = @(Import-Csv (Join-Path $output 'memory-trend.csv'))
+    Assert-True ($mixedRows[0].source -like '*\WXE\*' -and $mixedRows[0].signin_source -like '*\WXE_LAB\*') 'Split stages across aliases failed.'
+    Write-Capture $b1 'signin' 6GB
+    Expect-Error { & $generator -DailyRoot $daily -OutputDirectory $output -DataOnly } '*Ambiguous sign-in*'
+    Remove-Item -LiteralPath (Join-Path $labRoot 'signin\wxemem_json.txt')
+    Remove-Item -LiteralPath (Join-Path $labRoot 'signin')
+    Remove-Item -LiteralPath $labRoot
+
     Remove-Item -LiteralPath (Join-Path $daily "$b3\Kennan\WXE\postsignin\wxemem_json.txt")
     @($b3, $b1) | Set-Content -LiteralPath $list
     $null = & $generator -DailyRoot $daily -OutputDirectory $output -BuildList $list -DataOnly -WarningAction SilentlyContinue
