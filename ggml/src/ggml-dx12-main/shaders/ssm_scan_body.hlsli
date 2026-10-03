@@ -1,19 +1,17 @@
 // ssm_scan_body.hlsli - shared body for Mamba2 selective scan.
 //
-// Includers must define D_STATE (128 or 256). GROUP_SIZE is derived to
-// equal D_STATE so each workgroup has exactly D_STATE / WARP_SIZE waves,
-// and each wave owns one (head_idx, head_off) location with C_FACTOR
-// per-thread state slots.
+// Includers define D_STATE (96, 128 or 256).
+// Each wave owns one (head_idx, head_off) location.
 //
 // Inputs / outputs / op_params are documented in ssm_scan.hlsl.
 #include "ggml_common.hlsli"
 
 #ifndef D_STATE
-#error "Include ssm_scan_body.hlsli with D_STATE defined (128 or 256)"
+#error "Include ssm_scan_body.hlsli with D_STATE defined (96, 128 or 256)"
 #endif
 
-#define GROUP_SIZE D_STATE
-#define C_FACTOR (D_STATE / WARP_SIZE)
+#define GROUP_SIZE (((D_STATE + 63) / 64) * 64)
+#define C_FACTOR ((D_STATE + WARP_SIZE - 1) / WARP_SIZE)
 #define NUM_WAVES (GROUP_SIZE / WARP_SIZE)
 
 groupshared float temp_reduce[GROUP_SIZE];
@@ -40,6 +38,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint d_head = op_param_uint(13);
     const uint n_group = op_param_uint(14);
     const uint n_tok  = op_param_uint(15);
+    const uint K = ne1;
+    const uint snapshot_stride = ne13 * nb03 / 4u;
 
     const uint tid           = gtid.x;
     const uint subgroup      = tid / WARP_SIZE;
@@ -74,7 +74,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
     float state[C_FACTOR];
     [unroll] for (uint j = 0; j < C_FACTOR; j++) {
-        state[j] = asfloat(src0.Load((s0_base_idx + WARP_SIZE * j + lane) * 4u + src0_offset));
+        state[j] = 0.0f;
+        if (WARP_SIZE * j + lane < D_STATE) {
+            state[j] = asfloat(src0.Load((s0_base_idx + WARP_SIZE * j + lane) * 4u + src0_offset));
+        }
     }
 
     float a = asfloat(src3.Load(A_base_idx * 4u));
@@ -88,10 +91,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         const float x_dt = asfloat(src1.Load((x_base_idx + i * stride_x) * 4u + src1_offset)) * dt_sp;
 
         [unroll] for (uint j2 = 0; j2 < C_FACTOR; j2++) {
-            float B_val = asfloat(src4.Load((B_base_idx + i * stride_B + WARP_SIZE * j2 + lane) * 4u));
-            float C_val = asfloat(src5.Load((C_base_idx + i * stride_C + WARP_SIZE * j2 + lane) * 4u));
-            state[j2] = (state[j2] * dA) + (B_val * x_dt);
-            state_sum += state[j2] * C_val;
+            if (WARP_SIZE * j2 + lane < D_STATE) {
+                float B_val = asfloat(src4.Load((B_base_idx + i * stride_B + WARP_SIZE * j2 + lane) * 4u));
+                float C_val = asfloat(src5.Load((C_base_idx + i * stride_C + WARP_SIZE * j2 + lane) * 4u));
+                state[j2] = (state[j2] * dA) + (B_val * x_dt);
+                state_sum += state[j2] * C_val;
+            }
         }
 
         state_sum = WaveActiveSum(state_sum);
@@ -99,9 +104,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (lane == 0u) {
             dst.Store((y_base_idx + i * stride_y) * 4u + dst_offset, asuint(state_sum));
         }
+        const uint slot = n_tok - 1u - i;
+        if (K > 1u && slot > 0u && slot < K) {
+            [unroll] for (uint j3 = 0; j3 < C_FACTOR; ++j3) {
+                if (WARP_SIZE * j3 + lane < D_STATE) {
+                    dst.Store((s_base_idx + slot * snapshot_stride + WARP_SIZE * j3 + lane) * 4u + dst_offset, asuint(state[j3]));
+                }
+            }
+        }
     }
 
     [unroll] for (uint j3 = 0; j3 < C_FACTOR; j3++) {
-        dst.Store((s_base_idx + WARP_SIZE * j3 + lane) * 4u + dst_offset, asuint(state[j3]));
+        if (WARP_SIZE * j3 + lane < D_STATE) {
+            dst.Store((s_base_idx + WARP_SIZE * j3 + lane) * 4u + dst_offset, asuint(state[j3]));
+        }
     }
 }

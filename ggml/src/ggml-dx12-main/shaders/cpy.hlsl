@@ -42,7 +42,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                   can_pair_f16() && nb00 == src0_esize && (ne00 & 1) == 0 &&
                   src0_esize == 2;
 
-    uint idx = tid.x * (paired ? 2u : 1u);
+    uint idx = flat_idx_2d_256(tid) * (paired ? 2u : 1u);
     uint total = ne0 * ne1 * ne2 * ne3;
     if (idx >= total) return;
 
@@ -53,14 +53,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
     flat_to_4d(idx, ne00, ne01, ne02, j0, j1, j2, j3);
     uint off0 = offset_4d(j0, j1, j2, j3, nb00, nb01, nb02, nb03, src0_offset);
 
+    uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+    if (src_is_i32 && dst_is_i32) {
+        dst.Store(off_d, src0.Load(off0));
+        return;
+    }
+
     float v0 = load_typed(src0, off0, src0_esize, src_is_i32);
 
     if (paired) {
         float v1 = load_typed(src0, off0 + nb00, src0_esize, src_is_i32);
-        uint off_d = dst_offset + i0 * 2u + i1 * nb1 + i2 * nb2 + i3 * nb3;
-        store_f16_pair(dst, off_d, v0, v1);
+        uint off_pair = dst_offset + i0 * 2u + i1 * nb1 + i2 * nb2 + i3 * nb3;
+        store_f16_pair(dst, off_pair, v0, v1);
     } else {
-        uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_typed(dst, off_d, v0, dst_esize, dst_is_i32);
     }
 }

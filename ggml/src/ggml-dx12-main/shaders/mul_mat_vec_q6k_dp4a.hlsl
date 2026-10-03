@@ -31,16 +31,18 @@
 groupshared float shared_acc0[64];
 groupshared float shared_acc1[64];
 
-// Q6_K blocks are 210 bytes, so block_off can be 2-byte misaligned and
-// ql/qh fetches are 16 bytes wide. Doing this as four independent
-// load_u32_u calls costs 8 loads on the misaligned path and re-reads each
-// boundary word twice; an aligned Load4 (fast path) or 5 aligned word loads
-// (slow path) halves the load instructions in the inner loop. Same helper as
-// mul_mat_vec_q6k_mr_blocked.hlsl.
-//
-// Load4 requires 4-byte alignment: desktop AMD GCN/RDNA tolerates 2-byte
-// alignment, but some AMD console HW (Xbox GDKX) silently masks the low bits
-// and returns the wrong 16 bytes, hence the explicit reconstruction.
+#ifdef Q6K_SCALAR_LOADS
+// NVIDIA compiles this form to fewer registers and higher occupancy.
+uint load_u32_u(ByteAddressBuffer buf, uint byte_off) {
+    uint align_off = byte_off & ~3u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = buf.Load(align_off);
+    if (shift == 0) return w0;
+    uint w1 = buf.Load(align_off + 4u);
+    return (w0 >> shift) | (w1 << (32u - shift));
+}
+#else
+// Reconstruct aligned wide loads for devices that require strict alignment.
 uint4 load4_u_q6k(uint byte_off) {
     uint shift = (byte_off & 3u) * 8u;
     if (shift == 0u) {
@@ -64,6 +66,7 @@ uint4 load4_u_q6k(uint byte_off) {
     r.w = (w3 >> shift) | (w4 << isr);
     return r;
 }
+#endif
 
 uint read_byte_q6(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
@@ -97,6 +100,17 @@ void decode_q6k_row(uint block_off, uint t,
     bool high_nib = (sub >= 4u);
 
     // 4 dp4a chunks, each 4 bytes wide
+#ifdef Q6K_SCALAR_LOADS
+    uint ql_w0 = load_u32_u(src0, block_off + ql_base_in_block + 0);
+    uint ql_w1 = load_u32_u(src0, block_off + ql_base_in_block + 4);
+    uint ql_w2 = load_u32_u(src0, block_off + ql_base_in_block + 8);
+    uint ql_w3 = load_u32_u(src0, block_off + ql_base_in_block + 12);
+
+    uint qh_w0 = load_u32_u(src0, block_off + qh_base_in_block + 0);
+    uint qh_w1 = load_u32_u(src0, block_off + qh_base_in_block + 4);
+    uint qh_w2 = load_u32_u(src0, block_off + qh_base_in_block + 8);
+    uint qh_w3 = load_u32_u(src0, block_off + qh_base_in_block + 12);
+#else
     uint4 ql4 = load4_u_q6k(block_off + ql_base_in_block);
     uint ql_w0 = ql4.x;
     uint ql_w1 = ql4.y;
@@ -108,6 +122,7 @@ void decode_q6k_row(uint block_off, uint t,
     uint qh_w1 = qh4.y;
     uint qh_w2 = qh4.z;
     uint qh_w3 = qh4.w;
+#endif
 
     if (high_nib) {
         ql_w0 = (ql_w0 >> 4) & 0x0F0F0F0Fu;

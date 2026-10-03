@@ -19,7 +19,7 @@
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint total = ne0 * ne1 * ne2;
     if (idx >= total) return;
 
@@ -34,10 +34,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint c_base = src1_offset + i1 * nb11;
 
     float sum = 0.0f;
-    for (uint i0 = 0; i0 < nc; ++i0) {
-        float s_val = asfloat(src0.Load(s_base + i0 * nb00));
-        float c_val = asfloat(src1.Load(c_base + i0 * nb10));
-        sum += s_val * c_val;
+    if (nc == 4u && nb00 == 4u && nb10 == 4u) {
+        float4 s = asfloat(src0.Load4(s_base));
+        float4 c = asfloat(src1.Load4(c_base));
+        sum = dot(s, c);
+    } else {
+        for (uint i0 = 0; i0 < nc; ++i0) {
+            float s_val = asfloat(src0.Load(s_base + i0 * nb00));
+            float c_val = asfloat(src1.Load(c_base + i0 * nb10));
+            sum += s_val * c_val;
+        }
     }
 
 #if APPLY_BIAS

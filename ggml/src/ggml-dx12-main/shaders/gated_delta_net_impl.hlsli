@@ -30,7 +30,16 @@
 #endif
 #define ROWS_PER_LANE ((S_V) / EFFECTIVE_THREADS)
 
+void store_state(uint offset, uint slot, uint seq, uint index, float value) {
+    dst.Store(offset * 4u + dst_offset, asuint(value));
+    if (slot < ne0) {
+        temp.Store(ne1 + seq * nb1 + slot * nb2 + index * 4u, asuint(value));
+    }
+}
+
+#if EFFECTIVE_THREADS >= WARP_SIZE
 WAVE_SIZE_ATTR
+#endif
 [numthreads(EFFECTIVE_THREADS, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint head_id = gid.x;
@@ -142,7 +151,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                                      + state_out_base;
                 [unroll] for (uint rs = 0; rs < ROWS_PER_LANE; rs++) {
                     const uint i = rs * EFFECTIVE_THREADS + lane;
-                    dst.Store((slot_base + col * S_V + i) * 4u + dst_offset, asuint(s_shard[rs]));
+                    store_state(slot_base + col * S_V + i, uint(target_slot), seq_id,
+                                head_id * state_size + col * S_V + i, s_shard[rs]);
                 }
             }
         }
@@ -153,7 +163,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (K == 1u) {
         [unroll] for (uint r4 = 0; r4 < ROWS_PER_LANE; r4++) {
             const uint i = r4 * EFFECTIVE_THREADS + lane;
-            dst.Store((s_off + state_out_base + col * S_V + i) * 4u + dst_offset, asuint(s_shard[r4]));
+            store_state(s_off + state_out_base + col * S_V + i, 0u, seq_id,
+                        head_id * state_size + col * S_V + i, s_shard[r4]);
         }
     }
 }

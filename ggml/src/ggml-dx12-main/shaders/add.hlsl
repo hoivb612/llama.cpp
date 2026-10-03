@@ -9,7 +9,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     bool paired = (dst_esize == 2 && nb0 == 2 && (ne0 & 1) == 0 &&
                    (dst_offset & 3) == 0 && (nb1 & 3) == 0);
     uint stride = paired ? 2u : 1u;
-    uint idx = tid.x * stride;
+    uint idx = flat_idx_2d_256(tid) * stride;
     uint total = ne0 * ne1 * ne2 * ne3;
     if (idx >= total) return;
 

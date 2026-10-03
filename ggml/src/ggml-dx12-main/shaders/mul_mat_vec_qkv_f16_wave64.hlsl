@@ -81,10 +81,30 @@ float load_f16_scalar(uint byte_offset) {
     return f16_to_f32((word >> ((byte_offset & 2u) * 8u)) & 0xffffu);
 }
 
+#if QKV_ROWS2
+void store_qkv_pair(RWByteAddressBuffer buf, uint offset, uint stride, uint esize, float x, float y) {
+    if (esize == 2u && stride == 2u && (offset & 3u) == 0u) {
+        store_f16_pair(buf, offset, x, y);
+    } else if (esize == 4u && stride == 4u) {
+        buf.Store2(offset, asuint(float2(x, y)));
+    } else {
+        store_auto(buf, offset, x, esize);
+        store_auto(buf, offset + stride, y, esize);
+    }
+}
+#endif
+
 WAVE_SIZE_ATTR
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
+    bool paired = false;
+#if QKV_ROWS2
+    paired = op7 == 2u;
+#endif
     uint row = group_id.x;
+    if (paired) {
+        row *= 2u;
+    }
     if (row >= ne0) {
         return;
     }
@@ -100,6 +120,7 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     else                    { region = 2u; region_base = qk_rows; }
     uint local_row = row - region_base;
     bool rope = (region != 2u);
+    bool compute_peer = rope || paired;
 
     uint src0_row   = src0_offset + row * nb01;
     uint src0_row_p = src0_offset + (row ^ 1u) * nb01;
@@ -118,7 +139,7 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         ss = mad(x.x, x.x, mad(x.y, x.y, mad(x.z, x.z, mad(x.w, x.w, ss))));
         float4 xg = x * g;
         accumulate4_x(src0_row + k * 2u, xg, acc);
-        if (rope) {
+        if (compute_peer) {
             accumulate4_x(src0_row_p + k * 2u, xg, acc_p);
         }
     }
@@ -127,21 +148,21 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
         float xg = x * asfloat(src6.Load(k * 4u));
         ss = mad(x, x, ss);
         acc = mad(load_f16_scalar(src0_row + k * 2u), xg, acc);
-        if (rope) {
+        if (compute_peer) {
             acc_p = mad(load_f16_scalar(src0_row_p + k * 2u), xg, acc_p);
         }
     }
 #else
     for (; k + 3u < ne00; k += stride) {
         accumulate4(src0_row + k * 2u, src1_row + k * 4u, acc);
-        if (rope) {
+        if (compute_peer) {
             accumulate4(src0_row_p + k * 2u, src1_row + k * 4u, acc_p);
         }
     }
     for (; k < ne00; ++k) {
         float x = asfloat(src1.Load(src1_row + k * 4u));
         acc = mad(load_f16_scalar(src0_row + k * 2u), x, acc);
-        if (rope) {
+        if (compute_peer) {
             acc_p = mad(load_f16_scalar(src0_row_p + k * 2u), x, acc_p);
         }
     }
@@ -149,7 +170,7 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
 
     float sum   = WaveActiveSum(acc);
     float sum_p = 0.0f;
-    if (rope) {
+    if (compute_peer) {
         sum_p = WaveActiveSum(acc_p);
     }
 #if RMS_FUSED
@@ -199,16 +220,37 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
             mmv_rope_pair(pair_in_head, sum0, sum1, out0, out1);
             float outv = (row == row0) ? out0 : out1;
             if (region == 0u) {
-                store_auto(dst, dst_offset + local_row * op12, outv, dst_esize);
+#if QKV_ROWS2
+                if (paired) {
+                    store_qkv_pair(dst, dst_offset + local_row * op12, op12, dst_esize, out0, out1);
+                } else
+#endif
+                {
+                    store_auto(dst, dst_offset + local_row * op12, outv, dst_esize);
+                }
             } else {
                 int row_idx = asint(src3.Load(0));
                 uint off = op13 + local_row * cache_esize + (uint)row_idx * cache_nb1;
-                store_auto(temp, off, outv, cache_esize);
+#if QKV_ROWS2
+                if (paired) {
+                    store_qkv_pair(temp, off, cache_esize, cache_esize, out0, out1);
+                } else
+#endif
+                {
+                    store_auto(temp, off, outv, cache_esize);
+                }
             }
         } else {
             int row_idx = asint(src5.Load(0));
             uint off = op14 + local_row * cache_esize + (uint)row_idx * cache_nb1;
-            store_auto(temp, off, sum, cache_esize);
+#if QKV_ROWS2
+            if (paired) {
+                store_qkv_pair(temp, off, cache_esize, cache_esize, sum, sum_p);
+            } else
+#endif
+            {
+                store_auto(temp, off, sum, cache_esize);
+            }
         }
     }
 }

@@ -49,7 +49,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     // Weight row bases
     uint src0_base = src0_offset + i2_src0 * nb02 + i3_src0 * nb03;
     uint src0_row0 = src0_base + row0 * nb01;
-    uint src0_row1 = src0_base + (row0 + 1) * nb01;
+    uint src0_row1 = src0_base + min(row0 + 1, ne0 - 1) * nb01;
 
     // Activation base (shared between rows)
     uint src1_base = src1_offset + i2 * nb12 + i3 * nb13;
@@ -201,6 +201,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 #if RMS_FUSED
     float wave_ss = WaveActiveSum(ss);
 #endif
+#if !defined(WAVE_SIZE) || GROUP_SIZE != WAVE_SIZE
     uint wave_id = tid / WARP_SIZE;
     uint num_waves = GROUP_SIZE / WARP_SIZE;
 
@@ -224,13 +225,22 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         }
         GroupMemoryBarrierWithGroupSync();
     }
+#endif
 
     if (tid == 0) {
+#if defined(WAVE_SIZE) && GROUP_SIZE == WAVE_SIZE
+#if RMS_FUSED
+        float rms_scale = 1.0f / sqrt(wave_ss / (float)K + asfloat(op14));
+#endif
+        float result0 = wave_sum0;
+        float result1 = wave_sum1;
+#else
 #if RMS_FUSED
         float rms_scale = 1.0f / sqrt(shared_acc[64] / (float)K + asfloat(op14));
 #endif
-        // Row 0
         float result0 = shared_acc[0];
+        float result1 = shared_acc[32];
+#endif
 #if RMS_FUSED
         result0 *= rms_scale;
 #endif
@@ -238,9 +248,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 
         // Row 1 (guard for odd N)
         bool has_row1 = (row0 + 1 < ne0);
-        float result1 = 0.0f;
         if (has_row1) {
-            result1 = shared_acc[32];
 #if RMS_FUSED
             result1 *= rms_scale;
 #endif

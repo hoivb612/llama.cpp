@@ -1,8 +1,8 @@
 // mul_mat_id_q8_0_dp4a.hlsl - Q8_0 expert matvec with Q8_1 activations.
 //
-// One workgroup computes two output rows for one selected expert slot/token.
+// One workgroup computes two or four output rows for one selected expert slot/token.
 // The F32 activation is quantized once by the existing Q8_1 pre-pass and reused
-// across both rows and consecutive expert projections.
+// across the rows and consecutive expert projections.
 #include "ggml_common.hlsli"
 
 #ifndef GROUP_SIZE
@@ -11,7 +11,9 @@
 #define QK8_0       32
 #define Q8_0_BSIZE  34
 #define Q8_1_BSIZE  36
+#ifndef NUM_ROWS
 #define NUM_ROWS    2
+#endif
 #define BLOCKS_PER_ITER (GROUP_SIZE / 8)
 
 groupshared float shared_acc[NUM_ROWS * 8];
@@ -64,6 +66,43 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint lane = tid % 8;
     uint l0 = lane * 4;
 
+#if NUM_ROWS == 4
+    precise float acc[NUM_ROWS];
+    [unroll] for (uint r = 0; r < NUM_ROWS; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (uint block_idx = sub; block_idx < num_blocks; block_idx += BLOCKS_PER_ITER) {
+        uint q8_off = q8_vec_base + block_idx * Q8_1_BSIZE;
+        float a_d = f16_to_f32(src1.Load(q8_off) & 0xFFFFu);
+        uint a_packed = src1.Load(q8_off + 4 + l0);
+        [unroll] for (uint r = 0; r < NUM_ROWS; ++r) {
+            if (row0 + r < ne0) {
+                uint w_off = src0_base + (row0 + r) * nb01 + block_idx * Q8_0_BSIZE;
+                float w_d = read_f16_q80(src0, w_off);
+                uint w_packed = read_u32_q80(src0, w_off + 2 + l0);
+                int isum = dot4add_i8packed(w_packed, a_packed, int(0));
+                acc[r] += w_d * a_d * float(isum);
+            }
+        }
+    }
+    uint wave_id = tid / WaveGetLaneCount();
+    uint num_waves = (GROUP_SIZE + WaveGetLaneCount() - 1) / WaveGetLaneCount();
+    [unroll] for (uint r = 0; r < NUM_ROWS; ++r) {
+        float wave_sum = WaveActiveSum(acc[r]);
+        if (WaveIsFirstLane()) {
+            shared_acc[r * 8 + wave_id] = wave_sum;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (tid < NUM_ROWS && row0 + tid < ne0) {
+        float result = shared_acc[tid * 8];
+        for (uint w = 1; w < num_waves; ++w) {
+            result += shared_acc[tid * 8 + w];
+        }
+        uint off = offset_4d(row0 + tid, expert_slot, token, batch, nb0, nb1, nb2, nb3, dst_offset);
+        store_auto(dst, off, result, dst_esize);
+    }
+#else
     precise float acc0 = 0.0f;
     precise float acc1 = 0.0f;
 
@@ -120,4 +159,5 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             store_auto(dst, off1, result1, dst_esize);
         }
     }
+#endif
 }

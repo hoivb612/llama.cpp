@@ -4,7 +4,7 @@
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     if (idx >= ne0) return;
 
     float start = op_param_f32(0);

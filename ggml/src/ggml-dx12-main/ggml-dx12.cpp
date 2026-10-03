@@ -17,17 +17,20 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <map>
 
 #include "ggml-dx12.h"
+#include "ggml-dx12-autotune.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
@@ -36,6 +39,8 @@
 #endif
 
 using Microsoft::WRL::ComPtr;
+
+static uint32_t dx12_pso_log_stamp();
 
 static uint64_t dx12_qpc_us() {
     static const double ticks_to_us = []() {
@@ -50,6 +55,23 @@ static uint64_t dx12_qpc_us() {
 
 static uint64_t g_dx12_buf_set_us    = 0;
 static uint64_t g_dx12_buf_set_calls = 0;
+
+// ---------------------------------------------------------------------------
+// Agility SDK preview exports (D3D12 LinAlg Matrix path, Phase 0)
+// ---------------------------------------------------------------------------
+// When the consumer process (e.g. llama-cli.exe) loads, D3D12 looks for these
+// two exported symbols to decide which D3D12Core.dll to bind. Setting them
+// here, inside the ggml-dx12 DLL, redirects the loader to the preview redist
+// staged at `<exe-dir>/D3D12/D3D12Core.dll` by the build system.
+//
+// Guarded so the default (non-LinAlg) build keeps loading the OS D3D12 with
+// zero behavioral change.
+#ifdef GGML_DX12_LINALG_PREVIEW
+extern "C" {
+    __declspec(dllexport) extern const UINT D3D12SDKVersion = GGML_DX12_AGILITY_SDK_VERSION;
+    __declspec(dllexport) extern const char * D3D12SDKPath   = u8".\\D3D12\\";
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Env-var refresh hook (for in-process variant sweep by llama-mmv-tune)
@@ -81,6 +103,15 @@ static inline bool dx12_flag_default_on(const char * name) {
     return !v || !v[0] || v[0] != '0';
 }
 
+static bool dx12_qkv_f16_rows2_enabled() {
+    // Keep the pipeline blob and dispatch geometry fixed for the process.
+    static const bool enabled = [] {
+        const char * value = getenv("DX12_QKV_F16_ROWS2");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // Shader-path audit (DX12_SHADER_AUDIT=1). Counts dispatches per resolved
 // pipeline and dumps them at device teardown, flagging any pipeline that fell
 // through the specialized selector onto the per-op generic blob. Off by
@@ -91,7 +122,7 @@ static inline bool dx12_shader_audit_enabled() {
 }
 
 // Heuristic-pick capture sink: when set, the dispatch path appends each
-// dispatched MUL_MAT(_ID) node's selected key.flags here. Used by the tuner
+// dispatched matrix, attention or normalization node's selected key.flags here. Used by the tuner
 // to confirm which variant the heuristic picked for the shape it benched.
 namespace {
 thread_local std::vector<uint32_t> * g_dx12_flag_sink = nullptr;
@@ -118,6 +149,7 @@ thread_local const std::unordered_map<const ggml_tensor *, dx12_tensor_resource_
 }
 
 static uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor);
+static ID3D12Resource * dx12_get_resource(const struct ggml_tensor * tensor);
 
 // ---------------------------------------------------------------------------
 // Debug logging
@@ -240,6 +272,23 @@ static inline void dx12_check_hr(HRESULT hr, const char * msg, const char * file
 }
 #define DX12_CHECK(hr, msg) dx12_check_hr(hr, msg, __FILE__, __LINE__)
 
+static uint64_t dx12_completed_fence_value(ID3D12Fence * fence, ID3D12Device * device) {
+    g_tls_device = device;
+    const uint64_t value = fence->GetCompletedValue();
+    if (value == UINT64_MAX) {
+        DX12_CHECK((HRESULT)0x887A0005, "GetCompletedValue");
+    }
+    return value;
+}
+
+static void dx12_wait_fence_event(HANDLE event, ID3D12Fence * fence, ID3D12Device * device) {
+    const DWORD result = WaitForSingleObject(event, INFINITE);
+    if (result != WAIT_OBJECT_0) {
+        GGML_ABORT("DX12 fence wait failed (result=0x%08X, error=%lu)", (unsigned)result, GetLastError());
+    }
+    dx12_completed_fence_value(fence, device);
+}
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
@@ -256,6 +305,236 @@ static void dx12_shader_audit_report(dx12_device & dev);
 // Pipeline key — identifies a unique shader variant
 // ---------------------------------------------------------------------------
 
+// Intel Xe3 wave GEMM (flag 264) tile. Must track MTILE, NTILE, NWAVE, WAVE_M
+// and FOLD_BLOCKS in ggml-dx12/CMakeLists.txt: waves form a WAVE_M x WAVE_N
+// grid, BM = LA_M(8) * MTILE * WAVE_M, BN = LA_N(16) * NTILE * WAVE_N, and K
+// must fill whole LA_K(16)*FOLD windows.
+//
+// NTILE=1 with NWAVE=8 keeps BN=128 but halves the per-thread register set:
+// the f32 drain array is MTILE*NTILE*ACC_E floats and is live across the whole
+// K loop, so NTILE drives occupancy directly. VTune measured 54.9% -> 82.4%
+// occupancy and 11% faster (TUNING.md section 42).
+#define DX12_IW_MTILE  4
+#define DX12_IW_NWAVE  8
+#define DX12_IW_WAVE_M 1
+#define DX12_IW_WAVE_N (DX12_IW_NWAVE / DX12_IW_WAVE_M)
+#define DX12_IW_BM    (8 * DX12_IW_MTILE * DX12_IW_WAVE_M)
+#define DX12_IW_NTILE 1
+#define DX12_IW_FOLD  4
+#define DX12_IW_BN    (16 * DX12_IW_NTILE * DX12_IW_WAVE_N)
+
+// Quantized wave variants share a tile independent of F16.
+// Earlier large-shape tile measurements used MMQ instead; see TUNING.md section 46.
+#define DX12_IWQ8_MTILE  4
+#define DX12_IWQ8_NTILE  1
+#define DX12_IWQ8_NWAVE  8
+#define DX12_IWQ8_WAVE_M 2
+#define DX12_IWQ8_WAVE_N (DX12_IWQ8_NWAVE / DX12_IWQ8_WAVE_M)
+#define DX12_IWQ8_BM    (8 * DX12_IWQ8_MTILE * DX12_IWQ8_WAVE_M)
+#define DX12_IWQ8_BN    (16 * DX12_IWQ8_NTILE * DX12_IWQ8_WAVE_N)
+static constexpr uint32_t DX12_MMID_IW_FLAG = 267;
+static constexpr uint32_t DX12_IW_Q50_FLAG = 270;
+static constexpr uint32_t DX12_IW_Q6K_FLAG = 271;
+static constexpr uint32_t DX12_IW_Q5K_FLAG = 272;
+static constexpr uint32_t DX12_IW_Q40_FLAG = 273;
+static constexpr uint32_t DX12_IW_Q41_FLAG = 274;
+static constexpr uint32_t DX12_IW_Q51_FLAG = 275;
+static constexpr uint32_t DX12_IW_IQ4NL_FLAG = 276;
+static constexpr uint32_t DX12_IW_MXFP4_FLAG = 277;
+static constexpr uint32_t DX12_IW_STAGED_FLAG = 279;
+static constexpr uint32_t DX12_IW_VKPORT_BASE = 292;
+static constexpr uint32_t DX12_NV_COMPOSED_FLAG = 301;
+static constexpr uint32_t DX12_AMD_COMPOSED_FLAG = 302;
+static constexpr uint32_t DX12_MMID_BUCKET_FLAG = 303;
+static constexpr uint32_t DX12_MMID_BUCKET_TALL_FLAG = 304;
+static constexpr uint32_t DX12_MMID_BUCKET_WIDE_FLAG = 305;
+static constexpr uint32_t DX12_MMID_EXPERT_MAJOR_FLAG = 399;
+static constexpr uint32_t DX12_MMID_EXPERT_MAJOR_TALL_FLAG = 400;
+static constexpr uint32_t DX12_MMID_F16_WAVE_FLAG = 407;
+static constexpr uint32_t DX12_Q4K_GLU_WAVE_FLAG = 408;
+static constexpr uint32_t DX12_Q4K_GLU_WAVE_RMS_FLAG = 409;
+static constexpr uint32_t DX12_Q8_PIPELINE_FLAG = 410;
+static constexpr uint32_t DX12_F16_PIPELINE_FLAG = 411;
+static constexpr uint32_t DX12_F16_PIPELINE_SMALL_FLAG = 412;
+static constexpr uint32_t DX12_MMID_EXPERT_WIDE_FLAG = 413;
+static constexpr uint32_t DX12_MOE_ROUTER_FLAG = 450;
+
+static bool dx12_is_linalg_pipeline(uint32_t flag) {
+    return flag >= DX12_Q8_PIPELINE_FLAG && flag <= DX12_F16_PIPELINE_SMALL_FLAG;
+}
+static constexpr uint32_t DX12_LINALG_Q50_PACKED_BASE = 310;
+
+static bool dx12_is_linalg_q50_packed(uint32_t flags) {
+    return flags >= DX12_LINALG_Q50_PACKED_BASE && flags < DX12_LINALG_Q50_PACKED_BASE + 4;
+}
+
+static bool dx12_is_bucket_linalg_mmid(uint32_t flags) {
+    return flags == DX12_MMID_BUCKET_FLAG || flags == DX12_MMID_BUCKET_TALL_FLAG || flags == DX12_MMID_BUCKET_WIDE_FLAG ||
+           flags == DX12_MMID_EXPERT_MAJOR_FLAG || flags == DX12_MMID_EXPERT_MAJOR_TALL_FLAG ||
+           flags == DX12_MMID_EXPERT_WIDE_FLAG;
+}
+
+static bool dx12_is_expert_major_mmid(uint32_t flags) {
+    return flags == DX12_MMID_EXPERT_MAJOR_FLAG || flags == DX12_MMID_EXPERT_MAJOR_TALL_FLAG ||
+           flags == DX12_MMID_EXPERT_WIDE_FLAG;
+}
+static constexpr uint32_t DX12_IW_BIAS_BIT = 512;
+
+static bool dx12_is_vkport_gemm(uint32_t flag) {
+    return (flag >= DX12_IW_VKPORT_BASE && flag < DX12_IW_VKPORT_BASE + 4) ||
+           flag == DX12_NV_COMPOSED_FLAG || flag == DX12_AMD_COMPOSED_FLAG;
+}
+
+// Wave16 tiled GEMM reads F16 activations from the flag-263 pre-pass.
+static bool dx12_tiled_b_f16(uint32_t flag) {
+    static const bool enabled = dx12_flag_default_on("DX12_TILED_B_F16");
+    return enabled && (flag == DX12_IW_VKPORT_BASE || flag == DX12_IW_VKPORT_BASE + 1);
+}
+
+static uint32_t dx12_iw_base_flag(uint32_t flag) {
+    return flag & ~DX12_IW_BIAS_BIT;
+}
+
+static bool dx12_is_iw_gemm(uint32_t flags) {
+    const uint32_t flag = dx12_iw_base_flag(flags);
+    return flag == 264 || flag == 265 || flag == 266 ||
+           (flag >= DX12_IW_Q50_FLAG && flag <= DX12_IW_MXFP4_FLAG);
+}
+
+static uint32_t dx12_iw_quant_flag(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:   return 265;
+        case GGML_TYPE_Q4_K:   return 266;
+        case GGML_TYPE_Q5_0:   return DX12_IW_Q50_FLAG;
+        case GGML_TYPE_Q6_K:   return DX12_IW_Q6K_FLAG;
+        case GGML_TYPE_Q5_K:   return DX12_IW_Q5K_FLAG;
+        case GGML_TYPE_Q4_0:   return DX12_IW_Q40_FLAG;
+        case GGML_TYPE_Q4_1:   return DX12_IW_Q41_FLAG;
+        case GGML_TYPE_Q5_1:   return DX12_IW_Q51_FLAG;
+        case GGML_TYPE_IQ4_NL: return DX12_IW_IQ4NL_FLAG;
+        case GGML_TYPE_MXFP4:  return DX12_IW_MXFP4_FLAG;
+        default:              return 0;
+    }
+}
+
+static const char * dx12_iw_format_env(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F16:   return nullptr;
+        case GGML_TYPE_Q8_0:  return DX12_GETENV("DX12_LINALG_Q8_WAVE");
+        case GGML_TYPE_Q4_K:  return DX12_GETENV("DX12_LINALG_Q4K_WAVE");
+        case GGML_TYPE_Q5_0:  return DX12_GETENV("DX12_LINALG_Q50_WAVE");
+        case GGML_TYPE_Q6_K:  return DX12_GETENV("DX12_LINALG_Q6K_WAVE");
+        case GGML_TYPE_Q5_K:  return DX12_GETENV("DX12_LINALG_Q5K_WAVE");
+        default:             return DX12_GETENV("DX12_LINALG_QUANT_WAVE");
+    }
+}
+
+static bool dx12_iw_tiled_shape(ggml_type type, int64_t m, int64_t n, int64_t k) {
+    if (m < 1024 || n < 512 || k < 1024) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+            return true;
+        case GGML_TYPE_Q4_K:
+            return n == 512 &&
+                ((m == 1024 && k >= 2048 && k <= 4096) ||
+                 (m >= 3072 && k >= 8192 && 5 * m <= 2 * k));
+        case GGML_TYPE_Q8_0:
+            return n == 512 &&
+                ((m == 1024 && k <= 4096) ||
+                 (m >= 2048 && k >= 4096 && (m >= 4096 || k >= 2 * m)));
+        default:
+            return false;
+    }
+}
+
+static bool dx12_iw_staged_type(ggml_type type) {
+    if (dx12_iw_quant_flag(type) != 0) {
+        return true;
+    }
+    switch (type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool dx12_acc_allows_f16(const ggml_tensor * op) {
+    // Partial sums must also honor the accumulator requirement.
+    const int32_t prec = ggml_get_op_params_i32(op, op->op == GGML_OP_FLASH_ATTN_EXT ? 3 : 0);
+    return prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_F16;
+}
+
+static bool dx12_src1_allows(const ggml_tensor * op, ggml_prec conversion) {
+    if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+        return true;
+    }
+    const int32_t prec = ggml_get_op_params_i32(op, 3);
+    return prec == GGML_PREC_UNDEFINED || prec >= conversion;
+}
+
+static bool dx12_precision_supported(const ggml_tensor * op) {
+    const bool matmul = op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID;
+    if (!matmul && op->op != GGML_OP_FLASH_ATTN_EXT) {
+        return true;
+    }
+    switch (ggml_get_op_params_i32(op, matmul ? 0 : 3)) {
+        case GGML_PREC_UNDEFINED:
+        case GGML_PREC_F32:
+        case GGML_PREC_BF16:
+        case GGML_PREC_F16:
+            break;
+        default:
+            return false;
+    }
+    if (!matmul) {
+        return true;
+    }
+    // src0 conversion is not exposed by ggml_prec_set_src().
+    if (ggml_get_op_params_i32(op, 2) != GGML_PREC_UNDEFINED) {
+        return false;
+    }
+    const int32_t hint = ggml_get_op_params_i32(op, 1);
+    if (hint != GGML_HINT_NONE && hint != GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    switch (ggml_get_op_params_i32(op, 3)) {
+        case GGML_PREC_UNDEFINED:
+        case GGML_PREC_F32:
+        case GGML_PREC_BF16:
+        case GGML_PREC_F16:
+        case GGML_PREC_Q8:
+        case GGML_PREC_Q4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct dx12_pipeline_key {
     ggml_op       op;
     ggml_type     src0_type;
@@ -268,6 +547,70 @@ struct dx12_pipeline_key {
             && dst_type == o.dst_type && flags == o.flags;
     }
 };
+
+static constexpr uint32_t DX12_LINALG_CONV_FLAG     = 210;
+static constexpr uint32_t DX12_LINALG_OUT_PROD_FLAG = 211;
+static constexpr uint32_t DX12_LINALG_CONV_WIDE_FLAG = 212;
+static constexpr uint32_t DX12_LINALG_CONV_XWIDE_FLAG = 213;
+static constexpr uint32_t DX12_IW_CONV_FLAG = 214;
+static constexpr uint32_t DX12_IW_CONV_WIDE_FLAG = 215;
+static constexpr uint32_t DX12_IW_CONV_XWIDE_FLAG = 216;
+static constexpr uint32_t DX12_IW_OUT_PROD_FLAG = 217;
+
+static bool dx12_is_linalg_conv(uint32_t flag) {
+    return flag == DX12_LINALG_CONV_FLAG ||
+           (flag >= DX12_LINALG_CONV_WIDE_FLAG && flag <= DX12_IW_CONV_XWIDE_FLAG);
+}
+static constexpr uint32_t DX12_LINALG_FA_F16_BASE = 166;
+static constexpr uint32_t DX12_LINALG_FA_RDNA4_D128_FLAG = 320;
+static constexpr uint32_t DX12_LINALG_FA_PV_F16_D128_FLAG = 321;
+static constexpr uint32_t DX12_LINALG_FA_PV_F16_RDNA4_D128_FLAG = 322;
+static constexpr uint32_t DX12_LINALG_FA_COMPACT_D128_FLAG = 323;
+static constexpr uint32_t DX12_LINALG_FA_PV_F16_COMPACT_D128_FLAG = 324;
+static constexpr uint32_t DX12_FA_PIPELINE_D128_FLAG = 325;
+static constexpr uint32_t DX12_FA_MASK_PACKED_FLAG = 326;
+static constexpr uint32_t DX12_FA_PIPELINE_INTERLEAVED_D128_FLAG = 327;
+static constexpr uint32_t DX12_FA_PIPELINE_D64_BASE = 328;
+static constexpr uint32_t DX12_FA_PIPELINE_D96_BASE = 332;
+static constexpr uint32_t DX12_FA_MASK_PACKED_BR32_FLAG = 334;
+static constexpr uint32_t DX12_FA_PIPELINE_D96_BR32_FLAG = 335;
+static constexpr uint32_t DX12_Q6K_PACKED_MMV_FLAG = 340;
+static constexpr uint32_t DX12_MMID_Q4K_ROWS4_FLAG = 341;
+static constexpr uint32_t DX12_MMID_Q6K_ROWS4_FLAG = 342;
+static constexpr uint32_t DX12_LINALG_FULL_TILE_BASE = 350;
+static constexpr uint32_t DX12_MMID_F16_VEC_FLAG = 360;
+static constexpr uint32_t DX12_MMID_Q8_ROWS4_FLAG = 361;
+static constexpr uint32_t DX12_Q8_SMALL_M_FLAG = 390;
+static constexpr uint32_t DX12_F16_SMALL_M_FLAG = 392;
+static constexpr uint32_t DX12_Q4K_SHORT_F32_FLAG = 394;
+static constexpr uint32_t DX12_Q4K_SHORT_DP4A_FLAG = 395;
+static constexpr uint32_t DX12_F32_ROUTER_FLAG = 396;
+static constexpr uint32_t DX12_RMS_ROPE_PACKED_FLAG = 380;
+static constexpr uint32_t DX12_ADD_RMS_FIXED_FLAG = 381;
+static constexpr uint32_t DX12_RMS_FIXED_FLAG = 382;
+static constexpr uint32_t DX12_QK_NORM_PACKED_FLAG = 383;
+static constexpr uint32_t DX12_FA_PIPELINE_BC = 64;
+static constexpr size_t DX12_FA_MASK_MAX_BYTES = 16 * 1024 * 1024;
+static constexpr uint32_t DX12_LINALG_FA_Q8_0_BASE = 169;
+static constexpr uint32_t DX12_LINALG_FA_Q4_0_BASE = 172;
+static constexpr uint32_t DX12_LINALG_FA_NV_D64_FLAG = 175;
+static constexpr uint32_t DX12_LINALG_FA_NV_D96_FLAG = 176;
+static constexpr uint32_t DX12_LINALG_FA_NV_D128_W8_FLAG = 177;
+static constexpr uint32_t DX12_LINALG_FA_NV_D64_QKT_FLAG = 178;
+static constexpr uint32_t DX12_LINALG_FA_NV_D96_QKT_FLAG = 179;
+static constexpr uint32_t DX12_IW_FA_F16_BASE = 280;
+static constexpr uint32_t DX12_IW_FA_Q8_BASE = 284;
+static constexpr uint32_t DX12_IW_FA_Q4_BASE = 288;
+static constexpr uint32_t DX12_FA_QREGS_BASE = 296;
+static constexpr uint32_t DX12_FA_SCALAR_MASK_BASE = 420;
+static constexpr uint32_t DX12_FA_SCALAR_MASK_PACKED_BASE = 425;
+static constexpr uint32_t DX12_FA_SPARSE_FLAG = 430;
+static constexpr uint32_t DX12_FA_SPARSE_COMPACT_FLAG = 431;
+// GQA-shared cooperative decode: +0/1/2 = F16 D64/96/128, +3/4/5 = Q8_0 D64/96/128.
+static constexpr uint32_t DX12_FA_CD_GQA_BASE = 440;
+static constexpr uint32_t DX12_FA_CD_GQA_G = 4;
+static constexpr uint32_t DX12_LINALG_Q8_ALIGNED_FLAG = 268;
+static constexpr uint32_t DX12_LINALG_Q8_ALIGNED_128X64_FLAG = 269;
 
 struct dx12_pipeline_key_hash {
     size_t operator()(const dx12_pipeline_key & k) const {
@@ -317,7 +660,7 @@ struct dx12_pipeline {
 
 enum dx12_decision_kind : uint8_t {
     DX12_DEC_SKIP         = 0,  // view/reshape/permute/transpose — alias propagation only
-    DX12_DEC_NO_PIPELINE  = 1,  // pipeline missing or build failed — silently skip
+    DX12_DEC_NO_PIPELINE  = 1,  // pipeline missing or build failed
     DX12_DEC_COMPUTE      = 2,  // real dispatch (possibly fused)
 };
 
@@ -339,11 +682,15 @@ enum dx12_fusion_kind : uint8_t {
     DX12_FUSE_QK_ROPE_SCALE_SET_ROWS = 14, // Q ROPE+SCALE plus sibling K ROPE+VIEW+SET_ROWS
     DX12_FUSE_MMV_QK_MERGE        = 15, // MUL_MAT(Q proj, M=1) absorbing the K projection matvec: contiguous weights and a shared destination buffer let one dispatch cover both (no post-ops, so QK-norm models qualify)
     DX12_FUSE_QK_NORM_MERGE       = 16, // Q-side RMS_NORM+MUL+ROPE absorbing the sibling K-side RMS_NORM+MUL+ROPE+VIEW+SET_ROWS into one dispatch (QK-Norm models)
-    DX12_FUSE_MMID_WEIGHTED_SUM   = 17, // MUL_MAT_ID + MUL + expert views/adds
-    DX12_FUSE_MOE_SUM             = 18, // expert ADD chain from one weighted tensor
-    DX12_FUSE_MOE_WEIGHT_NORM     = 19, // GET_ROWS + SUM_ROWS + CLAMP + DIV
-    DX12_FUSE_MTP_GATE            = 20, // CONT(gate view) + SIGMOID + MUL
-    DX12_FUSE_MMV_QKV_PROJECTION  = 21, // QK-norm model: one projection-only matvec dispatch writes packed Q|K|V outputs in a dedicated resource
+    DX12_FUSE_NORM_MUL_ADD        = 17, // NORM + MUL(weight) + ADD(bias)
+    DX12_FUSE_ADD_NORM_MUL_ADD    = 18, // ADD(residual) + NORM + MUL(weight) + ADD(bias)
+    DX12_FUSE_MMID_WEIGHTED_SUM   = 19, // MUL_MAT_ID + MUL + expert views/adds
+    DX12_FUSE_MOE_SUM             = 20, // expert ADD chain from one weighted tensor
+    DX12_FUSE_MOE_WEIGHT_NORM     = 21, // GET_ROWS + SUM_ROWS + CLAMP + DIV
+    DX12_FUSE_MTP_GATE            = 22, // CONT(gate view) + SIGMOID + MUL
+    DX12_FUSE_MMV_QKV_PROJECTION  = 23, // QK-norm model: one projection-only matvec dispatch writes packed Q|K|V outputs in a dedicated resource
+    DX12_FUSE_MOE_ROUTER          = 24, // SOFT_MAX + RESHAPE + ARGSORT + VIEW + GET_ROWS (skip 4)
+    DX12_FUSE_MOE_ROUTER_NORM     = 25, // MOE_ROUTER + RESHAPE + SUM_ROWS + CLAMP + DIV (skip 8)
 };
 
 // Per-node identity used for cache invalidation.  Layout-stable across tokens
@@ -365,7 +712,8 @@ struct dx12_node_identity {
     int64_t  src1_ne2;       // n_kv_heads  — drives FA gqa_ratio
     int64_t  dst_ne1;        // M dimension — matvec vs batch routing
     int64_t  dst_ne0;        // output width — drives matvec_row_groups
-    int32_t  op_params[12];  // 48 bytes; covers RoPE mode/ext_factor/attn_factor, FA flags, ROPE sections, etc.
+    int32_t  tensor_flags;
+    int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
     uint8_t  src0_pad[7];    // explicit zero-pad so memcmp is deterministic
 };
 static_assert(sizeof(dx12_node_identity) % 8 == 0, "identity must be 8-byte aligned for safe memcmp");
@@ -378,7 +726,7 @@ struct dx12_node_decision {
     dx12_decision_kind kind;
     dx12_fusion_kind   fusion_kind;
     uint8_t            skip_count;            // nodes to advance past after this dispatch (fusion)
-    uint8_t            key_flags;             // dx12_pipeline_key.flags (matvec route, etc.)
+    uint32_t           key_flags;             // dx12_pipeline_key.flags (matvec route, etc.)
 
     // DX12_FUSE_MMV_SET_ROWS: node offset (relative to this MUL_MAT) of the
     // absorbed SET_ROWS. The SET_ROWS is not adjacent (K-projection nodes sit
@@ -423,7 +771,7 @@ struct dx12_node_decision {
     bool               use_dp4a_matvec;
     bool               needs_op_params;
     bool               conservative_barrier;  // SET_ROWS / FA / fused_rope_set_rows
-    bool               has_bias_add;          // matvec fused with following ADD bias
+    bool               has_bias_add;          // MUL_MAT fused with following ADD bias
     bool               fusion_skip_f32;       // RMS+Q8_1 fusion: skip F32 dst write (all consumers go through Q8_1 cache)
 
     dx12_pipeline *    pipeline;
@@ -454,7 +802,7 @@ struct dx12_shader_params {
     uint32_t src0_offset;              // byte offset into src0 buffer
     uint32_t src1_offset;              // byte offset into src1 buffer
     uint32_t dst_offset;               // byte offset into dst buffer
-    uint32_t src0_esize;               // src0 element size in bytes (2=F16, 4=F32)
+    uint32_t src0_esize;               // src0 element size (2=F16, 3=BF16 sentinel, 4=F32)
     uint32_t src1_esize;               // src1 element size in bytes
     uint32_t dst_esize;                // dst element size in bytes
     uint32_t op_params[16];            // extra op-specific params
@@ -494,7 +842,7 @@ constexpr UINT MICROSOFT = 0x1414; // WARP, basic render
 // Pascal is bucketed with Turing+ under NV_PASCAL_PLUS because the only
 // runtime distinction the dispatcher cares about today is dp4a availability
 // (SM 6.4 = Pascal). Hardware MMA / tensor-core gating uses the separate
-// wave_mma_supported / cooperative_vector_supported flags.
+// cooperative_vector_supported / linalg_matrix_supported flags.
 enum dx12_arch_family {
     DX12_ARCH_UNKNOWN = 0,
     DX12_ARCH_NV_LEGACY,        // pre-Pascal NVIDIA (no dp4a)
@@ -526,7 +874,7 @@ static const char * dx12_arch_family_str(dx12_arch_family a) {
     }
 }
 
-// Sub-family — capability-keyed refinement of arch_family. Only AMD has
+// Sub-family — DeviceId-keyed refinement of arch_family. Only AMD has
 // useful splits today; an authoritative AMD DeviceId lookup table follows.
 //
 // IMPORTANT: finer numbered splits (RDNA3 vs 3.5 vs 4 vs 5) are *not*
@@ -570,8 +918,8 @@ static bool dx12_subarch_is_rdna3_plus(dx12_arch_subfamily s) {
 // Why a table at all: D3D12 exposes no capability that cleanly separates
 // RDNA1/2 from RDNA3+ on Windows. The SM 6.9 WaveMMA tier was a Microsoft
 // preview that was deprecated and never shipped, so even genuine WMMA32
-// hardware (e.g. AMD 880M, RDNA 3.5) reports WaveMMA=no. The DeviceId is
-// the only authoritative signal.
+// hardware (e.g. AMD 880M, RDNA 3.5) advertises no matrix tier. The
+// DeviceId is the only authoritative signal.
 //
 // Maintenance: when a new AMD chip ships, add the DeviceId(s) here. The
 // authoritative source is `amdgpu.ids` in libdrm:
@@ -728,16 +1076,13 @@ static dx12_arch_family dx12_classify_arch_family(UINT vendor_id,
 // arch_family. NV/Intel sub-arch would need their own DeviceId tables.
 static dx12_arch_subfamily dx12_classify_arch_subfamily(dx12_arch_family fam,
                                                         UINT vendor_id,
-                                                        uint32_t device_id,
-                                                        bool wave_mma) {
+                                                        uint32_t device_id) {
     if (vendor_id == dx12_vendor::AMD) {
         dx12_arch_subfamily known = dx12_amd_subfamily_from_device_id(device_id);
         if (known != DX12_SUBARCH_UNKNOWN) {
             return known;
         }
-        // Unknown DeviceId - chip too new for our table (WaveMMA is a
-        // deprecated D3D12 preview no AMD driver exposes, so the old
-        // wave_mma heuristic never fired in practice).
+        // Unknown DeviceId - chip too new for our table.
         //
         // AMD splits its DeviceId space: APUs live below 0x7000, dGPUs at
         // 0x7300 and up. The two age very differently - a brand new APU
@@ -748,7 +1093,7 @@ static dx12_arch_subfamily dx12_classify_arch_subfamily(dx12_arch_family fam,
         const bool dgpu_did_space = (uint16_t)device_id >= 0x7000;
         switch (fam) {
             case DX12_ARCH_AMD_WAVE64:
-                return wave_mma ? DX12_SUBARCH_AMD_CDNA : DX12_SUBARCH_AMD_GCN;
+                return DX12_SUBARCH_AMD_GCN;
             case DX12_ARCH_AMD_RDNA:
                 return dgpu_did_space ? DX12_SUBARCH_AMD_RDNA4_PLUS : DX12_SUBARCH_AMD_RDNA1_2;
             default:
@@ -772,6 +1117,41 @@ struct dx12_device {
     bool cooperative_vector_supported = false;
     UINT work_graphs_tier = 0;
 
+    // D3D12 LinAlg Matrix (SM 6.10 preview, Agility SDK 1.720+) - subsumes
+    // CooperativeVector + WaveMMA into a unified API with three Matrix
+    // Scopes (Thread / Wave / ThreadGroup). Detected at device-init time
+    // when ggml-dx12 was built with -DGGML_DX12_LINALG_PREVIEW=ON; otherwise
+    // remains false.
+    //
+    //   linalg_matrix_tier == 0    : not supported (default; driver declines
+    //                                the feature OR build was not LinAlg-aware)
+    //   linalg_matrix_tier == 0x10 : D3D12_LINEAR_ALGEBRA_TIER_1_0
+    //
+    // Tier alone does not say which operations or component types are
+    // usable -- that needs the per-operation query
+    // (D3D12_FEATURE_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT, enum 78).
+    //
+    // The exact tier enum is preview-only and may change between Agility SDK
+    // drops; we surface the raw value so the runtime can gate per-tier paths
+    // without recompiling.
+    bool     linalg_matrix_supported = false;
+    uint32_t linalg_matrix_tier      = 0;
+    // Every wave-scope shader we ship (flash_attn_linalg, mul_mat_linalg_f16,
+    // conv_linalg) asks for f16 x f16 -> f32 at 16x16x16. Intel Xe3 reports
+    // the tier but only implements an f16 accumulator at 8x16x16, builds the
+    // PSO anyway, and returns wrong results. Route on this, not on the tier.
+    bool     linalg_wave_f16_16x16_supported = false;
+    bool     linalg_wave_f16_16x16_w32_supported = false;
+    bool     linalg_wave_f16_acc16_16x16_w64_supported = false;
+    bool     linalg_wave_f16_8x16x16_supported = false;
+    bool     linalg_wave_f16_8x16x16_w32_supported = false;
+    bool     linalg_tg_f16_64x128_supported = false;
+    bool     linalg_tg_f16_64x128_validated_fallback = false;
+    uint32_t linalg_tg_f16_64x128_min_threads = 0;
+    uint32_t linalg_tg_f16_64x128_max_threads = 0;
+    uint32_t linalg_tg_f16_64x128_preferred_threads = 0;
+    uint32_t linalg_tg_f16_64x128_threads = 0;
+
     // D3D12 Enhanced Barriers (ID3D12GraphicsCommandList7::Barrier). Enabled by
     // default when the device reports EnhancedBarriersSupported (disable via
     // DX12_ENHANCED_BARRIERS=0); hot-path UAV barriers are emitted as scoped
@@ -779,14 +1159,6 @@ struct dx12_device {
     // UNORDERED_ACCESS access) instead of legacy full-drain UAV barriers,
     // mirroring Vulkan's fine-grained model.
     bool enhanced_barriers = false;
-
-    // WaveMMA (SM 6.9 Wave Matrix) support
-    bool wave_mma_supported = false;
-    uint32_t wave_mma_K      = 0;     // hardware K dimension (even multiple of 16)
-    uint32_t wave_mma_M      = 0;     // M dimension (16 or 64)
-    uint32_t wave_mma_N      = 0;     // N dimension (16 or 64)
-    uint32_t wave_mma_wave_size = 0;  // required wave size for WaveMMA
-    bool     wave_mma_f16_acc32 = false; // F16 input with F32 accumulator
 
     // dp4a (integer dot product) support — SM 6.4+
     bool dp4a_supported = false;
@@ -821,9 +1193,9 @@ struct dx12_device {
     // wave_size proxies when expressing dispatcher intent.
     dx12_arch_family arch_family = DX12_ARCH_UNKNOWN;
 
-    // Capability-keyed sub-family refinement. Populated alongside
+    // DeviceId-keyed sub-family refinement. Populated alongside
     // arch_family. Today only AMD has useful splits (RDNA1/2 vs RDNA3+,
-    // GCN vs CDNA), keyed off wave_mma_supported. UNKNOWN for NV / Intel /
+    // GCN vs CDNA). UNKNOWN for NV / Intel /
     // everything we don't refine.
     dx12_arch_subfamily sub_family = DX12_SUBARCH_UNKNOWN;
 
@@ -874,6 +1246,7 @@ struct dx12_device {
     // acquisitions per token on dp4a models.
     dx12_pipeline * quantize_q8_1_pipeline = nullptr;
     dx12_pipeline * moe_bucket_pipeline    = nullptr;
+    dx12_pipeline * cvt_f32_f16_pipeline   = nullptr;
     dx12_pipeline * flash_attn_reduce_pipeline = nullptr;
 
     // Per-device shader blob maps — populated at init from wave-size-specific compiled variants
@@ -881,9 +1254,7 @@ struct dx12_device {
     std::unordered_map<int, dx12_shader_blob> unary_shader_blobs;
     void init_shader_blobs();
 
-    // Auto-tuning: optimal shader variants per quant type
-    // Determined by GPU microbenchmark at first model load.
-    // Bump TUNE_VERSION when adding/removing dimensions to invalidate cache.
+    // Auto-tuning: device-level shader choices measured at first model load.
     //
     // History:
     //  v5 -> v6: removed 5 dead dimensions (q5_0/q8_0/q6k/q5k/f16_load4) whose
@@ -910,22 +1281,18 @@ struct dx12_device {
     //              probed M range whenever 256t won at small M and 32t won
     //              at large M (the entire intended Q5_K use case) — the
     //              v10 thresholds were effectively just (lo+hi)/2 = 4224.
-    static constexpr int TUNE_VERSION = 11;
+    //  v11 -> v12: corrected type strides, dispatch geometry, legal K values,
+    //               repeated/interleaved timing, route gates, and cache
+    //               identity. Float-family thresholds are now type-specific;
+    //               the model-dependent Q5_K M threshold moved offline.
     bool tuning_done = false;
     bool q4k_dp4a_use_32 = false; // Q4_K dp4a matvec: true=32 threads, false=256 threads (default=256)
     bool q5k_dp4a_use_32 = false; // Q5_K dp4a matvec: true=32 threads, false=256 threads (default=256)
-    bool f16_mr_use_256  = false; // F16/F32 matvec:   true=256 threads (mr), false=32 threads (mr32)
-    // K-aware F16 mr selection: when K (src0->ne[0]) >= this threshold use the
-    // 256-thread mr variant, otherwise use the 32-thread mr32 variant. Set to
-    // UINT32_MAX to always use mr32 (the historical default for non-AMD-wave64
-    // devices) and 0 to always use mr256 (matches f16_mr_use_256=true).
-    uint32_t f16_mr_k_256_threshold = 0xFFFFFFFFu;
-    // M-aware Q5_K dp4a selection: when M (src0->ne[1]) >= this threshold use
-    // the 32-thread variant, otherwise use the 256-thread variant. Set to
-    // UINT32_MAX to never use 32t (preserves the historical default of
-    // q5k_dp4a_use_32=false meaning always 256t) and 0 to always use 32t
-    // (matches q5k_dp4a_use_32=true). Inverse semantics from f16 because the
-    // default Q5_K dp4a shader is 256t and 32t is the opt-in for large M.
+    uint32_t f16_mr_k_256_threshold  = ggml_dx12_autotune::NEVER;
+    uint32_t bf16_mr_k_256_threshold = ggml_dx12_autotune::NEVER;
+    uint32_t f32_mr_k_256_threshold  = ggml_dx12_autotune::NEVER;
+    // Offline-only Q5_K override. Runtime autotuning deliberately does not fit
+    // model-shape thresholds from synthetic M samples.
     uint32_t q5k_dp4a_m_32_threshold = 0xFFFFFFFFu;
 
     void run_autotune();
@@ -933,6 +1300,31 @@ struct dx12_device {
     // Pipeline cache
     std::mutex pipeline_mutex;
     std::unordered_map<dx12_pipeline_key, dx12_pipeline, dx12_pipeline_key_hash> pipeline_cache;
+
+    // Pipeline prewarm (see dx12_pso_log_path). PSOs are created lazily on
+    // first use, which puts driver shader compilation on the critical path of
+    // the first prefill - and of every one-shot graph, such as a vision
+    // encoder, that graph replay never covers. The keys a model actually uses
+    // are logged to disk and replayed on a background thread when the selected
+    // device receives its first buffer allocation, overlapping model load.
+    std::vector<dx12_pipeline_key> pso_used_keys;   // guarded by pipeline_mutex
+    std::thread                    pso_warm_thread;
+    std::atomic<bool>              pso_warm_stop{false};
+    std::once_flag                 pso_warm_once;
+    // Non-zero while a graph is being recorded or executed. PSO creation holds
+    // pipeline_mutex for its whole duration (up to ~4 ms), so a prewarm thread
+    // running concurrently with execution stalls every pipeline lookup the
+    // recorder makes - and with a vision model the second device's prewarm
+    // starts as its weights load, overlapping the first device's graphs.
+    // Backing off measured +2.7% median on SmolVLM2 mtmd prefill (1244 ->
+    // 1277). Note this is NOT the cause of the ~20 ms GPU bubble in the
+    // pre-encode graph: that survives this change and is still unexplained.
+    std::atomic<int>               exec_inflight{0};
+    bool                           pso_log_dirty = false;
+
+    void start_pipeline_prewarm();
+    void stop_pipeline_prewarm();
+    void save_pipeline_log();
 
     // Fast-path: skip mutex + map lookup when consecutive nodes use the same pipeline
     dx12_pipeline_key  last_pipeline_key = {};
@@ -942,9 +1334,15 @@ struct dx12_device {
     ComPtr<ID3D12RootSignature> common_root_sig;
     bool use_param_cbv = false;
 
-    // Split-KV temp buffer for flash attention (1 MB, lazily created)
+    // Split-KV temp buffer for flash attention (lazily created, grows on
+    // demand). 1 MB covers decode, where a partial is one query row per
+    // (head, split); a prefill split needs the whole ubatch, which is three
+    // orders of magnitude larger.
     ComPtr<ID3D12Resource> splitkv_temp;
+    size_t splitkv_temp_size = 0;
     static constexpr size_t SPLITKV_TEMP_SIZE = 1024 * 1024; // 1 MB
+    static constexpr size_t SPLITKV_TEMP_MAX  = 128ull * 1024 * 1024;
+#define DX12_FA_MAX_SPLITS 32u
 
     // ARGSORT/TOP_K large-N scratch (lazily created, grows on demand).
     // Layout: per row, ncols_padded slots of int2(col_idx, value_bits).
@@ -1003,16 +1401,16 @@ struct dx12_device {
     void xfer_wait() {
         flush_uploads();
         if (xfer.fence_value == 0) return;
-        if (xfer.fence->GetCompletedValue() >= xfer.fence_value) return;
-        xfer.fence->SetEventOnCompletion(xfer.fence_value, xfer.fence_event);
-        WaitForSingleObject(xfer.fence_event, INFINITE);
+        if (dx12_completed_fence_value(xfer.fence.Get(), device.Get()) >= xfer.fence_value) return;
+        DX12_CHECK(xfer.fence->SetEventOnCompletion(xfer.fence_value, xfer.fence_event), "SetEventOnCompletion(xfer)");
+        dx12_wait_fence_event(xfer.fence_event, xfer.fence.Get(), device.Get());
     }
 
     void xfer_wait_value(uint64_t value) {
         if (value == 0) return;
-        if (xfer.fence->GetCompletedValue() >= value) return;
-        xfer.fence->SetEventOnCompletion(value, xfer.fence_event);
-        WaitForSingleObject(xfer.fence_event, INFINITE);
+        if (dx12_completed_fence_value(xfer.fence.Get(), device.Get()) >= value) return;
+        DX12_CHECK(xfer.fence->SetEventOnCompletion(value, xfer.fence_event), "SetEventOnCompletion(xfer)");
+        dx12_wait_fence_event(xfer.fence_event, xfer.fence.Get(), device.Get());
     }
 
     // Block until the compute queue has drained. D3D12 does not keep a resource
@@ -1169,10 +1567,10 @@ struct dx12_device {
     size_t dev_index = 0;
     std::string name;        // "DX120", "DX121", etc. (for --dev matching)
     std::string description; // GPU name from adapter desc
-    // Stable string of the form "DX12:<VID>_<DID>" (hex, 4 digits each), used
+    // Stable string of the form "DX12:<VID>_<DID>_<LUIDHI>_<LUIDLO>", used
     // for ggml_backend_dev_props::device_id so external tools (notably
     // llama-mmv-tune validate-cache) can map the chosen backend device to the
-    // matching autotune cache file ($LOCALAPPDATA/.ggml_dx12_tune_<VID>_<DID>.txt).
+    // matching per-adapter autotune cache file.
     std::string device_id_str;
 
     dx12_device() = default;
@@ -1202,8 +1600,16 @@ struct dx12_device {
 
     void init(ComPtr<IDXGIAdapter1> adapter_, size_t idx);
     void create_common_root_signature();
-    dx12_pipeline * get_or_create_pipeline(const dx12_pipeline_key & key);
+    // `warm` suppresses the single-entry fast path and its bookkeeping so a
+    // background prewarm thread cannot race the recorder over last_pipeline_*.
+    dx12_pipeline * get_or_create_pipeline(const dx12_pipeline_key & key, bool warm = false);
 };
+
+// MoE GEMM tile shapes. The shader pads each expert's run to a multiple of
+// the tile height, so host and shader have to agree on it: flag 200 is the
+// 32x32 tile, 202/304 the 128x64 tile, and 305 the 128x128 tile.
+#define DX12_MMID_BM(flags_) ((flags_) == 202 || (flags_) == 203 || (flags_) == DX12_MMID_BUCKET_TALL_FLAG || (flags_) == DX12_MMID_BUCKET_WIDE_FLAG || (flags_) == DX12_MMID_EXPERT_MAJOR_TALL_FLAG || (flags_) == DX12_MMID_EXPERT_WIDE_FLAG ? 128u : 32u)
+#define DX12_MMID_BN(flags_) ((flags_) == DX12_MMID_BUCKET_WIDE_FLAG || (flags_) == DX12_MMID_EXPERT_WIDE_FLAG ? 128u : ((flags_) == 202 || (flags_) == 203 || (flags_) == DX12_MMID_BUCKET_TALL_FLAG || (flags_) == DX12_MMID_EXPERT_MAJOR_TALL_FLAG ? 64u : 32u))
 
 // ---------------------------------------------------------------------------
 // Buffer context
@@ -1237,6 +1643,622 @@ static inline uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
     return (uint8_t *)tensor->data - (uint8_t *)base;
 }
 
+static bool dx12_fa_compact_layout(const ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT ||
+        !node->src[0] || !node->src[1] || !node->src[2] ||
+        node->src[0]->ne[0] != 128 || node->src[1]->ne[1] < 1024 ||
+        node->src[1]->ne[1] % 64 != 0 || node->src[2]->ne[1] != node->src[1]->ne[1]) {
+        return false;
+    }
+    for (int i = 1; i <= 2; ++i) {
+        const ggml_tensor * kv = node->src[i];
+        if (kv->type != GGML_TYPE_F16 || kv->ne[0] != 128 || kv->nb[0] != 2 ||
+            ((dx12_tensor_offset(kv) | kv->nb[1] | kv->nb[2] | kv->nb[3]) & 31u) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint32_t dx12_linalg_full_tile_flag(const dx12_device & dev, const ggml_tensor * node, uint32_t flag) {
+#ifdef GGML_DX12_LINALG_PREVIEW
+    if (node->op != GGML_OP_MUL_MAT || dev.sub_family != DX12_SUBARCH_AMD_RDNA4_PLUS ||
+        dev.is_igpu || dev.blob_wave_size != 64 || !node->src[0] || !node->src[1] ||
+        node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
+        return 0;
+    }
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * b = node->src[1];
+    const bool quant = a->type == GGML_TYPE_Q8_0;
+    const char * mode = quant ? DX12_GETENV("DX12_LINALG_FULL_Q8") : DX12_GETENV("DX12_LINALG_FULL_F16");
+    if (!mode) {
+        const bool vision = a->type == GGML_TYPE_F16 && node->ne[1] == 1024 &&
+            ((a->ne[0] == 768 && (node->ne[0] == 768 || node->ne[0] == 3072)) ||
+             (a->ne[0] == 3072 && node->ne[0] == 768));
+        const bool text = quant && node->ne[1] == 64 &&
+            ((a->ne[0] == 576 && (node->ne[0] == 192 || node->ne[0] == 576 || node->ne[0] == 1536)) ||
+             (a->ne[0] == 1536 && node->ne[0] == 576));
+        if (!vision && !text) {
+            return 0;
+        }
+        mode = vision && node->ne[0] == 768 ? "2" : "1";
+    }
+    if (strcmp(mode, "1") != 0 && !(a->type == GGML_TYPE_F16 && strcmp(mode, "2") == 0)) {
+        return 0;
+    }
+    uint32_t slot, bm, bn, bk;
+    if (flag == 207 && a->type == GGML_TYPE_F16) {
+        slot = 0; bm = 128; bn = 64; bk = 16;
+    } else if ((flag == 213 || flag == 214) && quant) {
+        slot = flag == 213 ? 3 : 4; bm = 32; bn = flag == 213 ? 32 : 16; bk = 32;
+    } else {
+        return 0;
+    }
+    const uint64_t weight_align = quant ? 1u : 7u;
+    if (node->ne[1] % bm != 0 || node->ne[0] % bn != 0 || a->ne[0] % bk != 0 ||
+        a->nb[0] != ggml_type_size(a->type) || b->type != GGML_TYPE_F32 || b->nb[0] != sizeof(float) ||
+        ((dx12_tensor_offset(a) | a->nb[1] | a->nb[2] | a->nb[3]) & weight_align) != 0 ||
+        ((dx12_tensor_offset(b) | b->nb[1] | b->nb[2] | b->nb[3]) & 15u) != 0 ||
+        (dx12_tensor_offset(node) & 3u) != 0) {
+        return 0;
+    }
+    return DX12_LINALG_FULL_TILE_BASE + slot + (mode[0] == '2' ? 5 : 0);
+#else
+    GGML_UNUSED(dev); GGML_UNUSED(node); GGML_UNUSED(flag);
+    return 0;
+#endif
+}
+
+static bool dx12_mmid_rows4_enabled(const dx12_device & dev, const ggml_tensor * node) {
+    return dx12_flag_default_on("DX12_MOE_KQ_ROWS4") &&
+        dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev.is_igpu && dev.dp4a_supported &&
+        dev.blob_wave_size == 64 && node->src[0] && node->src[1] &&
+        (node->src[0]->type == GGML_TYPE_Q4_K || node->src[0]->type == GGML_TYPE_Q6_K) &&
+        node->src[0]->ne[0] % 256 == 0 && node->src[1]->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node->src[1]) && node->ne[3] == 1 &&
+        node->ne[0] <= 4 * 65535 && node->ne[1] <= 65535 && node->ne[2] <= 8;
+}
+
+static bool dx12_is_fa_pipeline_flag(uint32_t flag) {
+    return flag == DX12_FA_PIPELINE_D128_FLAG || flag == DX12_FA_PIPELINE_INTERLEAVED_D128_FLAG ||
+        (flag >= DX12_FA_PIPELINE_D64_BASE && flag <= DX12_FA_PIPELINE_D96_BASE + 1) ||
+        flag == DX12_FA_PIPELINE_D96_BR32_FLAG;
+}
+
+static uint32_t dx12_fa_pipeline_rows(const dx12_device & dev, const ggml_tensor * node) {
+    if (dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev.is_igpu &&
+        dev.wave_size == 64 && dev.blob_wave_size == 64 &&
+        node->src[0]->ne[0] == 96 && node->src[1]->nb[1] == 6144) {
+        const char * d96_br32 = DX12_GETENV("DX12_FA_D96_BR32");
+        const bool qualified = node->src[0]->ne[1] == 512 && node->src[0]->ne[2] == 32 &&
+            node->src[0]->ne[3] == 1 && node->src[1]->ne[2] == 32 && node->src[1]->ne[3] == 1 &&
+            node->src[1]->ne[1] <= 16384;
+        if (d96_br32 ? atoi(d96_br32) != 0 : qualified) {
+            return 32;
+        }
+    }
+    if (dev.arch_family == DX12_ARCH_NV_PASCAL_PLUS && dev.adapter_desc.DeviceId == 0x2F04 &&
+        dev.wave_size == 32 && dev.blob_wave_size == 32 &&
+        node->src[0]->ne[0] == 96 && node->src[1]->nb[1] == 6144 &&
+        dx12_flag_default_on("DX12_FA_D96_BR32")) {
+        return 32;
+    }
+    return node->src[0]->ne[0] == 64 && node->src[1]->nb[1] == 1024 ? 32 : 16;
+}
+
+static uint32_t dx12_fa_pipeline_flag(const dx12_device & dev, const ggml_tensor * node) {
+    const ggml_tensor * k = node->src[1];
+    if (k->ne[0] == 96 && k->nb[1] == 6144) {
+        if (dx12_fa_pipeline_rows(dev, node) == 32) {
+            return DX12_FA_PIPELINE_D96_BR32_FLAG;
+        }
+    }
+    if (k->ne[0] == 128) {
+        return k->nb[1] == 256 ? DX12_FA_PIPELINE_D128_FLAG :
+            k->nb[1] == 2048 ? DX12_FA_PIPELINE_INTERLEAVED_D128_FLAG : 0;
+    }
+    if (k->ne[0] == 64) {
+        switch (k->nb[1]) {
+            case 128:  return DX12_FA_PIPELINE_D64_BASE;
+            case 384:  return DX12_FA_PIPELINE_D64_BASE + 1;
+            case 1024: return DX12_FA_PIPELINE_D64_BASE + 2;
+            case 1536: return DX12_FA_PIPELINE_D64_BASE + 3;
+        }
+    }
+    if (k->ne[0] == 96) {
+        return k->nb[1] == 192 ? DX12_FA_PIPELINE_D96_BASE :
+            k->nb[1] == 6144 ? DX12_FA_PIPELINE_D96_BASE + 1 : 0;
+    }
+    return 0;
+}
+
+static bool dx12_fa_pipeline_layout(const dx12_device & dev, const ggml_tensor * node) {
+#ifdef GGML_DX12_LINALG_PREVIEW
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || !node->src[0] || !node->src[1] || !node->src[2]) {
+        return false;
+    }
+    const char * enabled = DX12_GETENV("DX12_FA_PIPELINE");
+    const char * half = DX12_GETENV("DX12_FA_PV_F16");
+    const bool amd = dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev.blob_wave_size == 64;
+    const bool nvidia = dev.arch_family == DX12_ARCH_NV_PASCAL_PLUS && dev.adapter_desc.DeviceId == 0x2F04 &&
+        dev.wave_size == 32 && dev.blob_wave_size == 32;
+    if (!enabled || strcmp(enabled, "1") != 0 || (half && strcmp(half, "1") == 0) ||
+        !dx12_flag_default_on("DX12_FA_LINALG") ||
+        (!amd && !nvidia) || dev.is_igpu ||
+        !dev.linalg_matrix_supported || !dev.linalg_wave_f16_16x16_supported || !dev.fp16_supported ||
+        !dx12_fa_pipeline_flag(dev, node)) {
+        return false;
+    }
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    if (nvidia && q->ne[0] != 128) {
+        const bool d64 = q->ne[0] == 64 && q->ne[2] == 16 && k->ne[2] == 8 && k->nb[1] == 1024;
+        const bool d96 = q->ne[0] == 96 && q->ne[2] == 32 && k->ne[2] == 32 && k->nb[1] == 6144;
+        if ((!d64 && !d96) || q->ne[1] < 256 || q->ne[1] > 1024 || k->ne[1] > 16384 ||
+            q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+            k->nb[2] != size_t(q->ne[0]) * 2 || v->nb[2] != k->nb[2] || v->nb[1] != k->nb[1]) {
+            return false;
+        }
+    }
+    if (k->ne[1] < 1024 || k->ne[1] % 64 != 0 || v->ne[1] != k->ne[1]) {
+        return false;
+    }
+    for (const ggml_tensor * kv : {k, v}) {
+        if (kv->type != GGML_TYPE_F16 || kv->ne[0] != q->ne[0] || kv->nb[0] != 2 ||
+            ((dx12_tensor_offset(kv) | kv->nb[1] | kv->nb[2] | kv->nb[3]) & 31u) != 0) {
+            return false;
+        }
+    }
+    const uint32_t rows = dx12_fa_pipeline_rows(dev, node);
+    const uint64_t groups = (q->ne[1] + rows - 1) / rows;
+    if (q->type != GGML_TYPE_F32 || q->nb[0] != 4 || q->ne[1] < 16 ||
+        groups > 65535 || q->ne[2] <= 0 || q->ne[2] > 65535 ||
+        q->ne[3] <= 0 || q->ne[3] > 65535 || groups * q->ne[2] * q->ne[3] < (rows == 32 ? 128 : 256) ||
+        k->ne[2] <= 0 || v->ne[2] != k->ne[2] || q->ne[2] % k->ne[2] != 0 ||
+        k->ne[3] <= 0 || v->ne[3] != k->ne[3] || q->ne[3] % k->ne[3] != 0) {
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        const ggml_tensor * t = node->src[i];
+        const uint64_t offset = dx12_tensor_offset(t);
+        if (offset > UINT32_MAX || ggml_nbytes(t) > UINT32_MAX - offset) {
+            return false;
+        }
+    }
+    if (const ggml_tensor * mask = node->src[3]) {
+        const uint64_t offset = dx12_tensor_offset(mask);
+        if ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
+            mask->nb[0] != ggml_type_size(mask->type) ||
+            ((offset | mask->nb[1] | mask->nb[2] | mask->nb[3]) & 7u) != 0 ||
+            offset > UINT32_MAX || ggml_nbytes(mask) > UINT32_MAX - offset ||
+            mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] ||
+            mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
+            mask->ne[2] > q->ne[2] || mask->ne[3] > q->ne[3] ||
+            q->ne[2] % mask->ne[2] != 0 || q->ne[3] % mask->ne[3] != 0 ||
+            mask->ne[2] * mask->ne[3] > 65535) {
+            return false;
+        }
+        const uint64_t words = (k->ne[1] + 16 * DX12_FA_PIPELINE_BC - 1) / (16 * DX12_FA_PIPELINE_BC);
+        if (groups * words * mask->ne[2] * mask->ne[3] > DX12_FA_MASK_MAX_BYTES / sizeof(uint32_t)) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(dev);
+    GGML_UNUSED(node);
+    return false;
+#endif
+}
+
+struct dx12_fa_mask_entry {
+    ID3D12Resource * resource = nullptr;
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    std::array<int64_t, GGML_MAX_DIMS> ne = {};
+    std::array<size_t, GGML_MAX_DIMS> nb = {};
+    uint32_t queries = 0;
+    uint32_t keys = 0;
+    uint32_t rows = 0;
+    uint32_t columns = 0;
+    ggml_type type = GGML_TYPE_F16;
+    size_t scratch_offset = 0;
+
+    bool matches(const dx12_fa_mask_entry & other) const {
+        return resource == other.resource && offset == other.offset && bytes == other.bytes &&
+            ne == other.ne && nb == other.nb && queries == other.queries && keys == other.keys &&
+            rows == other.rows && columns == other.columns && type == other.type;
+    }
+};
+
+static size_t dx12_fa_mask_bytes(const ggml_tensor * node, uint32_t rows, uint32_t columns) {
+    const ggml_tensor * mask = node->src[3];
+    const size_t bytes = mask ? ((node->src[0]->ne[1] + rows - 1) / rows) *
+        ((node->src[1]->ne[1] + 16 * columns - 1) / (16 * columns)) *
+        mask->ne[2] * mask->ne[3] * sizeof(uint32_t) : 0;
+    return (bytes + 255u) & ~size_t(255u);
+}
+
+static size_t dx12_fa_mask_bytes(const dx12_device & dev, const ggml_tensor * node) {
+    return dx12_fa_mask_bytes(node, dx12_fa_pipeline_rows(dev, node), DX12_FA_PIPELINE_BC);
+}
+
+static size_t dx12_fa_sparse_bytes(const ggml_tensor * node) {
+    const ggml_tensor * mask = node->src[3];
+    const size_t keys = size_t(node->src[1]->ne[1]);
+    if (keys >= DX12_FA_MASK_MAX_BYTES / sizeof(uint32_t)) {
+        return DX12_FA_MASK_MAX_BYTES + 1;
+    }
+    const size_t row_bytes = (keys + 1) * sizeof(uint32_t);
+    const size_t rows = size_t(node->src[0]->ne[1]) * mask->ne[2] * mask->ne[3];
+    if (rows > DX12_FA_MASK_MAX_BYTES / row_bytes) {
+        return DX12_FA_MASK_MAX_BYTES + 1;
+    }
+    const size_t bytes = row_bytes * rows;
+    return (bytes + 255u) & ~size_t(255u);
+}
+
+static bool dx12_fa_sparse_layout(const ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || !node->src[3]) {
+        return false;
+    }
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * mask = node->src[3];
+    const int32_t hint = ggml_get_op_params_i32(node, 4);
+    return hint > 0 && q->type == GGML_TYPE_F32 && q->ne[1] == 1 &&
+        q->ne[0] <= 1024 && v->ne[0] <= 1024 &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        k->ne[2] == v->ne[2] && k->ne[3] == q->ne[3] && v->ne[3] == q->ne[3] &&
+        (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
+        mask->nb[0] <= 255 &&
+        mask->ne[0] >= k->ne[1] && mask->ne[1] >= q->ne[1] &&
+        mask->ne[2] > 0 && mask->ne[2] <= 65535 && mask->ne[3] > 0 && mask->ne[3] <= 65535 &&
+        k->ne[1] >= std::max<int64_t>(4096, int64_t(hint) * 4) &&
+        ggml_get_op_params_f32(node, 1) == 0.0f && ggml_get_op_params_f32(node, 2) == 0.0f &&
+        dx12_fa_sparse_bytes(node) <= DX12_FA_MASK_MAX_BYTES;
+}
+
+static bool dx12_gdn_cache_layout(const ggml_tensor * node, const ggml_tensor * copy) {
+    if (copy->op != GGML_OP_CPY || copy->type != GGML_TYPE_F32 ||
+        !copy->src[0] || copy->src[0]->view_src != node || !ggml_is_contiguous(copy->src[0])) {
+        return false;
+    }
+    const ggml_tensor * v = node->src[2];
+    const int64_t state = v->ne[0] * v->ne[0] * v->ne[1];
+    const int64_t written = std::min<int64_t>(v->ne[2], ggml_get_op_params_i32(node, 0));
+    const size_t tail = size_t(v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3]) * sizeof(float);
+    const uint64_t offset = dx12_tensor_offset(copy);
+    if (copy->src[0]->view_offs != tail || copy->ne[0] != state || copy->ne[1] != v->ne[3] ||
+        copy->ne[2] < 1 || copy->ne[2] > written || copy->ne[3] != 1 ||
+        ggml_nelements(copy->src[0]) != ggml_nelements(copy) ||
+        copy->nb[0] != sizeof(float) || copy->nb[1] < state * sizeof(float) ||
+        copy->nb[2] < (copy->ne[1] - 1) * copy->nb[1] + state * sizeof(float) ||
+        ((offset | copy->nb[1] | copy->nb[2]) & 3u) != 0 ||
+        offset > UINT32_MAX || ggml_nbytes(copy) > UINT32_MAX - offset ||
+        copy->nb[1] > UINT32_MAX || copy->nb[2] > UINT32_MAX) {
+        return false;
+    }
+    ID3D12Resource * resource = dx12_get_resource(copy);
+    if (!resource) {
+        return false;
+    }
+    // Moving the cache write forward must not overwrite a live input or the normal output.
+    for (int s = -1; s < 6; ++s) {
+        const ggml_tensor * input = s < 0 ? node : node->src[s];
+        const uint64_t begin = dx12_tensor_offset(input);
+        if (resource == dx12_get_resource(input) &&
+            offset < begin + ggml_nbytes(input) && begin < offset + ggml_nbytes(copy)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int dx12_find_gdn_cache_copy(const ggml_cgraph * graph, int index) {
+    for (int c = index + 1; c < graph->n_nodes; ++c) {
+        const ggml_tensor * copy = graph->nodes[c];
+        if (copy->op == GGML_OP_VIEW || copy->op == GGML_OP_RESHAPE ||
+            copy->op == GGML_OP_PERMUTE || copy->op == GGML_OP_TRANSPOSE || copy->op == GGML_OP_NONE) {
+            continue;
+        }
+        return dx12_gdn_cache_layout(graph->nodes[index], copy) ? c : -1;
+    }
+    return -1;
+}
+
+static bool dx12_is_rtx5070_wave32(const dx12_device & dev) {
+    return !dev.is_igpu && dev.arch_family == DX12_ARCH_NV_PASCAL_PLUS && dev.adapter_desc.DeviceId == 0x2F04 &&
+           dev.wave_size == 32 && dev.blob_wave_size == 32;
+}
+
+static bool dx12_is_b390_wave16(const dx12_device & dev) {
+    return dev.arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS && dev.adapter_desc.DeviceId == 0xB080 &&
+           dev.fp16_supported && dev.wave_size == 16 && dev.blob_wave_size == 16;
+}
+
+static bool dx12_gdn_cache_enabled(const dx12_device & dev) {
+    const char * value = getenv("DX12_GDN_CACHE_FUSION");
+    return value ? strcmp(value, "1") == 0 :
+        dx12_is_rtx5070_wave32(dev) || dx12_is_b390_wave16(dev) ||
+        (dev.arch_family == DX12_ARCH_INTEL_UHD && dev.blob_wave_size == 16);
+}
+
+static bool dx12_is_fa_scalar_mask_flag(uint32_t flag) {
+    return flag >= DX12_FA_SCALAR_MASK_BASE && flag < DX12_FA_SCALAR_MASK_PACKED_BASE;
+}
+
+static bool dx12_fa_scalar_mask_layout(const ggml_tensor * node) {
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || !node->src[0] || !node->src[1] || !node->src[3]) {
+        return false;
+    }
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * mask = node->src[3];
+    const uint64_t offset = dx12_tensor_offset(mask);
+    // Match the scalar shader's 2048-tile class table and the producer's aligned four-element loads.
+    if ((q->ne[0] != 64 && q->ne[0] != 96 && q->ne[0] != 128) ||
+        q->ne[1] < 64 || k->ne[1] < 64 || k->ne[1] > 65536 || k->ne[1] % 4 != 0 ||
+        (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
+        mask->nb[0] != ggml_type_size(mask->type) ||
+        ((offset | mask->nb[1] | mask->nb[2] | mask->nb[3]) & 7u) != 0 ||
+        offset > UINT32_MAX || ggml_nbytes(mask) > UINT32_MAX - offset ||
+        mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] ||
+        mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
+        mask->ne[2] > q->ne[2] || mask->ne[3] > q->ne[3] ||
+        q->ne[2] % mask->ne[2] != 0 || q->ne[3] % mask->ne[3] != 0 ||
+        mask->ne[2] * mask->ne[3] > 65535) {
+        return false;
+    }
+    const uint32_t rows = q->ne[0] == 128 ? 16u : 32u;
+    return (q->ne[1] + rows - 1) / rows <= 65535 &&
+        dx12_fa_mask_bytes(node, rows, 32) <= DX12_FA_MASK_MAX_BYTES;
+}
+
+static bool dx12_use_small_m(const dx12_device & dev, const ggml_tensor * node) {
+    const char * q8_small_m = DX12_GETENV("DX12_Q8_SMALL_M");
+    const char * f16_small_m = DX12_GETENV("DX12_F16_SMALL_M");
+    return node->op == GGML_OP_MUL_MAT &&
+        ((node->src[0]->type == GGML_TYPE_Q8_0 && (!q8_small_m || q8_small_m[0] != '0')) ||
+         (node->src[0]->type == GGML_TYPE_F16 && (!f16_small_m || f16_small_m[0] != '0'))) &&
+        !dev.is_igpu && ((dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev.blob_wave_size == 64) ||
+                        (dx12_is_rtx5070_wave32(dev) && !(node->ne[0] == 1536 && node->ne[1] == 12) &&
+                         (node->src[0]->type != GGML_TYPE_Q8_0 || (q8_small_m && q8_small_m[0] == '1')))) &&
+        node->src[1]->type == GGML_TYPE_F32 &&
+        node->type == GGML_TYPE_F32 && node->ne[2] == 1 && node->ne[3] == 1 &&
+        (node->ne[1] == 2 || node->ne[1] == 3 || node->ne[1] == 6 || node->ne[1] == 12) &&
+        ((node->src[0]->ne[0] == 576 && (node->ne[0] == 192 || node->ne[0] == 576 || node->ne[0] == 1536)) ||
+         (node->src[0]->ne[0] == 1536 && node->ne[0] == 576)) &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
+        ((dx12_tensor_offset(node->src[0]) | dx12_tensor_offset(node->src[1]) | dx12_tensor_offset(node)) & 3u) == 0 &&
+        dx12_tensor_offset(node->src[0]) <= UINT32_MAX - ggml_nbytes(node->src[0]) &&
+        dx12_tensor_offset(node->src[1]) <= UINT32_MAX - ggml_nbytes(node->src[1]) &&
+        dx12_tensor_offset(node) <= UINT32_MAX - ggml_nbytes(node);
+}
+
+static bool dx12_f32_router_layout(const dx12_device & dev, const ggml_tensor * node) {
+    const char * router = getenv("DX12_F32_ROUTER");
+    return node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 &&
+        node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+        ((!dev.is_igpu && dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev.blob_wave_size == 64) ||
+         dx12_is_rtx5070_wave32(dev) || (dx12_is_b390_wave16(dev) && router && router[0] == '1')) &&
+        node->src[0]->ne[0] == 1024 && node->ne[0] == 32 &&
+        node->ne[1] >= 32 && node->ne[1] <= 512 && node->ne[2] == 1 && node->ne[3] == 1 &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
+        ((dx12_tensor_offset(node->src[0]) | dx12_tensor_offset(node->src[1]) | dx12_tensor_offset(node)) & 3u) == 0 &&
+        dx12_tensor_offset(node->src[0]) <= UINT32_MAX - ggml_nbytes(node->src[0]) &&
+        dx12_tensor_offset(node->src[1]) <= UINT32_MAX - ggml_nbytes(node->src[1]) &&
+        dx12_tensor_offset(node) <= UINT32_MAX - ggml_nbytes(node);
+}
+
+static bool dx12_q4k_short_layout(const dx12_device & dev, const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q4_K &&
+        dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev.is_igpu && dev.blob_wave_size == 64 &&
+        node->src[0]->ne[0] == 1024 && node->ne[0] <= 2048 &&
+        node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
+        node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
+        ((dx12_tensor_offset(node->src[0]) | dx12_tensor_offset(node->src[1]) | dx12_tensor_offset(node)) & 3u) == 0 &&
+        dx12_tensor_offset(node->src[0]) <= UINT32_MAX - ggml_nbytes(node->src[0]) &&
+        dx12_tensor_offset(node->src[1]) <= UINT32_MAX - ggml_nbytes(node->src[1]) &&
+        dx12_tensor_offset(node) <= UINT32_MAX - ggml_nbytes(node);
+}
+
+static uint32_t dx12_q4k_short_flag(const dx12_device & dev, const ggml_tensor * node) {
+    if (!dx12_q4k_short_layout(dev, node)) {
+        return 0;
+    }
+    const char * value = getenv("DX12_Q4K_SHORT");
+    const char mode = value ? value[0] : '3';
+    if (mode != '1' && mode != '2' && mode != '3') {
+        return 0;
+    }
+    const bool direct = mode == '1' || (mode == '3' && node->ne[0] <= 1024);
+    return direct ? DX12_Q4K_SHORT_F32_FLAG : DX12_Q4K_SHORT_DP4A_FLAG;
+}
+
+static bool dx12_linalg_even_weight_layout(const ggml_tensor * a) {
+    return a->nb[0] == ggml_type_size(a->type) &&
+        ((dx12_tensor_offset(a) | a->nb[1] | a->nb[2] | a->nb[3]) & 1u) == 0;
+}
+
+static bool dx12_composed_gemm_layout(const ggml_tensor * node) {
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * b = node->src[1];
+    const bool raw_weight_load = a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16 ||
+                                 a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q5_K;
+    return node->ne[0] % 128 == 0 && node->ne[1] % 64 == 0 &&
+        a->ne[0] % 64 == 0 && a->ne[0] % ggml_blck_size(a->type) == 0 &&
+        a->nb[0] == ggml_type_size(a->type) &&
+        a->nb[1] % 2 == 0 && a->nb[2] % 2 == 0 && a->nb[3] % 2 == 0 &&
+        (!raw_weight_load || (a->nb[1] % 4 == 0 && a->nb[2] % 4 == 0 && a->nb[3] % 4 == 0)) &&
+        dx12_tensor_offset(a) % 4 == 0 && ggml_nbytes(a) % 4 == 0 &&
+        b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) &&
+        node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+        b->ne[2] == node->ne[2] && b->ne[3] == node->ne[3] &&
+        ggml_nbytes(a) <= INT32_MAX && ggml_nbytes(b) <= INT32_MAX && ggml_nbytes(node) <= INT32_MAX &&
+        dx12_tensor_offset(b) % 4 == 0 && dx12_tensor_offset(node) % 4 == 0 &&
+        node->ne[0] / 128 <= 65535 && node->ne[1] / 64 <= 65535 &&
+        node->ne[2] * node->ne[3] <= 65535;
+}
+
+static bool dx12_use_linalg_amd_composed(const dx12_device & dev, const ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1] ||
+        dev.sub_family != DX12_SUBARCH_AMD_RDNA4_PLUS || dev.is_igpu ||
+        !dev.linalg_matrix_supported || !dev.linalg_wave_f16_16x16_w32_supported || !dev.fp16_supported ||
+        (node->src[0]->type != GGML_TYPE_Q4_K && node->src[0]->type != GGML_TYPE_Q6_K) ||
+        node->ne[1] != 512 || node->ne[0] < 2048 || node->ne[0] > 4096 ||
+        node->src[0]->ne[0] < 4096 || node->src[0]->ne[0] > 16384 ||
+        !dx12_flag_default_on("DX12_LINALG_AMD_COMPOSED") ||
+        !dx12_flag_default_on("DX12_LINALG_MM") || !dx12_flag_default_on("DX12_LINALG_MM_KQ") ||
+        DX12_GETENV("DX12_LINALG_TILE") || DX12_GETENV("DX12_MMQ_MIN_M") ||
+        DX12_GETENV("DX12_MMQ_MIN_N") || DX12_GETENV("DX12_MMQ_MIN_K")) {
+        return false;
+    }
+    return dx12_composed_gemm_layout(node);
+}
+
+static bool dx12_use_linalg_q8_aligned(const dx12_device & dev, const ggml_tensor * node, uint32_t flags) {
+    // Full tiles only: the shader omits edge masks and uses 16-byte F32 loads.
+    if (node->op != GGML_OP_MUL_MAT || (flags != 211 && flags != 212) ||
+        dev.sub_family != DX12_SUBARCH_AMD_RDNA4_PLUS || dev.is_igpu || dev.blob_wave_size != 64 ||
+        node->type != GGML_TYPE_F32 ||
+        !node->src[0] || node->src[0]->type != GGML_TYPE_Q8_0 ||
+        !node->src[1] || node->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(node) || !ggml_is_contiguous(node->src[1]) ||
+        node->src[0]->ne[0] % 32 != 0 ||
+        node->ne[0] % (flags == 211 ? 64 : 128) != 0 || node->ne[1] % 128 != 0 ||
+        node->src[0]->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) ||
+        ((dx12_tensor_offset(node->src[0]) | node->src[0]->nb[1] |
+          node->src[0]->nb[2] | node->src[0]->nb[3]) & 1u) != 0 ||
+        (dx12_tensor_offset(node->src[1]) & 15u) != 0) {
+        return false;
+    }
+    const char * env = DX12_GETENV("DX12_LINALG_Q8_ALIGNED");
+    return env == nullptr || env[0] != '0';
+}
+
+static bool dx12_linalg_pipeline_layout(const ggml_tensor * node, uint32_t flag) {
+    const ggml_type type = flag == DX12_Q8_PIPELINE_FLAG ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    const bool narrow_tile = flag == DX12_F16_PIPELINE_SMALL_FLAG;
+    return node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+           node->src[0]->type == type && node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+           node->src[0]->ne[0] >= 64 && node->src[0]->ne[0] % 64 == 0 &&
+           node->ne[0] % (narrow_tile ? 32 : 64) == 0 && node->ne[1] % (narrow_tile ? 32 : 128) == 0 &&
+           ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
+           node->src[0]->nb[0] == ggml_type_size(type) &&
+           ((dx12_tensor_offset(node->src[0]) | node->src[0]->nb[1] | node->src[0]->nb[2] | node->src[0]->nb[3]) & 3u) == 0 &&
+           (dx12_tensor_offset(node->src[1]) & 15u) == 0;
+}
+
+static bool dx12_use_linalg_q8_smol(const dx12_device & dev, const ggml_tensor * node) {
+    if (!dx12_flag_default_on("DX12_LINALG_Q8_SMOL") ||
+        DX12_GETENV("DX12_LINALG_TILE") || DX12_GETENV("DX12_LINALG_TILE_MIN_K") || DX12_GETENV("DX12_LINALG_MM_GROUPS") ||
+        DX12_GETENV("DX12_MMQ_MIN_M") || DX12_GETENV("DX12_MMQ_MIN_N") || DX12_GETENV("DX12_MMQ_MIN_K") ||
+        node->ne[1] != 512 || node->ne[2] != 1 || node->ne[3] != 1 ||
+        !dx12_use_linalg_q8_aligned(dev, node, 211)) {
+        return false;
+    }
+    const int64_t n = node->ne[0];
+    const int64_t k = node->src[0]->ne[0];
+    return (n == 576 && (k == 576 || k == 1536)) || (n == 192 && k == 576);
+}
+
+static bool dx12_use_linalg_q50_packed(const dx12_device & dev, const ggml_tensor * node, uint32_t flags) {
+    if (node->op != GGML_OP_MUL_MAT || flags < 230 || flags > 233 ||
+        !node->src[0] || node->src[0]->type != GGML_TYPE_Q5_0 ||
+        !node->src[1] || node->src[1]->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
+        dev.sub_family != DX12_SUBARCH_AMD_RDNA4_PLUS || dev.is_igpu || dev.blob_wave_size != 64 ||
+        !dev.linalg_matrix_supported || !dev.linalg_wave_f16_16x16_supported || !dev.fp16_supported ||
+        !dx12_flag_default_on("DX12_LINALG_Q50_PACKED") ||
+        !dx12_flag_default_on("DX12_LINALG_MM") || !dx12_flag_default_on("DX12_LINALG_MM_Q8")) {
+        return false;
+    }
+    const ggml_tensor * a = node->src[0];
+    return a->ne[0] % 32 == 0 && dx12_linalg_even_weight_layout(a) &&
+        ggml_nbytes(a) <= UINT32_MAX && dx12_tensor_offset(a) <= UINT32_MAX - ggml_nbytes(a);
+}
+
+static bool dx12_use_bucket_linalg_mmid(const dx12_device & dev, const ggml_tensor * node, uint32_t flags) {
+    const bool nv = dev.arch_family == DX12_ARCH_NV_PASCAL_PLUS && dev.adapter_desc.DeviceId == 0x2F04 &&
+        dev.wave_size == 32 && dev.blob_wave_size == 32;
+    if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2] ||
+        dev.is_igpu ||
+        !((dev.sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev.blob_wave_size == 64) || nv) ||
+        !dev.linalg_matrix_supported || !dev.linalg_wave_f16_16x16_supported || !dev.fp16_supported ||
+        !dx12_flag_default_on("DX12_LINALG_MMID_BUCKET") ||
+        !dx12_flag_default_on("DX12_LINALG_MMID") || !dx12_flag_default_on("DX12_LINALG_MM")) {
+        return false;
+    }
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * b = node->src[1];
+    const ggml_tensor * ids = node->src[2];
+    const char * bucket = DX12_GETENV("DX12_LINALG_MMID_BUCKET");
+    if (nv && !(bucket && bucket[0] == '1')) {
+        // Qualified Granite prefill shapes; other safe layouts remain opt-in.
+        const bool shape = (a->ne[0] == 1024 && node->ne[0] == 512) ||
+                           (a->ne[0] == 512 && node->ne[0] == 1024);
+        const bool type = a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_Q8_0 ||
+                          a->type == GGML_TYPE_Q4_K ||
+                          (a->type == GGML_TYPE_Q6_K && a->ne[0] == 512);
+        if (!shape || !type || (flags != 202 && flags != DX12_MMID_BUCKET_TALL_FLAG && flags != DX12_MMID_BUCKET_WIDE_FLAG) ||
+            a->ne[2] != 32 || ids->ne[0] != 8 || ids->ne[1] != 512) {
+            return false;
+        }
+    }
+    const bool kquant = a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q5_K || a->type == GGML_TYPE_Q6_K;
+    const bool quant = kquant || a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_Q5_0 ||
+        a->type == GGML_TYPE_Q4_0 || a->type == GGML_TYPE_Q4_1 || a->type == GGML_TYPE_Q5_1 ||
+        a->type == GGML_TYPE_IQ4_NL || a->type == GGML_TYPE_MXFP4;
+    if ((!quant && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_BF16) ||
+        (quant && !dx12_flag_default_on(kquant ? "DX12_LINALG_MM_KQ" : "DX12_LINALG_MM_Q8")) ||
+        a->ne[0] % ggml_blck_size(a->type) != 0 || a->nb[0] != ggml_type_size(a->type) ||
+        a->ne[2] <= 0 || a->ne[2] > 256 || a->ne[3] != 1 ||
+        b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) ||
+        (b->ne[1] != 1 && b->ne[1] != ids->ne[0]) || b->ne[2] != ids->ne[1] || b->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0 || ids->ne[0] > a->ne[2] ||
+        ids->ne[1] < 128 || ids->ne[1] > UINT32_MAX || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        ids->nb[0] != sizeof(int32_t) || ids->nb[1] < ids->ne[0] * sizeof(int32_t) ||
+        node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || node->ne[3] != 1 ||
+        node->ne[1] != ids->ne[0] || node->ne[2] != ids->ne[1]) {
+        return false;
+    }
+    const uint64_t n_pairs = (uint64_t)ids->ne[0] * ids->ne[1];
+    if ((n_pairs + DX12_MMID_BM(flags) - 1) / DX12_MMID_BM(flags) + a->ne[2] > 65535 ||
+        node->ne[0] > (int64_t)65535 * DX12_MMID_BN(flags) ||
+        a->nb[1] < ggml_row_size(a->type, a->ne[0]) || a->nb[2] < a->nb[1] * a->ne[1] ||
+        !dx12_linalg_even_weight_layout(a) ||
+        ((dx12_tensor_offset(b) | dx12_tensor_offset(ids) | ids->nb[1] | dx12_tensor_offset(node)) & 3u) != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : {a, b, ids, node}) {
+        if (ggml_nbytes(t) > UINT32_MAX || dx12_tensor_offset(t) > UINT32_MAX - ggml_nbytes(t)) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (t->nb[d] > UINT32_MAX || t->ne[d] > UINT32_MAX) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool dx12_use_wide_bucket_linalg_mmid(const dx12_device & dev, const ggml_tensor * node) {
+    if (!dx12_flag_default_on("DX12_LINALG_MMID_WIDE") || dev.arch_family != DX12_ARCH_NV_PASCAL_PLUS ||
+        dev.adapter_desc.DeviceId != 0x2F04 || dev.wave_size != 32 || dev.blob_wave_size != 32) {
+        return false;
+    }
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * ids = node->src[2];
+    return ((a->ne[0] == 1024 && node->ne[0] == 512) || (a->ne[0] == 512 && node->ne[0] == 1024)) &&
+        (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q8_0 ||
+         (a->type == GGML_TYPE_Q6_K && a->ne[0] == 512)) &&
+        a->ne[2] == 32 && ids->ne[0] == 8 && ids->ne[1] == 512;
+}
+
 // ---------------------------------------------------------------------------
 // Backend context (stream)
 // ---------------------------------------------------------------------------
@@ -1247,8 +2269,17 @@ static inline uint64_t dx12_tensor_offset(const struct ggml_tensor * tensor) {
 // stream chunks + logits readback), so a shallow ring forces several CPU<->GPU
 // lock-steps per token. CMD_RING_MAX bounds the fixed-size arrays; the live
 // depth is per-context and overridable via DX12_CMD_RING.
+//
+// Depth 16 rather than 4: a multimodal prefill graph issues far more
+// submissions than a decode token, so a 4-deep ring wraps repeatedly inside a
+// single graph and blocks. On SmolVLM2-256M the first prompt graph spent
+// 31.9 ms of its 32.4 ms dispatch-record phase parked in that wait; depth 16
+// cuts it to 1.9 ms and is worth ~12% end-to-end. Pure-LLM decode and prefill
+// are unaffected (Qwen3-4B pp512 5650 vs 5653, iGPU SmolLM2 1399 vs 1395), so
+// this only recovers time the deeper pipelining was already leaving on the
+// floor. Cost is PARAM_SLOT_SIZE (2 MiB) of upload buffer per slot.
 static const int CMD_RING_MAX     = 16;
-static const int CMD_RING_DEFAULT = 4;
+static const int CMD_RING_DEFAULT = 16;
 
 // ---------------------------------------------------------------------------
 // Whole-graph command-list replay (enabled by default; disable via DX12_COMMAND_REPLAY=0)
@@ -1307,6 +2338,7 @@ struct dx12_cmd_replay {
         uint32_t gqa_ratio;
         uint32_t n_kv;      // updated when the CBV slot is patched
         uint32_t n_splits;
+        uint32_t max_splits;
     };
     std::vector<fa_rec> fa;
 
@@ -1401,13 +2433,13 @@ struct dx12_backend_context {
     // Single-buffer compute UAV ordering point. Legacy: null-resource UAV
     // barrier (preserves default behavior). Enhanced: a scoped BUFFER barrier
     // over just this resource -- far cheaper than a GLOBAL/legacy full drain.
-    void emit_uav_barrier_buffer(ID3D12Resource * res) {
+    void emit_uav_barrier_buffer(ID3D12Resource * res, D3D12_BARRIER_ACCESS access_before = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) {
         if (dev->enhanced_barriers && res) {
             if (ID3D12GraphicsCommandList7 * cl7 = get_cmd_list7()) {
                 D3D12_BUFFER_BARRIER bb = {};
                 bb.SyncBefore   = D3D12_BARRIER_SYNC_COMPUTE_SHADING;
                 bb.SyncAfter    = D3D12_BARRIER_SYNC_COMPUTE_SHADING;
-                bb.AccessBefore = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+                bb.AccessBefore = access_before;
                 bb.AccessAfter  = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
                 bb.pResource    = res;
                 bb.Offset       = 0;
@@ -1513,6 +2545,15 @@ struct dx12_backend_context {
     uintptr_t last_moe_bucket_ids_id  = 0;
     uint32_t  last_moe_bucket_ids_off = 0;
     uint32_t  last_moe_bucket_size    = 0;
+    uint32_t  last_moe_bucket_experts = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS last_moe_bucket_ids_va = 0;
+    size_t last_moe_bucket_ids_bytes = 0;
+
+    ComPtr<ID3D12Resource> fa_mask_scratch;
+    size_t fa_mask_scratch_size = 0;
+    dx12_pipeline * fa_mask_packed_pipeline[4] = {};
+    dx12_pipeline * fa_sparse_compact_pipeline = nullptr;
+    uint64_t fa_mask_stats[3] = {};
 
     // Decode-only Q/K/V projection partition. Qwen-style QK-norm graphs place
     // Q post-ops between the three independent projection matvecs, while ggml's
@@ -1535,6 +2576,8 @@ struct dx12_backend_context {
     uint32_t                  last_q8_1_src_off  = 0;
     uint32_t                  last_q8_1_size     = 0;
     uintptr_t                 last_q8_1_src_id   = 0;
+    // the scratch holds one encoding at a time: 1 = q8_1, 2 = flat f16
+    uint32_t                  last_q8_1_kind     = 0;
     // Set by the fused rms_norm_mul_quantize_q8_1 dispatch to flag the q8_1
     // cache as pre-populated by *us*. The matmul barrier path uses this to
     // skip the "cached src1 in unsynced_writes → invalidate cache" check that
@@ -1711,10 +2754,14 @@ struct dx12_backend_context {
         last_q8_1_src_off = 0;
         last_q8_1_size    = 0;
         last_q8_1_src_id  = 0;
+        last_q8_1_kind    = 0;
         q8_1_cache_safe   = false;
         last_moe_bucket_ids_id  = 0;
         last_moe_bucket_ids_off = 0;
         last_moe_bucket_size    = 0;
+        last_moe_bucket_experts = 0;
+        last_moe_bucket_ids_va = 0;
+        last_moe_bucket_ids_bytes = 0;
     }
 
     ~dx12_backend_context() {
@@ -1756,6 +2803,24 @@ struct dx12_backend_context {
 
 struct dx12_globals_t {
     bool                                        initialized = false;
+    // Result of D3D12EnableExperimentalFeatures(D3D12ExperimentalShaderModels)
+    // attempted once at init. Populated even on failure so the device banner
+    // can report whether SM 6.10 is unlocked. SM 6.10 (cs_6_10) DXIL — which
+    // includes our LinAlg probe shader — will be rejected by D3D12CreateDevice
+    // unless this call succeeds *and* the runtime + driver support it.
+    HRESULT                                     experimental_shader_models_hr = E_FAIL;
+    bool                                        experimental_shader_models_enabled = false;
+    // Agility SDK device factory. Non-null only when GGML_DX12_LINALG_PREVIEW
+    // is built in AND CreateDeviceFactory succeeded. When non-null we MUST
+    // use device_factory->CreateDevice / EnableExperimentalFeatures instead
+    // of the global free functions, otherwise we silently fall back to the
+    // OS D3D12 runtime (no SM 6.10, no LinAlg). The D3D12SDKVersion exports
+    // on ggml-dx12.dll are NOT honoured by the Agility loader (loader only
+    // reads the host EXE's exports), so the runtime factory is the only
+    // viable load path for a DLL-hosted backend.
+    ComPtr<ID3D12DeviceFactory>                 device_factory;
+    UINT                                        agility_sdk_version = 0;
+    std::wstring                                agility_sdk_path;
     ComPtr<IDXGIFactory4>                       factory;
     std::vector<std::unique_ptr<dx12_device>>   devices;
     std::mutex                                  init_mutex;
@@ -1923,12 +2988,96 @@ static void dx12_ensure_initialized() {
         }
     }
 
-    // Enable experimental features for Cooperative Vector (best-effort, non-fatal)
+    // Try to load the Agility SDK preview from the staged `D3D12\` subdir
+    // next to ggml-dx12.dll. The D3D12SDKVersion / D3D12SDKPath exports on
+    // ggml-dx12.dll are deliberately ignored by the Agility loader (it only
+    // reads the host EXE's exports), so when ggml-dx12 is shipped as a DLL
+    // (the common case) the only viable load path is the runtime
+    // `ID3D12SDKConfiguration1::CreateDeviceFactory` API introduced for
+    // Agility 1.611+. Without this the process silently runs on the OS
+    // D3D12 runtime, missing SM 6.10 and LinAlg entirely.
+#ifdef GGML_DX12_LINALG_PREVIEW
+    {
+        // Derive the absolute path to the staged D3D12\ folder by asking
+        // the OS where our own DLL lives. CWD-relative paths don't work
+        // reliably (the host process may chdir anywhere before init).
+        HMODULE self_mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&dx12_ensure_initialized),
+                               &self_mod) && self_mod) {
+            wchar_t mod_path[MAX_PATH] = {};
+            DWORD n = GetModuleFileNameW(self_mod, mod_path, MAX_PATH);
+            if (n > 0 && n < MAX_PATH) {
+                std::wstring path(mod_path);
+                size_t slash = path.find_last_of(L"\\/");
+                if (slash != std::wstring::npos) {
+                    path.erase(slash + 1);
+                    path += L"D3D12\\";
+                    g_dx12.agility_sdk_path    = path;
+                    g_dx12.agility_sdk_version = (UINT)GGML_DX12_AGILITY_SDK_VERSION;
+                }
+            }
+        }
+
+        if (!g_dx12.agility_sdk_path.empty()) {
+            ComPtr<ID3D12SDKConfiguration1> sdk_cfg;
+            HRESULT hr = D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdk_cfg));
+            if (SUCCEEDED(hr) && sdk_cfg) {
+                // CreateDeviceFactory takes a UTF-8 path. Convert from the
+                // wide module path we built above.
+                char path_utf8[MAX_PATH * 2] = {};
+                WideCharToMultiByte(CP_UTF8, 0, g_dx12.agility_sdk_path.c_str(), -1,
+                                    path_utf8, sizeof(path_utf8), nullptr, nullptr);
+                ComPtr<ID3D12DeviceFactory> factory;
+                hr = sdk_cfg->CreateDeviceFactory(g_dx12.agility_sdk_version,
+                                                  path_utf8,
+                                                  IID_PPV_ARGS(&factory));
+                if (SUCCEEDED(hr) && factory) {
+                    g_dx12.device_factory = factory;
+                    DX12_LOG_INFO("Agility SDK v%u loaded from %s\n",
+                                  g_dx12.agility_sdk_version, path_utf8);
+                } else {
+                    DX12_LOG_INFO("Agility SDK v%u from %s NOT loaded (CreateDeviceFactory HRESULT 0x%08X) - falling back to OS D3D12 runtime\n",
+                                  g_dx12.agility_sdk_version, path_utf8, (uint32_t)hr);
+                }
+            } else {
+                DX12_LOG_INFO("Agility SDK: D3D12GetInterface(CLSID_D3D12SDKConfiguration) failed (HRESULT 0x%08X) - falling back to OS D3D12 runtime\n", (uint32_t)hr);
+            }
+        }
+    }
+#endif // GGML_DX12_LINALG_PREVIEW
+
+    // Enable experimental features. D3D12ExperimentalShaderModels is the
+    // documented unlock for SM 6.x preview shader models, including SM 6.10
+    // (cs_6_10) used by the LinAlg probe. Must be called before any device
+    // creation and only takes effect when Developer Mode is on. When the
+    // Agility device factory loaded above is available we route through it
+    // so the call hits the Agility runtime; otherwise we fall back to the
+    // global free function (which talks to OS D3D12 and will reject SM 6.10
+    // on modern Windows). We always attempt it (cheap, non-fatal) and
+    // surface the HRESULT in the device banner so a failed call is obvious
+    // instead of silently degrading to "cs_6_10 DXIL rejected on CreateDevice".
     {
         UUID features[] = { D3D12ExperimentalShaderModels };
-        HRESULT hr = D3D12EnableExperimentalFeatures(1, features, nullptr, nullptr);
+        HRESULT hr;
+        if (g_dx12.device_factory) {
+            hr = g_dx12.device_factory->EnableExperimentalFeatures(1, features, nullptr, nullptr);
+        } else {
+            hr = D3D12EnableExperimentalFeatures(1, features, nullptr, nullptr);
+        }
+        g_dx12.experimental_shader_models_hr      = hr;
+        g_dx12.experimental_shader_models_enabled = SUCCEEDED(hr);
         if (SUCCEEDED(hr)) {
-            DX12_LOG_DEBUG("Experimental shader models enabled\n");
+            DX12_LOG_INFO("D3D12 experimental shader models: enabled (required for cs_6_10 / LinAlg preview)\n");
+        } else if (hr == E_NOINTERFACE) {
+            // E_NOINTERFACE = OS / Agility loader doesn't recognise the GUID
+            // OR Windows Developer Mode is off.
+            DX12_LOG_INFO("D3D12 experimental shader models: NOT available (E_NOINTERFACE) - cs_6_10 / LinAlg shaders will be rejected; check Windows Developer Mode is ON and (for LinAlg builds) that the Agility SDK loaded\n");
+        } else if ((uint32_t)hr == 0x887E0003u) { // D3D12_ERROR_INVALID_REDIST or developer-mode not enabled
+            DX12_LOG_INFO("D3D12 experimental shader models: NOT enabled (HRESULT 0x%08X) - check Windows Developer Mode is ON\n", (uint32_t)hr);
+        } else {
+            DX12_LOG_INFO("D3D12 experimental shader models: NOT enabled (HRESULT 0x%08X)\n", (uint32_t)hr);
         }
     }
 
@@ -1991,55 +3140,6 @@ static void dx12_ensure_initialized() {
                 }
             }
 
-            ComPtr<ID3D12Device> test_device;
-            hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device));
-            if (FAILED(hr)) continue;
-
-            // Validate compute capability: try a small UAV buffer allocation.
-            {
-                D3D12_HEAP_PROPERTIES hp = {};
-                hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-                D3D12_RESOURCE_DESC rd = {};
-                rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-                rd.Width            = 4096;
-                rd.Height           = 1;
-                rd.DepthOrArraySize = 1;
-                rd.MipLevels        = 1;
-                rd.SampleDesc.Count = 1;
-                rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-                ComPtr<ID3D12Resource> test_buf;
-                hr = test_device->CreateCommittedResource(
-                    &hp, D3D12_HEAP_FLAG_NONE, &rd,
-                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&test_buf));
-                if (FAILED(hr)) {
-                    char name_buf[128];
-                    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
-                    DX12_LOG_WARN("Skipping %s: UAV allocation failed (HRESULT 0x%08X)\n", name_buf, (unsigned)hr);
-                    continue;
-                }
-            }
-
-            // Validate compute queue creation up front so we can fall back cleanly.
-            {
-                D3D12_COMMAND_QUEUE_DESC qd_test = {};
-                qd_test.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-                qd_test.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-                qd_test.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
-                ComPtr<ID3D12CommandQueue> test_q;
-                HRESULT q_hr = test_device->CreateCommandQueue(&qd_test, IID_PPV_ARGS(&test_q));
-                if (FAILED(q_hr)) {
-                    char name_buf[128];
-                    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
-                    DX12_LOG_WARN("Skipping %s: CreateCommandQueue failed (HRESULT 0x%08X)\n", name_buf, (unsigned)q_hr);
-                    saw_queue_creation_failure = true;
-                    continue;
-                }
-            }
-            test_device.Reset();
-
-            if (g_dx12.devices.size() >= GGML_DX12_MAX_DEVICES) break;
-
             // DX12_VISIBLE_DEVICES=<i>[,<j>...] restricts enumeration to the
             // listed adapter indices. GPU profilers (RGP) abort a capture when
             // one process owns D3D12 devices on several adapters, so a
@@ -2061,6 +3161,63 @@ static void dx12_ensure_initialized() {
                     continue;
                 }
             }
+
+            // RGP attaches to every D3D12 device created by the process. The
+            // short-lived capability probe below otherwise becomes the first
+            // capture target and disconnects before a trace can complete.
+            if (getenv("DX12_RGP_CAPTURE") == nullptr) {
+                ComPtr<ID3D12Device> test_device;
+                if (g_dx12.device_factory) {
+                    hr = g_dx12.device_factory->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device));
+                } else {
+                    hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device));
+                }
+                if (FAILED(hr)) continue;
+
+                // Validate compute capability: try a small UAV buffer allocation.
+                {
+                    D3D12_HEAP_PROPERTIES hp = {};
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = {};
+                    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    rd.Width            = 4096;
+                    rd.Height           = 1;
+                    rd.DepthOrArraySize = 1;
+                    rd.MipLevels        = 1;
+                    rd.SampleDesc.Count = 1;
+                    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    ComPtr<ID3D12Resource> test_buf;
+                    hr = test_device->CreateCommittedResource(
+                        &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&test_buf));
+                    if (FAILED(hr)) {
+                        char name_buf[128];
+                        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                        DX12_LOG_WARN("Skipping %s: UAV allocation failed (HRESULT 0x%08X)\n", name_buf, (unsigned)hr);
+                        continue;
+                    }
+                }
+
+                // Validate compute queue creation up front so we can fall back cleanly.
+                {
+                    D3D12_COMMAND_QUEUE_DESC qd_test = {};
+                    qd_test.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+                    qd_test.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+                    qd_test.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
+                    ComPtr<ID3D12CommandQueue> test_q;
+                    HRESULT q_hr = test_device->CreateCommandQueue(&qd_test, IID_PPV_ARGS(&test_q));
+                    if (FAILED(q_hr)) {
+                        char name_buf[128];
+                        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                        DX12_LOG_WARN("Skipping %s: CreateCommandQueue failed (HRESULT 0x%08X)\n", name_buf, (unsigned)q_hr);
+                        saw_queue_creation_failure = true;
+                        continue;
+                    }
+                }
+            }
+
+            if (g_dx12.devices.size() >= GGML_DX12_MAX_DEVICES) break;
 
             g_dx12.devices.push_back(std::make_unique<dx12_device>());
             g_dx12.devices.back()->init(std::move(adapter), g_dx12.devices.size() - 1);
@@ -2089,6 +3246,486 @@ static void dx12_ensure_initialized() {
 // dx12_device implementation
 // ---------------------------------------------------------------------------
 
+#ifdef GGML_DX12_LINALG_PREVIEW
+// Preview ABI mirrored from Agility SDK 1.720.0 through 1.721.3.
+struct dx12_linalg_shape {
+    UINT M, K, N;
+};
+
+struct dx12_linalg_wave_inputs {
+    UINT wave_size;
+    UINT a_type, b_type, acc_type;
+};
+
+struct dx12_linalg_wave_mm_support {
+    dx12_linalg_wave_inputs inputs;
+    UINT                    support_flags;
+    UINT                    num_shapes;
+    dx12_linalg_shape *     shapes;
+};
+
+struct dx12_linalg_tg_mm_support {
+    dx12_linalg_wave_inputs wave_inputs_;
+    dx12_linalg_shape       shape;
+    UINT                    support_flags;
+    UINT                    min_tg_size;
+    UINT                    max_tg_size;
+    UINT                    preferred_tg_size;
+};
+
+struct dx12_linalg_thread_vec_mm_support {
+    UINT vector_input_type;
+    UINT matrix_input_type;
+    UINT bias_input_type;
+    UINT vector_result_type;
+    UINT support_flags;
+};
+
+struct dx12_linalg_matrix_construction_support {
+    UINT component_type;
+    UINT wave_size;
+    UINT min_m, min_k, min_n;
+};
+
+struct dx12_linalg_outer_product_support {
+    UINT input_type, result_type;
+    BOOL supported;
+};
+
+struct dx12_linalg_accumulate_store_support {
+    UINT component_type;
+    BOOL rw_byte_address_supported;
+    BOOL group_shared_supported;
+};
+
+struct dx12_linalg_op_query {
+    UINT op_type;
+    union {
+        dx12_linalg_matrix_construction_support matrix_construction;
+        dx12_linalg_wave_mm_support             wave;
+        dx12_linalg_tg_mm_support               tg;
+        dx12_linalg_thread_vec_mm_support       thread_vec;
+        dx12_linalg_outer_product_support       outer_product;
+        dx12_linalg_accumulate_store_support    accumulate_store;
+    };
+};
+
+struct dx12_linalg_tg_caps {
+    bool supported = false;
+    UINT min_threads = 0;
+    UINT max_threads = 0;
+    UINT preferred_threads = 0;
+};
+
+// Does the device do this exact wave matrix multiply, at this exact shape?
+// The tier says only that the feature exists. A driver can expose the tier,
+// build the PSO, and still return wrong results for a shape or accumulator it
+// never implemented, so the shape has to be in the reported list.
+static bool dx12_query_linalg_wave_shape(
+        ID3D12Device * device,
+        UINT wave_size,
+        UINT a_type,
+        UINT b_type,
+        UINT acc_type,
+        dx12_linalg_shape shape) {
+    constexpr UINT D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL = 78;
+    constexpr UINT OP_WAVE_MATRIX_MULTIPLY = 1;
+
+    dx12_linalg_op_query q = {};
+    q.op_type               = OP_WAVE_MATRIX_MULTIPLY;
+    q.wave.inputs.wave_size = wave_size;
+    q.wave.inputs.a_type    = a_type;
+    q.wave.inputs.b_type    = b_type;
+    q.wave.inputs.acc_type  = acc_type;
+
+    HRESULT hr = device->CheckFeatureSupport(
+        (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+    if (FAILED(hr) || (q.wave.support_flags & 1u) == 0 || q.wave.num_shapes == 0) {
+        return false;
+    }
+
+    std::vector<dx12_linalg_shape> shapes(q.wave.num_shapes);
+    q.wave.shapes = shapes.data();
+    hr = device->CheckFeatureSupport(
+        (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+    if (FAILED(hr)) {
+        return false;
+    }
+    for (UINT i = 0; i < q.wave.num_shapes && i < shapes.size(); i++) {
+        if (shapes[i].M == shape.M && shapes[i].K == shape.K && shapes[i].N == shape.N) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static dx12_linalg_tg_caps dx12_query_linalg_tg_caps(
+        ID3D12Device * device,
+        UINT wave_size,
+        UINT a_type,
+        UINT b_type,
+        UINT acc_type,
+        dx12_linalg_shape shape) {
+    constexpr UINT D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL = 78;
+    constexpr UINT OP_THREADGROUP_MATRIX_MULTIPLY = 2;
+
+    dx12_linalg_op_query q = {};
+    q.op_type                   = OP_THREADGROUP_MATRIX_MULTIPLY;
+    q.tg.wave_inputs_.wave_size = wave_size;
+    q.tg.wave_inputs_.a_type    = a_type;
+    q.tg.wave_inputs_.b_type    = b_type;
+    q.tg.wave_inputs_.acc_type  = acc_type;
+    q.tg.shape                  = shape;
+
+    const HRESULT hr = device->CheckFeatureSupport(
+        (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL,
+        &q, sizeof(q));
+    if (FAILED(hr) || (q.tg.support_flags & 1u) == 0) {
+        return {};
+    }
+    return {
+        true,
+        q.tg.min_tg_size,
+        q.tg.max_tg_size,
+        q.tg.preferred_tg_size,
+    };
+}
+
+static uint32_t dx12_select_linalg_tg_threads(const dx12_linalg_tg_caps & caps) {
+    if (!caps.supported || caps.min_threads == 0 ||
+        caps.max_threads < caps.min_threads) {
+        return 0;
+    }
+
+    constexpr uint32_t candidates[] = { 64, 128, 256 };
+    if (caps.preferred_threads >= caps.min_threads &&
+        caps.preferred_threads <= caps.max_threads) {
+        for (uint32_t threads : candidates) {
+            if (threads == caps.preferred_threads) {
+                return threads;
+            }
+        }
+
+        uint32_t best = 0;
+        uint32_t best_distance = UINT32_MAX;
+        for (uint32_t threads : candidates) {
+            if (threads < caps.min_threads || threads > caps.max_threads) {
+                continue;
+            }
+            const uint32_t distance = threads > caps.preferred_threads
+                ? threads - caps.preferred_threads
+                : caps.preferred_threads - threads;
+            if (distance < best_distance) {
+                best = threads;
+                best_distance = distance;
+            }
+        }
+        return best;
+    }
+
+    for (auto it = std::rbegin(candidates); it != std::rend(candidates); ++it) {
+        if (*it >= caps.min_threads && *it <= caps.max_threads) {
+            return *it;
+        }
+    }
+    return 0;
+}
+
+// Enumerate the per-operation LinAlg capabilities the driver advertises.
+// Diagnostic only, gated on DX12_LINALG_CAPS=1; nothing in the dispatcher
+// consumes this yet. Structures mirror the Agility SDK preview d3d12.h
+// so the backend does not need the preview headers on its include path.
+// The LinAlg surface is byte-identical between 1.720.0 and 1.721.3.
+//
+//   D3D12_FEATURE_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT = 78
+//
+// Wave shapes use a two-pass query. The installed _1 preview API takes an
+// exact threadgroup shape as input, so those capabilities are probed with the
+// shapes used by the backend rather than an all-zero shape.
+static void dx12_dump_linalg_caps(ID3D12Device * device) {
+    constexpr UINT D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL = 78;
+
+    // D3D12_LINEAR_ALGEBRA_OPERATION_TYPE
+    constexpr UINT OP_MATRIX_CONSTRUCTION         = 0;
+    constexpr UINT OP_WAVE_MATRIX_MULTIPLY        = 1;
+    constexpr UINT OP_THREADGROUP_MATRIX_MULTIPLY = 2;
+    constexpr UINT OP_THREAD_VECTOR_MATRIX_MULTIPLY = 3;
+    constexpr UINT OP_THREAD_OUTER_PRODUCT        = 4;
+    constexpr UINT OP_ATOMIC_ACCUMULATE_STORE     = 5;
+
+    // D3D12_LINEAR_ALGEBRA_DATATYPE values we care about for inference.
+    constexpr UINT DT_S32 = 4;
+    constexpr UINT DT_U32 = 5;
+    constexpr UINT DT_F16 = 7;
+    constexpr UINT DT_F32 = 8;
+    constexpr UINT DT_S8  = 18;
+    constexpr UINT DT_U8  = 19;
+    struct { UINT v; const char * name; } dtypes[] = {
+        { DT_S32, "s32"  },
+        { DT_U32, "u32"  },
+        { DT_F16, "f16"  },
+        { DT_F32, "f32"  },
+        { DT_S8,  "s8"   },
+        { DT_U8,  "u8"   },
+        { 20, "f8e4m3"},
+        { 21, "f8e5m2"},
+    };
+
+    const UINT wave_sizes[] = { 0, 16, 32, 64 };
+    const dx12_linalg_shape tg_shapes[] = {
+        {  16,  8,   8 },
+        {  16, 16,   8 },
+        {  16, 16,  16 },
+        {  64, 16,  64 },
+        {  64, 16, 128 },
+        { 128, 16,  64 },
+        { 128, 16, 128 },
+        { 128, 16, 256 },
+    };
+
+    auto print_mul_flags = [](UINT flags) {
+        fprintf(stderr, " flags=0x%x%s%s%s%s", flags,
+                (flags & 1u) ? " supported" : "",
+                (flags & 2u) ? " emulated-inputs" : "",
+                (flags & 4u) ? " emulated-outputs" : "",
+                (flags & 8u) ? " transpose" : "");
+    };
+
+    fprintf(stderr, "ggml-dx12: linalg caps: matrix construction\n");
+    for (UINT ws : wave_sizes) {
+        for (const auto & type : dtypes) {
+            dx12_linalg_op_query q = {};
+            q.op_type = OP_MATRIX_CONSTRUCTION;
+            q.matrix_construction.component_type = type.v;
+            q.matrix_construction.wave_size = ws;
+
+            const HRESULT hr = device->CheckFeatureSupport(
+                (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+            if (FAILED(hr) ||
+                (q.matrix_construction.min_m == 0 &&
+                 q.matrix_construction.min_k == 0 &&
+                 q.matrix_construction.min_n == 0)) {
+                continue;
+            }
+            fprintf(stderr, "ggml-dx12:   wave%u %s min=%ux%ux%u\n",
+                    ws, type.name,
+                    q.matrix_construction.min_m,
+                    q.matrix_construction.min_k,
+                    q.matrix_construction.min_n);
+        }
+    }
+
+    fprintf(stderr, "ggml-dx12: linalg caps: wave matrix multiply\n");
+    bool reported_hr = false;
+    for (UINT ws : wave_sizes) {
+        for (const auto & ab : dtypes) {
+            for (const auto & acc : dtypes) {
+                // Accumulators are float or 32-bit int only.
+                if (acc.v != DT_F16 && acc.v != DT_F32 &&
+                    acc.v != DT_S32 && acc.v != DT_U32) {
+                    continue;
+                }
+                dx12_linalg_op_query q = {};
+                q.op_type              = OP_WAVE_MATRIX_MULTIPLY;
+                q.wave.inputs.wave_size = ws;
+                q.wave.inputs.a_type    = ab.v;
+                q.wave.inputs.b_type    = ab.v;
+                q.wave.inputs.acc_type  = acc.v;
+
+                HRESULT hr = device->CheckFeatureSupport(
+                    (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+                if (FAILED(hr)) {
+                    if (!reported_hr) {
+                        fprintf(stderr, "ggml-dx12:   query failed hr=0x%08lx (size=%zu)\n",
+                                (unsigned long)hr, sizeof(q));
+                        reported_hr = true;
+                    }
+                    continue;
+                }
+                if (q.wave.support_flags == 0 || q.wave.num_shapes == 0) {
+                    continue;
+                }
+
+                std::vector<dx12_linalg_shape> shapes(q.wave.num_shapes);
+                q.wave.shapes = shapes.data();
+                hr = device->CheckFeatureSupport(
+                    (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+                if (FAILED(hr)) {
+                    continue;
+                }
+
+                fprintf(stderr, "ggml-dx12:   wave%u %sx%s -> %s",
+                        ws, ab.name, ab.name, acc.name);
+                print_mul_flags(q.wave.support_flags);
+                fprintf(stderr, " shapes:");
+                for (UINT i = 0; i < q.wave.num_shapes && i < shapes.size(); i++) {
+                    fprintf(stderr, " %ux%ux%u", shapes[i].M, shapes[i].K, shapes[i].N);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    fprintf(stderr, "ggml-dx12: linalg caps: threadgroup matrix multiply\n");
+    for (UINT ws : wave_sizes) {
+        for (const auto & ab : dtypes) {
+            for (const auto & acc : dtypes) {
+                if (acc.v != DT_F16 && acc.v != DT_F32 &&
+                    acc.v != DT_S32 && acc.v != DT_U32) {
+                    continue;
+                }
+                for (const dx12_linalg_shape shape : tg_shapes) {
+                    dx12_linalg_op_query q = {};
+                    q.op_type                    = OP_THREADGROUP_MATRIX_MULTIPLY;
+                    q.tg.wave_inputs_.wave_size  = ws;
+                    q.tg.wave_inputs_.a_type     = ab.v;
+                    q.tg.wave_inputs_.b_type     = ab.v;
+                    q.tg.wave_inputs_.acc_type   = acc.v;
+                    q.tg.shape                   = shape;
+
+                    const HRESULT hr = device->CheckFeatureSupport(
+                        (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+                    if (FAILED(hr) || q.tg.support_flags == 0) {
+                        continue;
+                    }
+                    fprintf(stderr, "ggml-dx12:   wave%u %sx%s -> %s shape=%ux%ux%u",
+                            ws, ab.name, ab.name, acc.name,
+                            shape.M, shape.K, shape.N);
+                    print_mul_flags(q.tg.support_flags);
+                    fprintf(stderr, " tg=[%u..%u pref %u]\n",
+                            q.tg.min_tg_size, q.tg.max_tg_size, q.tg.preferred_tg_size);
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "ggml-dx12: linalg caps: thread vector-matrix multiply\n");
+    for (const auto & in : dtypes) {
+        for (const auto & out : dtypes) {
+            if (out.v != DT_F16 && out.v != DT_F32) {
+                continue;
+            }
+            dx12_linalg_op_query q = {};
+            q.op_type                 = OP_THREAD_VECTOR_MATRIX_MULTIPLY;
+            q.thread_vec.vector_input_type    = out.v;
+            q.thread_vec.matrix_input_type    = in.v;
+            q.thread_vec.bias_input_type      = out.v;
+            q.thread_vec.vector_result_type   = out.v;
+
+            HRESULT hr = device->CheckFeatureSupport(
+                (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+            if (FAILED(hr) || q.thread_vec.support_flags == 0) {
+                continue;
+            }
+            fprintf(stderr, "ggml-dx12:   vec %s x mat %s -> %s",
+                    out.name, in.name, out.name);
+            print_mul_flags(q.thread_vec.support_flags);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    fprintf(stderr, "ggml-dx12: linalg caps: thread outer product\n");
+    const struct { UINT in, out; const char * name; } outer_types[] = {
+        { DT_F16, DT_F32, "f16 -> f32" },
+        { DT_S8,  DT_S32, "s8 -> s32" },
+        { DT_U8,  DT_U32, "u8 -> u32" },
+    };
+    for (const auto & types : outer_types) {
+        dx12_linalg_op_query q = {};
+        q.op_type = OP_THREAD_OUTER_PRODUCT;
+        q.outer_product.input_type = types.in;
+        q.outer_product.result_type = types.out;
+        const HRESULT hr = device->CheckFeatureSupport(
+            (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+        if (SUCCEEDED(hr) && q.outer_product.supported) {
+            fprintf(stderr, "ggml-dx12:   %s supported\n", types.name);
+        }
+    }
+
+    fprintf(stderr, "ggml-dx12: linalg caps: atomic accumulate store\n");
+    for (const auto & type : dtypes) {
+        if (type.v != DT_F32 && type.v != DT_S32 && type.v != DT_U32) {
+            continue;
+        }
+        dx12_linalg_op_query q = {};
+        q.op_type = OP_ATOMIC_ACCUMULATE_STORE;
+        q.accumulate_store.component_type = type.v;
+        const HRESULT hr = device->CheckFeatureSupport(
+            (D3D12_FEATURE)D3D12_FEATURE_LINALG_MATRIX_OP_SUPPORT_VAL, &q, sizeof(q));
+        if (SUCCEEDED(hr) &&
+            (q.accumulate_store.rw_byte_address_supported ||
+             q.accumulate_store.group_shared_supported)) {
+            fprintf(stderr, "ggml-dx12:   %s rw=%d groupshared=%d\n", type.name,
+                    q.accumulate_store.rw_byte_address_supported,
+                    q.accumulate_store.group_shared_supported);
+        }
+    }
+}
+#endif
+
+struct dx12_memory_info {
+    DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+    DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal = {};
+    HRESULT local_status = E_NOINTERFACE;
+    HRESULT nonlocal_status = E_NOINTERFACE;
+    size_t free = 0;
+    size_t total = 0;
+};
+
+static dx12_memory_info dx12_query_memory(const dx12_device * dev) {
+    dx12_memory_info info;
+    info.total = dev->vram_total;
+    info.free = dev->vram_free;
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (SUCCEEDED(dev->adapter.As(&adapter3))) {
+        info.local_status = adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info.local);
+        info.nonlocal_status = adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info.nonlocal);
+    }
+    if (SUCCEEDED(info.local_status)) {
+        info.total = (size_t) info.local.Budget;
+        info.free = info.local.Budget > info.local.CurrentUsage ? (size_t) (info.local.Budget - info.local.CurrentUsage) : 0;
+    }
+    const bool is_igpu = dev->adapter_desc.DedicatedVideoMemory < (size_t) 512 * 1024 * 1024;
+    if (is_igpu && SUCCEEDED(info.nonlocal_status)) {
+        // Do not add a combined startup snapshot to a fresh non-local budget.
+        if (FAILED(info.local_status)) {
+            info.total = dev->adapter_desc.DedicatedVideoMemory;
+            info.free = info.total;
+        }
+        info.total += (size_t) info.nonlocal.Budget;
+        info.free += info.nonlocal.Budget > info.nonlocal.CurrentUsage ? (size_t) (info.nonlocal.Budget - info.nonlocal.CurrentUsage) : 0;
+        const size_t max_total = (size_t) 32 * 1024 * 1024 * 1024;
+        info.total = std::min(info.total, max_total);
+        info.free = std::min(info.free, info.total);
+    }
+    return info;
+}
+
+static void dx12_log_memory(const dx12_device * dev, const char * phase, const dx12_backend_context * ctx = nullptr) {
+    if (!DX12_GETENV("DX12_MEMORY_LOG")) {
+        return;
+    }
+    const dx12_memory_info info = dx12_query_memory(dev);
+    fprintf(stderr, "[DX12_MEMORY] device=%s phase=%s local_hr=0x%08X local_budget=%llu local_usage=%llu local_reservation=%llu nonlocal_hr=0x%08X nonlocal_budget=%llu nonlocal_usage=%llu nonlocal_reservation=%llu\n",
+        dev->name.c_str(), phase, (unsigned) info.local_status,
+        (unsigned long long) info.local.Budget, (unsigned long long) info.local.CurrentUsage,
+        (unsigned long long) info.local.CurrentReservation, (unsigned) info.nonlocal_status,
+        (unsigned long long) info.nonlocal.Budget, (unsigned long long) info.nonlocal.CurrentUsage,
+        (unsigned long long) info.nonlocal.CurrentReservation);
+    if (ctx) {
+        size_t staging = dev->xfer.upload_size + dev->xfer.readback_size + ctx->upload_staging_size + ctx->readback_staging_size;
+        for (const auto & slot : dev->upload_ring) {
+            if (slot.staging) {
+                staging += (size_t) slot.staging->GetDesc().Width;
+            }
+        }
+        fprintf(stderr, "[DX12_MEMORY] device=%s phase=%s graph=%llu splitkv=%zu q8=%zu mask=%zu argsort=%zu moe=%zu projection=%zu transfer_staging=%zu\n",
+            dev->name.c_str(), phase, (unsigned long long) ctx->dbg_trace_graph,
+            dev->splitkv_temp_size, ctx->q8_1_scratch_size, ctx->fa_mask_scratch_size,
+            dev->argsort_scratch_size, ctx->moe_bucket_scratch_size, ctx->projection_qkv_size, staging);
+    }
+}
+
 void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     adapter   = std::move(adapter_);
     dev_index = idx;
@@ -2101,13 +3738,20 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     description = narrow;
     name = std::string(GGML_DX12_NAME) + std::to_string(idx);
     {
-        char id_buf[32];
-        snprintf(id_buf, sizeof(id_buf), "DX12:%04X_%04X",
-                 adapter_desc.VendorId, adapter_desc.DeviceId);
+        char id_buf[64];
+        snprintf(id_buf, sizeof(id_buf), "DX12:%04X_%04X_%08X_%08X",
+                 adapter_desc.VendorId, adapter_desc.DeviceId,
+                 (uint32_t) adapter_desc.AdapterLuid.HighPart,
+                 adapter_desc.AdapterLuid.LowPart);
         device_id_str = id_buf;
     }
 
-    HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    HRESULT hr;
+    if (g_dx12.device_factory) {
+        hr = g_dx12.device_factory->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    } else {
+        hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device));
+    }
     DX12_CHECK(hr, "D3D12CreateDevice");
 
     // Route debug-layer messages to stderr when DX12_DEBUG is set.
@@ -2150,92 +3794,103 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     // No spaces: pixtool's --queue-name option cannot parse a value containing them.
     compute_queue->SetName(L"llama_dx12_compute");
 
-    // VRAM: use DXGI budget for accuracy.
-    // For iGPUs (small dedicated VRAM), also include the non-local (shared system RAM)
-    // segment. The OS-managed DXGI budget caps this sensibly (~50% of physical RAM),
-    // preventing over-reporting. For dGPUs, only use the local segment.
+    // Keep the startup snapshot only as a fallback for failed live queries.
     vram_total = adapter_desc.DedicatedVideoMemory;
-
-    ComPtr<IDXGIAdapter3> adapter3;
-    if (SUCCEEDED(adapter.As(&adapter3))) {
-        DXGI_QUERY_VIDEO_MEMORY_INFO local_info = {};
-        DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info = {};
-        bool have_local = SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info))
-                          && local_info.Budget > 0;
-        bool have_nonlocal = SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info))
-                             && nonlocal_info.Budget > 0;
-
-        if (have_local) {
-            vram_total = (size_t)local_info.Budget;
-            vram_free  = local_info.Budget > local_info.CurrentUsage
-                       ? (size_t)(local_info.Budget - local_info.CurrentUsage) : 0;
-        }
-
-        // iGPU: add non-local (shared system RAM) budget.
-        // DedicatedVideoMemory < 512MB is a reliable iGPU indicator on Windows.
-        // The DXGI non-local budget is OS-managed but can be very large (84%+ of
-        // physical RAM). Cap total at 32GB to match Vulkan's behavior and prevent
-        // iGPU from appearing to have more memory than a dGPU in multi-GPU systems.
-        static constexpr size_t IGPU_MAX_TOTAL = (size_t)32 * 1024 * 1024 * 1024;
-        bool is_igpu = (adapter_desc.DedicatedVideoMemory < (size_t)512 * 1024 * 1024);
-        if (is_igpu && have_nonlocal) {
-            size_t nonlocal_free = nonlocal_info.Budget > nonlocal_info.CurrentUsage
-                                 ? (size_t)(nonlocal_info.Budget - nonlocal_info.CurrentUsage) : 0;
-            vram_total += (size_t)nonlocal_info.Budget;
-            vram_free  += nonlocal_free;
-            // Only cap if the combined total exceeds the limit
-            if (vram_total > IGPU_MAX_TOTAL) {
-                vram_total = IGPU_MAX_TOTAL;
-                if (vram_free > IGPU_MAX_TOTAL) vram_free = IGPU_MAX_TOTAL;
-            }
-        }
-    }
-
-    // Fallback if budget queries didn't work
-    if (vram_total < (size_t)512 * 1024 * 1024 && adapter_desc.SharedSystemMemory > 0) {
+    if (vram_total < (size_t) 512 * 1024 * 1024 && adapter_desc.SharedSystemMemory > 0) {
         vram_total = adapter_desc.SharedSystemMemory;
-        vram_free = vram_total;
     }
-    if (vram_free == 0) {
-        vram_free = vram_total;
-    }
+    vram_free = vram_total;
+    const dx12_memory_info memory = dx12_query_memory(this);
+    vram_total = memory.total;
+    vram_free = memory.free;
+    dx12_log_memory(this, "init");
 
-    // Check WaveMMA (SM 6.9 Wave Matrix) support
-    // D3D12_FEATURE_WAVE_MMA queries hardware matrix multiply-accumulate capability
-    wave_mma_supported = false;
+    // Check Cooperative Vector support
+    cooperative_vector_supported = false;
     {
-        // D3D12_FEATURE_WAVE_MMA — feature enum value TBD (not yet in public headers)
-        // Structure matches the spec: input DataType + M + N, output Supported + K + AccumPrecision + RequiredWaveSize
-        // Try F16 with 16x16 first (most common and useful for LLM inference)
+        // Try to query CV support — requires preview Agility SDK headers
+        // For now, try the feature check and see if the driver supports it
         struct {
-            UINT DataType;          // 0=BYTE, 1=FLOAT16, 2=FLOAT
-            UINT M;                 // 0=16, 1=64
-            UINT N;                 // 0=16, 1=64
-            BOOL Supported;
-            UINT K;
-            UINT AccumPrecision;    // flags: 0x1=16-bit, 0x2=32-bit
-            UINT RequiredWaveSize;
-        } wave_mma_caps = {};
-        wave_mma_caps.DataType = 1;  // D3D12_WAVE_MMA_DATATYPE_FLOAT16
-        wave_mma_caps.M = 0;        // D3D12_WAVE_MMA_DIMENSION_16
-        wave_mma_caps.N = 0;        // D3D12_WAVE_MMA_DIMENSION_16
-
-        // D3D12_FEATURE_WAVE_MMA = 53 (tentative — may vary by SDK version)
-        // Try a range of feature enum values since the exact value depends on the SDK
-        bool found = false;
-        for (UINT feat_id = 53; feat_id <= 60 && !found; feat_id++) {
-            HRESULT hr2 = device->CheckFeatureSupport((D3D12_FEATURE)feat_id, &wave_mma_caps, sizeof(wave_mma_caps));
-            if (SUCCEEDED(hr2) && wave_mma_caps.Supported) {
-                wave_mma_supported = true;
-                wave_mma_K = wave_mma_caps.K;
-                wave_mma_M = 16;
-                wave_mma_N = 16;
-                wave_mma_wave_size = wave_mma_caps.RequiredWaveSize;
-                wave_mma_f16_acc32 = (wave_mma_caps.AccumPrecision & 0x2) != 0;
-                found = true;
-            }
+            UINT CooperativeVectorTier;
+        } exp_opts = {};
+        // D3D12_FEATURE value 52 = D3D12_FEATURE_D3D12_OPTIONS_EXPERIMENTAL (preview)
+        HRESULT hr2 = device->CheckFeatureSupport((D3D12_FEATURE)52, &exp_opts, sizeof(exp_opts));
+        if (SUCCEEDED(hr2) && exp_opts.CooperativeVectorTier >= 1) {
+            cooperative_vector_supported = true;
         }
     }
+
+    // Check D3D12 LinAlg Matrix support (Agility SDK 1.720+ preview).
+    //
+    // Only meaningful when the host loaded the preview D3D12Core.dll redist
+    // staged by the build under <exe-dir>/D3D12/. With the released OS
+    // D3D12, CheckFeatureSupport will return E_INVALIDARG for any unknown
+    // feature enum and we'll silently leave linalg_matrix_supported = false.
+    //
+    // Exact enum from the Agility SDK preview headers (d3d12.h, line ~2720;
+    // unchanged between 1.720.0 and 1.721.3):
+    //   D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT = 77
+    //   typedef struct { D3D12_LINEAR_ALGEBRA_TIER LinearAlgebraTier; }
+    //                                      D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT;
+    //   D3D12_LINEAR_ALGEBRA_TIER_NOT_SUPPORTED = 0
+    //   D3D12_LINEAR_ALGEBRA_TIER_1_0           = 0x10
+    linalg_matrix_supported = false;
+    linalg_matrix_tier      = 0;
+    linalg_wave_f16_16x16_supported = false;
+    linalg_wave_f16_16x16_w32_supported = false;
+    linalg_wave_f16_acc16_16x16_w64_supported = false;
+    linalg_wave_f16_8x16x16_supported = false;
+    linalg_wave_f16_8x16x16_w32_supported = false;
+    linalg_tg_f16_64x128_supported = false;
+    linalg_tg_f16_64x128_validated_fallback = false;
+    linalg_tg_f16_64x128_min_threads = 0;
+    linalg_tg_f16_64x128_max_threads = 0;
+    linalg_tg_f16_64x128_preferred_threads = 0;
+    linalg_tg_f16_64x128_threads = 0;
+#ifdef GGML_DX12_LINALG_PREVIEW
+    {
+        struct {
+            UINT LinearAlgebraTier;
+        } linalg_caps = {};
+        constexpr UINT D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT_VAL = 77;
+        HRESULT hr3 = device->CheckFeatureSupport(
+            (D3D12_FEATURE)D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT_VAL,
+            &linalg_caps, sizeof(linalg_caps));
+        if (SUCCEEDED(hr3) && linalg_caps.LinearAlgebraTier != 0) {
+            linalg_matrix_supported = true;
+            linalg_matrix_tier      = linalg_caps.LinearAlgebraTier;
+
+            constexpr UINT DT_F16 = 7;
+            constexpr UINT DT_F32 = 8;
+            const dx12_linalg_tg_caps tg_caps = dx12_query_linalg_tg_caps(
+                device.Get(), 0, DT_F16, DT_F16, DT_F32, { 64, 16, 128 });
+            linalg_tg_f16_64x128_supported = tg_caps.supported;
+            linalg_tg_f16_64x128_min_threads = tg_caps.min_threads;
+            linalg_tg_f16_64x128_max_threads = tg_caps.max_threads;
+            linalg_tg_f16_64x128_preferred_threads = tg_caps.preferred_threads;
+            linalg_tg_f16_64x128_threads =
+                dx12_select_linalg_tg_threads(tg_caps);
+        }
+        // hr3 distinguishes the two failure modes: E_INVALIDARG means the
+        // loaded D3D12Core does not know the feature enum (Agility redist
+        // not picked up), S_OK with tier 0 means the driver declines it.
+        if (!linalg_matrix_supported && getenv("DX12_DEBUG")) {
+            fprintf(stderr, "ggml-dx12: linalg probe: hr=0x%08lx tier=%u\n",
+                    (unsigned long)hr3, (unsigned)linalg_caps.LinearAlgebraTier);
+        }
+        if (linalg_matrix_supported && getenv("DX12_LINALG_CAPS")) {
+            dx12_dump_linalg_caps(device.Get());
+            fprintf(stderr,
+                    "ggml-dx12: linalg route: tg f16 64x16x128 %s "
+                    "threads=[%u..%u pref %u selected %u]\n",
+                    linalg_tg_f16_64x128_supported ? "supported" : "unsupported",
+                    linalg_tg_f16_64x128_min_threads,
+                    linalg_tg_f16_64x128_max_threads,
+                    linalg_tg_f16_64x128_preferred_threads,
+                    linalg_tg_f16_64x128_threads);
+        }
+    }
+#endif
 
     // dp4a (dot4add_i8packed) — check SM 6.4 support via shader model feature query
     // Query highest supported shader model
@@ -2353,6 +4008,9 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     // Intel/NVIDIA: use WaveLaneCountMin for best performance.
     // We also store the raw Min separately as `wave_size_min` so the arch
     // classifier can tell AMD-RDNA (Min=32) from AMD-wave64 GCN/CDNA (Min=64).
+#ifdef GGML_DX12_LINALG_PREVIEW
+    bool wave32_in_range = false;
+#endif
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts1 = {};
         HRESULT hr2 = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts1, sizeof(opts1));
@@ -2360,15 +4018,65 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
             bool is_amd = (adapter_desc.VendorId == dx12_vendor::AMD);
             wave_size     = is_amd ? opts1.WaveLaneCountMax : opts1.WaveLaneCountMin;
             wave_size_min = opts1.WaveLaneCountMin;
+#ifdef GGML_DX12_LINALG_PREVIEW
+            wave32_in_range = opts1.WaveOps && opts1.WaveLaneCountMin <= 32 && opts1.WaveLaneCountMax >= 32;
+#endif
         }
     }
+
+#ifdef GGML_DX12_LINALG_PREVIEW
+    if (linalg_matrix_supported) {
+        constexpr UINT DT_F16 = 7;
+        constexpr UINT DT_F32 = 8;
+        linalg_wave_f16_16x16_supported = dx12_query_linalg_wave_shape(
+            device.Get(), wave_size, DT_F16, DT_F16, DT_F32, { 16, 16, 16 }) ||
+            dx12_query_linalg_wave_shape(
+                device.Get(), 0, DT_F16, DT_F16, DT_F32, { 16, 16, 16 });
+        linalg_wave_f16_16x16_w32_supported = wave32_in_range &&
+            dx12_query_linalg_wave_shape(device.Get(), 32, DT_F16, DT_F16, DT_F32, { 16, 16, 16 });
+        linalg_wave_f16_acc16_16x16_w64_supported =
+            dx12_query_linalg_wave_shape(device.Get(), 64, DT_F16, DT_F16, DT_F16, { 16, 16, 16 });
+        // Intel Xe3 reports this native f16 tile with an f16 accumulator.
+        // Shape triples are M x K x N; composed tiles can be larger.
+        linalg_wave_f16_8x16x16_supported = dx12_query_linalg_wave_shape(
+            device.Get(), wave_size, DT_F16, DT_F16, DT_F16, { 8, 16, 16 }) ||
+            dx12_query_linalg_wave_shape(
+                device.Get(), 0, DT_F16, DT_F16, DT_F16, { 8, 16, 16 });
+        linalg_wave_f16_8x16x16_w32_supported = wave32_in_range &&
+            dx12_query_linalg_wave_shape(device.Get(), 32, DT_F16, DT_F16, DT_F16, { 8, 16, 16 });
+    }
+#endif
 
     // Classify into a coarse architecture family. Must come after vendor,
     // wave_size / wave_size_min and dp4a are known. For AMD, the static
     // DeviceId table inside the classifier is authoritative; the wave-size
     // fields are fallback for chips too new to be in the table.
     arch_family = dx12_classify_arch_family(adapter_desc.VendorId, wave_size, wave_size_min, adapter_desc.DeviceId, dp4a_supported);
-    sub_family  = dx12_classify_arch_subfamily(arch_family, adapter_desc.VendorId, adapter_desc.DeviceId, wave_mma_supported);
+    sub_family  = dx12_classify_arch_subfamily(arch_family, adapter_desc.VendorId, adapter_desc.DeviceId);
+
+#ifdef GGML_DX12_LINALG_PREVIEW
+    const char * linalg_tg_strict_caps = DX12_GETENV("DX12_LINALG_TG_STRICT_CAPS");
+    if (linalg_matrix_supported &&
+        !linalg_tg_f16_64x128_supported &&
+        arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+        !(linalg_tg_strict_caps && linalg_tg_strict_caps[0] != '0')) {
+        linalg_tg_f16_64x128_validated_fallback = true;
+        linalg_tg_f16_64x128_threads = 64;
+    }
+    if (const char * env = DX12_GETENV("DX12_LINALG_TG_THREADS")) {
+        const uint32_t threads = (uint32_t) atoi(env);
+        if (threads == 64 || threads == 128 || threads == 256) {
+            linalg_tg_f16_64x128_threads = threads;
+        }
+    }
+    if (getenv("DX12_LINALG_CAPS") &&
+        linalg_tg_f16_64x128_validated_fallback) {
+        fprintf(stderr,
+                "ggml-dx12: linalg route: using validated NVIDIA "
+                "tg f16 64x16x128 fallback with %u threads\n",
+                linalg_tg_f16_64x128_threads);
+    }
+#endif
 
     // User-mode driver version. IDXGIAdapter::CheckInterfaceSupport with
     // __uuidof(IDXGIDevice) returns the UMD version as a packed
@@ -2391,6 +4099,11 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
     }
 
     detect_memory_architecture();
+    if (is_igpu && adapter_desc.VendorId == dx12_vendor::AMD) {
+        // Keep transfer-object creation outside committed-buffer lifetimes.
+        // Some AMD UMA drivers can alias a later allocation otherwise.
+        init_xfer();
+    }
 
     create_common_root_signature();
     init_shader_blobs();
@@ -2405,21 +4118,42 @@ void dx12_device::init(ComPtr<IDXGIAdapter1> adapter_, size_t idx) {
         arch_token += "]";
     }
 
+#ifdef GGML_DX12_LINALG_PREVIEW
+    const char * linalg_state = linalg_matrix_supported ? "yes" : "no";
+    std::string  linalg_extra = linalg_matrix_supported
+        ? (std::string(" tier=") + std::to_string(linalg_matrix_tier) +
+           (linalg_wave_f16_16x16_supported ? " wave16x16" : " no-wave16x16") +
+           (linalg_wave_f16_8x16x16_supported ? " wave8x16x16" : ""))
+        : std::string();
+#else
+    const char * linalg_state = "n/a";
+    std::string  linalg_extra = " (build w/o GGML_DX12_LINALG_PREVIEW)";
+#endif
+
+    const char * experimental_sm_state = g_dx12.experimental_shader_models_enabled ? "yes" : "no";
+
+    // LinAlg subsumes cooperative vectors, so name the mechanism the device
+    // actually offers rather than a bare yes/no, matching how the Vulkan
+    // backend labels its matrix path.
+    const char * cv_state = (linalg_matrix_supported && linalg_wave_f16_16x16_supported)
+                          ? "linalg"
+                          : (cooperative_vector_supported ? "yes" : "no");
+
     const char * work_graphs_name =
         work_graphs_tier >= 11u ? "1.1" :
         work_graphs_tier >= (UINT)D3D12_WORK_GRAPHS_TIER_1_0 ? "1.0" : "no";
-    DX12_LOG_BANNER("Device %zu: %s (%s, VRAM: %.1f GB, arch: %s, SM: 6.%d, wave: %u, CV: %s, WorkGraphs: %s, WaveMMA: %s%s, dp4a: %s, fp16: %s, bf16: %s, driver: %s)\n",
+
+    DX12_LOG_BANNER("Device %zu: %s (%s, VRAM: %.1f GB, arch: %s, SM: 6.%d, wave: %u, CV: %s, WorkGraphs: %s, LinAlg: %s%s, ExpSM: %s, dp4a: %s, fp16: %s, bf16: %s, driver: %s)\n",
                   idx, name.c_str(), description.c_str(),
                   (double)vram_total / (1024.0 * 1024.0 * 1024.0),
                   arch_token.c_str(),
                   (int)(highest_sm & 0xF),
                   wave_size,
-                  cooperative_vector_supported ? "yes" : "no",
+                  cv_state,
                   work_graphs_name,
-                  wave_mma_supported ? "yes" : "no",
-                  wave_mma_supported ? (std::string(" K=") + std::to_string(wave_mma_K) +
-                                        " wave=" + std::to_string(wave_mma_wave_size) +
-                                        (wave_mma_f16_acc32 ? " f16→f32" : " f16→f16")).c_str() : "",
+                  linalg_state,
+                  linalg_extra.c_str(),
+                  experimental_sm_state,
                   dp4a_supported ? "yes" : "no",
                   fp16_supported ? "yes" : "no",
                   bf16_supported ? "yes" : "no",
@@ -2708,13 +4442,13 @@ void dx12_device::wait_gpu_idle() {
     if (!xfer.fence) return;
     flush_uploads();
     xfer.fence_value++;
-    if (FAILED(compute_queue->Signal(xfer.fence.Get(), xfer.fence_value))) return;
+    DX12_CHECK(compute_queue->Signal(xfer.fence.Get(), xfer.fence_value), "Signal fence (idle)");
     xfer_wait_value(xfer.fence_value);
 }
 
 void dx12_backend_context::wait_for_fence(uint64_t value) {
     if (value == 0) return; // never submitted
-    if (fence->GetCompletedValue() >= value) return;
+    if (dx12_completed_fence_value(fence.Get(), dev->device.Get()) >= value) return;
 
     // Vulkan-style two-stage wait: when an `almost_ready` fence has already
     // signaled (or is close to signaling), the bulk of the GPU work is done
@@ -2729,7 +4463,7 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
     // via DX12_NO_SPIN_WAIT=1 if it ever causes thermal/power problems.
     static const bool spin_disabled = (getenv("DX12_NO_SPIN_WAIT") != nullptr);
     const bool early_done =
-        almost_ready_fence != 0 && fence->GetCompletedValue() >= almost_ready_fence;
+        almost_ready_fence != 0 && dx12_completed_fence_value(fence.Get(), dev->device.Get()) >= almost_ready_fence;
     if (early_done && !spin_disabled) {
         // Tight loop with YieldProcessor; bounded by ~500us wall clock.
         LARGE_INTEGER qfreq, t0, tnow;
@@ -2738,7 +4472,7 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
         const LONGLONG spin_ticks = qfreq.QuadPart / 2000; // 500us
         for (int spins = 0; spins < 256; spins++) {
             for (int j = 0; j < 64; j++) YieldProcessor();
-            if (fence->GetCompletedValue() >= value) return;
+            if (dx12_completed_fence_value(fence.Get(), dev->device.Get()) >= value) return;
             QueryPerformanceCounter(&tnow);
             if (tnow.QuadPart - t0.QuadPart > spin_ticks) break;
         }
@@ -2746,7 +4480,7 @@ void dx12_backend_context::wait_for_fence(uint64_t value) {
 
     HRESULT hr = fence->SetEventOnCompletion(value, fence_event);
     DX12_CHECK(hr, "SetEventOnCompletion");
-    WaitForSingleObject(fence_event, INFINITE);
+    dx12_wait_fence_event(fence_event, fence.Get(), dev->device.Get());
 }
 
 void dx12_backend_context::wait_for_gpu() {
@@ -2960,6 +4694,9 @@ static const char * dx12_buft_get_name(ggml_backend_buffer_type_t buft) {
 
 static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dx12_device * dev = (dx12_device *)buft->context;
+    std::call_once(dev->pso_warm_once, [dev]() {
+        dev->start_pipeline_prewarm();
+    });
 
     auto * ctx = new dx12_buffer_context();
     ctx->dev       = dev;
@@ -3033,6 +4770,12 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
         }
     }
 
+    if (getenv("DX12_MEMORY_LOG")) {
+        fprintf(stderr, "[DX12_MEMORY] device=%s phase=buffer-alloc resource=%p bytes=%zu heap=%u\n",
+            dev->name.c_str(), (void *) ctx->resource.Get(), ctx->size, (unsigned) ctx->heap_type);
+        dx12_log_memory(dev, "buffer-alloc");
+    }
+
     static const ggml_backend_buffer_i iface = {
         /* .free_buffer   = */ [](ggml_backend_buffer_t buffer) {
             auto * ctx = (dx12_buffer_context *)buffer->context;
@@ -3046,6 +4789,10 @@ static ggml_backend_buffer_t dx12_buft_alloc_buffer(ggml_backend_buffer_type_t b
                 D3D12_RANGE wr = { 0, ctx->size };
                 ctx->resource->Unmap(0, &wr);
                 ctx->mapped = nullptr;
+            }
+            if (getenv("DX12_MEMORY_LOG")) {
+                fprintf(stderr, "[DX12_MEMORY] device=%s phase=buffer-free resource=%p bytes=%zu heap=%u\n",
+                    ctx->dev->name.c_str(), (void *) ctx->resource.Get(), ctx->size, (unsigned) ctx->heap_type);
             }
             delete ctx;
         },
@@ -3282,7 +5029,9 @@ static size_t dx12_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     // See dx12_max_single_resource_size(): D3D12 caps a single buffer near 4 GB
     // (lower on AMD UMA). ggml's generic allocator splits large model ranges
     // into multiple DX12 buffers to respect this.
-    return dx12_max_single_resource_size(dev);
+    const size_t limit = dx12_max_single_resource_size(dev);
+    const char * cap = getenv("DX12_BUFFER_MAX_1G");
+    return cap && strcmp(cap, "1") == 0 ? std::min(limit, (size_t) 1024 * 1024 * 1024) : limit;
 }
 
 static bool dx12_buft_is_host(ggml_backend_buffer_type_t buft) {
@@ -3291,12 +5040,14 @@ static bool dx12_buft_is_host(ggml_backend_buffer_type_t buft) {
 }
 
 static const ggml_backend_buffer_type_i dx12_buffer_type_interface = {
-    /* .get_name      = */ dx12_buft_get_name,
-    /* .alloc_buffer  = */ dx12_buft_alloc_buffer,
-    /* .get_alignment = */ dx12_buft_get_alignment,
-    /* .get_max_size  = */ dx12_buft_get_max_size,
-    /* .get_alloc_size = */ nullptr,
-    /* .is_host       = */ dx12_buft_is_host,
+    /* .get_name          = */ dx12_buft_get_name,
+    /* .alloc_buffer      = */ dx12_buft_alloc_buffer,
+    /* .alloc_buffer_n    = */ nullptr,
+    /* .get_alignment     = */ dx12_buft_get_alignment,
+    /* .get_max_size      = */ dx12_buft_get_max_size,
+    /* .get_alloc_size    = */ nullptr,
+    /* .get_alloc_size_n  = */ nullptr,
+    /* .is_host           = */ dx12_buft_is_host,
 };
 
 static ggml_backend_buffer_type g_dx12_buffer_types[GGML_DX12_MAX_DEVICES];
@@ -3357,6 +5108,14 @@ static bool dx12_gemm_route_enabled(const char * env, const dx12_device * d) {
     return env[0] != '0';
 }
 
+static bool dx12_iw_aux_enabled(const dx12_device & d) {
+    const char * env = DX12_GETENV("DX12_LINALG_AUX_F16");
+    return env && env[0] != '0' &&
+           d.arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+           d.linalg_matrix_supported && d.linalg_wave_f16_8x16x16_supported &&
+           !d.linalg_wave_f16_16x16_supported && d.fp16_supported && d.wave_size == 16;
+}
+
 // Multi-column dp4a matvec (NUM_COLS=2/4/8, flags 47-52).  Between the n=1
 // matvec and the n>=16 GEMM the generic path costs the same at n=2 as at n=8:
 // Q4_K at m=4096,k=14336 is 298 us at n=1 and 3734 us at n=2, so two rows cost
@@ -3415,6 +5174,51 @@ static uint64_t g_dx12_supports_op_us = 0;
 
 static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tensor * op);
 
+// Matvec variants compiled with NUM_ROWS=4 instead of the default 2.
+// The host row-group arithmetic must agree with the shader or output rows are
+// skipped or written twice, so these ids appear here, in the two
+// matvec_row_groups sites, and in the blob switch.
+static inline bool dx12_matvec_rows4(uint32_t flags) {
+    return flags == 143 || flags == 144 || flags == 145 || flags == 146;
+}
+
+// Runtime KV type ids consumed by flash_attn_kvmix.hlsl (0 = float path).
+static uint32_t dx12_fa_kv_type_id(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16: return 0;
+        case GGML_TYPE_Q4_0:   return 1;
+        case GGML_TYPE_Q4_1:   return 2;
+        case GGML_TYPE_Q5_0:   return 3;
+        case GGML_TYPE_Q5_1:   return 4;
+        case GGML_TYPE_Q8_0:   return 5;
+        case GGML_TYPE_IQ4_NL: return 6;
+        case GGML_TYPE_Q1_0:   return 7;
+        case GGML_TYPE_Q2_0:   return 8;
+        default:               return 0xFFFFFFFFu;
+    }
+}
+
+static bool dx12_block_copy_type_ok(ggml_type t) {    if (t == GGML_TYPE_I16 || t == GGML_TYPE_I64) return true;
+    return ggml_is_quantized(t) && (ggml_type_size(t) & 1u) == 0u;
+}
+
+static bool dx12_cpy_dequant_supported(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4: case GGML_TYPE_NVFP4: case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0: case GGML_TYPE_TQ1_0: case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (!DX12_GETENV("DX12_PHASE_PROFILE")) {
         return dx12_supports_op_impl(dev, op);
@@ -3426,6 +5230,9 @@ static bool dx12_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * 
 }
 
 static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (!dx12_precision_supported(op)) {
+        return false;
+    }
 
     switch (op->op) {
         case GGML_OP_NONE:
@@ -3488,8 +5295,10 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
         case GGML_OP_SUM_ROWS:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_IM2COL:
+        case GGML_OP_COL2IM_1D:
         case GGML_OP_IM2COL_3D:
         case GGML_OP_PAD:
+        case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_UPSCALE:
         case GGML_OP_POOL_1D:
         case GGML_OP_POOL_2D:
@@ -3519,6 +5328,13 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 if (!d || !d->fp16_supported) return false;
                 return true;
             }
+            // Dequantizing CPY/DUP: quantized src0 -> F32/F16/BF16 dst.
+            if ((op->op == GGML_OP_CPY || op->op == GGML_OP_DUP) &&
+                op->src[0] && ggml_is_quantized(op->src[0]->type) &&
+                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
+                 op->type == GGML_TYPE_BF16)) {
+                return dx12_cpy_dequant_supported(op->src[0]->type);
+            }
             // Support F32, F16, and BF16
             if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) {
                 for (int s = 0; s < GGML_MAX_SRC; s++) {
@@ -3528,6 +5344,24 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                         op->src[s]->type != GGML_TYPE_I32) {
                         return false;
                     }
+                }
+                return true;
+            }
+            // Byte-level CONCAT/REPEAT for types the float path cannot carry
+            // (I16, I64 and quants). Uses uint16 stores, so the block size
+            // must be even; dim-0 concat must split on a block boundary.
+            if ((op->op == GGML_OP_CONCAT || op->op == GGML_OP_REPEAT) &&
+                dx12_block_copy_type_ok(op->type)) {
+                if (!dev) return false;
+                auto * d = (dx12_device *)dev->context;
+                if (!d || !d->fp16_supported) return false;
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (op->src[s] && op->src[s]->type != op->type) return false;
+                }
+                if (op->op == GGML_OP_CONCAT) {
+                    const int dim = ggml_get_op_params_i32(op, 0);
+                    if (dim == 0 && op->src[0] &&
+                        op->src[0]->ne[0] % ggml_blck_size(op->type) != 0) return false;
                 }
                 return true;
             }
@@ -3560,9 +5394,11 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 op->src[1]->type != GGML_TYPE_I64) return false;
             if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
                 op->type == GGML_TYPE_BF16) {
-                // The SET_ROWS shader reads src0 as F32; decline non-F32 sources
-                // (upstream added F16-src cases) so they fall back to CPU.
-                if (op->src[0] && op->src[0]->type != GGML_TYPE_F32) return false;
+                // The shader reads src0 through load_auto, so F32/F16/BF16
+                // sources all work; anything else falls back to CPU.
+                if (op->src[0] && op->src[0]->type != GGML_TYPE_F32 &&
+                    op->src[0]->type != GGML_TYPE_F16 &&
+                    op->src[0]->type != GGML_TYPE_BF16) return false;
                 return true;
             }
             if (op->type == GGML_TYPE_Q8_0) {
@@ -3581,6 +5417,12 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 // row column count to be a multiple of the Q8_0 block size
                 // (mirrors the CPU `from_float` constraint).
                 if (!op->src[0] || op->src[0]->type != GGML_TYPE_F32) return false;
+                // The optimized quantized writers cover the KV-cache layout.
+                // Broadcasted batch dimensions exceed the strict backend-test
+                // tolerance and remain on the reference fallback.
+                if (op->src[1] &&
+                    (op->src[0]->ne[2] != op->src[1]->ne[1] ||
+                     op->src[0]->ne[3] != op->src[1]->ne[2])) return false;
                 if (op->src[0]->ne[0] % 32 != 0) return false;
                 if (!dev) return false;
                 auto * d = (dx12_device *)dev->context;
@@ -3596,6 +5438,9 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 static const bool enable_lq = dx12_flag_default_on("DX12_SET_ROWS_LEGACY_QUANT");
                 if (!enable_lq) return false;
                 if (!op->src[0] || op->src[0]->type != GGML_TYPE_F32) return false;
+                if (op->type == GGML_TYPE_Q5_1 && op->src[1] &&
+                    (op->src[0]->ne[2] != op->src[1]->ne[1] ||
+                     op->src[0]->ne[3] != op->src[1]->ne[2])) return false;
                 if (op->src[0]->ne[0] % 32 != 0) return false;
                 if (!dev) return false;
                 auto * d = (dx12_device *)dev->context;
@@ -3674,6 +5519,31 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                    op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[0]->nb[0] == sizeof(float);
 
+        case GGML_OP_OUT_PROD:
+#ifdef GGML_DX12_LINALG_PREVIEW
+            if (!dev || op->type != GGML_TYPE_F32 ||
+                !op->src[0] || op->src[0]->type != GGML_TYPE_F32 ||
+                !op->src[1] || op->src[1]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            {
+                auto * d = (dx12_device *)dev->context;
+                return d && d->linalg_matrix_supported &&
+                       (d->linalg_wave_f16_16x16_supported || dx12_iw_aux_enabled(*d)) && d->fp16_supported &&
+                       op->ne[0] == op->src[0]->ne[0] &&
+                       op->ne[1] == op->src[1]->ne[0] &&
+                       op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                       op->ne[2] == op->src[1]->ne[2] &&
+                       op->ne[3] == op->src[1]->ne[3] &&
+                       op->ne[2] % op->src[0]->ne[2] == 0 &&
+                       op->ne[3] % op->src[0]->ne[3] == 0 &&
+                       op->src[0]->nb[0] == sizeof(float) &&
+                       ggml_is_contiguous(op);
+            }
+#else
+            return false;
+#endif
+
         case GGML_OP_SOLVE_TRI:
             // Lower-triangular solve A*X=B for F32. Square A (ne00==ne01),
             // capped at MAX_N=256 by the shader's groupshared budget.
@@ -3682,6 +5552,15 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                    op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] == op->src[0]->ne[1] &&
                    op->src[0]->ne[0] <= 256;
+
+        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            if (op->type != GGML_TYPE_F32) return false;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (op->src[s] && op->src[s]->type != GGML_TYPE_F32) return false;
+            }
+            return true;
 
         case GGML_OP_GLU: {
             // Gated Linear Unit: supports SWIGLU, REGLU, GEGLU etc.
@@ -3693,13 +5572,17 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
-                        // src0 must be F32 or F16
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
+                        op->type == GGML_TYPE_BF16) {
+                        // src0 must be a supported floating-point type
                         if (op->src[0] && op->src[0]->type != GGML_TYPE_F32 &&
-                            op->src[0]->type != GGML_TYPE_F16) return false;
-                        // src1 (if present) must be F32 or F16
+                            op->src[0]->type != GGML_TYPE_F16 &&
+                            op->src[0]->type != GGML_TYPE_BF16) return false;
+                        // src1 (if present) must be a supported floating-point type
                         if (op->src[1] && op->src[1]->type != GGML_TYPE_F32 &&
-                            op->src[1]->type != GGML_TYPE_F16) return false;
+                            op->src[1]->type != GGML_TYPE_F16 &&
+                            op->src[1]->type != GGML_TYPE_BF16) return false;
                         return true;
                     }
                     return false;
@@ -3720,6 +5603,7 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 case GGML_UNARY_OP_GELU_ERF:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_NEG:
@@ -3733,7 +5617,8 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
                 case GGML_UNARY_OP_XIELU:
-                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) {
+                    if (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
+                        op->type == GGML_TYPE_BF16) {
                         return true;
                     }
                     return false;
@@ -3767,6 +5652,13 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
             }
             if (op->src[1] && op->src[1]->type != GGML_TYPE_F32 &&
                 op->src[1]->type != GGML_TYPE_F16) return false;
+            if (op->src[0] && op->src[1] &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                (op->src[0]->type == GGML_TYPE_Q4_K ||
+                 op->src[0]->type == GGML_TYPE_Q5_K ||
+                 op->src[0]->type == GGML_TYPE_Q6_K)) {
+                return false;
+            }
             // Quantized matvec shaders walk K in fixed-size blocks (QK_K=256,
             // QK4_0=32, etc.) and cannot handle non-contiguous K. F16/F32
             // shaders (mul_mat_vec.hlsl) have a strided fallback that honors
@@ -3828,6 +5720,7 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
             return true;
 
         case GGML_OP_FLASH_ATTN_EXT: {
+            if (op->type != GGML_TYPE_F32) return false;
             if (op->src[0]->type != GGML_TYPE_F32) return false;
             // K (src[1]) and V (src[2]) accepted types: F32, F16, BF16, plus the
             // 6 "legacy" quant types (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_NL). For quant
@@ -3837,25 +5730,20 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
             const ggml_type kt = op->src[1]->type;
             const ggml_type vt = op->src[2]->type;
             auto fa_type_ok = [](ggml_type t) {
-                return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 ||
-                       t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
-                       t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
-                       t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL;
+                return dx12_fa_kv_type_id(t) != 0xFFFFFFFFu;
             };
             auto fa_is_quant = [](ggml_type t) {
-                return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
-                       t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
-                       t == GGML_TYPE_Q8_0 || t == GGML_TYPE_IQ4_NL;
+                return dx12_fa_kv_type_id(t) != 0 && dx12_fa_kv_type_id(t) != 0xFFFFFFFFu;
             };
             if (!fa_type_ok(kt)) return false;
             if (!fa_type_ok(vt)) return false;
-            // Quant KV: require K type == V type and head dims that are a
-            // multiple of the block size (QK=32 for all 6 legacy quant types).
-            if (fa_is_quant(kt) || fa_is_quant(vt)) {
-                if (kt != vt) return false;
-                const int64_t QK = 32;
-                if (op->src[1]->ne[0] % QK != 0) return false;
-                if (op->src[2]->ne[0] % QK != 0) return false;
+            // Quant KV: head dims must be a multiple of the block size. K and V
+            // may differ in type; the kvmix shader carries both as runtime ids.
+            if (fa_is_quant(kt)) {
+                if (op->src[1]->ne[0] % ggml_blck_size(kt) != 0) return false;
+            }
+            if (fa_is_quant(vt)) {
+                if (op->src[2]->ne[0] % ggml_blck_size(vt) != 0) return false;
             }
             // The DX12 FA shaders implement the base
             // softmax(QK^T*scale + slope*mask + softcap(tanh) + sinks) @ V path.
@@ -3875,6 +5763,31 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
         case GGML_OP_ROLL:
             // F32 only; dst shape == src0 shape (handled by default unary fill_params path)
             return op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32;
+
+        case GGML_OP_LIGHTNING_INDEXER: {
+            // DSA indexer: src0=q, src1=k, src2=weights (prescaled), src3=mask.
+            if (op->type != GGML_TYPE_F32) return false;
+            const struct ggml_tensor * q = op->src[0];
+            const struct ggml_tensor * k = op->src[1];
+            const struct ggml_tensor * w = op->src[2];
+            const struct ggml_tensor * m = op->src[3];
+            if (!q || !k || !w || !m) return false;
+            if (q->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) return false;
+            if (m->type != GGML_TYPE_F16) return false;
+            // K rides the shared per-element dequant, so the float types and the
+            // legacy quant types are both fine; anything else stays on the CPU.
+            if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16 &&
+                k->type != GGML_TYPE_BF16 &&
+                k->type != GGML_TYPE_Q4_0 && k->type != GGML_TYPE_Q4_1 &&
+                k->type != GGML_TYPE_Q5_0 && k->type != GGML_TYPE_Q5_1 &&
+                k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_IQ4_NL) return false;
+            if (!ggml_is_contiguous(w) || !ggml_is_contiguous(m)) return false;
+            if (q->ne[0] > 256) return false;    // k row is staged in LDS
+            if (k->ne[0] != q->ne[0]) return false;
+            if (op->ne[0] > 65535 || op->ne[1] > 65535 || op->ne[3] > 65535) return false;
+            if (m->ne[3] == 0 || op->ne[3] % m->ne[3] != 0) return false;
+            return true;
+        }
 
         case GGML_OP_SSM_CONV:
             // F32 only (Mamba/Gated Delta Net 1D depthwise convolution)
@@ -3934,7 +5847,7 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
             if (ggml_nelements(op->src[3]) != (int64_t)n_head_check) return false;
             const uint32_t d_state = (uint32_t)op->src[0]->ne[0];
             const uint32_t head_dim = (uint32_t)op->src[0]->ne[1];
-            if (d_state != 128 && d_state != 256) return false;
+            if (d_state != 96 && d_state != 128 && d_state != 256) return false;
             if (head_dim % 16 != 0) return false;
             return true;
         }
@@ -3945,6 +5858,18 @@ static bool dx12_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tens
             // Shader assumes head_size == BLOCK_SIZE == 64.
             if (op->type != GGML_TYPE_F32) return false;
             for (int i = 0; i < 6; i++) {
+                if (!op->src[i] || op->src[i]->type != GGML_TYPE_F32) return false;
+                if (!ggml_is_contiguous(op->src[i])) return false;
+            }
+            return op->src[0]->ne[0] == 64;
+        }
+
+        case GGML_OP_GATED_LINEAR_ATTN: {
+            // Gated linear attention recurrent kernel.
+            // src0=k, src1=v, src2=q, src3=g, src4=state.
+            // Shader assumes head_size == BLOCK_SIZE == 64.
+            if (op->type != GGML_TYPE_F32) return false;
+            for (int i = 0; i < 5; i++) {
                 if (!op->src[i] || op->src[i]->type != GGML_TYPE_F32) return false;
                 if (!ggml_is_contiguous(op->src[i])) return false;
             }
@@ -4019,13 +5944,31 @@ static void dx12_rope_corr_dims(const struct ggml_tensor * rope,
 //   [12] | mrope sec[1]   —                pos_nb0               pos_nb0
 //   [13] | mrope sec[2]   —                —                     sr_idx_nb0
 //   [14] | mrope sec[3]   attn_factor      attn_factor           attn_factor
-//   [15] | has_ff         has_ff           has_ff                has_ff
+//   [15] | has_ff+n_offs  has_ff+n_offs    has_ff+n_offs         has_ff+n_offs
+//
+// Slot [15] packs has_ff in bit 31 and ggml's n_offs in the low bits.
 //
 // Note: STANDALONE preserves the ggml-native layout so the same packing
 // drives both rope.hlsl (NORMAL/NEOX) and rope_multi.hlsl (mrope/vision/
 // imrope). The mrope sections live at [11..14] and would be clobbered by
 // any of the non-standalone packings — that's why the fusion gates exclude
 // mrope.
+// Slot [15] carries two values: ggml's n_offs (the channel where the rotated
+// window starts) in the low bits and has_ff (freq_factors bound) in bit 31.
+// The shader cbuffer is fixed at op0..op15, so a new slot would have to be
+// added to every shader; packing mirrors what the matvec RoPE fusion already
+// does with head_dim/has_ff in op10.
+#define DX12_ROPE_HAS_FF_BIT 0x80000000u
+
+static inline uint32_t dx12_rope_n_offs(const struct ggml_tensor * rope_tensor) {
+    return (uint32_t)((const int32_t *) rope_tensor->op_params)[15];
+}
+
+static inline uint32_t dx12_rope_pack_ff_offs(const struct ggml_tensor * rope_tensor) {
+    const uint32_t has_ff = (rope_tensor->src[2] != nullptr) ? DX12_ROPE_HAS_FF_BIT : 0u;
+    return (dx12_rope_n_offs(rope_tensor) & ~DX12_ROPE_HAS_FF_BIT) | has_ff;
+}
+
 enum class dx12_rope_pack_kind : uint8_t {
     STANDALONE,           // rope.hlsl, rope_multi.hlsl
     ROPE_SET_ROWS,        // rope_set_rows.hlsl
@@ -4056,7 +5999,7 @@ static void dx12_pack_rope_op_params(
                       "ggml op_params must fit in dx12_shader_params op_params");
         memset(p.op_params, 0, sizeof(p.op_params));
         memcpy(p.op_params, rope_tensor->op_params, sizeof(rope_tensor->op_params));
-        p.op_params[15] = (rope_tensor->src[2] != nullptr) ? 1u : 0u;
+        p.op_params[15] = dx12_rope_pack_ff_offs(rope_tensor);
         return;
     }
 
@@ -4119,8 +6062,8 @@ static void dx12_pack_rope_op_params(
     // [14] attn_factor (always uniform in slot 14 across non-standalone
     // variants — see slot table comment above).
     p.op_params[14] = rope_up[8];
-    // [15] has_ff
-    p.op_params[15] = (rope_tensor->src[2] != nullptr) ? 1u : 0u;
+    // [15] has_ff (bit 31) + n_offs (low bits)
+    p.op_params[15] = dx12_rope_pack_ff_offs(rope_tensor);
 }
 
 // Pack the shared ROPE metadata for a Q/K projection matvec post-op fusion
@@ -4187,8 +6130,13 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
     p.dst_offset = (uint32_t)dst_off;
     p.dst_esize  = (tensor->type == GGML_TYPE_BF16) ? 3 : (uint32_t)ggml_type_size(tensor->type);
 
-    // Copy op_params — for FLASH_ATTN_EXT, repurpose to carry src2 + mask info
-    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+    // Pack operation-specific metadata.
+    if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
+        // src2/src3 are bound at their tensor offsets. ne2 is otherwise one
+        // for this operation, so carry the mask stream count there.
+        const struct ggml_tensor * m = tensor->src[3];
+        p.ne2 = (uint32_t)m->ne[3];
+    } else if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
         const struct ggml_tensor * src2  = tensor->src[2];
         const struct ggml_tensor * mask  = tensor->src[3];
         const struct ggml_tensor * sinks = tensor->src[4];
@@ -4231,6 +6179,15 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         // Mask (src3) parameters
         const uint32_t mask_esize = mask ? (mask->type == GGML_TYPE_BF16 ? 3u : (uint32_t)ggml_type_size(mask->type)) : 0u;
         p.op_params[8]  = mask ? (1u | ((uint32_t)mask->nb[0] << 8) | (mask_esize << 16)) : 0u; // mask info
+        // Spare op8 bits carry the runtime K/V type ids for flash_attn_kvmix:
+        // bits 1..5 = K type id, bits 25..29 = V type id (0 = float path).
+        {
+            const uint32_t k_id = src1 ? dx12_fa_kv_type_id(src1->type) : 0u;
+            const uint32_t v_id = src2 ? dx12_fa_kv_type_id(src2->type) : 0u;
+            if (k_id != 0xFFFFFFFFu && v_id != 0xFFFFFFFFu) {
+                p.op_params[8] |= ((k_id & 0x1Fu) << 1) | ((v_id & 0x1Fu) << 25);
+            }
+        }
         if (sinks) {
             p.op_params[8] |= (1u << 24);  // has_sinks bit
         }
@@ -4342,7 +6299,20 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
             const int64_t blck = (int64_t)ggml_blck_size(tensor->type);
             p.op_params[2] = (uint32_t)((tensor->ne[0] + blck - 1) / blck);
         }
+    } else if (tensor->op == GGML_OP_DSV4_HC_COMB) {
+        memcpy(p.op_params, tensor->op_params, sizeof(tensor->op_params));
+        p.op_params[2] = (uint32_t)tensor->src[2]->nb[0];
+    } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
+        const struct ggml_tensor * post = tensor->src[2];
+        const struct ggml_tensor * comb = tensor->src[3];
+        p.op_params[0] = (uint32_t)post->nb[0];
+        p.op_params[1] = (uint32_t)post->nb[1];
+        p.op_params[2] = comb ? (uint32_t)comb->nb[0] : 0;
+        p.op_params[3] = comb ? (uint32_t)comb->nb[1] : 0;
+        p.op_params[4] = comb ? (uint32_t)comb->nb[2] : 0;
+        p.op_params[5] = comb != nullptr;
     } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
+        p.ne0 = 0; // no auxiliary cache writes on the ordinary path
         // GDN op_params layout (matches gated_delta_net.hlsl):
         //   [0]=H [1]=n_tokens [2]=K (snapshot slot count) [3]=s_off
         //   [4..6]=sq1,sq2,sq3 [7..9]=sv1,sv2,sv3 [10..12]=sb1,sb2,sb3
@@ -4405,6 +6375,7 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         p.op_params[13] = (uint32_t)s0->ne[1];  // d_head
         p.op_params[14] = (uint32_t)B->ne[1];   // n_group
         p.op_params[15] = (uint32_t)x->ne[2];   // n_tok
+        p.ne1 = (uint32_t)ggml_get_op_params_i32(tensor, 0); // snapshot slots; dst is 1D
     } else if (tensor->op == GGML_OP_RWKV_WKV6 ||
                tensor->op == GGML_OP_RWKV_WKV7) {
         // RWKV WKV6/WKV7 op_params layout:
@@ -4416,6 +6387,14 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
             (tensor->op == GGML_OP_RWKV_WKV6) ? tensor->src[5] : tensor->src[6];
         memset(p.op_params, 0, sizeof(p.op_params));
         p.op_params[0] = (uint32_t)state->ne[1];
+    } else if (tensor->op == GGML_OP_GATED_LINEAR_ATTN) {
+        // GLA op_params layout (matches gla.hlsl):
+        //   [0] = B (n_seqs)   [1] = scale (float bits)
+        // S/H/T come from cbuffer ne00/ne01/ne02.
+        memset(p.op_params, 0, sizeof(p.op_params));
+        p.op_params[0] = tensor->src[4] ? (uint32_t)tensor->src[4]->ne[1] : 1u;
+        const float gla_scale = ggml_get_op_params_f32(tensor, 0);
+        memcpy(&p.op_params[1], &gla_scale, sizeof(float));
     } else if (tensor->op == GGML_OP_ADD_ID) {
         // ADD_ID op_params layout (matches add_id.hlsl):
         //   [0] = src2 nb0 (ids stride along dim 0, bytes — usually 4)
@@ -4478,11 +6457,10 @@ static void dx12_fill_params(const struct ggml_tensor * tensor, dx12_shader_para
         static_assert(sizeof(tensor->op_params) <= sizeof(p.op_params), "op_params size mismatch");
         memset(p.op_params, 0, sizeof(p.op_params));
         memcpy(p.op_params, tensor->op_params, sizeof(tensor->op_params));
-        // ROPE: signal has_ff=1 if freq_factors (src2) tensor is bound.
-        // op_params[15] is unused by ggml ROPE (sections only fills [11..14])
-        // and the standalone rope.hlsl shader reads it as the has_ff flag.
+        // ROPE: slot [15] holds n_offs (low bits) + has_ff in bit 31; see
+        // dx12_rope_pack_ff_offs.
         if (tensor->op == GGML_OP_ROPE) {
-            p.op_params[15] = (tensor->src[2] != nullptr) ? 1u : 0u;
+            p.op_params[15] = dx12_rope_pack_ff_offs(tensor);
         }
     }
 }
@@ -4523,8 +6501,7 @@ static inline void dx12_compute_node_identity(const struct ggml_tensor * node,
     if (node->src[3]) { id.has_src3 = 1; id.src3_type = (uint8_t)node->src[3]->type; }
     id.dst_ne0 = node->ne[0];
     id.dst_ne1 = node->ne[1];
-    // op_params: 12 i32 = 48 bytes covers RoPE mode/freq_base/freq_scale/ext_factor/attn_factor,
-    // FA scale/max_bias/logit_softcap, ROPE mrope sections (slots 11..14 are inside this window).
+    id.tensor_flags = node->flags;
     memcpy(id.op_params, node->op_params, sizeof(id.op_params));
 }
 
@@ -4609,6 +6586,59 @@ static inline uint32_t dx12_ceil_div(uint32_t m, uint32_t n) {
 // families and reflects actual arithmetic work, so submission batching tracks
 // GPU cost instead of memory traffic.  Unhandled ops return 0 (they are cheap
 // relative to matmul / attention and don't need to gate submission size).
+static bool dx12_linalg_conv_shape(
+        const ggml_tensor * node,
+        uint32_t & rows,
+        uint32_t & cols,
+        uint32_t & reduction) {
+    uint64_t r = 0;
+    uint64_t c = 0;
+    uint64_t k = 0;
+
+    switch (node->op) {
+        case GGML_OP_CONV_2D:
+            r = node->ne[2];
+            c = node->ne[0] * node->ne[1] * node->ne[3];
+            k = node->src[0]->ne[0] * node->src[0]->ne[1] * node->src[0]->ne[2];
+            break;
+        case GGML_OP_CONV_TRANSPOSE_2D:
+            r = node->ne[2];
+            c = node->ne[0] * node->ne[1] * node->ne[3];
+            k = node->src[0]->ne[0] * node->src[0]->ne[1] * node->src[0]->ne[3];
+            break;
+        case GGML_OP_CONV_3D: {
+            const uint64_t oc = (uint32_t)ggml_get_op_params_i32(node, 11);
+            const uint64_t ic = (uint32_t)ggml_get_op_params_i32(node, 9);
+            if (oc == 0 || node->ne[3] % oc != 0) {
+                return false;
+            }
+            r = oc;
+            c = node->ne[0] * node->ne[1] * node->ne[2] * (node->ne[3] / oc);
+            k = node->src[0]->ne[0] * node->src[0]->ne[1] * node->src[0]->ne[2] * ic;
+            break;
+        }
+        default:
+            return false;
+    }
+
+    if (r > UINT32_MAX || c > UINT32_MAX || k > UINT32_MAX) {
+        return false;
+    }
+    rows = (uint32_t)r;
+    cols = (uint32_t)c;
+    reduction = (uint32_t)k;
+    return true;
+}
+
+static void dx12_init_fastdiv(uint32_t d, uint32_t & mp, uint32_t & l) {
+    GGML_ASSERT(d > 0);
+    l = 0;
+    while (l < 32 && (uint32_t{1} << l) < d) {
+        ++l;
+    }
+    mp = (uint32_t)((uint64_t{1} << 32) * ((uint64_t{1} << l) - d) / d + 1);
+}
+
 static uint64_t dx12_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
@@ -4633,6 +6663,12 @@ static uint64_t dx12_get_node_flops(const ggml_tensor * node) {
         const uint64_t size_N = node->ne[3] / OC * node->ne[0] * node->ne[1] * node->ne[2];
         return OC * size_N * (size_K + (size_K - 1));
     }
+    if (node->op == GGML_OP_OUT_PROD) {
+        const uint64_t m = node->ne[0];
+        const uint64_t n = node->ne[1];
+        const uint64_t k = node->src[0]->ne[1];
+        return m * n * (k + (k - 1)) * node->ne[2] * node->ne[3];
+    }
     if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
@@ -4655,7 +6691,7 @@ static uint32_t dx12_replay_fa_n_splits(const dx12_cmd_replay::fa_rec & f, uint3
     if (f.total_groups_no_split < f.target_groups && n_kv > f.min_kv_per_split) {
         ns = (f.target_groups + f.total_groups_no_split - 1) / f.total_groups_no_split;
         ns = std::min(ns, (n_kv + f.min_kv_per_split - 1) / f.min_kv_per_split);
-        ns = std::min(ns, (uint32_t)32);
+        ns = std::min(ns, f.max_splits);
     }
     return ns;
 }
@@ -4673,6 +6709,16 @@ static uint64_t dx12_replay_signature(dx12_backend_context * bctx, const ggml_cg
     auto mix_res = [&](const ggml_tensor * t) {
         ID3D12Resource * r = dx12_get_resource(t);
         mix(r ? (uint64_t) r->GetGPUVirtualAddress() : 0);
+    };
+    const bool gdn_cache_enabled = dx12_gdn_cache_enabled(*bctx->dev);
+    auto mix_gdn_tensor = [&](const ggml_tensor * t) {
+        mix_res(t);
+        mix(dx12_tensor_offset(t));
+        mix(t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix(t->ne[d]);
+            mix(t->nb[d]);
+        }
     };
     const dx12_replay_cache & rc = bctx->replay_cache;
     const bool have_dec = ((int) rc.decisions.size() == cgraph->n_nodes);
@@ -4715,6 +6761,17 @@ static uint64_t dx12_replay_signature(dx12_backend_context * bctx, const ggml_cg
             case DX12_FUSE_MOE_WEIGHT_NORM:
                 if (const ggml_tensor * out = node_at(4)) {
                     mix_res(out);
+                }
+                break;
+            case DX12_FUSE_MOE_ROUTER:
+            case DX12_FUSE_MOE_ROUTER_NORM:
+                if (const ggml_tensor * ids = node_at(2)) {
+                    mix_res(ids);
+                    mix(dx12_tensor_offset(ids));
+                }
+                if (const ggml_tensor * out = node_at(d.fusion_kind == DX12_FUSE_MOE_ROUTER ? 4 : 8)) {
+                    mix_res(out);
+                    mix(dx12_tensor_offset(out));
                 }
                 break;
             case DX12_FUSE_MTP_GATE:
@@ -4820,11 +6877,27 @@ static uint64_t dx12_replay_signature(dx12_backend_context * bctx, const ggml_cg
         mix_res(n->src[0]);
         mix_res(n->src[1]);
         mix_res(n);
+        if (gdn_cache_enabled && n->op == GGML_OP_GATED_DELTA_NET) {
+            // The cache UAV and its strides are baked into the captured dispatch.
+            mix_gdn_tensor(n);
+            mix(ggml_get_op_params_i32(n, 0));
+            for (int s = 0; s < 6; ++s) {
+                mix_gdn_tensor(n->src[s]);
+            }
+            const int copy_index = dx12_find_gdn_cache_copy(cgraph, i);
+            mix(uint64_t(copy_index + 1));
+            if (copy_index >= 0) {
+                mix_gdn_tensor(cgraph->nodes[copy_index]);
+            }
+        }
         if (have_dec) mix_absorbed(i, rc.decisions[i]);
     }
     mix(bctx->q8_1_scratch        ? (uint64_t) bctx->q8_1_scratch->GetGPUVirtualAddress()        : 0);
     mix(bctx->dev->splitkv_temp   ? (uint64_t) bctx->dev->splitkv_temp->GetGPUVirtualAddress()   : 0);
     mix(bctx->dev->argsort_scratch? (uint64_t) bctx->dev->argsort_scratch->GetGPUVirtualAddress(): 0);
+    if (bctx->fa_mask_scratch) {
+        mix((uint64_t)bctx->fa_mask_scratch->GetGPUVirtualAddress());
+    }
     return h;
 }
 
@@ -5268,8 +7341,10 @@ static bool dx12_mmv_rope_chain_exclusive(const ggml_cgraph * cgraph,
 
 static bool dx12_tensor_consumed_only_by(const ggml_cgraph * cgraph,
                                          const ggml_tensor * tensor,
-                                         const ggml_tensor * consumer) {
+                                         const ggml_tensor * consumer,
+                                         const ggml_tensor * consumer2 = nullptr) {
     bool found = false;
+    bool found2 = false;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (!node) {
@@ -5279,14 +7354,125 @@ static bool dx12_tensor_consumed_only_by(const ggml_cgraph * cgraph,
             if (node->src[s] != tensor) {
                 continue;
             }
-            if (node != consumer || found) {
+            bool & seen = node == consumer ? found : found2;
+            if ((node != consumer && node != consumer2) || seen) {
                 return false;
             }
-            found = true;
+            seen = true;
         }
     }
-    return found;
+    return found && (!consumer2 || found2);
 }
+
+struct dx12_moe_expert_step {
+    int phase;
+    uint32_t flags;
+    dx12_pipeline * pipeline;
+};
+
+#ifdef GGML_DX12_LINALG_PREVIEW
+static bool dx12_match_expert_major(const dx12_device & dev, const ggml_cgraph * graph,
+                                    int first, bool all_shapes, uint32_t (&flags)[5]) {
+    if (dev.sub_family != DX12_SUBARCH_AMD_RDNA4_PLUS || dev.is_igpu || dev.blob_wave_size != 64) {
+        return false;
+    }
+    const ggml_tensor * a = graph->nodes[first];
+    const ggml_tensor * b = graph->nodes[first + 1];
+    const ggml_tensor * glu = graph->nodes[first + 2];
+    const ggml_tensor * down = graph->nodes[first + 3];
+    const ggml_tensor * weighted = graph->nodes[first + 4];
+    if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID ||
+        glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        down->op != GGML_OP_MUL_MAT_ID || weighted->op != GGML_OP_MUL ||
+        !a->src[0] || !a->src[1] || !a->src[2] || !b->src[0] || !down->src[0] ||
+        b->src[1] != a->src[1] || b->src[2] != a->src[2] ||
+        !((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a)) ||
+        down->src[1] != glu || down->src[2] != a->src[2] ||
+        weighted->src[0] != down || !weighted->src[1] ||
+        !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, glu) ||
+        !ggml_are_same_shape(down, weighted) ||
+        a->src[0]->ne[2] != b->src[0]->ne[2] || a->src[0]->ne[2] != down->src[0]->ne[2] ||
+        a->src[1]->ne[1] != 1 || a->src[0]->ne[0] != b->src[0]->ne[0] ||
+        down->src[0]->ne[0] != glu->ne[0]) {
+        return false;
+    }
+    if (!all_shapes && (a->src[0]->ne[0] != 1024 || a->src[0]->ne[2] != 32 ||
+                        a->ne[0] != 512 || a->ne[1] != 8 || a->ne[2] != 512 || down->ne[0] != 1024)) {
+        return false;
+    }
+    const ggml_tensor * weights = weighted->src[1];
+    if (weights->ne[0] != 1 || weights->ne[1] != down->ne[1] ||
+        weights->ne[2] != down->ne[2] || weights->ne[3] != 1) {
+        return false;
+    }
+    for (const ggml_tensor * t : {a, b, glu, down, weighted, weights}) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[3] != 1 ||
+            !dx12_get_resource(t) || ggml_nbytes(t) > UINT32_MAX ||
+            dx12_tensor_offset(t) > UINT32_MAX - ggml_nbytes(t) ||
+            (dx12_tensor_offset(t) & 3u)) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (t->ne[d] <= 0 || t->ne[d] > UINT32_MAX || t->nb[d] > UINT32_MAX) {
+                return false;
+            }
+        }
+    }
+    const ggml_tensor * consumers[] = {glu, glu, down, weighted};
+    const ggml_tensor * intermediates[] = {a, b, glu, down};
+    for (int j = 0; j < 4; ++j) {
+        if ((intermediates[j]->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) ||
+            !dx12_tensor_consumed_only_by(graph, intermediates[j], consumers[j])) {
+            return false;
+        }
+    }
+    if (glu->src[2] || weighted->src[2]) {
+        return false;
+    }
+    for (int j : {0, 1, 3}) {
+        const ggml_tensor * mm = graph->nodes[first + j];
+        if (mm->src[3] || ggml_get_op_params_i32(mm, 0) != GGML_PREC_DEFAULT ||
+            !dx12_src1_allows(mm, GGML_PREC_F16) ||
+            !dx12_get_resource(mm->src[0]) || !dx12_get_resource(mm->src[1]) ||
+            !dx12_get_resource(mm->src[2]) || mm->src[0]->ne[2] <= 0) {
+            return false;
+        }
+        const char * min_env = DX12_GETENV("DX12_LINALG_MMID_MIN_TOK");
+        const char * tall_env = DX12_GETENV("DX12_LINALG_MMID_TALL_MIN");
+        if (mm->ne[2] < (min_env ? atoll(min_env) : 8)) {
+            return false;
+        }
+        const int64_t per_expert = mm->ne[1] * mm->ne[2] / mm->src[0]->ne[2];
+        flags[j] = per_expert >= (tall_env ? atoll(tall_env) : 64) && mm->ne[0] % 64 == 0
+                 ? DX12_MMID_EXPERT_MAJOR_TALL_FLAG : DX12_MMID_EXPERT_MAJOR_FLAG;
+        const char * wide_env = DX12_GETENV("DX12_MOE_EXPERT_WIDE");
+        const ggml_type type = mm->src[0]->type;
+        const bool wide_default = a->src[0]->ne[0] == 1024 && a->src[0]->ne[2] == 32 &&
+            a->ne[0] == 512 && a->ne[1] == 8 && a->ne[2] == 512 && down->ne[0] == 1024 &&
+            (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K);
+        if (flags[j] == DX12_MMID_EXPERT_MAJOR_TALL_FLAG && (wide_env ? atoi(wide_env) != 0 : wide_default) &&
+            (type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)) {
+            flags[j] = DX12_MMID_EXPERT_WIDE_FLAG;
+        }
+        if (!dx12_use_bucket_linalg_mmid(dev, mm, flags[j]) ||
+            mm->src[0]->ne[0] != mm->src[1]->ne[0] || mm->src[0]->ne[1] != mm->ne[0]) {
+            return false;
+        }
+    }
+    // The epilogue writes one node early. Its inputs must remain live.
+    const ggml_tensor * epilogue_inputs[] = {glu, weights, down->src[0], down->src[2]};
+    for (const ggml_tensor * input : epilogue_inputs) {
+        if (dx12_get_resource(weighted) == dx12_get_resource(input) &&
+            dx12_tensor_offset(weighted) < dx12_tensor_offset(input) + ggml_nbytes(input) &&
+            dx12_tensor_offset(input) < dx12_tensor_offset(weighted) + ggml_nbytes(weighted)) {
+            return false;
+        }
+    }
+    flags[2] = 0;
+    flags[4] = 0;
+    return true;
+}
+#endif
 
 // QK-Norm merge (fl=104): find the sibling K-side RMS_NORM+MUL+ROPE+VIEW+SET_ROWS
 // chain that the Q-side 3-way chain at `q_idx` can absorb into one dispatch.
@@ -5361,6 +7547,7 @@ static void dx12_try_fuse_qk_norm_merge(const ggml_cgraph  * cgraph,
         // The KV cache is written through one root UAV with the layer offset
         // baked in, so its rows must be plainly strided.
         if ((uint64_t)ks->nb[0] != (uint64_t)ggml_type_size(ks->type)) continue;
+        if ((dx12_tensor_offset(ks) & 3u) != 0) continue;
         if (ks->ne[2] != 1 || ks->ne[3] != 1) continue;
 
         ID3D12Resource * kv_res = dx12_get_resource(ks);
@@ -5416,8 +7603,60 @@ static void dx12_try_fuse_qk_norm_merge(const ggml_cgraph  * cgraph,
     }
 }
 
+static uint32_t dx12_fa_min_kv_per_split(uint32_t fallback) {
+    if (const char * value = DX12_GETENV("DX12_FA_MIN_KV")) {
+        const uint32_t v = (uint32_t) atoi(value);
+        if (v >= 1) {
+            return v;
+        }
+    }
+    return fallback;
+}
+
+static uint32_t dx12_fa_linalg_split_below() {
+    static const uint32_t value = [] {
+        const char * e = DX12_GETENV("DX12_FA_SPLIT_BELOW");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 256u;
+    }();
+    return value;
+}
+
+static uint32_t dx12_fa_linalg_split_groups() {
+    static const uint32_t value = [] {
+        const char * e = DX12_GETENV("DX12_FA_SPLIT_GROUPS");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 512u;
+    }();
+    return value;
+}
+
+static uint32_t dx12_fa_split_count(uint32_t groups, uint32_t n_kv, uint32_t target, uint32_t min_kv, bool may_split,
+                                    uint32_t max_splits = DX12_FA_MAX_SPLITS) {
+    if (!may_split || groups == 0 || min_kv == 0 || groups >= target || n_kv <= min_kv) {
+        return 1;
+    }
+    const uint32_t group_splits = target / groups + (target % groups != 0);
+    const uint32_t kv_splits = n_kv / min_kv + (n_kv % min_kv != 0);
+    return std::min(max_splits, std::min(group_splits, kv_splits));
+}
+
 static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * bctx = (dx12_backend_context *)backend->context;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!dx12_precision_supported(cgraph->nodes[i])) {
+            DX12_LOG_ERROR("unsupported precision policy for %s\n", cgraph->nodes[i]->name);
+            return GGML_STATUS_FAILED;
+        }
+    }
+    // IDs can change in place between graph executions.
+    bctx->last_moe_bucket_ids_id = 0;
+    // Keeps the PSO prewarm thread off pipeline_mutex for the duration.
+    struct exec_guard {
+        dx12_device * d;
+        explicit exec_guard(dx12_device * dev) : d(dev) {
+            d->exec_inflight.fetch_add(1, std::memory_order_release);
+        }
+        ~exec_guard() { d->exec_inflight.fetch_sub(1, std::memory_order_release); }
+    } exec_scope(bctx->dev);
     const bool phase_profile = DX12_GETENV("DX12_PHASE_PROFILE") != nullptr;
     if (phase_profile) {
         bctx->phase_graph_start_us  = dx12_qpc_us();
@@ -5439,6 +7678,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     }
 
     g_tls_device = bctx->dev->device.Get();
+
+    // DX12_GRAPH_WALL: wall time of one graph_compute call, per backend
+    // context. Unlike DX12_PHASE_PROFILE this also covers one-shot contexts
+    // such as a vision encoder, which never reach the decode accounting path.
+    struct wall_guard {
+        bool on; int nodes; uint64_t t0; dx12_backend_context * c;
+        ~wall_guard() {
+            if (!on) return;
+            fprintf(stderr, "[DX12_GRAPH_WALL] nodes=%d cpu=%.3f ms | decision=%.2f params=%.2f "
+                    "setup=%.2f barrier=%.2f dispatch=%.2f submit=%.2f alloc_wait=%.2f\n",
+                    nodes, (double)(dx12_qpc_us() - t0) / 1000.0,
+                    c->phase_decision_us / 1000.0, c->phase_params_us / 1000.0,
+                    c->phase_setup_us / 1000.0, c->phase_barrier_us / 1000.0,
+                    c->phase_dispatch_us / 1000.0, c->phase_submit_us / 1000.0,
+                    c->phase_alloc_wait_us / 1000.0);
+            fflush(stderr);
+        }
+    } wall { DX12_GETENV("DX12_GRAPH_WALL") != nullptr, cgraph->n_nodes, 0, bctx };
+    if (wall.on) wall.t0 = dx12_qpc_us();
 
     static const int dx12_trace = (getenv("DX12_TRACE_GRAPH") != nullptr) ? atoi(getenv("DX12_TRACE_GRAPH")) : 0;
     static int dx12_trace_call = 0;
@@ -5470,6 +7728,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     bctx->dbg_barrier_global = 0;
     bctx->dbg_barrier_reasons.clear();
     bctx->dbg_trace_graph++;
+    dx12_log_memory(bctx->dev, "graph-entry", bctx);
 
     // DX12_FUSION_AUDIT: one-shot histogram of adjacent op pairs in the first
     // decode graph, printed sorted by frequency.  Decode graphs repeat
@@ -5504,6 +7763,91 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
     }
 
+    std::vector<dx12_fa_mask_entry> fa_masks;
+    size_t fa_mask_used = 0;
+    size_t fa_mask_needed = 0;
+    bool fa_pipeline_graph = false;
+    bool fa_scalar_mask_graph = false;
+    bool fa_sparse_graph = false;
+    const char * fa_sparse_env = getenv("DX12_FA_SPARSE");
+    const bool fa_sparse_enabled = fa_sparse_env && strcmp(fa_sparse_env, "1") == 0;
+    const bool gdn_cache_enabled = dx12_gdn_cache_enabled(*bctx->dev);
+    std::vector<ggml_tensor *> gdn_cache_dst(gdn_cache_enabled ? cgraph->n_nodes : 0, nullptr);
+    std::vector<char> gdn_cache_copies(gdn_cache_enabled ? cgraph->n_nodes : 0, 0);
+    uint32_t gdn_cache_dispatches = 0;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (fa_sparse_enabled && dx12_fa_sparse_layout(node)) {
+            fa_sparse_graph = true;
+            fa_mask_needed = std::min(DX12_FA_MASK_MAX_BYTES, fa_mask_needed + dx12_fa_sparse_bytes(node));
+        }
+        if (gdn_cache_enabled && node->op == GGML_OP_GATED_DELTA_NET) {
+            const int c = dx12_find_gdn_cache_copy(cgraph, j);
+            if (c >= 0) {
+                gdn_cache_dst[j] = cgraph->nodes[c];
+                gdn_cache_copies[c] = 1;
+            }
+        }
+    }
+    const char * fa_scalar_mask_env = getenv("DX12_FA_SCALAR_MASK");
+    const bool fa_scalar_mask_enabled = fa_scalar_mask_env && strcmp(fa_scalar_mask_env, "1") == 0 &&
+        dx12_is_b390_wave16(*bctx->dev) && dx12_flag_default_on("DX12_FA_PF_FP16");
+    const char * fa_pipeline_env = DX12_GETENV("DX12_FA_PIPELINE");
+    if (fa_pipeline_env && strcmp(fa_pipeline_env, "1") == 0) {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            if (dx12_fa_pipeline_layout(*bctx->dev, cgraph->nodes[j])) {
+                fa_pipeline_graph = true;
+                fa_mask_needed = std::min(DX12_FA_MASK_MAX_BYTES, fa_mask_needed + dx12_fa_mask_bytes(*bctx->dev, cgraph->nodes[j]));
+            }
+        }
+    }
+    if (fa_scalar_mask_enabled) {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (dx12_fa_scalar_mask_layout(node)) {
+                fa_scalar_mask_graph = true;
+                const uint32_t rows = node->src[0]->ne[0] == 128 ? 16u : 32u;
+                fa_mask_needed = std::min(DX12_FA_MASK_MAX_BYTES, fa_mask_needed + dx12_fa_mask_bytes(node, rows, 32));
+            }
+        }
+    }
+    struct fa_mask_stats {
+        bool enabled;
+        uint64_t * result;
+        uint32_t built = 0;
+        uint32_t reused = 0;
+        uint32_t invalidated = 0;
+        size_t bytes = 0;
+        ~fa_mask_stats() {
+            if (result) {
+                result[0] = built;
+                result[1] = reused;
+                result[2] = invalidated;
+            }
+            if (enabled) {
+                fprintf(stderr, "[DX12_FA_PIPELINE] mask_build=%u mask_reuse=%u invalidated=%u bytes=%zu\n",
+                    built, reused, invalidated, bytes);
+            }
+        }
+    } fa_stats { ((fa_pipeline_graph || fa_scalar_mask_graph) && DX12_GETENV("DX12_FA_PIPELINE_STATS") != nullptr) ||
+                     (fa_sparse_graph && getenv("DX12_FA_SPARSE_STATS") != nullptr),
+                 (fa_pipeline_graph || fa_scalar_mask_enabled || fa_sparse_graph || g_dx12_flag_sink) ? bctx->fa_mask_stats : nullptr };
+    if (fa_mask_needed > bctx->fa_mask_scratch_size) {
+        // This buffer belongs to this context, not to the shared device.
+        if (bctx->cmd_list_open) {
+            bctx->close_and_execute();
+        }
+        bctx->wait_for_gpu();
+        const size_t size = std::max(size_t(65536), fa_mask_needed);
+        auto scratch = dx12_create_buffer(bctx->dev, size + dx12_device::DX12_ROOT_SCRATCH_SLACK);
+        if (!scratch) {
+            DX12_LOG_ERROR("failed to allocate attention mask metadata\n");
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        bctx->fa_mask_scratch = scratch;
+        bctx->fa_mask_scratch_size = size;
+    }
+
     // Run auto-tuning on first graph compute
     if (!bctx->dev->tuning_done) {
         bctx->dev->run_autotune();
@@ -5522,7 +7866,61 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     if (!bctx->dev->splitkv_temp) {
         bctx->dev->splitkv_temp = dx12_create_buffer(bctx->dev,
             dx12_device::SPLITKV_TEMP_SIZE + dx12_device::DX12_ROOT_SCRATCH_SLACK);
+        bctx->dev->splitkv_temp_size = bctx->dev->splitkv_temp ? dx12_device::SPLITKV_TEMP_SIZE : 0;
     }
+
+    // Prefill split-KV needs room for one partial per (query, head, batch,
+    // split). Size the buffer here, before the command list is opened, so the
+    // grow can drain the GPU without abandoning a resource that is still
+    // referenced by an in-flight list. The dispatch site clamps n_splits to
+    // whatever actually fits, so a failed grow only costs speed.
+    {
+        size_t fa_need = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const struct ggml_tensor * n = cgraph->nodes[i];
+            if (!n || n->op != GGML_OP_FLASH_ATTN_EXT ||
+                !n->src[0] || !n->src[1] || !n->src[2]) {
+                continue;
+            }
+            // Reserve for the fallback too; pipeline creation can fail after this pass.
+            const uint32_t hd     = (uint32_t) n->src[0]->ne[0];
+            const uint32_t rows   = hd <= 96 ? 64u : 32u;
+            const uint32_t n_kv   = (uint32_t) n->src[1]->ne[1];
+            const uint32_t groups = dx12_ceil_div((uint32_t) n->src[0]->ne[1], rows) *
+                                    (uint32_t) n->src[0]->ne[2] * (uint32_t) n->src[0]->ne[3];
+            const uint32_t splits = dx12_fa_split_count(groups, n_kv,
+                dx12_fa_linalg_split_groups(), dx12_fa_min_kv_per_split(32u),
+                groups < dx12_fa_linalg_split_below());
+            if (splits <= 1) {
+                continue;
+            }
+            const size_t d_v  = (size_t) n->src[2]->ne[0];
+            const size_t part = (size_t) n->src[0]->ne[1] * n->src[0]->ne[2] * n->src[0]->ne[3];
+            fa_need = std::max(fa_need, part * (d_v + 2) * 4 * splits);
+        }
+        fa_need = std::min(fa_need, dx12_device::SPLITKV_TEMP_MAX);
+        if (fa_need > bctx->dev->splitkv_temp_size) {
+            // splitkv_temp lives on the device, so a submission from any other
+            // backend context sharing it can still be in flight here. This
+            // context's fence says nothing about that work, so drain the shared
+            // queue before releasing the resource; otherwise the old buffer is
+            // freed underneath a running dispatch (page fault / DEVICE_HUNG).
+            bctx->wait_for_gpu();
+            bctx->dev->init_xfer();
+            bctx->dev->wait_gpu_idle();
+            bctx->dev->splitkv_temp.Reset();
+            bctx->dev->splitkv_temp = dx12_create_buffer(bctx->dev,
+                fa_need + dx12_device::DX12_ROOT_SCRATCH_SLACK);
+            bctx->dev->splitkv_temp_size = bctx->dev->splitkv_temp ? fa_need : 0;
+            if (!bctx->dev->splitkv_temp) {
+                bctx->dev->splitkv_temp = dx12_create_buffer(bctx->dev,
+                    dx12_device::SPLITKV_TEMP_SIZE + dx12_device::DX12_ROOT_SCRATCH_SLACK);
+                bctx->dev->splitkv_temp_size = bctx->dev->splitkv_temp ? dx12_device::SPLITKV_TEMP_SIZE : 0;
+            }
+        }
+    }
+
+    dx12_log_memory(bctx->dev, "scratch-ready", bctx);
 
     // Profiling: profile only actual generation graphs (M=1 in MUL_MATs)
     static bool profiling = (getenv("DX12_PROFILE") != nullptr);
@@ -5677,6 +8075,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 break;
             }
             if (!v || ki < 0 || vi < 0) continue;
+            if (wt == GGML_TYPE_Q8_0 && dx12_src1_allows(q, GGML_PREC_Q8) &&
+                (!dx12_src1_allows(k, GGML_PREC_Q8) || !dx12_src1_allows(v, GGML_PREC_Q8))) {
+                continue;
+            }
 
             projection_triplets.push_back({ q, k, v, qi, ki, vi, 0, 0, 0 });
             qi = std::max(qi, std::max(ki, vi));
@@ -5752,6 +8154,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     bool do_profile = profiling && ((!is_prompt && gen_graph >= profile_gen_lo && gen_graph <= profile_gen_hi) ||
                                     (is_prompt && profile_prompt));
     if (tune_profile_active) do_profile = true;
+    const bool graph_gpu_profile = DX12_GETENV("DX12_GRAPH_GPU_PROFILE") != nullptr;
+    bool profile_queries = do_profile || graph_gpu_profile;
     std::map<std::string, double> op_times;
     std::map<std::string, uint32_t> op_counts;
     std::map<std::string, size_t> op_bytes;
@@ -5764,17 +8168,20 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     ComPtr<ID3D12Resource>  prof_readback;
     uint32_t prof_capacity = 0;
     uint32_t prof_idx = 0;
+    bool prof_graph_start = false;
     std::vector<std::string> prof_keys;   // one per dispatched node
     std::vector<size_t>      prof_bytes;  // weight bytes read, parallel to prof_keys
     UINT64 prof_freq = 1;
-    if (do_profile) {
-        prof_capacity = (uint32_t)cgraph->n_nodes * 2 + 32;
+    LARGE_INTEGER prof_cpu_start_qpc = {};
+    LARGE_INTEGER prof_cpu_freq = {};
+    if (profile_queries) {
+        prof_capacity = do_profile ? (uint32_t)cgraph->n_nodes * 2 + 32 : 2;
         D3D12_QUERY_HEAP_DESC qhd = {};
         qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
         qhd.Count = prof_capacity;
         HRESULT hr = bctx->dev->device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&prof_heap));
-        if (FAILED(hr)) { do_profile = false; }
-        if (do_profile) {
+        if (FAILED(hr)) { profile_queries = false; do_profile = false; }
+        if (profile_queries) {
             D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
             D3D12_RESOURCE_DESC rd = {};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -5784,14 +8191,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             hr = bctx->dev->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&prof_readback));
-            if (FAILED(hr)) { do_profile = false; }
+            if (FAILED(hr)) { profile_queries = false; do_profile = false; }
         }
-        if (do_profile) {
+        if (profile_queries) {
             hr = bctx->dev->compute_queue->GetTimestampFrequency(&prof_freq);
-            if (FAILED(hr) || prof_freq == 0) { do_profile = false; }
+            if (FAILED(hr) || prof_freq == 0) { profile_queries = false; do_profile = false; }
         }
-        if (do_profile) {
+        if (profile_queries) {
+            if (do_profile) {
             prof_keys.reserve(cgraph->n_nodes);
+            }
+            QueryPerformanceCounter(&prof_cpu_start_qpc);
+            QueryPerformanceFrequency(&prof_cpu_freq);
         }
     }
 
@@ -5925,6 +8336,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         const char * v = DX12_GETENV("DX12_RMS_NORM_MUL_1024_MIN");
         return (v && v[0]) ? (int64_t) atoi(v) : (int64_t) 2048;
     }();
+    static const bool norm_wide_1024 = dx12_flag_default_on("DX12_NORM_WIDE_1024");
+    static const int64_t norm_wide_1024_min = []{
+        const char * v = DX12_GETENV("DX12_NORM_WIDE_1024_MIN");
+        return (v && v[0]) ? (int64_t) atoi(v) : (int64_t) 2048;
+    }();
     // Absorb an RMS_NORM+MUL into the matvec that consumes its output - the
     // attention norm into the combined Q/K/V matvec (fl=88) and the FFN norm
     // into the gate/up+SwiGLU matvec (fl=89). Removes two dispatches and two
@@ -5958,6 +8374,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
            bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
            bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS ||
            bctx->dev->arch_family == DX12_ARCH_AMD_RDNA);
+    const char * q4k_glu_fold_k_env = DX12_GETENV("DX12_Q4K_GLU_FOLD_K_MAX");
+    const int64_t q4k_glu_fold_k_max = q4k_glu_fold_k_env
+        ? atoll(q4k_glu_fold_k_env)
+        : (bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS ? 1024 : INT64_MAX);
     // Replicated attn-norm fold (fl=102). Measured neutral on NVIDIA Ada for
     // Qwen3-4B Q4_K_M: retiring 18 RMS_NORM dispatches (0.085 ms) is paid back
     // almost exactly by the extra sum(x*x) pass and norm-weight read every
@@ -5994,6 +8414,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                 qk_norm_merge;
     // Debug: per-fusion-type bypasses for bisecting correctness issues
     static bool no_fuse_add_rms_mul   = (getenv("DX12_NO_FUSE_ADD_RMS_MUL")   != nullptr);
+    static bool no_fuse_norm_affine   = (getenv("DX12_NO_FUSE_NORM_AFFINE")   != nullptr);
     static bool env_no_fuse_rms_mul_rope5 = (getenv("DX12_NO_FUSE_RMS_MUL_ROPE5") != nullptr);
     static bool env_no_fuse_rms_mul_rope3 = (getenv("DX12_NO_FUSE_RMS_MUL_ROPE3") != nullptr);
     // AMD RDNA1/2 (wave-flexible 32/64) produces wrong values from the
@@ -6024,7 +8445,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // (no intermediate dispatch can invalidate), skip the F32 dst write to
     // save ne00*4 bytes of bandwidth per row. Default OFF (env opt-in) so a
     // bad gate cannot silently corrupt model output; enable after bench.
-    static bool fuse_rms_quant_q8_1_skip_f32 = (getenv("DX12_RMSNORM_QUANT_FUSION_SKIP_F32") != nullptr);
+    const bool fuse_rms_quant_q8_1_skip_f32 = (DX12_GETENV("DX12_RMSNORM_QUANT_FUSION_SKIP_F32") != nullptr);
     const char * q50_subgroup_env = DX12_GETENV("DX12_Q50_SUBGROUP");
     const bool q50_subgroup_auto =
         dx12_subarch_is_rdna3_plus(bctx->dev->sub_family);
@@ -6050,8 +8471,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         (dp4a_nv_q5k_env && dp4a_nv_q5k_env[0] != '0');
     const bool dp4a_q6k_ok = !dp4a_nvidia ||
         (!dp4a_nv_q6k_env || dp4a_nv_q6k_env[0] != '0');
-    auto is_dp4a_matvec_consumer = [&](ggml_type w) {
-        switch (w) {
+    auto is_dp4a_matvec_consumer = [&](const ggml_tensor * consumer) {
+        if (!dx12_src1_allows(consumer, GGML_PREC_Q8)) {
+            return false;
+        }
+        if (dx12_q4k_short_flag(*bctx->dev, consumer) == DX12_Q4K_SHORT_F32_FLAG) {
+            return false;
+        }
+        switch (consumer->src[0]->type) {
             case GGML_TYPE_Q4_K: return dp4a_q4k_ok;
             case GGML_TYPE_Q5_K: return dp4a_q5k_ok;
             case GGML_TYPE_Q6_K: return dp4a_q6k_ok;
@@ -6083,6 +8510,81 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         return (v > 0) ? (DWORD)v : 5000;
     }();
 
+    std::unique_ptr<std::unordered_map<const ggml_tensor *, dx12_moe_expert_step>> moe_expert_steps;
+#ifdef GGML_DX12_LINALG_PREVIEW
+    const char * expert_major_env = DX12_GETENV("DX12_MOE_EXPERT_MAJOR");
+    const bool expert_major_forced = expert_major_env && strcmp(expert_major_env, "1") == 0;
+    if ((!expert_major_env || expert_major_forced) && (is_prompt || expert_major_forced) && !no_fusion && !dump_name_env) {
+        size_t bucket_bytes = 0;
+        for (int first = 0; first + 4 < cgraph->n_nodes; ++first) {
+            uint32_t flags[5] = {};
+            if (!dx12_match_expert_major(*bctx->dev, cgraph, first, expert_major_forced, flags)) {
+                continue;
+            }
+            dx12_pipeline * pipelines[5] = {};
+            bool ready = true;
+            for (int j = 0; j < 4; ++j) {
+                const ggml_tensor * t = cgraph->nodes[first + j];
+                dx12_pipeline_key key = {};
+                key.op = t->op;
+                key.dst_type = t->type;
+                key.src0_type = t->src[0]->type;
+                key.src1_type = t->src[1]->type;
+                key.flags = flags[j];
+                pipelines[j] = bctx->dev->get_or_create_pipeline(key);
+                ready = ready && pipelines[j] && pipelines[j]->pso;
+            }
+            if (!ready) {
+                continue;
+            }
+            if (!moe_expert_steps) {
+                moe_expert_steps = std::make_unique<std::unordered_map<const ggml_tensor *, dx12_moe_expert_step>>();
+            }
+            for (int j = 0; j < 5; ++j) {
+                moe_expert_steps->emplace(cgraph->nodes[first + j], dx12_moe_expert_step{j, flags[j], pipelines[j]});
+            }
+            const ggml_tensor * mm = cgraph->nodes[first];
+            bucket_bytes = std::max(bucket_bytes,
+                (size_t)(mm->src[0]->ne[2] + 1 + mm->ne[1] * mm->ne[2]) * sizeof(uint32_t));
+            first += 4;
+        }
+        if (moe_expert_steps) {
+            dx12_pipeline_key key = {};
+            key.op = GGML_OP_NONE;
+            key.flags = 120;
+            bctx->dev->moe_bucket_pipeline = bctx->dev->get_or_create_pipeline(key);
+            auto ensure_scratch = [&](ComPtr<ID3D12Resource> & buffer, size_t & capacity, size_t want) {
+                if (buffer && capacity >= want) {
+                    return true;
+                }
+                auto next = dx12_create_buffer(bctx->dev, want + dx12_device::DX12_ROOT_SCRATCH_SLACK);
+                if (!next) {
+                    return false;
+                }
+                if (buffer) {
+                    bctx->moe_bucket_retired.push_back(buffer);
+                }
+                buffer = std::move(next);
+                capacity = want;
+                return true;
+            };
+            if (!bctx->dev->moe_bucket_pipeline || !bctx->dev->moe_bucket_pipeline->pso ||
+                !ensure_scratch(bctx->moe_bucket_scratch, bctx->moe_bucket_scratch_size, bucket_bytes)) {
+                moe_expert_steps.reset();
+            }
+        }
+    }
+#endif
+    const bool moe_expert_active = moe_expert_steps != nullptr;
+    if (moe_expert_active) {
+        // Recheck consumers and allocations on each trial graph, including changed IDs.
+        bctx->replay_cache.decisions.clear();
+        bctx->replay.captured = false;
+        if (dx12_trace) {
+            fprintf(stderr, "[DX12_MOE_EXPERT_MAJOR] layers=%zu\n", moe_expert_steps->size() / 5);
+        }
+    }
+
     // R1 — replay-cache validation pass.  Compute current node identities and
     // compare against the cached decisions.  On mismatch (graph topology
     // change, shape change that crosses a routing threshold, or first call),
@@ -6090,7 +8592,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // and store decisions as it runs.  On match (steady-state decode), the
     // per-node loop reads decisions directly from the cache and skips ~250
     // lines of pipeline lookup / fusion lookahead / route flag computation.
-    static const bool no_replay = (getenv("DX12_NO_GRAPH_REPLAY") != nullptr);
+    const bool no_replay = moe_expert_active || g_dx12_env_refresh || DX12_GETENV("DX12_NO_GRAPH_REPLAY") != nullptr;
     bool replay = false;
     dx12_replay_cache & rcache = bctx->replay_cache;
     if (!no_replay) {
@@ -6110,6 +8612,70 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     break;
                 }
                 const dx12_node_decision & cached = rcache.decisions[i];
+                if (cached.key_flags == DX12_F32_ROUTER_FLAG &&
+                    !dx12_f32_router_layout(*bctx->dev, cgraph->nodes[i])) {
+                    match = false;
+                    break;
+                }
+                if ((cached.key_flags == DX12_Q4K_SHORT_F32_FLAG || cached.key_flags == DX12_Q4K_SHORT_DP4A_FLAG) &&
+                    !dx12_q4k_short_layout(*bctx->dev, cgraph->nodes[i])) {
+                    match = false;
+                    break;
+                }
+                if ((cached.key_flags == DX12_Q8_SMALL_M_FLAG || cached.key_flags == DX12_F16_SMALL_M_FLAG) &&
+                    !dx12_use_small_m(*bctx->dev, cgraph->nodes[i])) {
+                    match = false;
+                    break;
+                }
+                if ((cached.key_flags == DX12_LINALG_FA_COMPACT_D128_FLAG ||
+                     cached.key_flags == DX12_LINALG_FA_PV_F16_COMPACT_D128_FLAG) &&
+                    !dx12_fa_compact_layout(cgraph->nodes[i])) {
+                    match = false;
+                    break;
+                }
+                if (dx12_is_linalg_q50_packed(cached.key_flags) &&
+                    !dx12_use_linalg_q50_packed(*bctx->dev, cgraph->nodes[i],
+                        230 + cached.key_flags - DX12_LINALG_Q50_PACKED_BASE)) {
+                    match = false;
+                    break;
+                }
+                if (dx12_is_bucket_linalg_mmid(cached.key_flags) &&
+                    !dx12_use_bucket_linalg_mmid(*bctx->dev, cgraph->nodes[i], cached.key_flags)) {
+                    match = false;
+                    break;
+                }
+                if (dx12_is_fa_pipeline_flag(cached.key_flags) &&
+                    (!dx12_fa_pipeline_layout(*bctx->dev, cgraph->nodes[i]) ||
+                     cached.key_flags != dx12_fa_pipeline_flag(*bctx->dev, cgraph->nodes[i]))) {
+                    match = false;
+                    break;
+                }
+                if ((cached.key_flags == DX12_MMID_BUCKET_TALL_FLAG || cached.key_flags == DX12_MMID_BUCKET_WIDE_FLAG) &&
+                    dx12_use_wide_bucket_linalg_mmid(*bctx->dev, cgraph->nodes[i]) !=
+                        (cached.key_flags == DX12_MMID_BUCKET_WIDE_FLAG)) {
+                    match = false;
+                    break;
+                }
+                if (cached.key_flags == DX12_AMD_COMPOSED_FLAG &&
+                    !dx12_use_linalg_amd_composed(*bctx->dev, cgraph->nodes[i])) {
+                    match = false;
+                    break;
+                }
+                if (dx12_is_linalg_pipeline(cached.key_flags) && cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                    !dx12_linalg_pipeline_layout(cgraph->nodes[i], cached.key_flags)) {
+                    match = false;
+                    break;
+                }
+                if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                    (cached.key_flags == DX12_LINALG_Q8_ALIGNED_FLAG ||
+                      cached.key_flags == DX12_LINALG_Q8_ALIGNED_128X64_FLAG ||
+                      cached.key_flags == DX12_Q8_PIPELINE_FLAG)) {
+                    const uint32_t generic_flag = cached.key_flags == DX12_LINALG_Q8_ALIGNED_FLAG ? 212 : 211;
+                    if (!dx12_use_linalg_q8_aligned(*bctx->dev, cgraph->nodes[i], generic_flag)) {
+                        match = false;
+                        break;
+                    }
+                }
                 const auto current_bundle = projection_bundle_by_q.find(cgraph->nodes[i]);
                 const bool has_current_bundle = current_bundle != projection_bundle_by_q.end();
                 const bool has_cached_bundle =
@@ -6183,9 +8749,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     const bool cr_size_ok = cr_igpu_exempt || cr_min_flops == 0 ||
                             bctx->last_decode_flops >= cr_min_flops;
 
+    if (fa_pipeline_graph || fa_scalar_mask_graph || fa_sparse_graph) {
+        cr.captured = false;
+    }
     const bool cr_eligible =
         cr.enabled && !cr.disabled_perm && bctx->dev->use_param_cbv &&
-        cr_size_ok &&
+        cr_size_ok && !fa_pipeline_graph && !fa_scalar_mask_graph && !fa_sparse_graph && !moe_expert_active &&
         !is_prompt && replay && !bctx->cmd_list_open &&
         !do_profile && !tune_profile_active && !sync_per_op &&
         dump_name_env == nullptr &&
@@ -6251,6 +8820,16 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     for (int i = 0; i < cgraph->n_nodes; i++) {
         uint64_t phase_detail_start_us = phase_profile ? dx12_qpc_us() : 0;
         struct ggml_tensor * node = cgraph->nodes[i];
+        const dx12_moe_expert_step * expert_step = nullptr;
+        if (moe_expert_active) {
+            const auto expert_it = moe_expert_steps->find(node);
+            if (expert_it != moe_expert_steps->end()) {
+                expert_step = &expert_it->second;
+            }
+        }
+        if (expert_step && expert_step->phase == 4) {
+            continue;
+        }
         if (dx12_trace >= 2) {
             fprintf(stderr, "[DX12_TRACE]  node %d/%d: op=%s name=%s\n",
                     i, cgraph->n_nodes, ggml_op_name(node->op), node->name);
@@ -6286,7 +8865,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             continue;
         }
         if (replay && rcache.decisions[i].kind == DX12_DEC_NO_PIPELINE) {
-            continue;
+            DX12_LOG_ERROR("missing cached pipeline for required node %s (%s)\n", node->name, ggml_op_name(node->op));
+            return GGML_STATUS_FAILED;
         }
 
         if (ggml_is_empty(node) || node->op == GGML_OP_NONE ||
@@ -6320,6 +8900,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         struct ggml_tensor * fused_rms_node       = nullptr;
         struct ggml_tensor * fused_rope_after_rms = nullptr;
         struct ggml_tensor * fused_5way_set_rows  = nullptr;
+        struct ggml_tensor * fused_norm_node      = nullptr;
+        struct ggml_tensor * fused_norm_mul_node  = nullptr;
+        struct ggml_tensor * fused_norm_bias_node = nullptr;
+        bool                 fused_norm_has_add   = false;
         // Merged Q/K QK-Norm dispatch (fl=104): the sibling K-side chain the Q
         // node absorbs. Its MUL/ROPE/VIEW/SET_ROWS sit at fixed offsets +1..+4.
         struct ggml_tensor * fused_qkn_k_norm     = nullptr;
@@ -6333,6 +8917,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         struct ggml_tensor * fused_moe_weighted   = nullptr;
         struct ggml_tensor * fused_moe_sum        = nullptr;
         struct ggml_tensor * fused_moe_norm_out   = nullptr;
+        struct ggml_tensor * fused_moe_router_out = nullptr;  // weights (GET_ROWS or DIV)
+        bool                 fused_moe_router_norm = false;
         struct ggml_tensor * fused_mtp_gate_sigmoid = nullptr;
         struct ggml_tensor * fused_mtp_gate_mul     = nullptr;
         struct ggml_tensor * fused_mtp_gate_input   = nullptr;
@@ -6424,7 +9010,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         bool     q80_glu_revertible = false;
         dx12_pipeline * pipeline = nullptr;
 
-        if (replay) {
+        if (expert_step) {
+            key.flags = expert_step->flags;
+            pipeline = expert_step->pipeline;
+        } else if (replay) {
             // R1 fast path: pull cached decision and reconstruct fused_*
             // tensor pointers from cgraph (relative indices).
             const dx12_node_decision & d = rcache.decisions[i];
@@ -6441,6 +9030,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     fused_mul_node     = cgraph->nodes[i + 2];
                     key.op             = GGML_OP_RMS_NORM;
                     break;
+                case DX12_FUSE_NORM_MUL_ADD:
+                    fused_norm_node      = node;
+                    fused_norm_mul_node  = cgraph->nodes[i + 1];
+                    fused_norm_bias_node = cgraph->nodes[i + 2];
+                    key.op               = GGML_OP_NORM;
+                    break;
+                case DX12_FUSE_ADD_NORM_MUL_ADD:
+                    fused_norm_has_add   = true;
+                    fused_norm_node      = cgraph->nodes[i + 1];
+                    fused_norm_mul_node  = cgraph->nodes[i + 2];
+                    fused_norm_bias_node = cgraph->nodes[i + 3];
+                    key.op               = GGML_OP_NORM;
+                    break;
                 case DX12_FUSE_RMS_MUL:
                     fused_mul_node = cgraph->nodes[i + 1];
                     key.op         = GGML_OP_RMS_NORM;
@@ -6455,7 +9057,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 case DX12_FUSE_MMID_WEIGHTED_SUM:
                     fused_moe_weighted = cgraph->nodes[i + 1];
                     fused_moe_sum      = cgraph->nodes[i + d.moe_sum_rel];
-                    key.flags          = 18;
+                    key.flags          = d.key_flags;
                     break;
                 case DX12_FUSE_MOE_SUM:
                     fused_moe_weighted = node->src[0] ? node->src[0]->view_src : nullptr;
@@ -6465,6 +9067,13 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 case DX12_FUSE_MOE_WEIGHT_NORM:
                     fused_moe_norm_out = cgraph->nodes[i + 4];
                     key.flags = 60;
+                    break;
+                case DX12_FUSE_MOE_ROUTER:
+                    fused_moe_router_out = cgraph->nodes[i + 4];
+                    break;
+                case DX12_FUSE_MOE_ROUTER_NORM:
+                    fused_moe_router_out  = cgraph->nodes[i + 8];
+                    fused_moe_router_norm = true;
                     break;
                 case DX12_FUSE_MTP_GATE:
                     fused_mtp_gate_sigmoid = cgraph->nodes[i + 1];
@@ -6651,7 +9260,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     memcpy(&fused_rms_eps, cgraph->nodes[r]->op_params, sizeof(float));
                 }
             }
-            // Bias-add fusion can co-occur with MUL_MAT(M=1).
+            // Bias-add fusion can co-occur with MUL_MAT.
             if (d.has_bias_add && i + 1 < cgraph->n_nodes) {
                 struct ggml_tensor * next = cgraph->nodes[i + 1];
                 if (next->src[0] == node) fused_bias_tensor = next->src[1];
@@ -6702,6 +9311,73 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        // MoE router: SOFT_MAX -> RESHAPE -> ARGSORT -> VIEW(top-k) -> GET_ROWS,
+        // optionally followed by RESHAPE -> SUM_ROWS -> CLAMP -> DIV.
+        static const bool no_moe_router = !dx12_flag_default_on("DX12_FUSE_MOE_ROUTER");
+        if (!no_fusion && !no_moe_router &&
+            node->op == GGML_OP_SOFT_MAX && !node->src[1] && !node->src[2] &&
+            node->src[0] && node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+            ggml_get_op_params_f32(node, 0) == 1.0f && ggml_get_op_params_f32(node, 1) == 0.0f &&
+            node->ne[0] <= 256 && node->ne[2] == 1 && node->ne[3] == 1 &&
+            node->src[0]->nb[0] == 4 && node->nb[0] == 4 &&
+            node->ne[1] <= 65535 && i + 4 < cgraph->n_nodes) {
+            ggml_tensor * reshape = cgraph->nodes[i + 1];
+            ggml_tensor * argsort = cgraph->nodes[i + 2];
+            ggml_tensor * view    = cgraph->nodes[i + 3];
+            ggml_tensor * rows    = cgraph->nodes[i + 4];
+            if (reshape->op == GGML_OP_RESHAPE && reshape->src[0] == node &&
+                argsort->op == GGML_OP_ARGSORT && argsort->src[0] == node &&
+                argsort->type == GGML_TYPE_I32 && argsort->nb[0] == 4 &&
+                ggml_get_op_params_i32(argsort, 0) == GGML_SORT_ORDER_DESC &&
+                view->op == GGML_OP_VIEW && view->view_src == argsort && view->view_offs == 0 &&
+                view->ne[0] >= 1 && view->ne[0] <= 16 && view->ne[0] <= node->ne[0] &&
+                view->nb[1] == argsort->nb[1] &&
+                rows->op == GGML_OP_GET_ROWS && rows->src[0] == reshape && rows->src[1] == view &&
+                rows->type == GGML_TYPE_F32 && rows->ne[0] == 1 && rows->ne[1] == view->ne[0] &&
+                rows->ne[2] == node->ne[1] &&
+                dx12_tensor_consumed_only_by(cgraph, reshape, rows) &&
+                dx12_tensor_consumed_only_by(cgraph, argsort, view)) {
+                ggml_tensor * out = rows;
+                bool norm = false;
+                if (i + 8 < cgraph->n_nodes) {
+                    ggml_tensor * r2    = cgraph->nodes[i + 5];
+                    ggml_tensor * sum   = cgraph->nodes[i + 6];
+                    ggml_tensor * clamp = cgraph->nodes[i + 7];
+                    ggml_tensor * div   = cgraph->nodes[i + 8];
+                    if (r2->op == GGML_OP_RESHAPE && r2->src[0] == rows &&
+                        sum->op == GGML_OP_SUM_ROWS && sum->src[0] == r2 &&
+                        clamp->op == GGML_OP_CLAMP && clamp->src[0] == sum &&
+                        div->op == GGML_OP_DIV && div->src[0] == r2 && div->src[1] == clamp &&
+                        div->type == GGML_TYPE_F32 && div->ne[0] == view->ne[0] && div->nb[0] == 4 &&
+                        !((rows->flags | r2->flags | sum->flags | clamp->flags) & GGML_TENSOR_FLAG_OUTPUT) &&
+                        dx12_tensor_consumed_only_by(cgraph, rows, r2) &&
+                        dx12_tensor_consumed_only_by(cgraph, r2, sum, div) &&
+                        dx12_tensor_consumed_only_by(cgraph, sum, clamp) &&
+                        dx12_tensor_consumed_only_by(cgraph, clamp, div)) {
+                        out = div;
+                        norm = true;
+                    }
+                }
+                ID3D12Resource * res = dx12_get_resource(node);
+                auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                    if (dx12_get_resource(a) != dx12_get_resource(b)) {
+                        return false;
+                    }
+                    const uint64_t a_lo = dx12_tensor_offset(a);
+                    const uint64_t b_lo = dx12_tensor_offset(b);
+                    return a_lo < b_lo + ggml_nbytes(b) && b_lo < a_lo + ggml_nbytes(a);
+                };
+                // Later outputs may reuse logits in the unfused allocation plan.
+                if (res && res == dx12_get_resource(argsort) && res == dx12_get_resource(out) &&
+                    !overlaps(argsort, node->src[0]) && !overlaps(out, node->src[0]) &&
+                    !overlaps(node, argsort) && !overlaps(node, out) && !overlaps(argsort, out)) {
+                    fused_moe_router_out  = out;
+                    fused_moe_router_norm = norm;
+                    key.flags = DX12_MOE_ROUTER_FLAG;
+                }
+            }
+        }
+
         // MoE selected-weight normalization:
         // GET_ROWS -> RESHAPE -> SUM_ROWS -> CLAMP -> DIV.
         static const bool no_moe_weight_norm =
@@ -6723,7 +9399,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 clamp->op == GGML_OP_CLAMP && clamp->src[0] == sum &&
                 div->op == GGML_OP_DIV && div->src[0] == reshape && div->src[1] == clamp &&
                 div->type == GGML_TYPE_F32 && ggml_is_contiguous(div) &&
+                !((node->flags | reshape->flags | sum->flags | clamp->flags) & GGML_TENSOR_FLAG_OUTPUT) &&
                 dx12_tensor_consumed_only_by(cgraph, node, reshape) &&
+                dx12_tensor_consumed_only_by(cgraph, reshape, sum, div) &&
                 dx12_tensor_consumed_only_by(cgraph, sum, clamp) &&
                 dx12_tensor_consumed_only_by(cgraph, clamp, div)) {
                 fused_moe_norm_out = div;
@@ -6771,13 +9449,99 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             dx12_topk_large_kl((uint32_t)node->src[0]->ne[0], (uint32_t)node->ne[0])) {
             key.flags = 51;
         }
+        if (node->op == GGML_OP_TOP_K && key.flags == 50 &&
+            !getenv("DX12_NO_TOPK_RADIX") &&
+            node->ne[0] > DX12_TOPK_BLOCK / 4u) {
+            key.flags = 63;
+        }
 
-        // SSM_SCAN d_state variant selection: the default ssm_scan shader is
-        // built with D_STATE=128. For d_state=256 (Falcon-H1 etc.) route to
-        // ssm_scan_d256 (key.flags=256). Other d_state values are rejected
-        // by supports_op.
-        if (node->op == GGML_OP_SSM_SCAN && node->src[0] && node->src[0]->ne[0] == 256) {
-            key.flags = 256;
+        if (node->op == GGML_OP_CONT && key.flags != 61 && node->src[0] &&
+            node->src[0]->type == node->type &&
+            !ggml_is_quantized(node->type) &&
+            (ggml_type_size(node->type) == 2 || ggml_type_size(node->type) == 4) &&
+            node->src[0]->nb[2] == ggml_type_size(node->type) &&
+            ggml_is_contiguous(node) &&
+            ggml_are_same_shape(node, node->src[0]) &&
+            dx12_ceil_div((uint32_t)node->ne[0], 32) <= 65535 &&
+            dx12_ceil_div((uint32_t)node->ne[2], 32) <= 65535 &&
+            node->ne[1] * node->ne[3] <= 65535) {
+            key.flags = 62;
+        }
+
+        // LIGHTNING_INDEXER K-type variant selection: the default shader reads
+        // float K, quantized K routes to a per-type wrapper (key.flags = type id).
+        if (node->op == GGML_OP_LIGHTNING_INDEXER && node->src[1]) {
+            key.flags = (uint32_t)node->src[1]->type;
+        }
+
+        // The default SSM_SCAN shader uses D_STATE=128.
+        if (node->op == GGML_OP_SSM_SCAN && node->src[0] && node->src[0]->ne[0] != 128) {
+            key.flags = (uint32_t)node->src[0]->ne[0];
+        }
+
+        // LayerNorm + affine scale/bias, optionally preceded by a residual ADD.
+        // The residual output remains materialized because the next sublayer
+        // consumes it directly; only the NORM/MUL/bias intermediates disappear.
+        if (!no_fusion && !no_fuse_norm_affine &&
+            (node->op == GGML_OP_NORM || node->op == GGML_OP_ADD)) {
+            const bool has_add = node->op == GGML_OP_ADD;
+            const int norm_idx = i + (has_add ? 1 : 0);
+            const int mul_idx  = norm_idx + 1;
+            const int bias_idx = norm_idx + 2;
+            if (bias_idx < cgraph->n_nodes) {
+                struct ggml_tensor * norm = cgraph->nodes[norm_idx];
+                struct ggml_tensor * mul  = cgraph->nodes[mul_idx];
+                struct ggml_tensor * add  = cgraph->nodes[bias_idx];
+                const struct ggml_tensor * weight = nullptr;
+                const struct ggml_tensor * bias = nullptr;
+                if (norm->op == GGML_OP_NORM && mul->op == GGML_OP_MUL &&
+                    add->op == GGML_OP_ADD &&
+                    (!has_add || norm->src[0] == node)) {
+                    weight = mul->src[0] == norm ? mul->src[1] :
+                             mul->src[1] == norm ? mul->src[0] : nullptr;
+                    bias = add->src[0] == mul ? add->src[1] :
+                           add->src[1] == mul ? add->src[0] : nullptr;
+                }
+                auto single_consumer = [&](const struct ggml_tensor * value,
+                                           const struct ggml_tensor * consumer) {
+                    int count = 0;
+                    bool expected = false;
+                    for (int j = 0; j < cgraph->n_nodes; ++j) {
+                        const struct ggml_tensor * candidate = cgraph->nodes[j];
+                        for (int s = 0; s < GGML_MAX_SRC && candidate->src[s]; ++s) {
+                            if (candidate->src[s] == value) {
+                                count++;
+                                expected |= candidate == consumer;
+                            }
+                        }
+                    }
+                    return count == 1 && expected;
+                };
+                const bool vector_weight =
+                    weight && weight->type == GGML_TYPE_F32 &&
+                    weight->ne[0] == norm->ne[0] &&
+                    weight->ne[1] == 1 && weight->ne[2] == 1 && weight->ne[3] == 1 &&
+                    ggml_is_contiguous(weight);
+                const bool vector_bias =
+                    bias && bias->type == GGML_TYPE_F32 &&
+                    bias->ne[0] == norm->ne[0] &&
+                    bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1 &&
+                    ggml_is_contiguous(bias);
+                const bool same_resource =
+                    !has_add || dx12_get_resource(node) == dx12_get_resource(add);
+                if (weight && bias && vector_weight && vector_bias && same_resource &&
+                    norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+                    add->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(norm, mul) && ggml_are_same_shape(norm, add) &&
+                    single_consumer(norm, mul) && single_consumer(mul, add)) {
+                    fused_norm_has_add   = has_add;
+                    fused_norm_node      = norm;
+                    fused_norm_mul_node  = mul;
+                    fused_norm_bias_node = add;
+                    key.op               = GGML_OP_NORM;
+                    key.flags            = 1;
+                }
+            }
         }
 
         // Op fusion: RMS_NORM + MUL → rms_norm_mul (single dispatch)
@@ -6817,7 +9581,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // The fused RMS+MUL+ROPE shaders implement attn_factor,
                     // freq_factors, and YaRN ext_factor (corr_low/high are
                     // precomputed host-side and forwarded into the shader).
-                    bool rope_ext_compatible = (rope->op == GGML_OP_ROPE);
+                    // They do not implement n_offs, so a shifted rotation
+                    // window falls back to the standalone rope shader.
+                    bool rope_ext_compatible =
+                        (rope->op == GGML_OP_ROPE) && dx12_rope_n_offs(rope) == 0;
                     // The fused RMS+MUL+ROPE shaders implement attn_factor,
                     // freq_factors, and YaRN ext_factor (corr_low/high are
                     // precomputed host-side and forwarded into the shader).
@@ -6908,8 +9675,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             struct ggml_tensor * c = cgraph->nodes[j];
                             if (!c) continue;
                             if (c->op == GGML_OP_MUL_MAT && c->src[1] == next && c->src[0]) {
-                                ggml_type w = c->src[0]->type;
-                                bool dp4a_consumer = is_dp4a_matvec_consumer(w);
+                                bool dp4a_consumer = is_dp4a_matvec_consumer(c);
                                 if (dp4a_consumer) {
                                     fused_rms_quant_consumer = c;
                                     key.flags = 12;
@@ -6922,7 +9688,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                     // skip_f32 — the F32 dst write is dead.
                                     if (fuse_rms_quant_q8_1_skip_f32 &&
                                         next->ne[1] * next->ne[2] * next->ne[3] == 1) {
-                                        bool safe = true;
+                                        bool safe = !(next->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT));
                                         int last_consumer_idx = j;
                                         // Walk i+2..i+8: every node MUST be either
                                         // (a) a dp4a MUL_MAT consuming `next` as src[1], or
@@ -6934,8 +9700,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                             for (int si = 0; si < GGML_MAX_SRC; ++si) {
                                                 if (d_n->src[si] == next) {
                                                     if (d_n->op == GGML_OP_MUL_MAT && si == 1 && d_n->src[0]) {
-                                                        ggml_type dw = d_n->src[0]->type;
-                                                        bool dc = is_dp4a_matvec_consumer(dw);
+                                                        bool dc = is_dp4a_matvec_consumer(d_n);
                                                         // Also require src[1]->ne[1..3] == 1 so the
                                                         // matmul takes the dp4a M=1 path that uses
                                                         // the q8_1 scratch cache.
@@ -6971,7 +9736,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                         if (getenv("DX12_RMSNORM_QUANT_FUSION_DEBUG")) {
                                             fprintf(stderr,
                                                 "[rms_q81_skipf32] node=%d next=%p safe=%d consumer=%p type=%d K=%lld\n",
-                                                i, (void*)next, safe, (void*)c, (int)w, (long long)next->ne[0]);
+                                                i, (void*)next, safe, (void*)c, (int)c->src[0]->type, (long long)next->ne[0]);
                                         }
                                     }
                                 }
@@ -7012,6 +9777,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) &&
                 scale_bias == 0.0f && std::isfinite(scale_value) &&
                 (q_mode == 0 || q_mode == 2) &&
+                ((const int32_t *)node->op_params)[15] == 0 &&   // no n_offs
                 dx12_tensor_consumed_only_by(cgraph, node, scale) &&
                 dx12_get_resource(node->src[0]) &&
                 dx12_get_resource(node->src[1]) &&
@@ -7081,8 +9847,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             int rope_mode = ((const int32_t *)node->op_params)[2];
             // The fused rope_set_rows shader implements attn_factor,
             // freq_factors, and YaRN ext_factor (corr_low/high precomputed host-side).
-            // Only fuse standard ROPE (mode 0/2), not mrope/imrope
-            if (rope_mode == 0 || rope_mode == 2) {
+            // Only fuse standard ROPE (mode 0/2), not mrope/imrope, and only
+            // when the rotation window starts at 0 (no n_offs support here).
+            if ((rope_mode == 0 || rope_mode == 2) && dx12_rope_n_offs(node) == 0) {
                 struct ggml_tensor * view = cgraph->nodes[i + 1];
                 struct ggml_tensor * set_rows = cgraph->nodes[i + 2];
                 if (view->op == GGML_OP_VIEW && set_rows->op == GGML_OP_SET_ROWS &&
@@ -7126,7 +9893,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // 250-token Phi-3 generation coherent). Allow dp4a by default;
         // DX12_NO_DP4A_WAVE64=1 falls back to MR if a regression appears.
         const bool no_dp4a_wave64 = (DX12_GETENV("DX12_NO_DP4A_WAVE64") != nullptr);
-        const bool allow_dp4a_wave = !(no_dp4a_wave64 && bctx->dev->wave_size >= 64);
+        const bool allow_dp4a_wave = !(no_dp4a_wave64 && bctx->dev->wave_size >= 64) &&
+                                     dx12_src1_allows(node, GGML_PREC_Q8);
         if (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->src[0]) {
             ggml_type t = node->src[0]->type;
             // The quantized matvec shaders read src1 with a hard-coded 4-byte
@@ -7176,9 +9944,20 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     if (src1_f32_contiguous && src0_vector_aligned) {
                         bool is_amd_wave64 = (bctx->dev->wave_size >= 64);
                         uint32_t K = (uint32_t)node->src[0]->ne[0];
-                        bool use_256 = is_amd_wave64
-                                    || bctx->dev->f16_mr_use_256
-                                    || (K >= bctx->dev->f16_mr_k_256_threshold);
+                        uint32_t threshold = t == GGML_TYPE_F16
+                            ? bctx->dev->f16_mr_k_256_threshold
+                            : (t == GGML_TYPE_BF16
+                                ? bctx->dev->bf16_mr_k_256_threshold
+                                : bctx->dev->f32_mr_k_256_threshold);
+                        bool use_256 = is_amd_wave64 || K >= threshold;
+                        const char * threads_env = t == GGML_TYPE_F16
+                            ? DX12_GETENV("DX12_F16_MR_THREADS")
+                            : (t == GGML_TYPE_BF16
+                                ? DX12_GETENV("DX12_BF16_MR_THREADS")
+                                : DX12_GETENV("DX12_F32_MR_THREADS"));
+                        if (threads_env) {
+                            use_256 = std::atoi(threads_env) >= 256;
+                        }
                         key.flags = use_256 ? 11 : 12;
                         if (t == GGML_TYPE_F16 &&
                             bctx->dev->adapter_desc.VendorId == dx12_vendor::AMD &&
@@ -7355,6 +10134,17 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         (node->src[1]->ne[0] % 32) == 0) {
                         key.flags = 10;          // Q4_K dp4a multi-row matvec
                         if (bctx->dev->q4k_dp4a_use_32) key.flags = 13; // 32-thread variant
+                        // Short-K UMA projections leave most lanes idle in the 256-thread shader.
+                        if (nv_igpu && bctx->dev->wave_size == 32 &&
+                            node->src[0]->ne[0] == 1024 &&
+                            (node->ne[0] == 512 || node->ne[0] == 1024) &&
+                            node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
+                            !DX12_GETENV("DX12_TUNE_FORCE_Q4K_DP4A_32")) {
+                            key.flags = 13;
+                        }
+                        if (const char * threads_env = DX12_GETENV("DX12_Q4K_DP4A_THREADS")) {
+                            key.flags = std::atoi(threads_env) <= 32 ? 13 : 10;
+                        }
                         // Opt-in 4-row variant (DX12_Q4K_DP4A_MR4=1): gated to
                         // AMD wave>=64 only (Vulkan parity — `rm_kq=4` on AMD
                         // GCN). Halves dispatch count vs the 2-row default; pays
@@ -7383,13 +10173,22 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         ggml_is_contiguous(node->src[1]) &&
                         (node->src[1]->ne[0] % 32) == 0) {
                         key.flags = 14;          // Q5_K dp4a multi-row matvec (256t)
-                        // 32t opt-in: global override OR per-dispatch M-threshold.
-                        // Larger M dispatches more workgroups with 32t, which on
-                        // wave64 iGPUs (AMD 880M) wins by ~2x at M>=9216.
+                        // Runtime tuning selects a device-wide default. Shape
+                        // thresholds remain explicit offline-tuning overrides.
                         uint32_t M = (uint32_t)node->src[0]->ne[1];
-                        if (bctx->dev->q5k_dp4a_use_32 ||
-                            M >= bctx->dev->q5k_dp4a_m_32_threshold) {
+                        bool default_32 = bctx->dev->q5k_dp4a_use_32;
+                        if (const char * default_env = DX12_GETENV("DX12_Q5K_DP4A_DEFAULT_THREADS")) {
+                            default_32 = std::atoi(default_env) <= 32;
+                        }
+                        uint32_t m_threshold = bctx->dev->q5k_dp4a_m_32_threshold;
+                        if (const char * m_env = DX12_GETENV("DX12_Q5K_DP4A_M_THRESH")) {
+                            m_threshold = (uint32_t)std::strtoul(m_env, nullptr, 10);
+                        }
+                        if (default_32 || M >= m_threshold) {
                             key.flags = 16; // 32-thread variant
+                        }
+                        if (const char * threads_env = DX12_GETENV("DX12_Q5K_DP4A_THREADS")) {
+                            key.flags = std::atoi(threads_env) <= 32 ? 16 : 14;
                         }
                         use_dp4a_matvec = true;  // triggers Q8_1 quantize pre-pass
                     }
@@ -7482,6 +10281,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             key.flags = 107;     // Q6_K dp4a NUM_ROWS=4
                         }
                         use_dp4a_matvec = true;  // triggers Q8_1 quantize pre-pass
+                        if (key.flags == 23 && dx12_flag_default_on("DX12_Q6K_PACKED_MMV") &&
+                            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !bctx->dev->is_igpu &&
+                            bctx->dev->blob_wave_size == 64 && node->ne[1] == 1 &&
+                            (node->ne[0] >= 65536 ||
+                             (dx12_flag_default_on("DX12_Q6K_PACKED_HEAD") &&
+                              node->src[0]->ne[0] == 1024 && node->ne[0] >= 32768)) &&
+                            ggml_get_op_params_i32(node, 0) == GGML_PREC_DEFAULT) {
+                            key.flags = DX12_Q6K_PACKED_MMV_FLAG;
+                        }
                     }
                     const char * q6k_subgroup_env = DX12_GETENV("DX12_Q6K_SUBGROUP");
                     // Default on across all vendors (wave-portable shader;
@@ -7860,6 +10668,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                          : width == 8 ? DX12_GETENV("DX12_Q4K_DP4A_NC8")
                          : width == 16 ? DX12_GETENV("DX12_Q4K_DP4A_NC16")
                                        : DX12_GETENV("DX12_Q4K_DP4A_NC32");
+                    // DX12_Q4K_NC_ROWS4=1 swaps NC2/NC4 for variants that emit
+                    // 4 output rows per group instead of 2.  Opt-in: no win on
+                    // Intel Xe3 (TUNING.md 17), untested on other vendors.
+                    if (width <= 4) {
+                        const char * r4 = DX12_GETENV("DX12_Q4K_NC_ROWS4");
+                        if (r4 != nullptr && atoi(r4) != 0) {
+                            flag = width == 2 ? 143 : 144;
+                        }
+                    }
                     break;
                 case GGML_TYPE_Q5_K:
                     flag = width == 2 ? 50 : (width == 4 ? 126 :
@@ -7987,43 +10804,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     bctx->dev->arch_family == DX12_ARCH_INTEL_UHD &&
                     node->ne[0] >= 64 && node->ne[1] >= 64 &&
                     dx12_flag_default_on("DX12_Q50_Q81_64")) {
-                    key.flags = 114;
+                    key.flags = 154;
                 }
                 if (t == GGML_TYPE_Q4_K &&
                     bctx->dev->arch_family == DX12_ARCH_INTEL_UHD &&
                     node->ne[0] >= 64 && node->ne[1] >= 64 &&
                     dx12_flag_default_on("DX12_Q4K_Q81_64")) {
-                    key.flags = 115;
+                    key.flags = 155;
                 }
                 if (t == GGML_TYPE_Q6_K &&
                     bctx->dev->arch_family == DX12_ARCH_INTEL_UHD &&
                     node->ne[0] >= 64 && node->ne[1] >= 64 &&
                     dx12_flag_default_on("DX12_Q6K_Q81_64")) {
-                    key.flags = 116;
+                    key.flags = 156;
                 }
                 use_dp4a = true;
-                // Register-blocked integer-dot GEMM: a MMQ_BM x MMQ_BN tile
-                // with 32 accumulators per thread against the 32x32 tile's 4,
-                // and quad-major groupshared tiles so the inner-loop reads do
-                // not collide on one LDS bank. Needs only SM 6.6
-                // dot4add_i8packed. Intel UHD keeps the flag-59 variant.
-                if (bctx->dev->arch_family != DX12_ARCH_INTEL_UHD &&
-                    node->ne[1] >= 64) {
-                    static const int mmq_min_n_env =
-                        ([]{ const char * e = DX12_GETENV("DX12_MMQ_MIN_N");
-                             return e ? std::max(0, atoi(e)) : -1; })();
-                    const uint32_t mmq_min_n = mmq_min_n_env >= 0
-                        ? (uint32_t)mmq_min_n_env : 256u;
-                    if (mmq_min_n != 0 && (uint32_t)node->ne[0] >= mmq_min_n) {
-                        switch (t) {
-                            case GGML_TYPE_Q8_0: key.flags = 104; break;
-                            case GGML_TYPE_Q4_K: key.flags = 127; break;
-                            case GGML_TYPE_Q5_K: key.flags = 128; break;
-                            case GGML_TYPE_Q6_K: key.flags = 129; break;
-                            default: break;
-                        }
-                    }
-                }
+                // The register-blocked integer-dot GEMM can override this
+                // further down, after the LinAlg block has had its say - on a
+                // LinAlg-capable device the choice depends on whether the
+                // wave-matrix path claimed the node.
                 goto skip_wmma_batch;
             }
             // Q8_0: the wmma tiled kernel (32x32 tile, on-the-fly dequant into
@@ -8113,6 +10912,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // because its 576- and 1536-wide projections emit only
                     // 72-192 tiles, while Phi-3's smallest GEMM emits 384.
                     if (t == GGML_TYPE_F16 && bctx->dev->fp16_supported &&
+                        dx12_src1_allows(node, GGML_PREC_F16) && dx12_acc_allows_f16(node) &&
                         node->ne[0] >= 64 && node->ne[1] >= 64) {
                         const char * wmma_fp16_env = DX12_GETENV("DX12_WMMA_FP16");
                         const bool wmma_fp16_arch =
@@ -8150,6 +10950,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                             (nv_igpu && node->ne[1] >= 512);
                         const bool wmma_fp16_auto =
                             wmma_fp16_arch && !amd_rdna3_igpu && !amd_rdna4 &&
+                            !(bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                              bctx->dev->linalg_matrix_supported) &&
                             wmma_fp16_occupancy &&
                             node->ne[0] >= 256 && node->ne[1] >= 256;
                         const bool wmma_fp16 =
@@ -8231,12 +11033,547 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     key.flags = 106;
                 }
             }
+#ifdef GGML_DX12_LINALG_PREVIEW
+            // SM 6.10 wave-matrix GEMM. Same 64x64 output tile as fl=105 but
+            // the inner product runs on the matrix units instead of the FP32
+            // ALUs. Only reachable on a device advertising the feature and on
+            // a build compiled with the preview toolchain.
+            //
+            // DX12_LINALG_MM=0 falls back to fl=105. DX12_LINALG_MM=1 also
+            // routes the small and ragged fl=4 shapes here, which is the only
+            // way to exercise the kernel's edge handling from
+            // test-backend-ops: its F16 cases never reach the 64x64 gate.
+            // Q8_0 and the K-quants reach the same kernel through a dequant
+            // staging path, which is what the bulk of a real prefill runs on.
+            const bool linalg_src1_f32 =
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32;
+            const ggml_type linalg_t =
+                node->src[0] ? node->src[0]->type : GGML_TYPE_COUNT;
+
+            // The Intel Xe3 kernel uses F16 accumulators. The tile-selection
+            // block below requires an F32 accumulator, which this driver does
+            // not advertise. Composing larger F16 tiles does not add F32 MMA.
+            //
+            // The divisibility gates are not tuning: root SRVs are not bounds
+            // checked, so a partial tile reads outside the weight tensor. The
+            // shader handles the M tail itself (padded scratch plus a guarded
+            // store) and skips whole waves past ne0, so only K and N need a
+            // gate here.
+            bool linalg_iw = false;
+            // F16 comes from the descriptor; quantized weights are staged in LDS.
+            const bool iw_f16 = (linalg_t == GGML_TYPE_F16);
+            const bool iw_q8  = (linalg_t == GGML_TYPE_Q8_0);
+            const bool iw_q50 = (linalg_t == GGML_TYPE_Q5_0);
+            const bool iw_q4k = (linalg_t == GGML_TYPE_Q4_K) &&
+                                node->src[0]->ne[0] % 256 == 0;
+            const uint32_t iw_quant_flag = dx12_iw_quant_flag(linalg_t);
+            const bool iw_q = iw_quant_flag != 0;
+            const char * iw_min_m_env = iw_q50 ? DX12_GETENV("DX12_LINALG_Q50_MIN_M") : nullptr;
+            const int64_t iw_min_m = iw_min_m_env ? std::max<int64_t>(2, atoll(iw_min_m_env)) : DX12_IWQ8_BM;
+            if (dx12_src1_allows(node, GGML_PREC_F16) && dx12_acc_allows_f16(node) &&
+                bctx->dev->linalg_matrix_supported &&
+                bctx->dev->linalg_wave_f16_8x16x16_supported &&
+                !bctx->dev->linalg_wave_f16_16x16_supported &&
+                bctx->dev->fp16_supported &&
+                node->src[0] && node->src[1] &&
+                (iw_f16 || iw_q) && linalg_src1_f32 &&
+                ggml_is_contiguous(node->src[1]) &&
+                node->src[0]->nb[0] == ggml_type_size(linalg_t) &&
+                // M=1 is decode, and an 8-row tile would throw away seven
+                // eighths of the work; the matvec kernels own that shape.
+                node->ne[1] >= 2 &&
+                // K must fill whole fold windows: the shader accumulates in
+                // F16 and drains to F32 every LA_K*FOLD_BLOCKS elements. At
+                // 64 that also covers the 32-element Q8_0 block, so a staged
+                // group of four quants never straddles a block.
+                node->src[0]->ne[0] % (16 * DX12_IW_FOLD) == 0 &&
+                (!iw_q || node->src[0]->ne[0] % ggml_blck_size(linalg_t) == 0) &&
+                node->ne[0] % (16 * (iw_q ? DX12_IWQ8_NTILE : DX12_IW_NTILE)) == 0 &&
+                // The quants have tuned dp4a matvecs that own the thin shapes
+                // and beat a matrix tile there by 3-5x: at n=8 only 32 groups
+                // launch and the machine idles (TUNING.md section 37).
+                (!iw_q || node->ne[1] >= iw_min_m) &&
+                node->src[0]->nb[1] % 4 == 0 &&
+                node->src[0]->nb[2] % 4 == 0 &&
+                node->src[0]->nb[3] % 4 == 0 &&
+                dx12_tensor_offset(node->src[0]) % 4 == 0) {
+                const char * iw_env = DX12_GETENV("DX12_LINALG_F16_WAVE");
+                const bool iw_enabled = iw_env == nullptr || iw_env[0] != '0';
+                const bool iw_q8_enabled = dx12_gemm_route_enabled(
+                    DX12_GETENV("DX12_LINALG_Q8_WAVE"), bctx->dev);
+                const bool iw_q4k_enabled = dx12_gemm_route_enabled(
+                    DX12_GETENV("DX12_LINALG_Q4K_WAVE"), bctx->dev);
+                const bool iw_q50_enabled = dx12_gemm_route_enabled(
+                    DX12_GETENV("DX12_LINALG_Q50_WAVE"), bctx->dev);
+                const char * iw_extra_env =
+                    linalg_t == GGML_TYPE_Q6_K ? DX12_GETENV("DX12_LINALG_Q6K_WAVE") :
+                    linalg_t == GGML_TYPE_Q5_K ? DX12_GETENV("DX12_LINALG_Q5K_WAVE") :
+                                              DX12_GETENV("DX12_LINALG_QUANT_WAVE");
+                const bool iw_extra_enabled = iw_extra_env && iw_extra_env[0] != '0';
+                const bool iw_q_ok = iw_q50 ? iw_q50_enabled : iw_q8 ? iw_q8_enabled :
+                                     iw_q4k ? iw_q4k_enabled : iw_extra_enabled;
+                if (iw_enabled && (iw_f16 || iw_q_ok)) {
+                    key.flags  = iw_f16 ? 264 : iw_quant_flag;
+                    use_dp4a   = false;
+                    linalg_iw  = true;
+                }
+            }
+            if (!linalg_iw) {
+            const bool linalg_q8 = linalg_src1_f32 && linalg_t == GGML_TYPE_Q8_0;
+            // A K-quant file falls back to Q5_0 on any row that is not a
+            // multiple of 256, which for SmolLM2/SmolVLM2 (576 wide) is most
+            // of the model. Without this those GEMMs drop to the legacy tiled
+            // kernel at a fraction of the matrix path's throughput. The other
+            // 32-element block types ride the same staging path.
+            const bool linalg_q50 = linalg_src1_f32 &&
+                (linalg_t == GGML_TYPE_Q5_0 || linalg_t == GGML_TYPE_Q4_0 ||
+                 linalg_t == GGML_TYPE_Q4_1 || linalg_t == GGML_TYPE_Q5_1 ||
+                 linalg_t == GGML_TYPE_IQ4_NL || linalg_t == GGML_TYPE_MXFP4) &&
+                node->src[0]->ne[0] % 32 == 0;
+            const bool linalg_kq = linalg_src1_f32 &&
+                (linalg_t == GGML_TYPE_Q4_K || linalg_t == GGML_TYPE_Q5_K ||
+                 linalg_t == GGML_TYPE_Q6_K) &&
+                node->src[0]->ne[0] % 256 == 0;
+            const bool linalg_quant = linalg_q8 || linalg_kq || linalg_q50;
+            if (dx12_src1_allows(node, GGML_PREC_F16) &&
+                bctx->dev->linalg_matrix_supported &&
+                bctx->dev->linalg_wave_f16_16x16_supported &&
+                bctx->dev->fp16_supported &&
+                node->src[0] &&
+                (linalg_t == GGML_TYPE_F16 || linalg_t == GGML_TYPE_BF16 ||
+                 linalg_t == GGML_TYPE_F32 || linalg_quant)) {
+                // 0 = off, 1 = tiled shapes only, 2 = also the fl=4 shapes
+                const int linalg_mm =
+                    ([]{ const char * e = DX12_GETENV("DX12_LINALG_MM");
+                         if (e == nullptr)  return 1;
+                         if (e[0] == '0')   return 0;
+                         return 2; })();
+                const int linalg_mm_q8 =
+                    ([]{ const char * e = DX12_GETENV("DX12_LINALG_MM_Q8");
+                         if (e == nullptr)  return 1;
+                         if (e[0] == '0')   return 0;
+                         return 2; })();
+                const int linalg_mm_kq =
+                    ([]{ const char * e = DX12_GETENV("DX12_LINALG_MM_KQ");
+                         if (e == nullptr)  return 1;
+                         if (e[0] == '0')   return 0;
+                         return 2; })();
+                const int quant_mode = linalg_kq ? linalg_mm_kq : linalg_mm_q8;                // The quantised path has no fl=105 equivalent to key off, so
+                // it uses the same shape rule fl=105 applies to floats.
+                // Below 64 rows the tile is mostly padding, but neither
+                // alternative has a small-batch path at all: the matvec kernels
+                // re-read the weights per row and the int-dot GEMM has its own
+                // row minimum. The padded wave-matrix tile still streams the
+                // weights once, so it wins by a wide margin over the shapes
+                // speculative decoding and small-batch serving produce.
+                // 2, not 1: M=1 is decode, which wants the mat-vec kernels.
+                // At M=2 the 32x32 wmma tile wastes 30 of its 32 rows - the
+                // SmolVLM2 mtmd 2-row text chunk cost 7.10 ms of GPU on fl=4
+                // and 3.95 ms once routed here, reproducible to +/-0.05 ms.
+                static const int64_t linalg_mm_min_m =
+                    ([]{ const char * e = DX12_GETENV("DX12_LINALG_MM_MIN_M");
+                         return e ? atoll(e) : 2; })();
+                const bool quant_take = linalg_quant && quant_mode != 0 &&
+                    (quant_mode == 2 ||
+                     (node->ne[0] >= 128 && node->ne[1] >= linalg_mm_min_m));
+                // Floats had no small-batch rule at all: fl=105 needs 64 rows,
+                // so anything narrower fell back to the 32x32 wmma tile even
+                // though the argument above applies just as well to floats -
+                // the padded wave-matrix tile still streams the weights once.
+                // SmolVLM2 F16 mtmd prefill (7-row text GEMMs) 1294 -> 1578 t/s.
+                const bool float_take = !linalg_quant && key.flags == 4 &&
+                    node->ne[0] >= 128 && node->ne[1] >= linalg_mm_min_m;
+                if (linalg_mm != 0 &&
+                    (quant_take || float_take || key.flags == 105 ||
+                     (linalg_mm == 2 && key.flags == 4 && !linalg_quant))) {
+                    // Pick the tile shape. Two things matter: the group count
+                    // has to fill the machine, and a wave wants as many
+                    // accumulators as it can hold per staging load, since it
+                    // issues LA_MT*LA_NT MACs against LA_MT+LA_NT LDS reads.
+                    // The 128x128 tile splits its 4 waves as a 2x2 grid over
+                    // the output (LA_WN=2), which is the only way to reach 16
+                    // accumulators per wave - stacking waves along M alone
+                    // caps it at 8. Measured Q8_0 TFLOP/s at M=512:
+                    //
+                    //   tile      N=1536  N=576  K=1536,N=576
+                    //   128x64      42.4   11.3     14.7
+                    //   128x128     30.9    7.3     10.9
+                    //   32x32       24.6   16.6     19.4
+                    //   32x16       16.3   14.9     16.5
+                    //
+                    // so the big tiles need width and the small ones need the
+                    // group count, and taking the largest that still fills the
+                    // machine picks the winner in every column. 128x128 only
+                    // pays off well above these sizes (Qwen3-4B K=2560 N=4096:
+                    // 61.1 vs 128x64's 48.1), which is why it is tried first
+                    // but rarely selected on small models.
+                    // Forcing the small tiles everywhere costs Qwen3-4B 18%.
+                    const uint32_t linalg_mm_target =
+                        ([]{ const char * e = DX12_GETENV("DX12_LINALG_MM_GROUPS");
+                             return e ? (uint32_t)std::max(1, atoi(e)) : 0u; })();
+                    const uint32_t linalg_mm_target_default =
+                        bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS && !linalg_quant ? 32u : 64u;
+                    const uint32_t linalg_mm_target_use =
+                        linalg_mm_target ? linalg_mm_target : linalg_mm_target_default;
+                    const uint32_t la_n  = (uint32_t)node->ne[0];
+                    const uint32_t la_m  = (uint32_t)node->ne[1];
+                    const uint32_t la_bs = (uint32_t)(node->ne[2] * node->ne[3]);
+                    const uint32_t la_bm[4] = { 128, 128, 32, 32 };
+                    const uint32_t la_bn[4] = { 64, 128, 32, 16 };
+                    static const uint32_t la_order[4] = { 1, 0, 2, 3 };
+                    // Forces a slot index for A/B against the heuristic.
+                    const int la_force =
+                        ([]{ const char * e = DX12_GETENV("DX12_LINALG_TILE");
+                             return e ? atoi(e) : -1; })();
+                    uint32_t la_sel = 3;
+                    // The 2D-grid tile stages twice as much per K step, so it
+                    // only repays that once K is long enough: it wins big on
+                    // Qwen3-4B (K>=2560) but loses to NVIDIA's eight-wave
+                    // 128x64 tile on Qwen3-0.6B (K=1024) and SmolVLM2's
+                    // vision shapes (K=768). Group count alone cannot tell
+                    // these apart.
+                    const char * la_wide_min_k_env = DX12_GETENV("DX12_LINALG_TILE_MIN_K");
+                    const int64_t la_wide_min_k = la_wide_min_k_env
+                        ? atoll(la_wide_min_k_env)
+                        : (bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS && !linalg_quant ? 1024 : 2048);
+                    const int64_t la_k = node->src[0] ? node->src[0]->ne[0] : 0;
+                    for (uint32_t i = 0; i < 4; i++) {
+                        const uint32_t s = la_order[i];
+                        if (s == 1 && la_k < la_wide_min_k) { continue; }
+                        const uint32_t g = dx12_ceil_div(la_n, la_bn[s]) *
+                                           dx12_ceil_div(la_m, la_bm[s]) * la_bs;
+                        if (g >= linalg_mm_target_use) { la_sel = s; break; }
+                    }
+                    if (la_force >= 0 && la_force < 4) { la_sel = (uint32_t)la_force; }
+                    if (linalg_q8 && dx12_use_linalg_q8_smol(*bctx->dev, node)) { la_sel = 0; }
+                    // 207 float, 211 Q8_0, 215 Q4_K, 219 Q5_K, 223 Q6_K,
+                    // 230 Q5_0.
+                    uint32_t la_base = 207;
+                    if      (linalg_q8)                    la_base = 211;
+                    else if (linalg_t == GGML_TYPE_Q4_K)   la_base = 215;
+                    else if (linalg_t == GGML_TYPE_Q5_K)   la_base = 219;
+                    else if (linalg_t == GGML_TYPE_Q6_K)   la_base = 223;
+                    else if (linalg_q50)                   la_base =
+                linalg_t == GGML_TYPE_Q4_0   ? 234 :
+                linalg_t == GGML_TYPE_Q4_1   ? 238 :
+                linalg_t == GGML_TYPE_Q5_1   ? 242 :
+                linalg_t == GGML_TYPE_IQ4_NL ? 246 :
+                linalg_t == GGML_TYPE_MXFP4  ? 250 : 230;
+                    key.flags = la_base + la_sel;
+                    if (linalg_q8 &&
+                        bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS &&
+                        node->ne[1] <= 31 && node->src[0]->ne[0] >= 2048) {
+                        const char * q8_nc16_env = DX12_GETENV("DX12_LINALG_Q8_NC16");
+                        if (q8_nc16_env == nullptr || q8_nc16_env[0] != '0') {
+                            key.flags = 262;
+                        }
+                    }
+                    // The quantised path reads src1 as F32 directly, so the
+                    // Q8_1 pre-quantize the dp4a tile needs must not run.
+                    use_dp4a = false;
+                }
+
+                static const bool linalg_tg_enabled =
+                    ([]{ const char * e = DX12_GETENV("DX12_LINALG_TG");
+                         return e == nullptr || e[0] != '0'; })();
+                const bool linalg_tg_aligned =
+                    node->src[0] && node->src[1] &&
+                    node->src[0]->type == GGML_TYPE_F16 &&
+                    node->src[1]->type == GGML_TYPE_F32 &&
+                    node->src[0]->ne[0] % 16 == 0 &&
+                    node->ne[0] % 128 == 0 &&
+                    node->ne[1] % 64 == 0 &&
+                    node->src[0]->nb[0] == 2 &&
+                    node->src[1]->nb[0] == 4 &&
+                    node->nb[0] == 4 &&
+                    ((node->src[0]->view_offs | node->src[0]->nb[1] |
+                      node->src[0]->nb[2] | node->src[0]->nb[3]) & 31u) == 0 &&
+                    ((node->view_offs | node->nb[1] |
+                      node->nb[2] | node->nb[3]) & 127u) == 0;
+                if (linalg_tg_enabled &&
+                    bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                    (bctx->dev->linalg_tg_f16_64x128_supported ||
+                     bctx->dev->linalg_tg_f16_64x128_validated_fallback) &&
+                    bctx->dev->linalg_tg_f16_64x128_threads != 0 &&
+                    linalg_tg_aligned) {
+                    key.flags = 261;
+                }
+            }
+            }
+#endif
+
+            // Q8_0 prefill: a register-blocked integer-dot GEMM (128x64 tile,
+            // 32 accumulators per thread) beats the 32x32 integer tile
+            // everywhere it has been measured. Against the Q8_0 LinAlg
+            // wave-matrix path it wins from a moderate width upwards rather
+            // than only on very wide outputs: on RDNA4 the wave-matrix tiles
+            // manage 36-44 TFLOP/s on a 3072-wide output where the
+            // integer-dot kernel holds 45-47. Below roughly 1024 the 128x64
+            // tile is too coarse -- a 576-wide output is nine tiles across,
+            // which leaves most of the machine idle and drops the kernel to
+            // 10-12 TFLOP/s, well under what the smaller wave-matrix tiles
+            // reach. 111..114 are the Q8_0 LinAlg tile shapes.
+            // Shared row minimum for the int-dot GEMMs. Below this the node
+            // falls back to a matvec that re-reads the weights per row.
+            const char * mmq_min_m_env = DX12_GETENV("DX12_MMQ_MIN_M");
+            const bool mmq_min_m_explicit = mmq_min_m_env != nullptr;
+            const bool nv_large_k =
+                bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                node->src[0] && node->src[0]->ne[0] >= 2048;
+            const int64_t mmq_min_m = mmq_min_m_env
+                ? atoll(mmq_min_m_env)
+                : (nv_large_k ? 4 : 64);
+
+            // The int-dot GEMM only pulls ahead of the wave-matrix tiles once
+            // K is long enough to amortise its per-tile Q8_1 setup; below that
+            // the LinAlg tiles win outright, and the width gate above cannot
+            // see it because it only looks at N. Measured on Q8_0, M=512
+            // (LinAlg TFLOP/s vs int-dot):
+            //   K= 576 N=1536  42.4 vs 35.7
+            //   K=2560 N=4096  61.1 vs 48.1
+            //   K=4096 N=2560  47.3 vs 39.6
+            //   K=9728 N=2560  39.1 vs 41.0   <- int-dot back in front
+            // So hand the node to the int-dot kernel only past this K, and
+            // only when LinAlg actually claimed it (otherwise the old width
+            // rule still applies). NVIDIA is the exception: on RTX 5070 the
+            // fused int-dot path wins across the measured Qwen and Phi shapes,
+            // including short K, while LinAlg pays to dequantize through F16
+            // LDS before every matrix step.
+            static const int64_t mmq_min_k =
+                ([]{ const char * e = DX12_GETENV("DX12_MMQ_MIN_K");
+                     return e ? atoll(e) : 8192; })();
+            const bool mmq_k_ok = !node->src[0] || node->src[0]->ne[0] >= mmq_min_k;
+            const bool nv_linalg_mmq =
+                bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                bctx->dev->linalg_matrix_supported;
+
+            // Do not replace the explicitly enabled Xe3 wave kernels with MMQ.
+            if (t == GGML_TYPE_Q8_0 && key.flags != 265 && bctx->dev->dp4a_supported &&
+                allow_dp4a_wave &&
+                bctx->dev->arch_family != DX12_ARCH_INTEL_UHD &&
+                node->src[0] && node->src[0]->ne[0] % 32 == 0 &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1])) {
+                const int mmq_min_n_env =
+                    ([]{ const char * e = DX12_GETENV("DX12_MMQ_MIN_N");
+                         return e ? std::max(0, atoi(e)) : -1; })();
+                const bool linalg_took = key.flags >= 211 && key.flags <= 214;
+                const bool aligned_q8 = dx12_use_linalg_q8_aligned(*bctx->dev, node, key.flags);
+                // Packed loads also move the smaller down-projections back to LinAlg.
+                const bool rdna4_q8_linalg =
+                    bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS &&
+                    !bctx->dev->is_igpu &&
+                    mmq_min_n_env < 0 && !mmq_min_m_explicit &&
+                    DX12_GETENV("DX12_MMQ_MIN_K") == nullptr &&
+                    ((key.flags == 212 &&
+                      node->src[0]->ne[0] == 9728 && node->ne[0] == 2560 &&
+                      node->ne[1] >= (aligned_q8 ? 512 : 768) &&
+                      node->ne[1] <= 2048 && node->ne[1] % 256 == 0) ||
+                     (aligned_q8 && node->src[0]->ne[0] == 8192 && node->ne[0] == 3072 &&
+                      ((node->ne[1] == 256 && key.flags == 211) ||
+                       (node->ne[1] == 512 && key.flags == 212))));
+                const uint32_t mmq_min_n = mmq_min_n_env >= 0
+                    ? (uint32_t)mmq_min_n_env
+                    : (linalg_took
+                        ? (nv_linalg_mmq ? 1u : (mmq_k_ok ? 1024u : UINT32_MAX))
+                        : 256u);
+                // RDNA1/2 UMA has a second MMQ win below the normal crossover:
+                // M=2-16 nearly doubles small-model throughput, while M=32
+                // regresses, so keep the middle range on the existing path.
+                const bool rdna12_uma_small_m =
+                    !mmq_min_m_explicit &&
+                    bctx->dev->is_igpu &&
+                    bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA1_2 &&
+                    node->ne[1] >= 2 && node->ne[1] <= 16;
+                if (mmq_min_n != 0 &&
+                    (uint32_t)node->ne[0] >= mmq_min_n &&
+                    (node->ne[1] >= mmq_min_m || rdna12_uma_small_m) &&
+                    !rdna4_q8_linalg) {
+                    const char * narrow_64_env = DX12_GETENV("DX12_MMQ_NARROW64");
+                    // 2 = force regardless of width, for A/B measurement of the
+                    // 64x64 (4x4 per thread) tile. See TUNING.md section 41.
+                    const bool narrow_64 =
+                        (narrow_64_env
+                            ? narrow_64_env[0] != '0'
+                            : bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS) &&
+                        (node->ne[0] <= 2560 ||
+                         (narrow_64_env && narrow_64_env[0] == '2'));
+                    key.flags = narrow_64 ? 162 : 104;
+                    use_dp4a  = true;
+                }
+            }
+
+            // Same kernel shape for Q4_K. 115..118 are its LinAlg tiles.
+            if (t == GGML_TYPE_Q4_K && key.flags != 266 && bctx->dev->dp4a_supported &&
+                allow_dp4a_wave &&
+                bctx->dev->arch_family != DX12_ARCH_INTEL_UHD &&
+                node->src[0] && node->src[0]->ne[0] % 256 == 0 &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1])) {
+                const int mmq_min_n_env =
+                    ([]{ const char * e = DX12_GETENV("DX12_MMQ_MIN_N");
+                         return e ? std::max(0, atoi(e)) : -1; })();
+                const bool linalg_took = key.flags >= 215 && key.flags <= 218;
+                const bool nv_q4_linalg_mid_projection =
+                    mmq_min_n_env < 0 && nv_linalg_mmq &&
+                    node->src[0]->ne[0] == 4096 && node->ne[0] == 2560;
+                const uint32_t mmq_min_n = mmq_min_n_env >= 0
+                    ? (uint32_t)mmq_min_n_env
+                    : (linalg_took
+                        ? (nv_linalg_mmq ? 1u : (mmq_k_ok ? 4096u : UINT32_MAX))
+                        : 256u);
+                if (mmq_min_n != 0 &&
+                    (uint32_t)node->ne[0] >= mmq_min_n && node->ne[1] >= mmq_min_m &&
+                    !(linalg_took && nv_q4_linalg_mid_projection)) {
+                    const char * narrow_64_env = DX12_GETENV("DX12_MMQ_NARROW64");
+                    const bool narrow_64 =
+                        (narrow_64_env
+                            ? narrow_64_env[0] != '0'
+                            : bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS) &&
+                        (node->ne[0] <= 2560 ||
+                         (narrow_64_env && narrow_64_env[0] == '2'));
+                    key.flags = narrow_64 ? 163 : 127;
+                    use_dp4a  = true;
+                }
+            }
+
+            // Q2_K prefill uses the same register-blocked Q8_1 integer-dot
+            // tile. Default it on for AMD RDNA, with an explicit environment
+            // override available for other devices and A/B measurements.
+            const char * q2k_mmq_env = DX12_GETENV("DX12_Q2K_MMQ");
+            const bool q2k_mmq_enabled = q2k_mmq_env
+                ? q2k_mmq_env[0] != '0'
+                : bctx->dev->arch_family == DX12_ARCH_AMD_RDNA;
+            if (t == GGML_TYPE_Q2_K && bctx->dev->dp4a_supported &&
+                allow_dp4a_wave &&
+                bctx->dev->arch_family != DX12_ARCH_INTEL_UHD &&
+                q2k_mmq_enabled &&
+                node->src[0] && node->src[0]->ne[0] % 256 == 0 &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1])) {
+                const int mmq_min_n_env =
+                    ([]{ const char * e = DX12_GETENV("DX12_MMQ_MIN_N");
+                         return e ? std::max(0, atoi(e)) : -1; })();
+                const uint32_t mmq_min_n = mmq_min_n_env >= 0
+                    ? (uint32_t)mmq_min_n_env : 256u;
+                if (mmq_min_n != 0 &&
+                    (uint32_t)node->ne[0] >= mmq_min_n && node->ne[1] >= mmq_min_m) {
+                    key.flags = 160;
+                    use_dp4a  = true;
+                }
+            }
+
+            // Same kernel shape for Q5_K (219..222) and Q6_K (223..226).
+            if ((t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K) &&
+                key.flags != DX12_IW_Q5K_FLAG && key.flags != DX12_IW_Q6K_FLAG &&
+                bctx->dev->dp4a_supported && allow_dp4a_wave &&
+                bctx->dev->arch_family != DX12_ARCH_INTEL_UHD &&
+                node->src[0] && node->src[0]->ne[0] % 256 == 0 &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1])) {
+                const int mmq_min_n_env =
+                    ([]{ const char * e = DX12_GETENV("DX12_MMQ_MIN_N");
+                         return e ? std::max(0, atoi(e)) : -1; })();
+                const uint32_t la_lo = (t == GGML_TYPE_Q5_K) ? 219u : 223u;
+                const bool linalg_took =
+                    key.flags >= la_lo && key.flags <= la_lo + 3;
+                const bool nv_narrow =
+                    nv_linalg_mmq && node->ne[0] <= 2560;
+                // NVIDIA favors narrow MMQ through N=2560 and 128x128 MMQ at N>=4096.
+                // Keep the LinAlg crossover between them; other vendors keep wide Q6_K on LinAlg.
+                const uint32_t linalg_min_n =
+                    (t == GGML_TYPE_Q6_K && !nv_linalg_mmq) ? UINT32_MAX : 4096u;
+                const uint32_t mmq_min_n = mmq_min_n_env >= 0
+                    ? (uint32_t)mmq_min_n_env
+                    : (linalg_took
+                        ? (nv_narrow ? 1u : linalg_min_n)
+                        : 256u);
+                if (mmq_min_n != 0 &&
+                    (uint32_t)node->ne[0] >= mmq_min_n && node->ne[1] >= mmq_min_m) {
+                    const char * narrow_64_env = DX12_GETENV("DX12_MMQ_NARROW64");
+                    const bool narrow_64 =
+                        (narrow_64_env
+                            ? narrow_64_env[0] != '0'
+                            : nv_narrow) &&
+                        node->ne[0] <= 2560;
+                    key.flags = narrow_64
+                        ? ((t == GGML_TYPE_Q5_K) ? 164u : 165u)
+                        : ((t == GGML_TYPE_Q5_K) ? 128u : 129u);
+                    use_dp4a  = true;
+                }
+            }
+
+            const char * q50_intdot_env = DX12_GETENV("DX12_Q50_INTDOT");
+            const bool q50_intdot =
+                q50_intdot_env
+                    ? q50_intdot_env[0] != '0'
+                    : nv_linalg_mmq && node->ne[0] <= 2560;
+            if (t == GGML_TYPE_Q5_0 && key.flags != DX12_IW_Q50_FLAG &&
+                q50_intdot &&
+                bctx->dev->dp4a_supported && allow_dp4a_wave &&
+                node->src[0] && node->src[0]->ne[0] % 32 == 0 &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1]) &&
+                node->ne[0] >= 16 && node->ne[1] >= mmq_min_m) {
+                const char * q50_64_env = DX12_GETENV("DX12_Q50_Q81_64");
+                key.flags = q50_64_env && q50_64_env[0] != '0' &&
+                            node->ne[0] >= 64 && node->ne[1] >= 64
+                    ? 154u : 58u;
+                use_dp4a = true;
+            }
+
+            if (t == GGML_TYPE_Q5_0 && key.flags == 58 && use_dp4a &&
+                bctx->dev->arch_family != DX12_ARCH_INTEL_UHD &&
+                bctx->dev->fp16_supported && node->ne[1] >= 64) {
+                const bool q50_mmq_auto =
+                    bctx->dev->adapter_desc.VendorId == dx12_vendor::AMD &&
+                    bctx->dev->adapter_desc.DeviceId == 0x150E;
+                const char * e = DX12_GETENV("DX12_Q50_MMQ");
+                const bool q50_mmq = e ? e[0] != '0' : q50_mmq_auto;
+                const char * min_n_env = DX12_GETENV("DX12_MMQ_MIN_N");
+                const uint32_t min_n = min_n_env ? (uint32_t)std::max(0, atoi(min_n_env)) : 128u;
+                if (q50_mmq && min_n != 0 && (uint32_t)node->ne[0] >= min_n) {
+                    const char * share_env = DX12_GETENV("DX12_Q50_MMQ_WAVE_SHARE");
+                    const bool share = share_env
+                        ? share_env[0] != '0'
+                        : (q50_mmq_auto && bctx->dev->wave_size == 64);
+                    key.flags = share ? 149 : 147;
+                }
+            }
         }
 
         if (node->op == GGML_OP_MUL_MAT && node->ne[1] == 1 && node->src[0]) {
             const ggml_type t = node->src[0]->type;
             if (t == GGML_TYPE_Q2_0 || t == GGML_TYPE_TQ1_0 || t == GGML_TYPE_TQ2_0) {
-                key.flags = 131;
+                key.flags = 157;
+            }
+            const char * q2_dp4a_env = DX12_GETENV("DX12_Q2_0_DP4A");
+            const bool q2_dp4a = q2_dp4a_env ? q2_dp4a_env[0] != '0' : node->ne[0] >= 1024;
+            const char * q2_portable_env = DX12_GETENV("DX12_Q2_0_DP4A_PORTABLE");
+            const bool q2_portable = q2_portable_env
+                ? q2_portable_env[0] != '0'
+                : bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
+                  (bctx->dev->adapter_desc.VendorId == 0x1002 &&
+                   bctx->dev->adapter_desc.DeviceId == 0x150E);
+            if (t == GGML_TYPE_Q2_0 &&
+                q2_dp4a &&
+                bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS &&
+                bctx->dev->wave_size >= 64 &&
+                bctx->dev->dp4a_supported && allow_dp4a_wave &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1]) &&
+                (node->src[0]->ne[0] % 64) == 0) {
+                key.flags = 145;
+                use_dp4a_matvec = true;
+            } else if (t == GGML_TYPE_Q2_0 &&
+                       q2_dp4a &&
+                       q2_portable &&
+                       bctx->dev->dp4a_supported && allow_dp4a_wave &&
+                       node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                       ggml_is_contiguous(node->src[1]) &&
+                       (node->src[0]->ne[0] % 64) == 0) {
+                key.flags = 146;
+                use_dp4a_matvec = true;
             }
         }
 
@@ -8244,7 +11581,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // short-context decode). One global read per element vs three.
         // Neutral on B390 (compute-bound by exp), kept opt-in for vendors
         // where global memory bandwidth dominates. DX12_SOFT_MAX_CACHED=1.
-        if (node->op == GGML_OP_SOFT_MAX && node->src[0] &&
+        if (node->op == GGML_OP_SOFT_MAX && node->src[0] && !fused_moe_router_out &&
             node->src[0]->ne[0] <= 1024) {
             static const bool soft_max_cached_on =
                 (DX12_GETENV("DX12_SOFT_MAX_CACHED") != nullptr);
@@ -8271,18 +11608,19 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             if (t == GGML_TYPE_IQ1_S &&
                 node->ne[0] <= 65535 && node->ne[1] <= 65535 &&
                 node->ne[2] * node->ne[3] <= 65535) {
-                key.flags = 130;
+                key.flags = 158;
             }
         }
 
         // Tiled dense GEMM with dequant-to-LDS for the types above.  The
-        // per-element paths (43, 130) re-decode a weight row once per token,
+        // per-element paths (43, 158) re-decode a weight row once per token,
         // which dominates for codebook types; a 64x64 tile decodes it once
         // per 64 tokens.  Must be evaluated after them so it wins.  MXFP4,
         // NVFP4 and Q1_0 reach the same per-element template through the
         // src0_type fallback rather than flag 43, so they are picked up here
         // by type.
         if (bctx->dev->fp16_supported && node->op == GGML_OP_MUL_MAT &&
+            dx12_src1_allows(node, GGML_PREC_F16) && dx12_acc_allows_f16(node) &&
             node->ne[1] > 1 && node->src[0] && node->src[1]) {
             const ggml_type t = node->src[0]->type;
             const bool per_element_fallback =
@@ -8293,7 +11631,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             const char * mm_tok_env = DX12_GETENV("DX12_MM_GEMM_MINTOK");
             const int64_t mm_min_tok = mm_tok_env ? atoll(mm_tok_env) : 16;
             if (mm_enabled &&
-                (key.flags == 43 || key.flags == 130 || per_element_fallback) &&
+                (key.flags == 43 || key.flags == 158 || per_element_fallback) &&
                 node->ne[1] >= mm_min_tok &&
                 node->src[1]->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(node->src[1]) &&
@@ -8303,6 +11641,33 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 key.flags = 121;
             }
         }
+
+#ifdef GGML_DX12_LINALG_PREVIEW
+        const char * staged_wave_env = DX12_GETENV("DX12_LINALG_DENSE_STAGED");
+        if (node->op == GGML_OP_MUL_MAT && staged_wave_env && staged_wave_env[0] != '0' &&
+            dx12_src1_allows(node, GGML_PREC_F16) && dx12_acc_allows_f16(node) &&
+            !dx12_is_iw_gemm(key.flags) &&
+            dx12_flag_default_on("DX12_LINALG_F16_WAVE") &&
+            bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+            bctx->dev->linalg_matrix_supported &&
+            bctx->dev->linalg_wave_f16_8x16x16_supported &&
+            !bctx->dev->linalg_wave_f16_16x16_supported &&
+            bctx->dev->fp16_supported && bctx->dev->wave_size == 16 &&
+            node->src[0] && node->src[1] && dx12_iw_staged_type(node->src[0]->type) &&
+            node->ne[1] >= 16 &&
+            (node->src[1]->type == GGML_TYPE_F32 || node->src[1]->type == GGML_TYPE_F16) &&
+            node->src[0]->nb[0] == ggml_type_size(node->src[0]->type) &&
+            node->src[1]->nb[0] == ggml_type_size(node->src[1]->type) &&
+            node->src[0]->ne[0] % ggml_blck_size(node->src[0]->type) == 0 &&
+            dx12_ceil_div((uint32_t)node->ne[0], 64) <= 65535 &&
+            dx12_ceil_div((uint32_t)node->ne[1], 64) <= 65535 &&
+            (uint64_t)node->ne[2] * (uint64_t)node->ne[3] <= 65535) {
+            key.flags = DX12_IW_STAGED_FLAG;
+            use_dp4a = false;
+            use_dp4a_matvec = false;
+            is_matvec_dispatch = false;
+        }
+#endif
 
         // Cooperative MoE matvec for dense and common quant types.
         // This is lossless relative to the scalar path: F32 activations are read
@@ -8376,6 +11741,24 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 dx12_ceil_div((uint32_t)node->ne[0], 2) <= 65535) {
                 key.flags = 17;
                 use_dp4a_matvec = true;
+                const char * rows4_env = getenv("DX12_MOE_Q8_ROWS4");
+                if ((dx12_is_rtx5070_wave32(*bctx->dev) ||
+                     (dx12_is_b390_wave16(*bctx->dev) && rows4_env && rows4_env[0] == '1')) &&
+                    (!rows4_env || rows4_env[0] != '0') &&
+                    node->src[0]->ne[2] == 32 && node->src[0]->ne[3] == 1 &&
+                    node->ne[1] == 8 && node->ne[2] == 1 && node->ne[3] == 1 &&
+                    (node->src[1]->ne[1] == 1 || node->src[1]->ne[1] == 8) &&
+                    node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1 &&
+                    ((node->src[0]->ne[0] == 1024 && node->ne[0] == 512) ||
+                     (node->src[0]->ne[0] == 512 && node->ne[0] == 1024)) &&
+                    ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) &&
+                    node->src[2]->type == GGML_TYPE_I32 && node->src[2]->nb[0] == sizeof(int32_t) &&
+                    ((dx12_tensor_offset(node->src[0]) | node->src[0]->nb[1] |
+                      node->src[0]->nb[2] | dx12_tensor_offset(node->src[1]) |
+                      dx12_tensor_offset(node->src[2]) | dx12_tensor_offset(node)) & 3u) == 0 &&
+                    ggml_get_op_params_i32(node, 0) == GGML_PREC_DEFAULT) {
+                    key.flags = DX12_MMID_Q8_ROWS4_FLAG;
+                }
             }
         }
 
@@ -8407,11 +11790,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // MUL_MAT_ID Q4_K decode: dp4a on Q8_1 activations. Q4_K sub-blocks are
         // 32 elements and QK8_1 is 32, so they map 1:1 and one qs word feeds two
         // dp4a lanes (low and high nibbles). Reuses the Q8_1 quantize pre-pass
-        // and scratch already driven by use_dp4a_matvec, so the only new piece
-        // is the kernel itself. Mirrors the Q8_0 MoE dp4a route above.
-        // Decode only: the kernel is matvec-shaped (two output rows per group),
-        // so at prefill it re-reads the weights once per token and loses to the
-        // block decoder (granite-a400m pp2048 406 -> 334 on Arc B390).
+        // and scratch already driven by use_dp4a_matvec.
+        // Decode only: the matvec-shaped kernel loses to the block decoder at
+        // prefill. The LinAlg MMID route below remains last and may override it.
         if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] &&
             node->src[0]->type == GGML_TYPE_Q4_K &&
             dx12_flag_default_on("DX12_MOE_Q4K_DP4A") &&
@@ -8422,8 +11803,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             node->src[2]->ne[1] <= 8 &&
             (node->src[0]->ne[0] % 256) == 0 &&
             dx12_ceil_div((uint32_t)node->ne[0], 2) <= 65535) {
-            key.flags = 117;
+            key.flags = 159;
             use_dp4a_matvec = true;
+            if (dx12_mmid_rows4_enabled(*bctx->dev, node)) {
+                key.flags = DX12_MMID_Q4K_ROWS4_FLAG;
+            }
         }
 
         // Tiled MoE GEMM for prefill. Every matvec route above owns a single
@@ -8435,6 +11819,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // over the matvec variants, and only above a token floor that keeps
         // decode on them.
         if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] && node->src[1] && node->src[2] &&
+            dx12_src1_allows(node, GGML_PREC_F16) && dx12_acc_allows_f16(node) &&
             bctx->dev->fp16_supported) {
             const ggml_type t = node->src[0]->type;
             const bool gemm_type =
@@ -8478,6 +11863,104 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 (uint64_t)n_expert <= 65535) {
                 key.flags = gemm_tall ? 122 : 119;
                 use_dp4a_matvec = false;
+#ifdef GGML_DX12_LINALG_PREVIEW
+                const char * wave_env = DX12_GETENV("DX12_LINALG_MMID_WAVE");
+                const char * wave_extra_env = DX12_GETENV("DX12_LINALG_MMID_EXTRA");
+                const bool wave_extra = wave_extra_env && wave_extra_env[0] != '0' && ggml_is_quantized(t);
+                if (dx12_gemm_route_enabled(wave_env, bctx->dev) &&
+                    dx12_flag_default_on("DX12_LINALG_MMID") &&
+                    bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+                    bctx->dev->linalg_wave_f16_8x16x16_supported &&
+                    bctx->dev->wave_size == 16 && pairs_per_expert >= 128 &&
+                    (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+                     t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K || wave_extra)) {
+                    key.flags = DX12_MMID_IW_FLAG;
+                    is_matvec_dispatch = false;
+                }
+#endif
+            }
+        }
+
+       // MoE prefill on the wave-matrix GEMM. Every mul_mat_id_* kernel is a
+        // matvec, so each expert's weights get re-read once per routed token;
+        // with top-8 of 40 experts that is ~400x the necessary weight traffic
+        // and it dominates the whole graph. The row-map pass groups the rows
+        // by expert so the ordinary GEMM can run over them. Last, so it wins
+        // over the matvec selections above.
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] && node->src[2] &&
+            dx12_src1_allows(node, GGML_PREC_F16) &&
+            bctx->dev->linalg_matrix_supported &&
+            bctx->dev->linalg_wave_f16_16x16_supported &&
+            bctx->dev->fp16_supported) {
+            const int mmid_linalg =
+                ([]{ const char * e = DX12_GETENV("DX12_LINALG_MMID");
+                     return (e && e[0] == '0') ? 0 : 1; })();
+            const int64_t mmid_min_tok =
+                ([]{ const char * e = DX12_GETENV("DX12_LINALG_MMID_MIN_TOK");
+                     return e ? atoll(e) : 8; })();
+            const ggml_type t = node->src[0]->type;
+            const bool k256 = (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
+                               t == GGML_TYPE_Q6_K);
+            const bool b32  = (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q5_0 ||
+                               t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
+                               t == GGML_TYPE_Q5_1 || t == GGML_TYPE_IQ4_NL ||
+                               t == GGML_TYPE_MXFP4);
+            const bool type_ok = (t == GGML_TYPE_F16 || t == GGML_TYPE_BF16) ||
+                (k256 && node->src[0]->ne[0] % 256 == 0) ||
+                (b32  && node->src[0]->ne[0] % 32  == 0);
+            // One groupshared counter per expert bounds the routing table the
+            // group builds for itself.
+            if (mmid_linalg && type_ok &&
+                node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(node->src[1]) &&
+                node->src[0]->ne[2] <= 256 &&
+                node->ne[2] >= mmid_min_tok) {
+                // An expert's run is padded up to a whole tile, so the tall
+                // tile only pays off once the average per-expert row count
+                // covers it; below that the padding costs more than the
+                // weight re-reads it saves.
+                const int64_t n_rows  = node->ne[1] * node->ne[2] * node->ne[3];
+                const int64_t per_exp = n_rows / node->src[0]->ne[2];
+                const int64_t mmid_tall_min =
+                    ([]{ const char * e = DX12_GETENV("DX12_LINALG_MMID_TALL_MIN");
+                         return e ? atoll(e) : 64; })();
+                key.flags = (per_exp >= mmid_tall_min && node->ne[0] % 64 == 0)
+                          ? 202 : 200;
+                if (dx12_use_bucket_linalg_mmid(*bctx->dev, node, key.flags)) {
+                    key.flags = key.flags == 202 ? DX12_MMID_BUCKET_TALL_FLAG : DX12_MMID_BUCKET_FLAG;
+                    if (key.flags == DX12_MMID_BUCKET_TALL_FLAG && dx12_use_wide_bucket_linalg_mmid(*bctx->dev, node)) {
+                        key.flags = DX12_MMID_BUCKET_WIDE_FLAG;
+                    }
+                }
+                // The GEMM consumes F32 activations directly; leaving the
+                // matvec paths' Q8_1 pre-pass armed would rebind src1 to the
+                // quantised scratch underneath it.
+                use_dp4a_matvec = false;
+                is_matvec_dispatch = false;
+            }
+        }
+
+        // RDNA1/2 Q8_0 MoE prefill: group routed rows by expert and reuse each
+        // weight tile across a 128-row int-dot GEMM instead of repeated matvecs.
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] && node->src[2] &&
+            node->src[0]->type == GGML_TYPE_Q8_0 &&
+            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA1_2 &&
+            bctx->dev->dp4a_supported && allow_dp4a_wave &&
+            dx12_flag_default_on("DX12_MOE_Q8_MMQ") &&
+            node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(node->src[1]) &&
+            (node->src[0]->ne[0] % 32) == 0 &&
+            node->src[0]->ne[3] == 1 &&
+            node->src[0]->ne[2] <= 256) {
+            const int64_t mmid_mmq_min_tok =
+                ([]{ const char * e = DX12_GETENV("DX12_MOE_Q8_MMQ_MIN_TOK");
+                     return e ? atoll(e) : 32; })();
+            const int64_t n_rows = node->ne[1] * node->ne[2] * node->ne[3];
+            const int64_t n_tiles = (n_rows + 127) / 128 + node->src[0]->ne[2];
+            if (node->ne[2] >= mmid_mmq_min_tok && n_tiles <= 65535) {
+                key.flags = 203;
+                use_dp4a_matvec = true;
+                is_matvec_dispatch = false;
             }
         }
 
@@ -8530,7 +12013,39 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 key.flags = 18;
                 use_dp4a_matvec = false;
                 is_matvec_dispatch = false;
+                if (allow_dp4a_wave && dx12_mmid_rows4_enabled(*bctx->dev, node)) {
+                    key.flags = t == GGML_TYPE_Q4_K ? DX12_MMID_Q4K_ROWS4_FLAG : DX12_MMID_Q6K_ROWS4_FLAG;
+                    use_dp4a_matvec = true;
+                }
             }
+        }
+
+        const char * f16_expert_vec = getenv("DX12_MOE_F16_VEC");
+        if (node->op == GGML_OP_MUL_MAT_ID && (key.flags == 1 || key.flags == 18) &&
+            ((!bctx->dev->is_igpu && bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && bctx->dev->blob_wave_size == 64) ||
+             dx12_is_rtx5070_wave32(*bctx->dev) ||
+             (dx12_is_b390_wave16(*bctx->dev) && f16_expert_vec && f16_expert_vec[0] == '1')) &&
+            node->src[0] && node->src[1] &&
+            node->src[0]->type == GGML_TYPE_F16 && node->src[1]->type == GGML_TYPE_F32 &&
+            (f16_expert_vec ? f16_expert_vec[0] == '1' :
+                node->ne[2] == 1 &&
+                (bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS ||
+                 (node->src[0]->ne[2] == 32 && node->ne[1] == 8)) &&
+                ((node->src[0]->ne[0] == 1024 && node->ne[0] == 512) ||
+                 (node->src[0]->ne[0] == 512 && node->ne[0] == 1024))) &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
+            node->src[0]->ne[0] % 256 == 0 && node->ne[2] <= 8 && node->ne[3] == 1 &&
+            node->ne[1] <= 65535 && node->ne[0] <= 4 * 65535 &&
+            ggml_get_op_params_i32(node, 0) == GGML_PREC_DEFAULT &&
+            ((dx12_tensor_offset(node->src[0]) | node->src[0]->nb[1] | node->src[0]->nb[2] | node->src[0]->nb[3]) & 7u) == 0 &&
+            ((dx12_tensor_offset(node->src[1]) | node->src[1]->nb[1] | node->src[1]->nb[2] | node->src[1]->nb[3]) & 15u) == 0) {
+            key.flags = DX12_MMID_F16_VEC_FLAG;
+            if (bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && bctx->dev->blob_wave_size == 64 &&
+                dx12_flag_default_on("DX12_MOE_F16_WAVE")) {
+                key.flags = DX12_MMID_F16_WAVE_FLAG;
+            }
+            use_dp4a_matvec = false;
+            is_matvec_dispatch = false;
         }
 
         // The weighted expert tensor is laid out [N, n_used, n_tokens].
@@ -8577,18 +12092,215 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+#ifdef GGML_DX12_LINALG_PREVIEW
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+            dx12_src1_allows(node, GGML_PREC_F16) &&
+            bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+            bctx->dev->wave_size == 32 && bctx->dev->linalg_matrix_supported &&
+            bctx->dev->linalg_wave_f16_16x16_supported && bctx->dev->fp16_supported) {
+            const char * composed_env = DX12_GETENV("DX12_LINALG_NV_COMPOSED");
+            if (composed_env && (composed_env[0] < '0' || composed_env[0] > '1' || composed_env[1] != '\0')) {
+                DX12_LOG_ERROR("DX12_LINALG_NV_COMPOSED must be 0 or 1\n");
+                return GGML_STATUS_FAILED;
+            }
+            const ggml_type type = node->src[0]->type;
+            const int64_t k = node->src[0]->ne[0];
+            const int64_t n = node->ne[0];
+            const bool qualified_type_shape =
+                type == GGML_TYPE_Q5_K ? k == 3072 && n == 9216 && node->ne[2] == 1 && node->ne[3] == 1 :
+                type == GGML_TYPE_BF16 ? ((n == 1024 && (k == 1024 || k == 2048 || k == 3072)) ||
+                                          (k == 1024 && (n == 2048 || n == 3072))) &&
+                                          node->ne[2] == 1 && node->ne[3] == 1 : true;
+            // Qualified on RTX 5070 pp6144 with 512-token microbatches.
+            const bool automatic = bctx->dev->adapter_desc.DeviceId == 0x2F04 &&
+                node->ne[1] == 512 && node->ne[0] >= 512 && node->src[0]->ne[0] >= 1024 &&
+                qualified_type_shape &&
+                !DX12_GETENV("DX12_LINALG_TILE") && !DX12_GETENV("DX12_MMQ_MIN_N");
+            const bool enabled = composed_env ? composed_env[0] == '1' : automatic;
+            const bool supported_type = type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0 ||
+                                        type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
+                                        type == GGML_TYPE_Q4_0;
+            const bool format_enabled = type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || dx12_flag_default_on(
+                type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ? "DX12_LINALG_MM_KQ" : "DX12_LINALG_MM_Q8");
+            if (enabled && supported_type && format_enabled && dx12_flag_default_on("DX12_LINALG_MM") &&
+                dx12_composed_gemm_layout(node)) {
+                key.flags = DX12_NV_COMPOSED_FLAG;
+                use_dp4a = false;
+                use_dp4a_matvec = false;
+                is_matvec_dispatch = false;
+            }
+        }
+        if (dx12_use_linalg_q8_aligned(*bctx->dev, node, key.flags)) {
+            key.flags = key.flags == 211 ? DX12_LINALG_Q8_ALIGNED_128X64_FLAG : DX12_LINALG_Q8_ALIGNED_FLAG;
+        }
+        const bool pipeline_default = node->op == GGML_OP_MUL_MAT && node->src[0] &&
+            node->ne[1] == 512 &&
+            ((node->src[0]->ne[0] == 576 && (node->ne[0] == 192 || node->ne[0] == 576 || node->ne[0] == 1536)) ||
+             (node->src[0]->ne[0] == 1536 && node->ne[0] == 576)) &&
+            !DX12_GETENV("DX12_LINALG_TILE") && !DX12_GETENV("DX12_LINALG_TILE_MIN_K") &&
+            !DX12_GETENV("DX12_LINALG_MM_GROUPS");
+        const char * q8_pipeline = DX12_GETENV("DX12_LINALG_Q8_PIPELINE");
+        if ((q8_pipeline ? q8_pipeline[0] == '1' : pipeline_default) &&
+            key.flags == DX12_LINALG_Q8_ALIGNED_128X64_FLAG &&
+            dx12_linalg_pipeline_layout(node, DX12_Q8_PIPELINE_FLAG)) {
+            key.flags = DX12_Q8_PIPELINE_FLAG;
+        }
+        const char * f16_pipeline = DX12_GETENV("DX12_LINALG_F16_PIPELINE");
+        const int f16_pipeline_mode = f16_pipeline ? atoi(f16_pipeline) : (pipeline_default ? 1 : 0);
+        if ((f16_pipeline_mode == 1 || (f16_pipeline_mode == 2 && key.flags == 207) ||
+             (f16_pipeline_mode == 3 && key.flags == 209)) &&
+            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !bctx->dev->is_igpu &&
+            bctx->dev->blob_wave_size == 64 && (key.flags == 207 || key.flags == 209)) {
+            const uint32_t flag = key.flags == 207 ? DX12_F16_PIPELINE_FLAG : DX12_F16_PIPELINE_SMALL_FLAG;
+            if (dx12_linalg_pipeline_layout(node, flag)) {
+                key.flags = flag;
+            }
+        }
+        if (dx12_use_linalg_q50_packed(*bctx->dev, node, key.flags)) {
+            key.flags = DX12_LINALG_Q50_PACKED_BASE + key.flags - 230;
+        }
+        if (dx12_src1_allows(node, GGML_PREC_F16) && dx12_use_linalg_amd_composed(*bctx->dev, node)) {
+            key.flags = DX12_AMD_COMPOSED_FLAG;
+            use_dp4a = false;
+            use_dp4a_matvec = false;
+            is_matvec_dispatch = false;
+        }
+        if (node->op == GGML_OP_MUL_MAT &&
+            dx12_src1_allows(node, GGML_PREC_F16) && dx12_acc_allows_f16(node) &&
+            (node->src[0]->type == GGML_TYPE_F16 || dx12_iw_quant_flag(node->src[0]->type) != 0) &&
+            bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+            bctx->dev->linalg_matrix_supported && bctx->dev->fp16_supported &&
+            bctx->dev->linalg_wave_f16_8x16x16_supported &&
+            !bctx->dev->linalg_wave_f16_16x16_supported &&
+            node->ne[0] % 128 == 0 && node->ne[1] % 128 == 0) {
+            const char * tiled_env = DX12_GETENV("DX12_LINALG_TILED_GEMM");
+            if (!tiled_env && node->src[0]->type == GGML_TYPE_Q4_K) {
+                tiled_env = DX12_GETENV("DX12_LINALG_Q4K_VKPORT");
+            }
+            if (tiled_env && (tiled_env[0] < '0' || tiled_env[0] > '4' || tiled_env[1] != '\0')) {
+                DX12_LOG_ERROR("DX12_LINALG_TILED_GEMM / DX12_LINALG_Q4K_VKPORT must be 0..4\n");
+                return GGML_STATUS_FAILED;
+            }
+            // Wave32 modes 3/4 are opt-in (DX12_LINALG_TILED_W32=1): driver 32.0.101.9033 gives wrong
+            // results and device removal on B390. With the opt-in, B390 uses mode 3 automatically.
+            static const bool w32_enabled = [] {
+                const char * v = DX12_GETENV("DX12_LINALG_TILED_W32");
+                return v && v[0] == '1';
+            }();
+            const bool automatic = w32_enabled && bctx->dev->adapter_desc.DeviceId == 0xB080 &&
+                dx12_iw_tiled_shape(node->src[0]->type, node->ne[0], node->ne[1], node->src[0]->ne[0]);
+            // Mode 2 (wave16, F16 accumulate) is the default; its KLD stays at or below Vulkan's F16 accumulation.
+            // For F16 weights at n < 256 the wave GEMM is faster.
+            const int default_mode = node->src[0]->type == GGML_TYPE_F16 && node->ne[1] < 256 ? 0 : 2;
+            int mode = tiled_env ? tiled_env[0] - '0' : automatic ? 3 : default_mode;
+            if (mode > 2 && !w32_enabled) {
+                mode = 0;
+            }
+            const char * global_env = mode ? DX12_GETENV("DX12_LINALG_F16_WAVE") : nullptr;
+            const char * format_env = mode ? dx12_iw_format_env(node->src[0]->type) : nullptr;
+            const bool raw_weight_load = node->src[0]->type == GGML_TYPE_F16 ||
+                                         node->src[0]->type == GGML_TYPE_Q4_K ||
+                                         node->src[0]->type == GGML_TYPE_Q5_K;
+            if (mode != 0 &&
+                (!global_env || global_env[0] != '0') && (!format_env || format_env[0] != '0') &&
+                (mode > 2 || bctx->dev->wave_size == 16) &&
+                (mode <= 2 || bctx->dev->linalg_wave_f16_8x16x16_w32_supported) &&
+                (mode % 2 != 0 || dx12_tensor_offset(node) % 128 == 0) &&
+                node->src[0]->ne[0] % 64 == 0 &&
+                node->src[0]->ne[0] % ggml_blck_size(node->src[0]->type) == 0 &&
+                node->src[0]->nb[0] == ggml_type_size(node->src[0]->type) &&
+                (node->src[0]->type == GGML_TYPE_MXFP4 ||
+                 (node->src[0]->nb[1] % 2 == 0 && node->src[0]->nb[2] % 2 == 0 && node->src[0]->nb[3] % 2 == 0)) &&
+                (!raw_weight_load || (node->src[0]->nb[1] % 4 == 0 &&
+                                      node->src[0]->nb[2] % 4 == 0 && node->src[0]->nb[3] % 4 == 0)) &&
+                dx12_tensor_offset(node->src[0]) % 4 == 0 && ggml_nbytes(node->src[0]) % 4 == 0 &&
+                node->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[1]) &&
+                node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+                node->src[1]->ne[2] == node->ne[2] && node->src[1]->ne[3] == node->ne[3] &&
+                ggml_nbytes(node->src[0]) <= INT32_MAX &&
+                ggml_nbytes(node->src[1]) <= INT32_MAX && ggml_nbytes(node) <= INT32_MAX &&
+                dx12_tensor_offset(node->src[1]) % 4 == 0 && dx12_tensor_offset(node) % 4 == 0 &&
+                node->ne[0] / 128 <= 65535 && node->ne[1] / 128 <= 65535 &&
+                node->ne[2] * node->ne[3] <= 65535) {
+                key.flags = DX12_IW_VKPORT_BASE + mode - 1;
+                use_dp4a = false;
+                use_dp4a_matvec = false;
+                is_matvec_dispatch = false;
+            }
+        }
+#endif
+        if (key.flags == 4 && dx12_flag_default_on("DX12_F32_ROUTER") &&
+            dx12_f32_router_layout(*bctx->dev, node)) {
+            key.flags = DX12_F32_ROUTER_FLAG;
+        }
+        if (key.flags == 10 || key.flags == 13) {
+            const uint32_t short_flag = dx12_q4k_short_flag(*bctx->dev, node);
+            if (short_flag && (short_flag != DX12_Q4K_SHORT_DP4A_FLAG || allow_dp4a_wave)) {
+                key.flags = short_flag;
+                use_dp4a_matvec = short_flag == DX12_Q4K_SHORT_DP4A_FLAG;
+            }
+        }
+        if (dx12_use_small_m(*bctx->dev, node)) {
+            key.flags = node->src[0]->type == GGML_TYPE_Q8_0 ? DX12_Q8_SMALL_M_FLAG : DX12_F16_SMALL_M_FLAG;
+            is_matvec_dispatch = true;
+            use_dp4a = false;
+            use_dp4a_matvec = false;
+        }
         // Op fusion: MUL_MAT(M=1) + ADD -> matvec with fused bias add
-        if (!no_fusion && is_matvec_dispatch && key.flags != 83 && i + 1 < cgraph->n_nodes) {
+        // ne[1] == 1 is required: the fused shaders apply the bias to a single
+        // output column, and the ADD node is skipped. The NUM_COLS matvecs also
+        // set is_matvec_dispatch but produce 2..31 columns, so they must not
+        // reach here or the bias would be dropped for every column.
+        //
+        // The LinAlg GEMM tiles take the same bias, but from one contiguous
+        // value per output channel, and are exempt from the M=1 rule because
+        // they materialize the whole output tile.
+        const char * iw_bias_env = DX12_GETENV("DX12_LINALG_WAVE_BIAS");
+        const bool iw_bias = node->op == GGML_OP_MUL_MAT && dx12_is_iw_gemm(key.flags) &&
+                             bctx->dev->wave_size == 16 && iw_bias_env && iw_bias_env[0] != '0';
+        const bool linalg_gemm = node->op == GGML_OP_MUL_MAT &&
+            ((key.flags >= 207 && key.flags <= 226) ||
+             (key.flags >= 230 && key.flags <= 253) ||
+             dx12_is_linalg_q50_packed(key.flags) ||
+             key.flags == 262 || dx12_is_linalg_pipeline(key.flags) || key.flags == DX12_LINALG_Q8_ALIGNED_FLAG ||
+             key.flags == DX12_LINALG_Q8_ALIGNED_128X64_FLAG || iw_bias);
+        static const bool no_fuse_gemm_bias =
+            DX12_GETENV("DX12_NO_FUSE_GEMM_BIAS") != nullptr;
+        if (!no_fusion &&
+            ((is_matvec_dispatch && node->ne[1] == 1) ||
+             (linalg_gemm && !no_fuse_gemm_bias)) &&
+            key.flags != 83 && i + 1 < cgraph->n_nodes) {
             struct ggml_tensor * next = cgraph->nodes[i + 1];
             if (next->op == GGML_OP_ADD) {
                 struct ggml_tensor * bias = nullptr;
                 if (next->src[0] == node) bias = next->src[1];
                 else if (next->src[1] == node) bias = next->src[0];
-                // Bias must be F32, same shape as output, contiguous
-                if (bias && bias->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
-                    bias->ne[0] == node->ne[0] && ggml_is_contiguous(bias)) {
+                const bool layout_ok =
+                    ggml_are_same_shape(node, next) &&
+                    ggml_are_same_stride(node, next);
+                const bool bias_ok =
+                    bias && bias->type == GGML_TYPE_F32 &&
+                    bias->ne[0] == node->ne[0] &&
+                    ggml_is_contiguous(bias) &&
+                    (!linalg_gemm || ggml_nelements(bias) == node->ne[0]);
+                const bool consumer_ok =
+                    !linalg_gemm || dx12_tensor_consumed_only_by(cgraph, node, next);
+                if (bias_ok && node->type == GGML_TYPE_F32 &&
+                    next->type == GGML_TYPE_F32 && layout_ok && consumer_ok) {
                     fused_bias_add = next;
                     fused_bias_tensor = bias;
+                    if (iw_bias) {
+                        key.flags |= DX12_IW_BIAS_BIT;
+                    }
+                    if (linalg_gemm && DX12_GETENV("DX12_FUSE_GEMM_BIAS_LOG")) {
+                        fprintf(stderr,
+                                "[DX12_GEMM_BIAS] %s N=%lld M=%lld B=%lld flag=%u\n",
+                                node->name,
+                                (long long)node->ne[0],
+                                (long long)node->ne[1],
+                                (long long)(node->ne[2] * node->ne[3]),
+                                (unsigned)key.flags);
+                    }
                 }
             }
         }
@@ -8736,6 +12448,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         const int64_t q80_glu_k_max =
             q80_glu_k_env ? atoll(q80_glu_k_env) : (q80_glu_wide ? 4096 : 1024);
         if (!no_fusion && !no_mmv_glu && !fused_bias_add && is_matvec_dispatch &&
+            node->ne[1] == 1 &&
             i + 2 < cgraph->n_nodes &&
             node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
             (node->src[0]->type == GGML_TYPE_F16 ||
@@ -8821,6 +12534,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     // The dp4a GLU shader now has a cross-wave reduction, so it
                     // is correct on any wave size; dp4a support is still required.
                     if (node->src[0]->type == GGML_TYPE_Q8_0 && q80_glu_dp4a &&
+                        dx12_src1_allows(mm_up, GGML_PREC_Q8) &&
                         bctx->dev->dp4a_supported &&
                         allow_dp4a_wave && node->src[1]->type == GGML_TYPE_F32 &&
                         ggml_is_contiguous(node->src[1]) &&
@@ -8873,7 +12587,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Wq|Wk|Wv contiguous and redirected Qcur|Kcur|Vcur into one packed,
         // non-aliased resource, so the ordinary row-indexed matvec shader can
         // cover all three matrices by extending ne0. Post-ops remain separate.
-        if (!no_fusion && is_matvec_dispatch &&
+        if (!no_fusion && is_matvec_dispatch && node->ne[1] == 1 &&
             !fused_bias_add && !fused_mmv_glu_up && !fused_mmv_set_rows &&
             node->op == GGML_OP_MUL_MAT) {
             auto projection_it = projection_bundle_by_q.find(node);
@@ -8889,7 +12603,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                      (key.flags == 9 || key.flags == 17 ||
                       key.flags == 44 || key.flags == 67)) ||
                     (node->src[0]->type == GGML_TYPE_Q4_K && key.flags == 9);
-                if (route_ok && t->q_idx == i) {
+                if (route_ok && t->q_idx == i &&
+                    (!use_dp4a_matvec || (dx12_src1_allows(t->k, GGML_PREC_Q8) &&
+                                         dx12_src1_allows(t->v, GGML_PREC_Q8)))) {
                     fused_qkv_projection       = true;
                     fused_qkv_projection_k     = t->k;
                     fused_qkv_projection_v     = t->v;
@@ -9022,6 +12738,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 struct ggml_tensor * pos = rope->src[1];
                 struct ggml_tensor * ff  = rope->src[2];
                 if (rp[2] != 0) return false;                        // NORMAL only
+                if (rp[15] != 0) return false;                       // no n_offs
                 if (!(rp[1] > 0 && (rp[1] % 2) == 0)) return false;  // n_dims even
                 if (rope->type != GGML_TYPE_F32) return false;
                 if (!(rope->src[0] && rope->src[0]->ne[2] == 1 && rope->src[0]->ne[3] == 1)) return false;
@@ -9043,6 +12760,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     struct ggml_tensor * mm = cgraph->nodes[k];
                     if (!mm || mm->op != GGML_OP_MUL_MAT || mm->src[1] != activation) continue;
                     if (!mm->src[0]) continue;
+                    if (qkv_combined_flag == 99 && !dx12_src1_allows(mm, GGML_PREC_Q8)) continue;
                     const bool mixed_v_type =
                         qkv_mixed_q5_q8 && qkv_combined_flag == 77 &&
                         !qkv_v_q8_dp4a_route &&
@@ -9303,6 +13021,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 struct ggml_tensor * ff  = rope->src[2];  // freq_factors (optional)
                 bool rope_ok =
                     rope_mode == 0 &&                            // NORMAL only
+                    rp[15] == 0 &&                               // no n_offs
                     n_dims > 0 && (n_dims % 2) == 0 &&
                     rope->type == GGML_TYPE_F32 &&
                     rope->src[0] && rope->src[0]->ne[2] == 1 && rope->src[0]->ne[3] == 1 &&
@@ -9368,9 +13087,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // V-cache SET_ROWS matvec fusion (DX12_MMV_SET_ROWS_FUSION): a
         // standalone M=1 V-projection matvec on one of the retained AMD wave64
-        // decode shaders (F16 fl=63, Q8_0 fl=67, Q5_0 fl=72) writes its result
-        // straight into the scattered KV cache slot, eliminating the later V
-        // SET_ROWS dispatch. The chain is not contiguous: K-projection nodes
+        // decode shaders (F16 fl=63, Q8_0 fl=67, Q5_0 fl=72), Q4_K fl=9 or Q6_K
+        // fl=23 writes its result straight into the scattered KV cache slot,
+        // eliminating the later V SET_ROWS dispatch. The other fl=9 shaders
+        // have no scatter store. The chain is not contiguous: K-projection nodes
         // (and the K ROPE+SET_ROWS fusion) sit between the V matvec and the V
         // SET_ROWS, so only the SET_ROWS node is absorbed (the RESHAPE/VIEW in
         // between are already view-skips).
@@ -9382,7 +13102,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             node->type == GGML_TYPE_F32 &&
             node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
             (key.flags == 63 || key.flags == 67 || key.flags == 72 ||
-             key.flags == 9 || key.flags == 23)) {
+             (key.flags == 9 && node->src[0]->type == GGML_TYPE_Q4_K) || key.flags == 23)) {
             const int WINDOW = 16;
             int sr_idx = -1;
             for (int k = i + 1; k < cgraph->n_nodes && k <= i + WINDOW; ++k) {
@@ -9457,7 +13177,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                        node->src[0]->type != GGML_TYPE_BF16) {
                 rms_flag = 89;
                 ok0 = fused_mmv_glu_up;
-            } else if (fused_mmv_glu_glu && key.flags == 32) {
+            } else if (fused_mmv_glu_glu && key.flags == 32 &&
+                       node->src[0]->ne[0] <= q4k_glu_fold_k_max) {
                 rms_flag = 91;
                 ok0 = fused_mmv_glu_up;
             } else if (fused_mmv_glu_glu && key.flags == 66) {
@@ -9574,6 +13295,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        const char * q4_glu_wave = DX12_GETENV("DX12_Q4K_GLU_WAVE");
+        if ((q4_glu_wave ? q4_glu_wave[0] == '1' : node->ne[0] == 3072) && node->op == GGML_OP_MUL_MAT &&
+            (key.flags == 32 || key.flags == 91) &&
+            bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !bctx->dev->is_igpu &&
+            bctx->dev->blob_wave_size == 64 && node->src[0]->ne[0] == 1024 &&
+            node->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[1])) {
+            key.flags = key.flags == 32 ? DX12_Q4K_GLU_WAVE_FLAG : DX12_Q4K_GLU_WAVE_RMS_FLAG;
+        }
+
         // fl=67 is the gateway flag for the QKV merge, the Q/K ROPE fusion, the
         // V SET_ROWS fusion and the RMS fold; the scalar shaders it displaces
         // (fl=18/28) are excluded from all four by the {63,67,72} allow-list.
@@ -9602,23 +13332,66 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             use_dp4a_matvec = true;
         }
 
+#ifdef GGML_DX12_LINALG_PREVIEW
+        if (key.flags == 0 && bctx->dev->linalg_matrix_supported &&
+            (bctx->dev->linalg_wave_f16_16x16_supported || dx12_iw_aux_enabled(*bctx->dev)) &&
+            bctx->dev->fp16_supported) {
+            const bool iw_aux = dx12_iw_aux_enabled(*bctx->dev);
+            static const bool linalg_conv = [] {
+                const char * e = DX12_GETENV("DX12_LINALG_CONV");
+                return !e || e[0] != '0';
+            }();
+            if (linalg_conv) {
+                uint32_t rows = 0;
+                uint32_t cols = 0;
+                uint32_t reduction = 0;
+                if (dx12_linalg_conv_shape(node, rows, cols, reduction) &&
+                    rows >= 16 && cols >= 16 && reduction >= 16) {
+                    const uint32_t padded_64  = dx12_ceil_div(rows, 64u) * 64u;
+                    const uint32_t padded_128 = dx12_ceil_div(rows, 128u) * 128u;
+                    key.flags = rows >= 65 && padded_128 == padded_64
+                                  ? (iw_aux ? DX12_IW_CONV_XWIDE_FLAG : DX12_LINALG_CONV_XWIDE_FLAG)
+                              : rows >= 64
+                                  ? (iw_aux ? DX12_IW_CONV_WIDE_FLAG : DX12_LINALG_CONV_WIDE_FLAG)
+                                  : (iw_aux ? DX12_IW_CONV_FLAG : DX12_LINALG_CONV_FLAG);
+                }
+            }
+            if (node->op == GGML_OP_OUT_PROD) {
+                key.flags = iw_aux ? DX12_IW_OUT_PROD_FLAG : DX12_LINALG_OUT_PROD_FLAG;
+            }
+        }
+#endif
+
+        if (key.flags == 0 && norm_wide_1024 &&
+            (bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA1_2 ||
+             bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS) &&
+            node->ne[0] >= norm_wide_1024_min &&
+            node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1) {
+            if (node->op == GGML_OP_RMS_NORM) {
+                key.flags = 86;
+            } else if (node->op == GGML_OP_NORM) {
+                key.flags = 2;
+            } else if (node->op == GGML_OP_L2_NORM) {
+                key.flags = 1;
+            }
+        }
+
         // End of record-path decision block.  Look up pipeline and store the
         // decision into the replay cache so subsequent tokens can fast-path.
-        if (g_dx12_flag_sink && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
-            g_dx12_flag_sink->push_back((uint32_t)key.flags);
-        }
         pipeline = bctx->dev->get_or_create_pipeline(key);
         if (!pipeline || !pipeline->pso) {
             if (!no_replay) {
                 rcache.decisions[i].kind = DX12_DEC_NO_PIPELINE;
             }
-            continue;
+            DX12_LOG_ERROR("missing pipeline for required node %s (%s, flags=%u)\n",
+                           node->name, ggml_op_name(node->op), (unsigned)key.flags);
+            return GGML_STATUS_FAILED;
         }
         if (!no_replay) {
             dx12_node_decision & d = rcache.decisions[i];
             d.kind               = DX12_DEC_COMPUTE;
             d.pipeline           = pipeline;
-            d.key_flags          = (uint8_t)key.flags;
+            d.key_flags          = key.flags;
             d.is_matvec_dispatch = is_matvec_dispatch;
             d.use_dp4a           = use_dp4a;
             d.use_dp4a_matvec    = use_dp4a_matvec;
@@ -9626,6 +13399,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             // `i += N` site.  needs_op_params and conservative_barrier are
             // filled in at their respective sites.
             if (fused_qk_postop)                   d.fusion_kind = DX12_FUSE_QK_ROPE_SCALE_SET_ROWS;
+            else if (fused_norm_bias_node)         d.fusion_kind = fused_norm_has_add
+                                                                  ? DX12_FUSE_ADD_NORM_MUL_ADD
+                                                                  : DX12_FUSE_NORM_MUL_ADD;
             else if (fused_add_rms_node)           d.fusion_kind = DX12_FUSE_ADD_RMS_MUL;
             else if (fused_qkn_k_norm)             d.fusion_kind = DX12_FUSE_QK_NORM_MERGE;
             else if (fused_5way_set_rows)          d.fusion_kind = DX12_FUSE_RMS_MUL_ROPE5;
@@ -9646,10 +13422,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 node->op == GGML_OP_MUL_MAT_ID
                     ? DX12_FUSE_MMID_WEIGHTED_SUM : DX12_FUSE_MOE_SUM;
             else if (fused_moe_norm_out)            d.fusion_kind = DX12_FUSE_MOE_WEIGHT_NORM;
+            else if (fused_moe_router_out)          d.fusion_kind = fused_moe_router_norm
+                                                                  ? DX12_FUSE_MOE_ROUTER_NORM
+                                                                  : DX12_FUSE_MOE_ROUTER;
             else if (fused_mtp_gate_mul)             d.fusion_kind = DX12_FUSE_MTP_GATE;
             else                                    d.fusion_kind = DX12_FUSE_NONE;
             // skip_count derived from fusion_kind (matches the `i += N` block below).
             switch (d.fusion_kind) {
+                case DX12_FUSE_NORM_MUL_ADD:       d.skip_count = 2; break;
+                case DX12_FUSE_ADD_NORM_MUL_ADD:   d.skip_count = 3; break;
                 case DX12_FUSE_ADD_RMS_MUL:        d.skip_count = 2; break;
                 case DX12_FUSE_RMS_MUL_ROPE5:      d.skip_count = 4; break;
                 case DX12_FUSE_QK_NORM_MERGE:      d.skip_count = 2; break;  // Q chain adjacent; K chain via node_absorbed[]
@@ -9663,6 +13444,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 case DX12_FUSE_QK_ROPE_SCALE_SET_ROWS: d.skip_count = 1; break;
                 case DX12_FUSE_MMID_WEIGHTED_SUM:  break;
                 case DX12_FUSE_MOE_WEIGHT_NORM:    d.skip_count = 4; break;
+                case DX12_FUSE_MOE_ROUTER:         d.skip_count = 4; break;
+                case DX12_FUSE_MOE_ROUTER_NORM:    d.skip_count = 8; break;
                 case DX12_FUSE_MTP_GATE:           d.skip_count = 2; break;
                 default:                            d.skip_count = 0; break;  // incl. MMV_SET_ROWS (non-contiguous)
             }
@@ -9732,6 +13515,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
         } // end of `if (replay) { ... } else { ... }`
+
+        // Keep the ordinary copy decision cached, so a later alias/layout rejection still executes it.
+        if (!gdn_cache_copies.empty() && gdn_cache_copies[i]) {
+            continue;
+        }
+        ggml_tensor * gdn_cache = gdn_cache_dst.empty() ? nullptr : gdn_cache_dst[i];
 
         // Mark the absorbed SET_ROWS so the loop skips its dispatch when it is
         // reached (both record and replay). The matvec below writes the cache.
@@ -9874,6 +13663,32 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             params.op_params[2] = (uint32_t)fused_moe_weighted->nb[2];
             params.op_params[3] = (uint32_t)fused_moe_weighted->nb[3];
             params.op_params[4] = 0;
+        } else if (fused_norm_bias_node) {
+            dx12_fill_params(node, params);
+            const struct ggml_tensor * weight =
+                fused_norm_mul_node->src[0] == fused_norm_node
+                    ? fused_norm_mul_node->src[1] : fused_norm_mul_node->src[0];
+            const struct ggml_tensor * bias =
+                fused_norm_bias_node->src[0] == fused_norm_mul_node
+                    ? fused_norm_bias_node->src[1] : fused_norm_bias_node->src[0];
+            params.ne0 = (uint32_t)fused_norm_bias_node->ne[0];
+            params.ne1 = (uint32_t)fused_norm_bias_node->ne[1];
+            params.ne2 = (uint32_t)fused_norm_bias_node->ne[2];
+            params.ne3 = (uint32_t)fused_norm_bias_node->ne[3];
+            params.nb0 = (uint32_t)fused_norm_bias_node->nb[0];
+            params.nb1 = (uint32_t)fused_norm_bias_node->nb[1];
+            params.nb2 = (uint32_t)fused_norm_bias_node->nb[2];
+            params.nb3 = (uint32_t)fused_norm_bias_node->nb[3];
+            params.dst_offset = (uint32_t)dx12_tensor_offset(fused_norm_bias_node);
+            params.dst_esize = (uint32_t)ggml_type_size(fused_norm_bias_node->type);
+            params.op_params[0] = fused_norm_has_add ? 1u : 0u;
+            params.op_params[1] = fused_norm_has_add
+                                ? (uint32_t)dx12_tensor_offset(node) : 0u;
+            memcpy(&params.op_params[2], fused_norm_node->op_params, sizeof(uint32_t));
+            params.op_params[3] = fused_norm_has_add
+                                ? (uint32_t)ggml_type_size(node->type) : 0u;
+            params.op_params[4] = (uint32_t)dx12_tensor_offset(weight);
+            params.op_params[5] = (uint32_t)dx12_tensor_offset(bias);
         } else if (fused_add_rms_node) {
             // Triple fusion: ADD + RMS_NORM + MUL
             // node = ADD, fused_rms_node = RMS_NORM, fused_mul_node = MUL
@@ -10182,8 +13997,52 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (node->op == GGML_OP_ARGSORT && key.flags == 52) {
             params.op_params[1] = (uint32_t)cgraph->nodes[i + 1]->ne[0];
         }
+        if (fused_moe_router_out) {
+            const ggml_tensor * ids = cgraph->nodes[i + 2];
+            const ggml_tensor * out = fused_moe_router_out;
+            params.op_params[0] = (uint32_t)dx12_tensor_offset(ids);
+            params.op_params[1] = (uint32_t)ids->nb[1];
+            params.op_params[2] = (uint32_t)cgraph->nodes[i + 3]->ne[0];
+            params.op_params[3] = (uint32_t)dx12_tensor_offset(out);
+            // DIV dst is [k, rows]; GET_ROWS dst is [1, k, rows].
+            params.op_params[4] = (uint32_t)(fused_moe_router_norm ? out->nb[0] : out->nb[1]);
+            params.op_params[5] = (uint32_t)(fused_moe_router_norm ? out->nb[1] : out->nb[2]);
+            params.op_params[6] = fused_moe_router_norm ? 1u : 0u;
+            if (fused_moe_router_norm) {
+                const ggml_tensor * clamp = cgraph->nodes[i + 7];
+                memcpy(&params.op_params[7], &clamp->op_params[0], 4);
+                memcpy(&params.op_params[8], &clamp->op_params[1], 4);
+            }
+        }
+
+        if (dx12_is_linalg_conv(key.flags) &&
+            (node->op == GGML_OP_CONV_2D || node->op == GGML_OP_CONV_TRANSPOSE_2D)) {
+            uint32_t ow_mp, owoh_mp, kw_mp, kwkh_mp;
+            uint32_t ow_l,  owoh_l,  kw_l,  kwkh_l;
+            dx12_init_fastdiv((uint32_t)node->ne[0], ow_mp, ow_l);
+            dx12_init_fastdiv((uint32_t)(node->ne[0] * node->ne[1]), owoh_mp, owoh_l);
+            dx12_init_fastdiv((uint32_t)node->src[0]->ne[0], kw_mp, kw_l);
+            dx12_init_fastdiv((uint32_t)(node->src[0]->ne[0] * node->src[0]->ne[1]),
+                              kwkh_mp, kwkh_l);
+            params.op_params[6]  = ow_mp;
+            params.op_params[7]  = owoh_mp;
+            params.op_params[8]  = kw_mp;
+            params.op_params[9]  = kwkh_mp;
+            params.op_params[10] = ow_l | (owoh_l << 8) | (kw_l << 16) | (kwkh_l << 24);
+        }
+        if (expert_step && expert_step->phase == 3) {
+            params.dst_offset = (uint32_t)dx12_tensor_offset(cgraph->nodes[i + 1]);
+            params.op_params[7] = 2u;
+            params.op_params[8] = (uint32_t)dx12_tensor_offset(cgraph->nodes[i + 1]->src[1]);
+        }
         static constexpr uint32_t BASE_PARAMS = 30;  // ne/nb/offsets/esizes = 30 DWORDs
-        bool needs_op_params = (node->op == GGML_OP_SOFT_MAX || 
+        if (gdn_cache) {
+            params.ne0 = (uint32_t)gdn_cache->ne[2];
+            params.ne1 = (uint32_t)dx12_tensor_offset(gdn_cache);
+            params.nb1 = (uint32_t)gdn_cache->nb[1];
+            params.nb2 = (uint32_t)gdn_cache->nb[2];
+        }
+        bool needs_op_params = (expert_step || node->op == GGML_OP_SOFT_MAX ||
                                  node->op == GGML_OP_FLASH_ATTN_EXT || 
                                  node->op == GGML_OP_ROPE ||
                                  node->op == GGML_OP_RMS_NORM ||
@@ -10191,18 +14050,24 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  node->op == GGML_OP_L2_NORM ||
                                  node->op == GGML_OP_GATED_DELTA_NET ||
                                  node->op == GGML_OP_SSM_SCAN ||
+                                 node->op == GGML_OP_DSV4_HC_COMB ||
+                                 node->op == GGML_OP_DSV4_HC_PRE ||
+                                 node->op == GGML_OP_DSV4_HC_POST ||
                                  node->op == GGML_OP_RWKV_WKV6 ||
                                  node->op == GGML_OP_RWKV_WKV7 ||
+                                 node->op == GGML_OP_GATED_LINEAR_ATTN ||
                                  node->op == GGML_OP_GROUP_NORM ||
                                  node->op == GGML_OP_GLU ||
                                  node->op == GGML_OP_SCALE ||
                                  node->op == GGML_OP_CLAMP ||
                                  node->op == GGML_OP_UPSCALE ||
                                  node->op == GGML_OP_IM2COL ||
+                                 node->op == GGML_OP_COL2IM_1D ||
                                  node->op == GGML_OP_IM2COL_3D ||
                                  node->op == GGML_OP_POOL_2D ||
                                  node->op == GGML_OP_POOL_1D ||
                                  node->op == GGML_OP_PAD ||
+                                 node->op == GGML_OP_PAD_REFLECT_1D ||
                                  node->op == GGML_OP_ROLL ||
                                  node->op == GGML_OP_CONV_2D ||
                                  node->op == GGML_OP_CONV_2D_DW ||
@@ -10230,9 +14095,18 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  node->op == GGML_OP_DIAG_MASK_INF ||
                                  fused_bias_tensor ||
                                  fused_add_rms_node ||
+                                 fused_norm_bias_node ||
                                  fused_rope_set_rows ||
                                  fused_mmv_glu_up);
-        uint32_t num_constants = (needs_op_params || is_matvec_dispatch)
+        const bool linalg_gemm_dispatch = node->op == GGML_OP_MUL_MAT &&
+            ((key.flags >= 207 && key.flags <= 226) ||
+             (key.flags >= 230 && key.flags <= 253) ||
+             dx12_is_linalg_q50_packed(key.flags) ||
+             key.flags == 261 || key.flags == 262 ||
+             dx12_is_iw_gemm(key.flags) || dx12_is_vkport_gemm(key.flags) || key.flags == DX12_IW_STAGED_FLAG ||
+             dx12_is_linalg_pipeline(key.flags) || key.flags == DX12_LINALG_Q8_ALIGNED_FLAG ||
+             key.flags == DX12_LINALG_Q8_ALIGNED_128X64_FLAG);
+        uint32_t num_constants = (needs_op_params || is_matvec_dispatch || linalg_gemm_dispatch)
                                ? (uint32_t)(sizeof(params) / 4) : BASE_PARAMS;
         // FLASH_ATTN_EXT re-uploads the full params block at line ~2425 after
         // computing n_splits + gqa_ratio (which are encoded into op_params[15]
@@ -10250,7 +14124,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         // Bind resources — for fused ops, use the fused node's resources
         ID3D12Resource * src0_res = dx12_get_resource(node->src[0]);
         ID3D12Resource * src1_res;
-        if (fused_add_rms_node) {
+        if (fused_norm_has_add) {
+            src1_res = dx12_get_resource(node->src[1]);
+        } else if (fused_add_rms_node) {
             // Triple fusion: src1 stays as ADD's src1 (NOT MUL's weight)
             src1_res = dx12_get_resource(node->src[1]);
         } else if (fused_mul_node) {
@@ -10266,6 +14142,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         ID3D12Resource * dst_res;
         if (fused_qk_postop) {
             dst_res = dx12_get_resource(fused_qk_scale);
+        } else if (fused_norm_bias_node) {
+            dst_res = dx12_get_resource(fused_norm_bias_node);
         } else if (fused_5way_set_rows) {
             dst_res = dx12_get_resource(fused_5way_set_rows);
         } else if (fused_rope_after_rms) {
@@ -10296,6 +14174,21 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             dst_res = dx12_get_resource(fused_qkv_q_rope);      // Q ROPE output buffer (u0)
         } else {
             dst_res = dx12_get_resource(node);
+        }
+        if (expert_step && expert_step->phase == 3) {
+            dst_res = dx12_get_resource(cgraph->nodes[i + 1]);
+        }
+
+        if (bctx->last_moe_bucket_ids_id && dst_res &&
+            dst_res->GetGPUVirtualAddress() == bctx->last_moe_bucket_ids_va) {
+            const uint64_t begin = params.dst_offset;
+            const uint64_t end = begin + (uint64_t)params.nb0 * (params.ne0 - 1u) +
+                (uint64_t)params.nb1 * (params.ne1 - 1u) + (uint64_t)params.nb2 * (params.ne2 - 1u) +
+                (uint64_t)params.nb3 * (params.ne3 - 1u) + params.dst_esize;
+            if (begin < bctx->last_moe_bucket_ids_off + bctx->last_moe_bucket_ids_bytes &&
+                bctx->last_moe_bucket_ids_off < end) {
+                bctx->last_moe_bucket_ids_id = 0;
+            }
         }
 
         if (src0_res) {
@@ -10423,7 +14316,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                           (node->op == GGML_OP_SSM_SCAN) ||
                           (node->op == GGML_OP_RWKV_WKV6) ||
                           (node->op == GGML_OP_RWKV_WKV7) ||
-                          (node->op == GGML_OP_ADD_ID);
+                          (node->op == GGML_OP_GATED_LINEAR_ATTN) ||
+                          (node->op == GGML_OP_ADD_ID) ||
+                          (node->op == GGML_OP_DSV4_HC_COMB) ||
+                          (node->op == GGML_OP_DSV4_HC_POST);
         if (gdn_or_ssm) {
             if (node->src[2]) {
                 ID3D12Resource * src2_res = dx12_get_resource(node->src[2]);
@@ -10448,14 +14344,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         // Optional src2/src3 — only bind for ops that use them
-        bool needs_src2 = (node->op == GGML_OP_SOFT_MAX) || (node->op == GGML_OP_MUL_MAT_ID) || (fused_bias_tensor != nullptr) || (fused_add_rms_node != nullptr) || (fused_rope_after_rms != nullptr) ||
+        bool needs_src2 = (node->op == GGML_OP_SOFT_MAX) || (node->op == GGML_OP_MUL_MAT_ID) || (fused_bias_tensor != nullptr) || (fused_add_rms_node != nullptr) || (fused_norm_bias_node != nullptr) || (fused_rope_after_rms != nullptr) ||
+                          (node->op == GGML_OP_LIGHTNING_INDEXER) ||
                           (fused_mmv_glu_up != nullptr) ||
                           (fused_ssm_bias != nullptr) ||
                           (fused_mmv_set_rows != nullptr) ||
                           (fused_mmv_q_rope != nullptr) ||
                           (fused_mmv_k_set_rows != nullptr) ||
                           (node->op == GGML_OP_ROPE && node->src[2] != nullptr);
-        bool needs_src3 = (node->op == GGML_OP_FLASH_ATTN_EXT) || (fused_rope_set_rows != nullptr) || (fused_5way_set_rows != nullptr) ||
+        bool needs_src3 = (node->op == GGML_OP_FLASH_ATTN_EXT) || (node->op == GGML_OP_LIGHTNING_INDEXER) || (fused_norm_bias_node != nullptr) || (fused_rope_set_rows != nullptr) || (fused_5way_set_rows != nullptr) ||
                           (fused_moe_sum != nullptr && node->op == GGML_OP_MUL_MAT_ID) ||
                           (fused_mmv_k_set_rows != nullptr) ||
                           (fused_rope_after_rms != nullptr && fused_5way_set_rows == nullptr && fused_rope_after_rms->src[2] != nullptr);
@@ -10465,6 +14362,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             D3D12_GPU_VIRTUAL_ADDRESS src2_offset = 0;
             if (fused_rope_after_rms) {
                 src2_res = dx12_get_resource(fused_rope_after_rms->src[1]);  // ROPE position indices
+            } else if (fused_norm_bias_node) {
+                const struct ggml_tensor * weight =
+                    fused_norm_mul_node->src[0] == fused_norm_node
+                        ? fused_norm_mul_node->src[1] : fused_norm_mul_node->src[0];
+                src2_res = dx12_get_resource(weight);
             } else if (fused_add_rms_node) {
                 src2_res = dx12_get_resource(fused_mul_node->src[1]);  // weight tensor
             } else if (fused_bias_tensor) {
@@ -10497,6 +14399,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // freq_factors tensor (Llama-3.1, Phi-3 LongRope)
                 src2_res = dx12_get_resource(node->src[2]);
                 src2_offset = dx12_tensor_offset(node->src[2]);
+            } else if (node->op == GGML_OP_LIGHTNING_INDEXER) {
+                src2_res = dx12_get_resource(node->src[2]);
+                src2_offset = dx12_tensor_offset(node->src[2]);
             } else {
                 src2_res = dx12_get_resource(node->src[2]);
             }
@@ -10517,6 +14422,11 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 const ggml_tensor * weights = fused_moe_weighted->src[1];
                 src3_res = dx12_get_resource(weights);
                 src3_offset = dx12_tensor_offset(weights);
+            } else if (fused_norm_bias_node) {
+                const struct ggml_tensor * bias =
+                    fused_norm_bias_node->src[0] == fused_norm_mul_node
+                        ? fused_norm_bias_node->src[1] : fused_norm_bias_node->src[0];
+                src3_res = dx12_get_resource(bias);
             } else if (fused_rope_set_rows) {
                 src3_res = dx12_get_resource(fused_rope_set_rows->src[1]);  // SET_ROWS row indices
             } else if (fused_rope_after_rms && fused_rope_after_rms->src[2]) {
@@ -10528,6 +14438,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // element 0 (single-token M=1 decode); offset baked into the VA.
                 src3_res    = dx12_get_resource(fused_mmv_k_set_rows->src[1]);
                 src3_offset = dx12_tensor_offset(fused_mmv_k_set_rows->src[1]);
+            } else if (node->op == GGML_OP_LIGHTNING_INDEXER) {
+                src3_res = dx12_get_resource(node->src[3]);
+                src3_offset = dx12_tensor_offset(node->src[3]);
             } else {
                 src3_res = dx12_get_resource(node->src[3]);
             }
@@ -10609,6 +14522,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                           (node->op == GGML_OP_SSM_SCAN) ||
                           (node->op == GGML_OP_RWKV_WKV6) ||
                           (node->op == GGML_OP_RWKV_WKV7) ||
+                          (node->op == GGML_OP_GATED_LINEAR_ATTN) ||
                           (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[4] != nullptr);
         bool needs_src5 = needs_src4;
         bool needs_src6 = (node->op == GGML_OP_SSM_SCAN) ||
@@ -10672,8 +14586,28 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         uint32_t matvec_row_groups = 0;
 
         switch (node->op) {
+            case GGML_OP_CONT: {
+                if (key.flags == 62) {
+                    groups_x = dx12_ceil_div((uint32_t)node->ne[0], 32);
+                    groups_y = dx12_ceil_div((uint32_t)node->ne[2], 32);
+                    groups_z = (uint32_t)(node->ne[1] * node->ne[3]);
+                } else {
+                    uint32_t total_elements = (uint32_t)ggml_nelements(node);
+                    bool paired_f16 = node->type == GGML_TYPE_F16 && node->src[0] &&
+                                      node->src[0]->type == GGML_TYPE_F16 &&
+                                      node->src[0]->nb[0] == 2 &&
+                                      (node->ne[0] & 1) == 0 &&
+                                      ((dx12_tensor_offset(node) & 3) == 0) &&
+                                      ((node->nb[1] & 3) == 0);
+                    if (paired_f16) total_elements /= 2;
+                    groups_x = dx12_ceil_div(total_elements, 256);
+                }
+                break;
+            }
             case GGML_OP_MUL_MAT: {
                 bool is_matvec = (node->ne[1] == 1) || (key.flags == 83) ||
+                                 (key.flags == DX12_Q8_SMALL_M_FLAG) ||
+                                 (key.flags == DX12_F16_SMALL_M_FLAG) ||
                                  (key.flags == 47) || (key.flags == 48) || (key.flags == 49) ||
                                  (key.flags == 50) || (key.flags == 51) || (key.flags == 52) ||
                                  (key.flags == 124) || (key.flags == 125) ||
@@ -10682,7 +14616,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                  (key.flags == 135) || (key.flags == 136) ||
                                  (key.flags == 137) || (key.flags == 138) ||
                                  (key.flags == 139) || (key.flags == 140) ||
-                                 (key.flags == 141) || (key.flags == 142); // M=1, or NC2..NC32 batch paths
+                                 (key.flags == 141) || (key.flags == 142) ||
+                                 (key.flags == 143) || (key.flags == 144); // M=1, or NC2..NC32 batch paths
 
                 if (is_matvec) {
                     if (key.flags == 83) {
@@ -10705,13 +14640,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                   key.flags == 99 || key.flags == 103)
                                      ? params.ne0 : (uint32_t)node->ne[0];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
-                    if (key.flags == 9 || key.flags == 10 || key.flags == 11 ||
+                    if (key.flags == DX12_Q4K_SHORT_F32_FLAG || key.flags == DX12_Q4K_SHORT_DP4A_FLAG ||
+                        key.flags == DX12_Q6K_PACKED_MMV_FLAG || key.flags == 9 || key.flags == 10 || key.flags == 11 ||
                         key.flags == 12 || key.flags == 13 || key.flags == 14 ||
                         key.flags == 15 || key.flags == 16 || key.flags == 17 ||
                         key.flags == 18 || key.flags == 19 || key.flags == 20 ||
                         key.flags == 21 || key.flags == 22 || key.flags == 23 ||
                         key.flags == 24 || key.flags == 25 || key.flags == 26 ||
                         key.flags == 27 || key.flags == 31 || key.flags == 32 ||
+                        key.flags == DX12_Q4K_GLU_WAVE_FLAG || key.flags == DX12_Q4K_GLU_WAVE_RMS_FLAG ||
                         key.flags == 33 || key.flags == 34 || key.flags == 35 ||
                         key.flags == 36 || key.flags == 37 || key.flags == 38 ||
                         key.flags == 44 || key.flags == 47 || key.flags == 48 ||
@@ -10722,6 +14659,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         key.flags == 136 || key.flags == 137 || key.flags == 138 ||
                         key.flags == 139 || key.flags == 140 ||
                         key.flags == 141 || key.flags == 142 ||
+                        key.flags == 143 || key.flags == 144 || key.flags == 145 || key.flags == 146 ||
                         key.flags == 55 || key.flags == 56 || key.flags == 57 ||
                         key.flags == 61 || key.flags == 67 || key.flags == 72 ||
                         key.flags == 73 || key.flags == 74 ||
@@ -10733,11 +14671,12 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         key.flags == 82 ||
                         key.flags == 89 || key.flags == 91 ||
                         key.flags == 78 || key.flags == 100 || key.flags == 101 ||
-                        key.flags == 102 || key.flags == 103 || key.flags == 131) {
+                        key.flags == 102 || key.flags == 103 || key.flags == 157) {
                         // Multi-row: 2 rows per group (NC2/4/8 variants produce 2 rows x NUM_COLS cols)
                         // (55/56/57 = IQ4_NL / Q4_0 / Q5_0 mr256 variants on this branch)
                         // (76/77/79/84 = combined Q/K/V Q8_0/Q5_0/mixed rows2 dispatch)
-                        matvec_row_groups = (N + 1) / 2;
+                        const uint32_t rpg = dx12_matvec_rows4(key.flags) ? 4u : 2u;
+                        matvec_row_groups = (N + rpg - 1) / rpg;
                     } else if (key.flags == 28 || key.flags == 29 || key.flags == 45 ||
                                key.flags == 46 || key.flags == 107) {
                         // 4 rows per group: Q8_0 mr64 (28), Q5_0 mr64 (29),
@@ -10749,7 +14688,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         matvec_row_groups = N;
                     }
                     // F16 rope-pair de-dup: one group owns two rows (the pair).
-                    if (rope_rows2) {
+                    const bool qkv_rows2 = key.flags == 88 &&
+                        bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                        params.op_params[7] == 2u && dx12_qkv_f16_rows2_enabled();
+                    if (rope_rows2 || qkv_rows2) {
                         matvec_row_groups = (N + 1) / 2;
                     }
                     if (matvec_row_groups > 65535) {
@@ -10763,8 +14705,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 } else if (key.flags == 4 || key.flags == 30 || key.flags == 54 ||
                            key.flags == 58 || key.flags == 59 ||
                            key.flags == 105 || key.flags == 106 ||
-                           key.flags == 114 || key.flags == 115 ||
-                           key.flags == 116) {
+                           key.flags == 154 || key.flags == 155 ||
+                           key.flags == 156) {
                     // Register-blocked tiled dispatch [numthreads(16,16,1)]
                     // fl=30 = Q4_K wmma cooperative-LDS variant (same dispatch)
                     // fl=54 = tiny-K wmma_kfull (same 32x32 tile)
@@ -10772,23 +14714,35 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t M = (uint32_t)node->ne[1];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
-                    // fl=105/106/114/115/116 are the 64x64 (4x4 per thread) tiles; rest 32x32.
+                    // fl=105/106/154/155/156 are the 64x64 (4x4 per thread) tiles; rest 32x32.
                     const uint32_t tile =
                         (key.flags == 105 || key.flags == 106 ||
-                         key.flags == 114 || key.flags == 115 ||
-                         key.flags == 116) ? 64u : 32u;
+                         key.flags == 154 || key.flags == 155 ||
+                         key.flags == 156) ? 64u : 32u;
                     groups_x = (N + tile - 1) / tile;
                     groups_y = (M + tile - 1) / tile;
                     groups_z = batches;
+                } else if (key.flags == DX12_F32_ROUTER_FLAG) {
+                    groups_x = dx12_ceil_div((uint32_t)node->ne[0], 8);
+                    groups_y = dx12_ceil_div((uint32_t)node->ne[1], 4);
+                    groups_z = 1;
                 } else if (key.flags == 104 || key.flags == 127 ||
-                           key.flags == 128 || key.flags == 129) {
+                           key.flags == 128 || key.flags == 129 ||
+                           key.flags == 147 || key.flags == 149 ||
+                           key.flags == 160 || key.flags == 162 ||
+                           key.flags == 163 || key.flags == 164 ||
+                           key.flags == 165) {
                     // Register-blocked Q8_1 integer-dot GEMM; the tile is
                     // MMQ_BM x MMQ_BN with 256 threads.
                     uint32_t N = (uint32_t)node->ne[0];
                     uint32_t M = (uint32_t)node->ne[1];
                     uint32_t batches = (uint32_t)(node->ne[2] * node->ne[3]);
-                    groups_x = (N + GGML_DX12_MMQ_BN - 1) / GGML_DX12_MMQ_BN;
-                    groups_y = (M + GGML_DX12_MMQ_BM - 1) / GGML_DX12_MMQ_BM;
+                    const uint32_t bn = (key.flags >= 162 && key.flags <= 165)
+                        ? 64u : GGML_DX12_MMQ_BN;
+                    const uint32_t bm = (key.flags >= 162 && key.flags <= 165)
+                        ? 64u : GGML_DX12_MMQ_BM;
+                    groups_x = (N + bn - 1) / bn;
+                    groups_y = (M + bm - 1) / bm;
                     groups_z = batches;
                 } else if (key.flags == 53) {
                     // FP16 wmma 64x64 tile [numthreads(16,16,1)] for F16xF16 GEMM
@@ -10798,10 +14752,67 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     groups_x = (N + 63) / 64;
                     groups_y = (M + 63) / 64;
                     groups_z = batches;
-                } else if (key.flags == 121) {
+                } else if (key.flags == 121 || key.flags == DX12_IW_STAGED_FLAG) {
                     // Tiled dense quant GEMM: 64x64 output tile, one group per tile.
                     groups_x = dx12_ceil_div((uint32_t)node->ne[0], 64);
                     groups_y = dx12_ceil_div((uint32_t)node->ne[1], 64);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+#ifdef GGML_DX12_LINALG_PREVIEW
+                } else if (dx12_is_linalg_pipeline(key.flags)) {
+                    const bool narrow_tile = key.flags == DX12_F16_PIPELINE_SMALL_FLAG;
+                    groups_x = (uint32_t)node->ne[1] / (narrow_tile ? 32 : 128);
+                    groups_y = (uint32_t)node->ne[0] / (narrow_tile ? 32 : 64);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+                } else if ((key.flags >= 207 && key.flags <= 226) ||
+                           (key.flags >= 230 && key.flags <= 253) ||
+                           dx12_is_linalg_q50_packed(key.flags)) {
+                    // LinAlg wave-matrix GEMM; the tile shape varies per flag
+                    // so that narrow outputs still produce enough groups.
+                    // 207 float, 211 Q8_0, 215 Q4_K, 219 Q5_K, 223 Q6_K,
+                    // 230 Q5_0, 234 Q4_0, 238 Q4_1, 242 Q5_1, 246 IQ4_NL,
+                    // 250 MXFP4.
+                    // Must match the selection table in graph_compute: if the
+                    // two disagree the dispatch covers only part of the output.
+                    const uint32_t la_bm[4] = { 128, 128, 32, 32 };
+                    const uint32_t la_bn[4] = { 64, 128, 32, 16 };
+                    const uint32_t s = dx12_is_linalg_q50_packed(key.flags)
+                        ? key.flags - DX12_LINALG_Q50_PACKED_BASE
+                        : (key.flags >= 230 ? ((key.flags - 230) % 4) : ((key.flags - 207) % 4));
+                    groups_x = dx12_ceil_div((uint32_t)node->ne[1], la_bm[s]);
+                    groups_y = dx12_ceil_div((uint32_t)node->ne[0], la_bn[s]);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+                } else if (key.flags == DX12_LINALG_Q8_ALIGNED_FLAG ||
+                           key.flags == DX12_LINALG_Q8_ALIGNED_128X64_FLAG) {
+                    groups_x = (uint32_t)node->ne[1] / 128;
+                    groups_y = (uint32_t)node->ne[0] / (key.flags == DX12_LINALG_Q8_ALIGNED_FLAG ? 128 : 64);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+                } else if (key.flags == 262) {
+                    groups_x = dx12_ceil_div((uint32_t)node->ne[1], 16);
+                    groups_y = dx12_ceil_div((uint32_t)node->ne[0], 16);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+                } else if (dx12_is_vkport_gemm(key.flags)) {
+                    groups_x = (uint32_t)node->ne[0] / 128;
+                    groups_y = (uint32_t)node->ne[1] /
+                        (key.flags == DX12_NV_COMPOSED_FLAG || key.flags == DX12_AMD_COMPOSED_FLAG ? 64 : 128);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+                } else if (dx12_is_iw_gemm(key.flags)) {
+                    // Intel Xe3 wave GEMM. DX12_IW_BM/BN must track MTILE and
+                    // NWAVE in ggml-dx12/CMakeLists.txt - the shader derives
+                    // its tile from those and this derives the group count.
+                    const uint32_t iw_bm = dx12_iw_base_flag(key.flags) != 264 ? DX12_IWQ8_BM : DX12_IW_BM;
+                    const uint32_t iw_bn = dx12_iw_base_flag(key.flags) != 264 ? DX12_IWQ8_BN : DX12_IW_BN;
+                    groups_x = dx12_ceil_div((uint32_t)node->ne[1], iw_bm);
+                    groups_y = dx12_ceil_div((uint32_t)node->ne[0], iw_bn);
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+                } else if (key.flags == 261) {
+                    groups_x = (uint32_t)node->ne[1] / 64;
+                    groups_y = (uint32_t)node->ne[0] / 128;
+                    groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
+#endif
+                } else if (key.flags == 158) {
+                    // IQ1_S batch dequant matvec: one output element per thread.
+                    groups_x = (uint32_t)node->ne[0];
+                    groups_y = (uint32_t)node->ne[1];
                     groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
                 } else if (key.flags == 130) {
                     groups_x = (uint32_t)node->ne[0];
@@ -10894,6 +14905,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     groups_x = (uint32_t)(node->ne[2] * node->ne[3]);
                 } else {
                     groups_x = dx12_ceil_div((uint32_t)ggml_nelements(node), 256);
+                    if (groups_x > 65535) {
+                        groups_y = dx12_ceil_div(groups_x, 65535u);
+                        groups_x = 65535;
+                    }
                 }
                 break;
             }
@@ -10905,6 +14920,15 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
+                if (key.flags == 63) {
+                    uint32_t nrows = (uint32_t)(node->src[0]->ne[1] *
+                                                node->src[0]->ne[2] *
+                                                node->src[0]->ne[3]);
+                    groups_x = std::min(nrows, 65535u);
+                    groups_y = dx12_ceil_div(nrows, 65535u);
+                    groups_z = 1;
+                    break;
+                }
                 if (key.flags == 51) {
                     // TOP_K fast path: FIRST pass covers the whole source row,
                     // one block per BLOCK_SIZE candidates. Later passes issue
@@ -11034,10 +15058,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // 8 rows because 16 regresses most tested shapes. Override with
                 // DX12_FA_TILED_BR=8/16.
                 static const bool fa_tiled_enabled = dx12_flag_default_on("DX12_FA_TILED");
-                static const uint32_t fa_tiled_min_q = [] {
-                    const char * env = DX12_GETENV("DX12_FA_TILED_MINQ");
-                    return env ? (uint32_t)std::max(1, atoi(env)) : 64u;
-                }();
+                static const char * fa_tiled_min_q_env = DX12_GETENV("DX12_FA_TILED_MINQ");
                 // The tile only pays for itself once the head is wide enough to
                 // amortize the staged K/V tile. At D=64 the untiled path wins by
                 // 19-30% PP on RX 6800 (135M Q8_0 8887->11526, 135M F16
@@ -11054,10 +15075,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // Override with DX12_FA_TILED_MIND.
                 const char * fa_tiled_min_d_env = DX12_GETENV("DX12_FA_TILED_MIND");
                 const bool fa_rdna4 = bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS;
+                const bool fa_rdna12_uma =
+                    bctx->dev->is_igpu &&
+                    bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA1_2;
                 const uint32_t fa_tiled_min_d = fa_tiled_min_d_env
                     ? (uint32_t)std::max(1, atoi(fa_tiled_min_d_env))
                     : ((bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
                         fa_rdna4) ? 64u : 72u);
+                // Below this many query rows the untiled path is used instead.
+                // It is written for decode (one query per thread group) and
+                // collapses as soon as there is more than one: on RDNA4 the
+                // kv=7680 D=64 GQA-8 op case runs 99 GFLOP/s at 4 queries vs
+                // 350 on the tiled path, and 2.06 TFLOP/s at 1 query. So RDNA4
+                // takes the tile for anything batched, which matters for
+                // speculative decode, multi-sequence batches and the ragged
+                // tail ubatch of a prefill. Model-level pp/tg are unchanged.
+                // Left at 64 elsewhere - untested on the other vendors.
+                const uint32_t fa_tiled_min_q = fa_tiled_min_q_env
+                    ? (uint32_t)std::max(1, atoi(fa_tiled_min_q_env))
+                    : ((fa_rdna4 || fa_rdna12_uma) ? 2u : 64u);
                 // Each workgroup re-streams the whole K/V for its head, so 16 rows
                 // halves that traffic and wins on long KV. Short KV stays cache
                 // resident, where the larger tile's LDS/occupancy cost dominates
@@ -11140,29 +15176,48 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     const bool fa_pf_wide =
                         fa_pf_wide_env ? fa_pf_wide_env[0] != '0' : fa_pf_wide_auto;
                     const bool fa_pf_small_wave = head_dim == 64 && fa_pf_wide;
-                    const bool fa_pf_intel_mask_arch =
+                    // Scanning and classifying the mask once per query group
+                    // beats re-scanning every KV tile on Intel and on the
+                    // NVIDIA Pascal+ iGPU. Measured pp6144 with mask prescan:
+                    // Qwen3-4B (d=128) +5.8%, Phi-3 (d=96) +6.3%, Qwen3-0.6B
+                    // +4.5%; the win grows with prompt length (neutral at
+                    // p=1024, +3.4% at p=3072) because longer prompts leave
+                    // more fully-masked tiles to skip. Discrete NVIDIA is not
+                    // measured yet, so it keeps the stock blob.
+                    const bool fa_pf_prescan_arch =
                         (bctx->dev->arch_family == DX12_ARCH_INTEL_UHD ||
-                         bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS) &&
+                         bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
+                         (bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                          bctx->dev->is_igpu)) &&
                         bctx->dev->fp16_supported &&
                         node->src[3] != nullptr;
                     const bool fa_pf_mask_opt_ok =
                         fa_pf_mask_opt && fa_pf_small_wave &&
-                        fa_pf_intel_mask_arch &&
+                        fa_pf_prescan_arch &&
                         dx12_flag_default_on("DX12_FA_PF_FP16") &&
                         head_dim == 64 && value_dim == 64;
-                    // Same prescan for the wider heads, which have no "wide"
-                    // blob and so keep the stock BR=16 tile shape.
+                    // The wider heads use the same prescan with their selected query tile.
                     const bool fa_pf_mask_opt_wide_d =
                         fa_pf_mask_opt && !fa_pf_small_wave &&
-                        fa_pf_intel_mask_arch &&
+                        fa_pf_prescan_arch &&
                         (head_dim == 96 || head_dim == 128);
+                    const char * fa_pf_d96_br16_env = DX12_GETENV("DX12_FA_PF_D96_BR16");
+                    if (fa_pf_d96_br16_env &&
+                        (fa_pf_d96_br16_env[0] < '0' || fa_pf_d96_br16_env[0] > '1' || fa_pf_d96_br16_env[1] != '\0')) {
+                        DX12_LOG_ERROR("DX12_FA_PF_D96_BR16 must be 0 or 1\n");
+                        return GGML_STATUS_FAILED;
+                    }
+                    const bool fa_pf_d96_br16 =
+                        fa_pf_d96_br16_env && fa_pf_d96_br16_env[0] == '1' &&
+                        bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                        bctx->dev->is_igpu && bctx->dev->wave_size == 32;
                     const fa_pf_variant pf_var =
                         fa_pf_mask_opt_ok ? fa_pf_variant{ 113u, 32u }  // flash_attn_pf_64_wide_prescan_relaxed_maskclass.hlsl
                       : fa_pf_small_wave ? fa_pf_variant{ 110u, 32u }  // flash_attn_pf_64_wide.hlsl
                       : head_dim == 64   ? fa_pf_variant{ 107u,  8u }  // flash_attn_pf_64.hlsl
                       : head_dim == 96   ? (fa_pf_mask_opt_wide_d
-                                            ? fa_pf_variant{ 114u, 16u }  // flash_attn_pf_96_prescan.hlsl
-                                            : fa_pf_variant{ 108u, 16u }) // flash_attn_pf_96.hlsl
+                                            ? (fa_pf_d96_br16 ? fa_pf_variant{ 112u, 16u } : fa_pf_variant{ 114u, 32u })
+                                            : (fa_pf_d96_br16 ? fa_pf_variant{ 111u, 16u } : fa_pf_variant{ 108u, 32u }))
                       : fa_pf_mask_opt_wide_d
                                          ? fa_pf_variant{ 115u, 16u }  // flash_attn_pf_128_prescan.hlsl
                                          : fa_pf_variant{ 109u, 16u }; // flash_attn_pf_128.hlsl
@@ -11175,6 +15230,54 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         key.flags = pf_key.flags;
                         fa_tiled = true;
                         fa_tile_br = pf_var.br;
+                    }
+                }
+                const char * fa_tiled_large_env = DX12_GETENV("DX12_FA_TILED_LARGE");
+                const bool fa_tiled_large_device =
+                    bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS ||
+                    (fa_tiled_large_env != nullptr && atoi(fa_tiled_large_env) != 0);
+                if (!fa_tiled &&
+                    key.flags == 0 &&
+                    dx12_flag_default_on("DX12_FA_TILED_LARGE") &&
+                    fa_tiled_large_device &&
+                    bctx->dev->fp16_supported) {
+                    static const uint32_t fa_tiled_large_min_q = [] {
+                        const char * env = DX12_GETENV("DX12_FA_TILED_LARGE_MINQ");
+                        return env ? (uint32_t)std::max(1, atoi(env)) : 64u;
+                    }();
+                    uint32_t large_flag = 0;
+                    if (head_dim == 192 && (value_dim == 128 || value_dim == 192)) {
+                        large_flag = 43;
+                    } else if (head_dim == 256 && value_dim == 256) {
+                        large_flag = 44;
+                    } else if (head_dim == 320 && value_dim == 256) {
+                        large_flag = 45;
+                    } else if (head_dim == 512 && value_dim == 512) {
+                        large_flag = 46;
+                    } else if (head_dim == 576 && value_dim == 512) {
+                        large_flag = 47;
+                    }
+                    if (large_flag != 0 &&
+                        N_queries >= fa_tiled_large_min_q &&
+                        n_heads > 0 && n_kv_heads > 0 && (n_heads % n_kv_heads) == 0 &&
+                        node->src[4] == nullptr &&
+                        node->src[0]->type == GGML_TYPE_F32 && node->src[0]->nb[0] == 4 &&
+                        node->src[1]->type == GGML_TYPE_F16 &&
+                        node->src[2]->type == GGML_TYPE_F16 &&
+                        node->src[1]->nb[0] == sizeof(ggml_fp16_t) &&
+                        node->src[2]->nb[0] == sizeof(ggml_fp16_t) &&
+                        dx12_ceil_div(N_queries, 8u) <= 65535) {
+                        dx12_pipeline_key tiled_key = key;
+                        tiled_key.flags = large_flag;
+                        dx12_pipeline * tiled_pl = bctx->dev->get_or_create_pipeline(tiled_key);
+                        if (tiled_pl && tiled_pl->pso) {
+                            bctx->cmd_list->SetPipelineState(tiled_pl->pso.Get());
+                            bctx->last_pso = tiled_pl->pso.Get();
+                            pipeline = tiled_pl;
+                            key.flags = tiled_key.flags;
+                            fa_tiled = true;
+                            fa_tile_br = 8;
+                        }
                     }
                 }
                 if (!fa_tiled &&
@@ -11201,6 +15304,186 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     }
                 }
 
+                // Rows of Q each workgroup owns. The prefill path above may
+                // have already changed it; the wave-matrix path below
+                // overrides this again when it takes over the dispatch.
+                uint32_t fa_rows = fa_tile_br;
+                bool     fa_linalg = false;
+#ifdef GGML_DX12_LINALG_PREVIEW
+                // Wave-matrix FA. Same shape requirements as the tiled path
+                // plus a 16-aligned head dim, so it can only ever take over a
+                // dispatch the tiled path already accepted. Prefill only: at
+                // small N_queries most of the 16/32-row tile is padding.
+                const int fa_linalg_env = [] {
+                    const char * v = DX12_GETENV("DX12_FA_LINALG");
+                    return v && v[0] ? atoi(v) : -1;
+                }();
+                static const int fa_qk_transposed_env = [] {
+                    const char * v = DX12_GETENV("DX12_FA_QK_TRANSPOSED");
+                    return v && v[0] ? atoi(v) : -1;
+                }();
+                // Quantised K/V cache: the tiled and pf gates above only accept
+                // float caches, so -ctk/-ctv q8_0|q4_0 fell through to the
+                // decode-shaped kernel, which collapses at prefill widths
+                // (measured 15-18x off Vulkan). The wave-matrix kernel stages
+                // K/V through LDS, so dequantising during staging is enough.
+                // Head dims are multiples of 32, so a row never splits a block.
+                const ggml_type fa_kt = node->src[1]->type;
+                const ggml_type fa_vt = node->src[2]->type;
+                const bool fa_kv_quant_ok =
+                    !fa_tiled && key.flags == 0 &&
+                    fa_kt == fa_vt &&
+                    (fa_kt == GGML_TYPE_Q8_0 || fa_kt == GGML_TYPE_Q4_0) &&
+                    N_queries >= fa_tiled_min_q &&
+                    head_dim == value_dim &&
+                    n_heads > 0 && n_kv_heads > 0 && (n_heads % n_kv_heads) == 0 &&
+                    node->src[0]->type == GGML_TYPE_F32 && node->src[0]->nb[0] == 4 &&
+                    node->src[1]->nb[0] == ggml_type_size(fa_kt) &&
+                    node->src[2]->nb[0] == ggml_type_size(fa_vt);
+                if ((fa_tiled || fa_kv_quant_ok) && fa_linalg_env != 0 &&
+                    bctx->dev->linalg_matrix_supported &&
+                    bctx->dev->linalg_wave_f16_16x16_supported &&
+                    bctx->dev->fp16_supported &&
+                    N_queries >= 16 &&
+                    (head_dim == 64 || head_dim == 96 || head_dim == 128)) {
+                    uint32_t linalg_rows = head_dim <= 96 ? 64u : 32u;
+                    dx12_pipeline_key la_key = key;
+                    const uint32_t la_base = !fa_kv_quant_ok           ? DX12_LINALG_FA_F16_BASE
+                                           : fa_kt == GGML_TYPE_Q8_0 ? DX12_LINALG_FA_Q8_0_BASE
+                                                                     : DX12_LINALG_FA_Q4_0_BASE;
+                    la_key.flags = la_base + (head_dim == 64 ? 0u : (head_dim == 96 ? 1u : 2u));
+                    if (head_dim == 128 && fa_kt == GGML_TYPE_F16 && fa_vt == GGML_TYPE_F16 &&
+                        bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS &&
+                        !bctx->dev->is_igpu && bctx->dev->blob_wave_size == 64 &&
+                        N_kv >= 1024 &&
+                        uint64_t(dx12_ceil_div(N_queries, 32u)) * n_heads * node->src[0]->ne[3] >= 256 &&
+                        dx12_flag_default_on("DX12_FA_RDNA4")) {
+                        la_key.flags = DX12_LINALG_FA_RDNA4_D128_FLAG;
+                    }
+                    const char * fa_pv_f16_env = DX12_GETENV("DX12_FA_PV_F16");
+                    if (fa_pv_f16_env && strcmp(fa_pv_f16_env, "1") == 0 &&
+                        dx12_acc_allows_f16(node) &&
+                        head_dim == 128 && fa_kt == GGML_TYPE_F16 && fa_vt == GGML_TYPE_F16 &&
+                        bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS &&
+                        !bctx->dev->is_igpu && bctx->dev->blob_wave_size == 64 &&
+                        bctx->dev->linalg_wave_f16_acc16_16x16_w64_supported) {
+                        la_key.flags = la_key.flags == DX12_LINALG_FA_RDNA4_D128_FLAG
+                            ? DX12_LINALG_FA_PV_F16_RDNA4_D128_FLAG : DX12_LINALG_FA_PV_F16_D128_FLAG;
+                    }
+                    if (bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS && !fa_kv_quant_ok) {
+                        la_key.flags = fa_qk_transposed_env != 0 && head_dim <= 96
+                            ? (head_dim == 64 ? DX12_LINALG_FA_NV_D64_QKT_FLAG
+                                              : DX12_LINALG_FA_NV_D96_QKT_FLAG)
+                            : (head_dim == 64 ? DX12_LINALG_FA_NV_D64_FLAG
+                               : head_dim == 96 ? DX12_LINALG_FA_NV_D96_FLAG
+                                                : DX12_LINALG_FA_NV_D128_W8_FLAG);
+                        linalg_rows = 32;
+                    }
+                    if ((la_key.flags == DX12_LINALG_FA_RDNA4_D128_FLAG ||
+                         la_key.flags == DX12_LINALG_FA_PV_F16_RDNA4_D128_FLAG) &&
+                        dx12_flag_default_on("DX12_FA_COMPACT") && dx12_fa_compact_layout(node)) {
+                        la_key.flags = la_key.flags == DX12_LINALG_FA_RDNA4_D128_FLAG
+                            ? DX12_LINALG_FA_COMPACT_D128_FLAG : DX12_LINALG_FA_PV_F16_COMPACT_D128_FLAG;
+                    }
+                    if (fa_pipeline_graph && dx12_fa_pipeline_layout(*bctx->dev, node) &&
+                        dx12_fa_mask_bytes(*bctx->dev, node) <= bctx->fa_mask_scratch_size) {
+                        la_key.flags = dx12_fa_pipeline_flag(*bctx->dev, node);
+                        linalg_rows = dx12_fa_pipeline_rows(*bctx->dev, node);
+                    }
+                    dx12_pipeline * la_pl = bctx->dev->get_or_create_pipeline(la_key);
+                    if (la_pl && la_pl->pso &&
+                        dx12_ceil_div(N_queries, linalg_rows) <= 65535) {
+                        bctx->cmd_list->SetPipelineState(la_pl->pso.Get());
+                        bctx->last_pso = la_pl->pso.Get();
+                        pipeline = la_pl;
+                        key.flags = la_key.flags;
+                        fa_rows = linalg_rows;
+                        fa_linalg = true;
+                        fa_tiled  = true;
+                    }
+                }
+                const char * fa_iw_env = DX12_GETENV("DX12_FA_LINALG_WAVE");
+                const int fa_iw_mode = fa_iw_env ? atoi(fa_iw_env) : 0;
+                const bool fa_iw_quant = fa_kt == fa_vt &&
+                    (fa_kt == GGML_TYPE_Q8_0 || fa_kt == GGML_TYPE_Q4_0);
+                const bool fa_iw_float =
+                    (fa_kt == GGML_TYPE_F16 || fa_kt == GGML_TYPE_F32) &&
+                    (fa_vt == GGML_TYPE_F16 || fa_vt == GGML_TYPE_F32);
+                if (fa_iw_mode > 0 && fa_linalg_env != 0 &&
+                    dx12_acc_allows_f16(node) &&
+                    (fa_iw_float || fa_iw_quant) && head_dim == value_dim &&
+                    n_heads > 0 && n_kv_heads > 0 && n_heads % n_kv_heads == 0 &&
+                    node->src[0]->type == GGML_TYPE_F32 && node->src[0]->nb[0] == 4 &&
+                    node->src[1]->nb[0] == ggml_type_size(fa_kt) &&
+                    node->src[2]->nb[0] == ggml_type_size(fa_vt) &&
+                    bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+                    bctx->dev->linalg_matrix_supported &&
+                    bctx->dev->linalg_wave_f16_8x16x16_supported &&
+                    !bctx->dev->linalg_wave_f16_16x16_supported &&
+                    bctx->dev->fp16_supported && bctx->dev->wave_size == 16 &&
+                    N_queries >= 16 &&
+                    (head_dim == 64 || head_dim == 96 || head_dim == 128) &&
+                    dx12_ceil_div(N_queries, 32) <= 65535) {
+                    dx12_pipeline_key la_key = key;
+                    const uint32_t base = !fa_iw_quant ? DX12_IW_FA_F16_BASE :
+                        fa_kt == GGML_TYPE_Q8_0 ? DX12_IW_FA_Q8_BASE : DX12_IW_FA_Q4_BASE;
+                    la_key.flags = base + (head_dim == 64 ? 0 : head_dim == 96 ? 1 : 2);
+                    dx12_pipeline * la_pl = bctx->dev->get_or_create_pipeline(la_key);
+                    if (!la_pl || !la_pl->pso) {
+                        DX12_LOG_ERROR("failed to prepare Intel wave attention\n");
+                        return GGML_STATUS_FAILED;
+                    }
+                    bctx->cmd_list->SetPipelineState(la_pl->pso.Get());
+                    bctx->last_pso = la_pl->pso.Get();
+                    pipeline = la_pl;
+                    key.flags = la_key.flags;
+                    fa_rows = 32;
+                    fa_linalg = true;
+                    fa_tiled = true;
+                }
+#endif
+
+                const char * fa_qregs = DX12_GETENV("DX12_FA_Q_REGS");
+                if (fa_qregs && (fa_qregs[0] < '0' || fa_qregs[0] > '1' || fa_qregs[1] != '\0')) {
+                    DX12_LOG_ERROR("DX12_FA_Q_REGS must be 0 or 1\n");
+                    return GGML_STATUS_FAILED;
+                }
+                if ((!fa_qregs || fa_qregs[0] == '1') && (key.flags == 113 || key.flags == 115) &&
+                    bctx->dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+                    bctx->dev->adapter_desc.DeviceId == 0xB080 &&
+                    bctx->dev->fp16_supported && bctx->dev->wave_size == 16 &&
+                    bctx->dev->blob_wave_size == 16 && dx12_flag_default_on("DX12_FA_PF_FP16")) {
+                    dx12_pipeline_key q_key = key;
+                    q_key.flags = DX12_FA_QREGS_BASE + key.flags - 113;
+                    dx12_pipeline * q_pl = bctx->dev->get_or_create_pipeline(q_key);
+                    if (!q_pl || !q_pl->pso) {
+                        DX12_LOG_ERROR("failed to prepare register Q attention\n");
+                        return GGML_STATUS_FAILED;
+                    }
+                    bctx->cmd_list->SetPipelineState(q_pl->pso.Get());
+                    bctx->last_pso = q_pl->pso.Get();
+                    pipeline = q_pl;
+                    key.flags = q_key.flags;
+                }
+
+                if (fa_scalar_mask_graph && dx12_fa_scalar_mask_layout(node) &&
+                    (key.flags == 113 || key.flags == 114 || key.flags == 115 ||
+                     key.flags == DX12_FA_QREGS_BASE || key.flags == DX12_FA_QREGS_BASE + 2)) {
+                    dx12_pipeline_key mask_key = key;
+                    mask_key.flags = DX12_FA_SCALAR_MASK_BASE +
+                        (key.flags == DX12_FA_QREGS_BASE ? 3u :
+                         key.flags == DX12_FA_QREGS_BASE + 2 ? 4u : key.flags - 113u);
+                    dx12_pipeline * mask_pl = bctx->dev->get_or_create_pipeline(mask_key);
+                    if (!mask_pl || !mask_pl->pso) {
+                        DX12_LOG_ERROR("failed to prepare scalar attention mask consumer\n");
+                        return GGML_STATUS_FAILED;
+                    }
+                    bctx->cmd_list->SetPipelineState(mask_pl->pso.Get());
+                    bctx->last_pso = mask_pl->pso.Get();
+                    pipeline = mask_pl;
+                    key.flags = mask_key.flags;
+                }
+
                 // GQA fold: when multiple Q-heads share one KV-head, launch
                 // one workgroup per kv_head and have it process all gqa_ratio
                 // Q-heads. This shares K/V VRAM loads across the gqa_ratio
@@ -11219,7 +15502,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }();
                 if (!fa_tiled && gqa_enabled &&
                     n_kv_heads > 0 && n_heads > n_kv_heads &&
-                    (n_heads % n_kv_heads) == 0) {
+                    (n_heads % n_kv_heads) == 0 &&
+                    fa_tiled_type(node->src[1]->type) &&
+                    fa_tiled_type(node->src[2]->type)) {
                     uint32_t r = n_heads / n_kv_heads;
                     if (r <= MAX_GQA) {
                         gqa_ratio = r;
@@ -11252,6 +15537,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 static const bool fa_coop_enabled = dx12_flag_default_on("DX12_FA_COOP");
                 static const bool fa_coop_q8_0_enabled = dx12_flag_default_on("DX12_FA_COOP_Q8_0");
                 bool fa_coop = false;
+                bool fa_cd_gqa = false;
                 const bool coop_kv_f16 =
                     node->src[1] && node->src[2] &&
                     node->src[1]->type == GGML_TYPE_F16 && node->src[1]->nb[0] == 2 &&
@@ -11280,13 +15566,35 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         : (coop_d == 64 ? 26u : coop_d == 96 ? 30u : 27u);
                     dx12_pipeline_key coop_key = key;
                     coop_key.flags = coop_flag;
+                    // GQA-shared variant: one wave serves up to DX12_FA_CD_GQA_G Q heads of a KV head.
+                    // At G=2 half the slots idle and it loses to the per-head path on the B390.
+                    const char * fa_cd_gqa_env = DX12_GETENV("DX12_FA_CD_GQA");
+                    // The shared-head kernel regresses decode on AMD wave64.
+                    const bool fa_cd_gqa_enabled = fa_cd_gqa_env && fa_cd_gqa_env[0]
+                        ? fa_cd_gqa_env[0] != '0'
+                        : bctx->dev->adapter_desc.VendorId != dx12_vendor::AMD;
+                    float fa_max_bias = 0.0f;
+                    memcpy(&fa_max_bias, (const float *) node->op_params + 1, sizeof(float));
+                    const bool cd_gqa = fa_cd_gqa_enabled &&
+                        n_kv_heads > 0 && n_heads >= 3 * n_kv_heads && n_heads % n_kv_heads == 0 &&
+                        fa_max_bias == 0.0f &&
+                        (!node->src[3] || node->src[3]->ne[2] == 1);
+                    if (cd_gqa) {
+                        coop_key.flags = DX12_FA_CD_GQA_BASE + (coop_kv_q8_0 ? 3u : 0u) +
+                            (coop_d == 64 ? 0u : coop_d == 96 ? 1u : 2u);
+                    }
                     dx12_pipeline * coop_pl = bctx->dev->get_or_create_pipeline(coop_key);
                     if (coop_pl && coop_pl->pso) {
                         bctx->cmd_list->SetPipelineState(coop_pl->pso.Get());
                         bctx->last_pso = coop_pl->pso.Get();
                         pipeline = coop_pl;
-                        key.flags = coop_flag;
+                        key.flags = coop_key.flags;
                         fa_coop = true;
+                        if (cd_gqa) {
+                            fa_cd_gqa = true;
+                            gqa_ratio = n_heads / n_kv_heads;
+                            dispatch_heads = n_kv_heads * ((gqa_ratio + DX12_FA_CD_GQA_G - 1) / DX12_FA_CD_GQA_G);
+                        }
                     }
                 }
 
@@ -11297,15 +15605,25 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // mmid_dequant. The small-D 64/128 variants and GQA-fold remain
                 // F32/F16/BF16-only for now (coverage-first).
                 if (!gqa_fold && key.flags == 0) {
+                    const ggml_type fa_kt = node->src[1]->type;
+                    const ggml_type fa_vt = node->src[2]->type;
                     uint32_t fa_quant_flag = 0;
-                    switch (node->src[1]->type) {
-                        case GGML_TYPE_Q4_0:   fa_quant_flag = 20; break;
-                        case GGML_TYPE_Q4_1:   fa_quant_flag = 21; break;
-                        case GGML_TYPE_Q5_0:   fa_quant_flag = 22; break;
-                        case GGML_TYPE_Q5_1:   fa_quant_flag = 23; break;
-                        case GGML_TYPE_Q8_0:   fa_quant_flag = 24; break;
-                        case GGML_TYPE_IQ4_NL: fa_quant_flag = 25; break;
-                        default: break;
+                    if (fa_kt == fa_vt) {
+                        switch (fa_kt) {
+                            case GGML_TYPE_Q4_0:   fa_quant_flag = 20; break;
+                            case GGML_TYPE_Q4_1:   fa_quant_flag = 21; break;
+                            case GGML_TYPE_Q5_0:   fa_quant_flag = 22; break;
+                            case GGML_TYPE_Q5_1:   fa_quant_flag = 23; break;
+                            case GGML_TYPE_Q8_0:   fa_quant_flag = 24; break;
+                            case GGML_TYPE_IQ4_NL: fa_quant_flag = 25; break;
+                            default: break;
+                        }
+                    }
+                    // Mixed K/V types, or the Q1_0/Q2_0 caches that have no
+                    // dedicated wrapper, go through the runtime-id kvmix shader.
+                    if (fa_quant_flag == 0 &&
+                        (dx12_fa_kv_type_id(fa_kt) != 0 || dx12_fa_kv_type_id(fa_vt) != 0)) {
+                        fa_quant_flag = 34;
                     }
                     if (fa_quant_flag != 0) {
                         dx12_pipeline_key quant_key = key;
@@ -11326,12 +15644,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 //   D <= 64  → flash_attn_64  (GROUP_SIZE=TILE_KV=64)
                 //   D <= 128 → flash_attn_128 (GROUP_SIZE=TILE_KV=128) — covers
                 //              ViT (D=72/80) and many Q-heads (D=80/96/128)
-                bool kv_is_quant_fa = (node->src[1]->type == GGML_TYPE_Q4_0 ||
-                                       node->src[1]->type == GGML_TYPE_Q4_1 ||
-                                       node->src[1]->type == GGML_TYPE_Q5_0 ||
-                                       node->src[1]->type == GGML_TYPE_Q5_1 ||
-                                       node->src[1]->type == GGML_TYPE_Q8_0 ||
-                                       node->src[1]->type == GGML_TYPE_IQ4_NL);
+                bool kv_is_quant_fa = (dx12_fa_kv_type_id(node->src[1]->type) != 0 ||
+                                       dx12_fa_kv_type_id(node->src[2]->type) != 0);
                 if (!gqa_fold && !kv_is_quant_fa && key.flags == 0 && head_dim <= 128) {
                     dx12_pipeline_key small_key = key;
                     small_key.flags = (head_dim <= 64) ? 2 : 3;
@@ -11355,10 +15669,27 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // FA=0 because n_splits caps at 4 (N_kv=128 / 32 min KV/split),
                 // giving only ~36 wgs of work on a 142-SM RTX 6000 Ada.
                 bool fa_is_small_d = (key.flags == 0 && head_dim <= 128 && !gqa_fold && !kv_is_quant_fa);
+                const bool fa_sparse = fa_sparse_enabled && dx12_fa_sparse_layout(node);
+                if (fa_sparse) {
+                    dx12_pipeline_key sparse_key = key;
+                    sparse_key.flags = DX12_FA_SPARSE_FLAG;
+                    pipeline = bctx->dev->get_or_create_pipeline(sparse_key);
+                    if (!pipeline || !pipeline->pso) {
+                        DX12_LOG_ERROR("failed to prepare sparse attention consumer\n");
+                        return GGML_STATUS_FAILED;
+                    }
+                    bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+                    bctx->last_pso = pipeline->pso.Get();
+                    key.flags = sparse_key.flags;
+                    fa_tiled = fa_linalg = fa_coop = gqa_fold = false;
+                    fa_is_small_d = false;
+                    gqa_ratio = 1;
+                    dispatch_heads = n_heads;
+                }
                 // Cooperative decode wgs are single-wave (cheap), so give them the
                 // same fine-split budget as the small-D variants they replace.
                 bool fa_fine = fa_is_small_d || fa_coop;
-                uint32_t min_kv_per_split = fa_fine ? 16u : 32u;
+                uint32_t min_kv_per_split = dx12_fa_min_kv_per_split(fa_fine ? 16u : 32u);
                 // DX12_FA_MIN_KV overrides the minimum KV columns per split.
                 // For few-head models below N_kv 512 this clamp - not the
                 // target-group count - is what caps n_splits: SmolLM2 (9 heads,
@@ -11369,21 +15700,59 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // the knob is here to retest on parts with more EUs. No effect
                 // at N_kv >= 512 or on many-head models, where the 32-split cap
                 // or the target-derived count already binds first.
-                if (const char * fa_minkv_env = DX12_GETENV("DX12_FA_MIN_KV")) {
-                    const uint32_t v = (uint32_t) atoi(fa_minkv_env);
-                    if (v >= 1) min_kv_per_split = v;
-                }
                 uint32_t query_groups = fa_tiled
-                    ? dx12_ceil_div(N_queries, fa_tile_br)
+                    ? dx12_ceil_div(N_queries, fa_rows)
                     : N_queries;
                 uint32_t total_groups_no_split = query_groups * dispatch_heads * batch;
                 uint32_t target_groups = fa_tiled ? 0u : (fa_fine ? 512u : 256u);
                 uint32_t n_splits = 1;
-                if (!fa_tiled &&
-                    total_groups_no_split < target_groups && N_kv > min_kv_per_split) {
-                    n_splits = (target_groups + total_groups_no_split - 1) / total_groups_no_split;
-                    n_splits = std::min(n_splits, (N_kv + min_kv_per_split - 1) / min_kv_per_split);
-                    n_splits = std::min(n_splits, (uint32_t)32);      // cap at 32 splits
+                bool     may_split = !fa_tiled;
+                // The wave-matrix path owns 64 query rows per group, so a
+                // prefill dispatch can land at well under one group per CU
+                // (SmolLM2 at ubatch 512: 8 x 9 = 72 on 64 CUs, i.e. two
+                // rounds with the second nearly empty). It writes partials in
+                // the same layout as the scalar path, so the existing reduce
+                // applies. The target is a group count, not a CU count: D3D12
+                // exposes no CU count, unlike the Vulkan backend which reads
+                // shader_core_count and splits below 2x that.
+                if (fa_linalg) {
+                    // Two knobs, because the decision and the amount are
+                    // different questions. A dispatch that already fills the
+                    // machine gains nothing and still pays for the reduce
+                    // (Phi-3 and Qwen3 sit at 8 x 32 = 256 groups and lose
+                    // ~1%), while one that does not wants far more splits than
+                    // just reaching the threshold would give (SmolLM2 at 72
+                    // groups: 4 splits -> 16.8k, 15 splits -> 18.6k t/s).
+                    target_groups = dx12_fa_linalg_split_groups();
+                    may_split = total_groups_no_split < dx12_fa_linalg_split_below();
+                }
+                if (dx12_is_fa_pipeline_flag(key.flags)) {
+                    may_split = false;
+                }
+                // The GQA-shared decode launches G-times fewer waves, so it needs more splits to fill the GPU.
+                uint32_t max_splits = DX12_FA_MAX_SPLITS;
+                if (fa_cd_gqa) {
+                    static const uint32_t cd_gqa_max_splits = [] {
+                        const char * e = DX12_GETENV("DX12_FA_CD_GQA_MAX_SPLITS");
+                        return e ? (uint32_t) std::max(1, atoi(e)) : 64u;
+                    }();
+                    const size_t per_split = (size_t) N_queries * n_heads * batch * ((size_t) node->src[2]->ne[0] + 2) * 4;
+                    const size_t fit = per_split ? bctx->dev->splitkv_temp_size / per_split : 1;
+                    max_splits = (uint32_t) std::max<size_t>(1, std::min<size_t>(cd_gqa_max_splits, fit));
+                }
+                const uint32_t split_kv = fa_sparse ? (uint32_t)ggml_get_op_params_i32(node, 4) : N_kv;
+                n_splits = dx12_fa_split_count(total_groups_no_split, split_kv, target_groups, min_kv_per_split, may_split, max_splits);
+                if (n_splits > 1) {
+                    if (fa_linalg) {
+                        // Never write past the partial buffer; a short buffer
+                        // just means fewer splits, not a wrong result.
+                        const size_t per_split =
+                            (size_t) N_queries * n_heads * batch *
+                            ((size_t) node->src[2]->ne[0] + 2) * 4;
+                        const size_t budget = bctx->dev->splitkv_temp_size;
+                        const uint32_t fit = per_split ? (uint32_t)(budget / per_split) : 0u;
+                        n_splits = std::max(1u, std::min(n_splits, fit));
+                    }
                 }
 
                 // op_params[15]: low 16 bits = n_splits, high 16 bits = gqa_ratio.
@@ -11410,6 +15779,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     rec.gqa_ratio             = gqa_ratio;
                     rec.n_kv                  = N_kv;
                     rec.n_splits              = n_splits;
+                    rec.max_splits            = max_splits;
                     bctx->replay.fa.push_back(rec);
                 }
 
@@ -11427,7 +15797,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 break;
             }
-            case GGML_OP_IM2COL: {
+            case GGML_OP_IM2COL:
+            case GGML_OP_COL2IM_1D: {
                 // One thread per output element; split groups across X/Y to
                 // clear D3D12's 65535 per-dim limit for large IM2COL tensors.
                 uint32_t total_elements = (uint32_t)(ggml_nelements(node));
@@ -11453,9 +15824,36 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 break;
             }
-            case GGML_OP_CONV_2D_DW:
+            case GGML_OP_CONV_2D:
             case GGML_OP_CONV_3D:
-            case GGML_OP_CONV_TRANSPOSE_1D: {
+            case GGML_OP_CONV_TRANSPOSE_1D:
+            case GGML_OP_CONV_TRANSPOSE_2D: {
+                if (dx12_is_linalg_conv(key.flags)) {
+                    uint32_t rows = 0;
+                    uint32_t cols = 0;
+                    uint32_t reduction = 0;
+                    GGML_ASSERT(dx12_linalg_conv_shape(node, rows, cols, reduction));
+                    const uint32_t bm = key.flags == DX12_LINALG_CONV_XWIDE_FLAG ||
+                                        key.flags == DX12_IW_CONV_XWIDE_FLAG ? 128u :
+                                        key.flags == DX12_LINALG_CONV_WIDE_FLAG ||
+                                        key.flags == DX12_IW_CONV_WIDE_FLAG ? 64u : 32u;
+                    groups_x = dx12_ceil_div(rows, bm);
+                    const uint32_t col_groups = dx12_ceil_div(cols, 32u);
+                    groups_y = std::min(col_groups, 65535u);
+                    groups_z = dx12_ceil_div(col_groups, 65535u);
+                    break;
+                }
+                uint32_t total_elements = (uint32_t)(ggml_nelements(node));
+                uint32_t total_groups = dx12_ceil_div(total_elements, 256);
+                if (total_groups > 65535) {
+                    groups_x = 65535;
+                    groups_y = (total_groups + 65534) / 65535;
+                } else {
+                    groups_x = total_groups;
+                }
+                break;
+            }
+            case GGML_OP_CONV_2D_DW: {
                 // One thread per dst element; split groups across X/Y to clear
                 // D3D12's 65535 per-dim limit (large perf tests have ~67M dst).
                 uint32_t total_elements = (uint32_t)(ggml_nelements(node));
@@ -11468,21 +15866,46 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 }
                 break;
             }
+            case GGML_OP_OUT_PROD: {
+                GGML_ASSERT(key.flags == DX12_LINALG_OUT_PROD_FLAG || key.flags == DX12_IW_OUT_PROD_FLAG);
+                groups_x = dx12_ceil_div((uint32_t)node->ne[1], 32u);
+                const uint32_t col_groups = dx12_ceil_div((uint32_t)node->ne[0], 32u);
+                const uint64_t total = (uint64_t)col_groups * node->ne[2] * node->ne[3];
+                GGML_ASSERT(total <= (uint64_t)65535 * 65535);
+                groups_y = (uint32_t)std::min<uint64_t>(total, 65535u);
+                groups_z = (uint32_t)((total + 65534u) / 65535u);
+                break;
+            }
             case GGML_OP_MUL_MAT_ID: {
-                if (key.flags == 119 || key.flags == 122) {
+                if (key.flags == 119 || key.flags == 122 || key.flags == DX12_MMID_IW_FLAG) {
                     // mul_mat_id_gemm.hlsl: BMx64 tile of one expert.  A token
                     // cannot pick the same expert twice, so n_tokens bounds the
                     // pairs assigned to any one expert.
                     const uint32_t n_tokens = (uint32_t)node->src[2]->ne[1];
                     groups_x = dx12_ceil_div((uint32_t)node->ne[0], 64);
-                    groups_y = dx12_ceil_div(n_tokens, dx12_mmid_gemm_bm(key.flags == 122));
+                    groups_y = dx12_ceil_div(n_tokens, dx12_mmid_gemm_bm(key.flags != 119));
                     groups_z = (uint32_t)node->src[0]->ne[2];
-                } else if (key.flags == 1 || key.flags == 18 || key.flags == 53) {
+                } else if (key.flags == 200 || key.flags == 202 || key.flags == 203 || dx12_is_bucket_linalg_mmid(key.flags)) {
+                    // One group per padded row tile per BN-wide output block.
+                    // Tiles past the last expert's run find no owner in the
+                    // routing scan and exit immediately.
+                    const uint32_t bm = DX12_MMID_BM(key.flags);
+                    const int64_t n_rows =
+                        node->ne[1] * node->ne[2] * node->ne[3];
+                    const int64_t n_tiles =
+                        (n_rows + bm - 1) / bm + node->src[0]->ne[2];
+                    groups_x = (uint32_t)n_tiles;
+                    groups_y = dx12_ceil_div((uint32_t)node->ne[0],
+                                             DX12_MMID_BN(key.flags));
+                    groups_z = 1;
+                } else if (key.flags == 1 || key.flags == 18 || key.flags == 53 || key.flags == DX12_MMID_F16_VEC_FLAG || key.flags == DX12_MMID_Q8_ROWS4_FLAG ||
+                           key.flags == DX12_MMID_F16_WAVE_FLAG ||
+                           key.flags == DX12_MMID_Q4K_ROWS4_FLAG || key.flags == DX12_MMID_Q6K_ROWS4_FLAG) {
                     const uint32_t rows_per_group = key.flags == 53 ? 16 : 4;
                     groups_x = dx12_ceil_div((uint32_t)node->ne[0], rows_per_group);
                     groups_y = (uint32_t)node->ne[1];
                     groups_z = (uint32_t)(node->ne[2] * node->ne[3]);
-                } else if (key.flags == 17 || key.flags == 117) {
+                } else if (key.flags == 17 || key.flags == 159) {
                     // mul_mat_id_q8_0_dp4a.hlsl / mul_mat_id_q4k_dp4a.hlsl: NUM_ROWS=2.
                     groups_x = dx12_ceil_div((uint32_t)node->ne[0], 2);
                     groups_y = (uint32_t)node->ne[1];
@@ -11505,6 +15928,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // One thread per output element (i1, i2, i3) over [nr, n_t, n_s]
                 uint32_t total_elements = (uint32_t)(node->ne[0] * node->ne[1] * node->ne[2]);
                 groups_x = (total_elements + 255) / 256;
+                if (groups_x > 65535) {
+                    groups_y = dx12_ceil_div(groups_x, 65535u);
+                    groups_x = 65535;
+                }
                 break;
             }
             case GGML_OP_GATED_DELTA_NET: {
@@ -11526,6 +15953,20 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 groups_x = H * B;
                 break;
             }
+            case GGML_OP_GATED_LINEAR_ATTN: {
+                // One workgroup per (batch, head); BLOCK_SIZE (==64) threads.
+                uint32_t H = (uint32_t)node->src[0]->ne[1];
+                uint32_t B = (uint32_t)node->src[4]->ne[1];
+                groups_x = H * B;
+                break;
+            }
+            case GGML_OP_LIGHTNING_INDEXER: {
+                // One group per (kv position, token, stream).
+                groups_x = (uint32_t)node->ne[0];
+                groups_y = (uint32_t)node->ne[1];
+                groups_z = (uint32_t)node->ne[3];
+                break;
+            }
             case GGML_OP_SSM_SCAN: {
                 // Vulkan-style: groups_x = ceil(n_head*head_dim / num_subgroups), groups_y = n_seq
                 const struct ggml_tensor * src0 = node->src[0];
@@ -11540,7 +15981,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 // Intel (reports 8, runs the w16 blob) and left half the
                 // (head, head_off) locations uncomputed.
                 const uint32_t wave     = bctx->dev->blob_wave_size ? bctx->dev->blob_wave_size : 32u;
-                const uint32_t num_subgroups = d_state / wave;
+                const uint32_t group_size = dx12_ceil_div(d_state, 64u) * 64u;
+                const uint32_t num_subgroups = group_size / wave;
                 groups_x = (n_head * head_dim + num_subgroups - 1) / num_subgroups;
                 groups_y = n_seq;
                 groups_z = 1;
@@ -11585,6 +16027,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                       ((node->nb[1] & 3) == 0);
                     if (paired_f16) total_elements /= 2;
                     groups_x = (total_elements + 255) / 256;
+                    if (groups_x > 65535) {
+                        groups_y = dx12_ceil_div(groups_x, 65535u);
+                        groups_x = 65535;
+                    }
                     break;
                 }
                 groups_x = 1;
@@ -11634,14 +16080,95 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                   (node->nb[1] & 3) == 0;
                 if (paired_f16) total_elements /= 2;
                 groups_x = (total_elements + 255) / 256;
+                if (groups_x > 65535) {
+                    groups_y = dx12_ceil_div(groups_x, 65535u);
+                    groups_x = 65535;
+                }
                 break;
             }
         }
 
+        const uint32_t full_tile_flag = dx12_linalg_full_tile_flag(*bctx->dev, node, key.flags);
+        if (full_tile_flag) {
+            dx12_pipeline_key full_key = key;
+            full_key.flags = full_tile_flag;
+            dx12_pipeline * full_pipeline = bctx->dev->get_or_create_pipeline(full_key);
+            if (!full_pipeline || !full_pipeline->pso) {
+                DX12_LOG_ERROR("failed to prepare full-tile GEMM pipeline\n");
+                return GGML_STATUS_FAILED;
+            }
+            pipeline = full_pipeline;
+            key.flags = full_tile_flag;
+            bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+            bctx->last_pso = pipeline->pso.Get();
+        }
+
+        uint32_t norm_flag = 0;
+        const bool norm_amd = bctx->dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && bctx->dev->blob_wave_size == 64;
+        const bool norm_nvidia = bctx->dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+            bctx->dev->adapter_desc.DeviceId == 0x2F04 && bctx->dev->wave_size == 32 && bctx->dev->blob_wave_size == 32;
+        const bool norm_intel = dx12_is_b390_wave16(*bctx->dev);
+        if (key.op == GGML_OP_RMS_NORM && ((!bctx->dev->is_igpu && (norm_amd || norm_nvidia)) || norm_intel)) {
+            const bool single_row = params.ne1 == 1 && params.ne2 == 1 && params.ne3 == 1;
+            const char * rms_fixed = DX12_GETENV("DX12_RMS_FIXED");
+            const char * add_fixed = DX12_GETENV("DX12_ADD_RMS_FIXED");
+            const char * packed_norm = DX12_GETENV("DX12_NORM_ROPE_PACKED");
+            const char * packed_qk = DX12_GETENV("DX12_QK_NORM_PACKED");
+            const bool vector_row = params.ne00 == 1024 && params.ne0 == 1024 && params.ne10 == 1024 &&
+                params.src0_esize == 4 && params.src1_esize == 4 && params.dst_esize == 4 &&
+                params.nb00 == 4 && params.nb10 == 4 && params.nb0 == 4 &&
+                ((params.src0_offset | params.src1_offset | params.dst_offset |
+                  params.nb01 | params.nb02 | params.nb03 | params.nb11 | params.nb12 | params.nb13 |
+                  params.nb1 | params.nb2 | params.nb3) & 15u) == 0;
+            if (fused_mul_node && key.flags == 2 && vector_row &&
+                (rms_fixed ? rms_fixed[0] == '1' : single_row && !norm_intel)) {
+                norm_flag = DX12_RMS_FIXED_FLAG;
+            } else if (fused_add_rms_node && key.flags == 3 && vector_row &&
+                (add_fixed ? add_fixed[0] == '1' : single_row && !norm_intel) &&
+                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) &&
+                params.op_params[10] == 1024 && params.op_params[3] == 4 &&
+                ((params.op_params[0] | params.op_params[1] |
+                  params.op_params[4] | params.op_params[5] | params.op_params[6]) & 15u) == 0) {
+                norm_flag = DX12_ADD_RMS_FIXED_FLAG;
+            } else if ((norm_amd || norm_intel) && fused_5way_set_rows && key.flags == 8 &&
+                (packed_norm ? packed_norm[0] == '1' : !norm_intel && params.ne02 == 1 && params.ne03 == 1) &&
+                params.ne00 == 128 && params.op_params[1] == 128 && params.op_params[2] == 2 &&
+                params.dst_esize == 2 && params.nb0 == 2 &&
+                ((params.dst_offset | params.op_params[9] | params.nb3) & 3u) == 0) {
+                norm_flag = DX12_RMS_ROPE_PACKED_FLAG;
+            } else if ((norm_nvidia || norm_intel) && key.flags == 104 && fused_qkn_k_norm && fused_qkn_k_set_rows &&
+                (!packed_qk || strcmp(packed_qk, "1") == 0) &&
+                params.ne00 == 128 && params.op_params[1] == 128 && params.op_params[2] == 2 &&
+                fused_qkn_k_set_rows->type == GGML_TYPE_F16 && fused_qkn_k_set_rows->nb[0] == 2 &&
+                ((dx12_tensor_offset(fused_qkn_k_set_rows) | fused_qkn_k_set_rows->nb[1]) & 3u) == 0) {
+                // Keep flag104 through parameter packing and root binding; only replace its PSO here.
+                norm_flag = DX12_QK_NORM_PACKED_FLAG;
+            }
+        }
+        if (norm_flag != 0) {
+            dx12_pipeline_key norm_key = key;
+            norm_key.flags = norm_flag;
+            dx12_pipeline * norm_pipeline = bctx->dev->get_or_create_pipeline(norm_key);
+            if (!norm_pipeline || !norm_pipeline->pso) {
+                DX12_LOG_ERROR("failed to prepare specialized norm pipeline\n");
+                return GGML_STATUS_FAILED;
+            }
+            pipeline = norm_pipeline;
+            key.flags = norm_flag;
+            bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+            bctx->last_pso = pipeline->pso.Get();
+        }
         // Override dispatch dimensions for triple fusion (ADD+RMS_NORM+MUL uses row-based dispatch)
         if (fused_add_rms_node) {
             uint32_t total_rows = (uint32_t)(fused_mul_node->ne[1] * fused_mul_node->ne[2] * fused_mul_node->ne[3]);
             groups_x = total_rows;
+            groups_y = 1;
+            groups_z = 1;
+        }
+        if (fused_norm_bias_node) {
+            groups_x = (uint32_t)(fused_norm_bias_node->ne[1] *
+                                  fused_norm_bias_node->ne[2] *
+                                  fused_norm_bias_node->ne[3]);
             groups_y = 1;
             groups_z = 1;
         }
@@ -11656,6 +16183,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        if (profile_queries && !prof_graph_start) {
+            bctx->cmd_list->EndQuery(prof_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, prof_idx++);
+            prof_graph_start = true;
+        }
         if (do_profile && prof_idx + 2 <= prof_capacity) {
             // Record start timestamp into query heap
             bctx->cmd_list->EndQuery(prof_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, prof_idx);
@@ -11671,6 +16202,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 
         // Determine the effective destination tensor (accounting for fusion)
         struct ggml_tensor * dst_tensor = fused_qk_postop ? fused_qk_scale :
+                                          (fused_norm_bias_node ? fused_norm_bias_node :
                                           (fused_mtp_gate_mul ? fused_mtp_gate_mul :
                                           (fused_moe_norm_out ? fused_moe_norm_out :
                                           (fused_moe_sum ? fused_moe_sum :
@@ -11684,7 +16216,10 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                           (fused_mmv_set_rows ? fused_mmv_set_rows :
                                           (fused_mmv_q_rope ? fused_mmv_q_rope :
                                           (fused_qkv ? fused_qkv_q_rope :
-                                          (fused_mmv_k_set_rows ? fused_mmv_k_set_rows : node))))))))))))));
+                                          (fused_mmv_k_set_rows ? fused_mmv_k_set_rows : node)))))))))))))));
+        if (expert_step && expert_step->phase == 3) {
+            dst_tensor = cgraph->nodes[i + 1];
+        }
 
         // PIX markers: label each node's barrier + dispatch so a capture can be
         // read as a graph rather than an unnamed dispatch list.
@@ -12154,6 +16689,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             uint32_t this_src_off = (uint32_t)dx12_tensor_offset(node->src[1]);
             bool reuse_q8_1 = (bctx->last_q8_1_src_id == (uintptr_t)node->src[1] &&
                                bctx->last_q8_1_src_off == this_src_off &&
+                               bctx->last_q8_1_kind == 1 &&
                                bctx->last_q8_1_size == (uint32_t)q8_1_size);
 
             // Dispatch quantize_q8_1 shader (skipped on reuse).  Cache the
@@ -12170,6 +16706,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 if (reuse_q8_1) bctx->dbg_q8_quant_reused++;
                 if (!reuse_q8_1) {
                     bctx->dbg_q8_quant_dispatched++;
+                    // The tensor hazard tracker does not track scratch readers.
+                    bctx->emit_uav_barrier_buffer(bctx->q8_1_scratch.Get(), D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
                     bctx->cmd_list->SetPipelineState(q_pipeline->pso.Get());
                     bctx->last_pso = q_pipeline->pso.Get();
 
@@ -12197,6 +16735,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     bctx->last_q8_1_src_id   = (uintptr_t)node->src[1];
                     bctx->last_q8_1_src_off  = this_src_off;
                     bctx->last_q8_1_size     = (uint32_t)q8_1_size;
+                    bctx->last_q8_1_kind     = 1;
                     bctx->last_q8_1_src_va   = src1_res->GetGPUVirtualAddress();
                 }
 
@@ -12252,6 +16791,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             uint32_t this_src_off = (uint32_t)dx12_tensor_offset(node->src[1]);
             bool reuse_q8_1 = (bctx->last_q8_1_src_id == (uintptr_t)node->src[1] &&
                                bctx->last_q8_1_src_off == this_src_off &&
+                               bctx->last_q8_1_kind == 1 &&
                                bctx->last_q8_1_size == (uint32_t)q8_1_size);
 
             // Cached quantize pipeline pointer (see use_dp4a path)
@@ -12275,6 +16815,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     q_params.ne0 = num_q8_blocks;
                     bctx->set_shader_params(q_params, 30);
 
+                    bctx->emit_uav_barrier_buffer(bctx->q8_1_scratch.Get(), D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
                     bctx->cmd_list->SetComputeRootShaderResourceView(1, src1_res->GetGPUVirtualAddress());
                     bctx->cmd_list->SetComputeRootUnorderedAccessView(3, bctx->q8_1_scratch->GetGPUVirtualAddress());
                     bctx->last_src0_va = src1_res->GetGPUVirtualAddress();
@@ -12289,6 +16830,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     bctx->last_q8_1_src_id   = (uintptr_t)node->src[1];
                     bctx->last_q8_1_src_off  = this_src_off;
                     bctx->last_q8_1_size     = (uint32_t)q8_1_size;
+                    bctx->last_q8_1_kind     = 1;
                     bctx->last_q8_1_src_va   = src1_res->GetGPUVirtualAddress();
                 }
 
@@ -12308,9 +16850,284 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+#ifdef GGML_DX12_LINALG_PREVIEW
+        const bool tiled_b_f16 = node->op == GGML_OP_MUL_MAT && dx12_tiled_b_f16(key.flags);
+        if (node->op == GGML_OP_MUL_MAT && dx12_is_vkport_gemm(key.flags) && !tiled_b_f16 &&
+            src0_res && src1_res && dst_res) {
+            const D3D12_GPU_VIRTUAL_ADDRESS a_va = src0_res->GetGPUVirtualAddress() + dx12_tensor_offset(node->src[0]);
+            const D3D12_GPU_VIRTUAL_ADDRESS b_va = src1_res->GetGPUVirtualAddress() + dx12_tensor_offset(node->src[1]);
+            const D3D12_GPU_VIRTUAL_ADDRESS d_va = dst_res->GetGPUVirtualAddress() + dx12_tensor_offset(node);
+            bctx->cmd_list->SetComputeRootShaderResourceView(1, a_va);
+            bctx->cmd_list->SetComputeRootShaderResourceView(2, b_va);
+            bctx->cmd_list->SetComputeRootUnorderedAccessView(3, d_va);
+            bctx->last_src0_va = a_va;
+            bctx->last_src1_va = b_va;
+            bctx->last_dst_va = d_va;
+            params.src0_offset = params.src1_offset = params.dst_offset = 0;
+            bctx->set_shader_params(params, num_constants);
+        }
+        // Intel Xe3 wave GEMM: convert the activations to F16 first, so the A
+        // operand can come from a descriptor matrix load. Reuses the Q8_1
+        // scratch. Quantized variants also use this activation pre-pass;
+        // their weights are dequantized into LDS by the GEMM.
+        if (node->op == GGML_OP_MUL_MAT && (dx12_is_iw_gemm(key.flags) || tiled_b_f16) &&
+            pipeline && node->src[1] && src1_res) {
+            const uint32_t k_elems  = (uint32_t)node->src[0]->ne[0];
+            const uint32_t nrows    = (uint32_t)(ggml_nelements(node->src[1]) / k_elems);
+            // The GEMM reads whole 64-row tiles, so the tail tile needs rows
+            // that exist. They are never stored back, so their contents do
+            // not matter - only that the load stays inside the allocation.
+            // The pad is destination-only: converting it would read past the
+            // end of src1 and fault the device.
+            const uint32_t iw_pad   = dx12_iw_base_flag(key.flags) != 264 ? DX12_IWQ8_BM : DX12_IW_BM;
+            const uint32_t n_elems  = (nrows + iw_pad) * k_elems;
+            const uint32_t c_elems  = nrows * k_elems;
+            const size_t   f16_size = (size_t)n_elems * 2u;
+
+            if (f16_size > bctx->q8_1_scratch_size) {
+                // Retire, don't release: the open cmd list still holds the VA.
+                if (bctx->q8_1_scratch) {
+                    bctx->q8_1_scratch_retired.push_back(bctx->q8_1_scratch);
+                }
+                bctx->q8_1_scratch.Reset();
+                bctx->q8_1_scratch = dx12_create_buffer(bctx->dev,
+                    f16_size + dx12_device::DX12_ROOT_SCRATCH_SLACK);
+                if (bctx->q8_1_scratch) {
+                    bctx->q8_1_scratch->SetName(L"dx12_q8_1_scratch");
+                    bctx->q8_1_scratch_size = f16_size;
+                } else {
+                    bctx->q8_1_scratch_size = 0;
+                }
+                bctx->last_q8_1_src_id = 0;
+                bctx->last_q8_1_size   = 0;
+            }
+
+            if (!bctx->dev->cvt_f32_f16_pipeline) {
+                dx12_pipeline_key c_key = {};
+                c_key.op    = GGML_OP_NONE;
+                c_key.flags = 263;
+                bctx->dev->cvt_f32_f16_pipeline = bctx->dev->get_or_create_pipeline(c_key);
+            }
+            dx12_pipeline * c_pipeline = bctx->dev->cvt_f32_f16_pipeline;
+            if (!bctx->q8_1_scratch || !c_pipeline || !c_pipeline->pso) {
+                DX12_LOG_ERROR("failed to prepare the Xe3 LinAlg activation conversion\n");
+                return GGML_STATUS_FAILED;
+            }
+            {
+                // Same cache the Q8_1 pre-pass uses: qkv projections in a layer
+                // share one activation tensor.
+                const uint32_t this_src_off = (uint32_t)dx12_tensor_offset(node->src[1]);
+                const bool reuse = bctx->last_q8_1_src_id  == (uintptr_t)node->src[1] &&
+                                   bctx->last_q8_1_src_off == this_src_off &&
+                                   bctx->last_q8_1_kind    == 2 &&
+                                   bctx->last_q8_1_size    == n_elems;
+                if (!reuse) {
+                    bctx->emit_uav_barrier_buffer(bctx->q8_1_scratch.Get(), D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+                    bctx->cmd_list->SetPipelineState(c_pipeline->pso.Get());
+                    bctx->last_pso = c_pipeline->pso.Get();
+
+                    dx12_shader_params c_params = {};
+                    c_params.src0_offset = this_src_off;
+                    c_params.dst_offset  = 0;
+                    c_params.ne0         = n_elems;
+                    c_params.ne1         = c_elems;
+                    bctx->set_shader_params(c_params, 30);
+
+                    bctx->cmd_list->SetComputeRootShaderResourceView(1, src1_res->GetGPUVirtualAddress());
+                    bctx->cmd_list->SetComputeRootUnorderedAccessView(3, bctx->q8_1_scratch->GetGPUVirtualAddress());
+                    bctx->last_src0_va = src1_res->GetGPUVirtualAddress();
+                    bctx->last_dst_va  = bctx->q8_1_scratch->GetGPUVirtualAddress();
+
+                    // Eight elements per thread, 64 threads per group. The y
+                    // split must match the linearisation in the shader.
+                    const uint32_t c_groups = dx12_ceil_div(dx12_ceil_div(n_elems, 8u), 64u);
+                    bctx->cmd_list->Dispatch(std::min(c_groups, 65535u),
+                                             dx12_ceil_div(c_groups, 65535u), 1);
+
+                    // Probe: run the convert N extra times so its marginal cost
+                    // rises above run-to-run noise. See TUNING.md section 40.
+                    static const int cvt_rep =
+                        ([]{ const char * e = DX12_GETENV("DX12_CVT_REP");
+                             return e ? atoi(e) : 0; })();
+                    for (int r = 0; r < cvt_rep; ++r) {
+                        bctx->cmd_list->Dispatch(std::min(c_groups, 65535u),
+                                                 dx12_ceil_div(c_groups, 65535u), 1);
+                    }
+
+                    bctx->emit_uav_barrier_buffer(bctx->q8_1_scratch.Get());
+
+                    bctx->last_q8_1_src_id  = (uintptr_t)node->src[1];
+                    bctx->last_q8_1_src_off = this_src_off;
+                    bctx->last_q8_1_size    = n_elems;
+                    bctx->last_q8_1_kind    = 2;
+                    bctx->last_q8_1_src_va  = src1_res->GetGPUVirtualAddress();
+                }
+
+                bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+                bctx->last_pso = pipeline->pso.Get();
+                // Bind at the weight, not at the heap. The matrix Load faults
+                // once its byte offset reaches 2 GB, so keep the offset the
+                // shader passes it small and let the VA carry the distance.
+                // No single weight tensor is anywhere near 2 GB.
+                const D3D12_GPU_VIRTUAL_ADDRESS w_va =
+                    src0_res->GetGPUVirtualAddress() + dx12_tensor_offset(node->src[0]);
+                bctx->cmd_list->SetComputeRootShaderResourceView(1, w_va);
+                bctx->last_src0_va = w_va;
+                bctx->cmd_list->SetComputeRootShaderResourceView(2, bctx->q8_1_scratch->GetGPUVirtualAddress());
+                bctx->last_src1_va = bctx->q8_1_scratch->GetGPUVirtualAddress();
+                if (dst_res) {
+                    bctx->cmd_list->SetComputeRootUnorderedAccessView(3, dst_res->GetGPUVirtualAddress());
+                    bctx->last_dst_va = dst_res->GetGPUVirtualAddress();
+                }
+                params.src1_offset = 0;
+                params.src0_offset = 0;
+                if (tiled_b_f16) {
+                    params.nb11 = k_elems * 2u;
+                    params.nb12 = params.nb11 * (uint32_t)node->src[1]->ne[1];
+                    params.nb13 = params.nb12 * (uint32_t)node->src[1]->ne[2];
+                }
+                bctx->set_shader_params(params, num_constants);
+            }
+        }
+#endif
+
+        if (gdn_cache) {
+            ID3D12Resource * cache_resource = dx12_get_resource(gdn_cache);
+            bctx->emit_uav_barrier_buffer(cache_resource,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+            bctx->cmd_list->SetComputeRootUnorderedAccessView(6, cache_resource->GetGPUVirtualAddress());
+            ++gdn_cache_dispatches;
+        }
+
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && key.flags == DX12_FA_SPARSE_FLAG) {
+            const ggml_tensor * mask = node->src[3];
+            dx12_fa_mask_entry entry;
+            entry.resource = dx12_get_resource(mask);
+            entry.offset = dx12_tensor_offset(mask);
+            entry.bytes = ggml_nbytes(mask);
+            std::copy(mask->ne, mask->ne + GGML_MAX_DIMS, entry.ne.begin());
+            std::copy(mask->nb, mask->nb + GGML_MAX_DIMS, entry.nb.begin());
+            entry.queries = params.ne01;
+            entry.keys = params.ne11;
+            entry.type = mask->type;
+            const auto found = std::find_if(fa_masks.begin(), fa_masks.end(),
+                [&](const dx12_fa_mask_entry & cached) { return cached.matches(entry); });
+            ID3D12Resource * scratch = bctx->fa_mask_scratch.Get();
+            if (found != fa_masks.end()) {
+                entry.scratch_offset = found->scratch_offset;
+                ++fa_stats.reused;
+            } else {
+                const size_t bytes = dx12_fa_sparse_bytes(node);
+                GGML_ASSERT(scratch && bytes <= bctx->fa_mask_scratch_size);
+                if (fa_mask_used + bytes > bctx->fa_mask_scratch_size) {
+                    fa_masks.clear();
+                    fa_mask_used = 0;
+                }
+                entry.scratch_offset = fa_mask_used;
+                fa_mask_used += bytes;
+                if (!bctx->fa_sparse_compact_pipeline) {
+                    dx12_pipeline_key compact_key = {};
+                    compact_key.op = GGML_OP_NONE;
+                    compact_key.flags = DX12_FA_SPARSE_COMPACT_FLAG;
+                    bctx->fa_sparse_compact_pipeline = bctx->dev->get_or_create_pipeline(compact_key);
+                }
+                dx12_pipeline * prepass = bctx->fa_sparse_compact_pipeline;
+                if (!prepass || !prepass->pso) {
+                    DX12_LOG_ERROR("failed to prepare sparse attention compaction\n");
+                    return GGML_STATUS_FAILED;
+                }
+                bctx->emit_uav_barrier_buffer(scratch,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+                bctx->emit_uav_barrier_buffer(entry.resource);
+                bctx->cmd_list->SetComputeRootUnorderedAccessView(6, scratch->GetGPUVirtualAddress() + entry.scratch_offset);
+                bctx->cmd_list->SetPipelineState(prepass->pso.Get());
+                bctx->last_pso = prepass->pso.Get();
+                bctx->cmd_list->Dispatch(params.ne01, (uint32_t)mask->ne[2], (uint32_t)mask->ne[3]);
+                if (dx12_shader_audit_enabled()) {
+                    ++prepass->dispatches;
+                }
+                bctx->emit_uav_barrier_buffer(scratch);
+                bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+                bctx->last_pso = pipeline->pso.Get();
+                if ((params.op_params[15] & 0xFFFFu) > 1u) {
+                    bctx->cmd_list->SetComputeRootUnorderedAccessView(6, bctx->dev->splitkv_temp->GetGPUVirtualAddress());
+                }
+                fa_masks.push_back(entry);
+                ++fa_stats.built;
+                fa_stats.bytes += bytes;
+            }
+            bctx->last_src6_va = scratch->GetGPUVirtualAddress() + entry.scratch_offset;
+            bctx->cmd_list->SetComputeRootShaderResourceView(9, bctx->last_src6_va);
+        }
+
+        if (node->op == GGML_OP_FLASH_ATTN_EXT &&
+            (dx12_is_fa_pipeline_flag(key.flags) || dx12_is_fa_scalar_mask_flag(key.flags)) && node->src[3]) {
+            GGML_ASSERT(!bctx->replay.capturing && (params.op_params[15] & 0xFFFFu) == 1u);
+            const ggml_tensor * mask = node->src[3];
+            dx12_fa_mask_entry entry;
+            entry.resource = dx12_get_resource(mask);
+            entry.offset = dx12_tensor_offset(mask);
+            entry.bytes = ggml_nbytes(mask);
+            std::copy(mask->ne, mask->ne + GGML_MAX_DIMS, entry.ne.begin());
+            std::copy(mask->nb, mask->nb + GGML_MAX_DIMS, entry.nb.begin());
+            entry.queries = params.ne01;
+            entry.keys = params.ne11;
+            const bool scalar_mask = dx12_is_fa_scalar_mask_flag(key.flags);
+            entry.rows = scalar_mask ? (node->src[0]->ne[0] == 128 ? 16u : 32u) : dx12_fa_pipeline_rows(*bctx->dev, node);
+            entry.columns = scalar_mask ? 32u : DX12_FA_PIPELINE_BC;
+            entry.type = mask->type;
+            const auto found = std::find_if(fa_masks.begin(), fa_masks.end(),
+                [&](const dx12_fa_mask_entry & cached) { return cached.matches(entry); });
+            ID3D12Resource * scratch = bctx->fa_mask_scratch.Get();
+            if (found != fa_masks.end()) {
+                bctx->cmd_list->SetComputeRootUnorderedAccessView(6, scratch->GetGPUVirtualAddress() + found->scratch_offset);
+                fa_stats.reused++;
+            } else {
+                const size_t bytes = dx12_fa_mask_bytes(node, entry.rows, entry.columns);
+                GGML_ASSERT(scratch && bytes <= bctx->fa_mask_scratch_size);
+                if (fa_mask_used + bytes > bctx->fa_mask_scratch_size) {
+                    fa_masks.clear();
+                    fa_mask_used = 0;
+                }
+                entry.scratch_offset = fa_mask_used;
+                fa_mask_used += bytes;
+                const uint32_t mask_variant = (scalar_mask ? 2u : 0u) + (entry.rows == 32 ? 1u : 0u);
+                if (!bctx->fa_mask_packed_pipeline[mask_variant]) {
+                    dx12_pipeline_key mask_key = {};
+                    mask_key.op = GGML_OP_NONE;
+                    mask_key.flags = scalar_mask ? DX12_FA_SCALAR_MASK_PACKED_BASE + mask_variant - 2u :
+                        (mask_variant ? DX12_FA_MASK_PACKED_BR32_FLAG : DX12_FA_MASK_PACKED_FLAG);
+                    bctx->fa_mask_packed_pipeline[mask_variant] = bctx->dev->get_or_create_pipeline(mask_key);
+                }
+                dx12_pipeline * prepass = bctx->fa_mask_packed_pipeline[mask_variant];
+                if (!prepass || !prepass->pso) {
+                    DX12_LOG_ERROR("failed to prepare packed attention mask prepass\n");
+                    return GGML_STATUS_FAILED;
+                }
+                bctx->emit_uav_barrier_buffer(scratch);
+                bctx->emit_uav_barrier_buffer(entry.resource);
+                bctx->cmd_list->SetComputeRootUnorderedAccessView(6, scratch->GetGPUVirtualAddress() + entry.scratch_offset);
+                bctx->cmd_list->SetPipelineState(prepass->pso.Get());
+                bctx->last_pso = prepass->pso.Get();
+                bctx->cmd_list->Dispatch(dx12_ceil_div(params.ne11, 16 * entry.columns),
+                    dx12_ceil_div(params.ne01, entry.rows), (uint32_t)(mask->ne[2] * mask->ne[3]));
+                if (dx12_shader_audit_enabled()) {
+                    prepass->dispatches++;
+                }
+                bctx->emit_uav_barrier_buffer(scratch);
+                bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
+                bctx->last_pso = pipeline->pso.Get();
+                fa_masks.push_back(entry);
+                fa_stats.built++;
+                fa_stats.bytes += bytes;
+            }
+        }
+
         // MoE tiled GEMM: bucket the routing pairs by expert, then hand the
         // scratch to the GEMM on u1 (see mul_mat_id_gemm.hlsl).
-        if (node->op == GGML_OP_MUL_MAT_ID && (key.flags == 119 || key.flags == 122) && pipeline && node->src[2]) {
+        if (node->op == GGML_OP_MUL_MAT_ID &&
+            (key.flags == 119 || key.flags == 122 || key.flags == DX12_MMID_IW_FLAG || dx12_is_bucket_linalg_mmid(key.flags)) &&
+            pipeline && node->src[2]) {
             const ggml_tensor * ids = node->src[2];
             const uint32_t n_expert  = (uint32_t)node->src[0]->ne[2];
             const uint32_t n_pairs   = (uint32_t)(ids->ne[0] * ids->ne[1]);
@@ -12343,11 +17160,17 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 dx12_pipeline * b_pipeline = bctx->dev->moe_bucket_pipeline;
                 const uint32_t ids_off = (uint32_t)dx12_tensor_offset(ids);
                 // gate/up/down in a layer route through one ids tensor.
-                const bool reuse = bctx->last_moe_bucket_ids_id  == (uintptr_t)ids &&
+                // The row order is part of the intermediate layout, even across a list reset.
+                const bool pinned = expert_step && expert_step->phase != 0;
+                const bool reuse = pinned || (bctx->last_moe_bucket_ids_id  == (uintptr_t)ids &&
                                    bctx->last_moe_bucket_ids_off == ids_off &&
-                                   bctx->last_moe_bucket_size    == n_pairs;
+                                   bctx->last_moe_bucket_size    == n_pairs &&
+                                   bctx->last_moe_bucket_experts == n_expert &&
+                                   bctx->last_moe_bucket_ids_va == ids_res->GetGPUVirtualAddress() &&
+                                   bctx->last_moe_bucket_ids_bytes == ggml_nbytes(ids));
                 if (b_pipeline && b_pipeline->pso) {
                     if (!reuse) {
+                        bctx->emit_uav_barrier_buffer(bctx->moe_bucket_scratch.Get());
                         bctx->cmd_list->SetPipelineState(b_pipeline->pso.Get());
                         bctx->last_pso = b_pipeline->pso.Get();
 
@@ -12359,7 +17182,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         b_params.nb01        = (uint32_t)ids->nb[1];
                         b_params.src0_offset = ids_off;
                         b_params.op_params[0] = pairs_off;
-                        bctx->set_shader_params(b_params, 30);
+                        // op0 follows the 30 base DWORDs and is needed in root-constant mode.
+                        bctx->set_shader_params(b_params, (uint32_t)(sizeof(b_params) / sizeof(uint32_t)));
 
                         bctx->cmd_list->SetComputeRootShaderResourceView(1,
                             ids_res->GetGPUVirtualAddress());
@@ -12374,6 +17198,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                         bctx->last_moe_bucket_ids_id  = (uintptr_t)ids;
                         bctx->last_moe_bucket_ids_off = ids_off;
                         bctx->last_moe_bucket_size    = n_pairs;
+                        bctx->last_moe_bucket_experts = n_expert;
+                        bctx->last_moe_bucket_ids_va = ids_res->GetGPUVirtualAddress();
+                        bctx->last_moe_bucket_ids_bytes = ggml_nbytes(ids);
 
                         bctx->cmd_list->SetPipelineState(pipeline->pso.Get());
                         bctx->last_pso = pipeline->pso.Get();
@@ -12395,10 +17222,32 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                     bctx->set_shader_params(params, num_constants);
                     bctx->cmd_list->SetComputeRootUnorderedAccessView(6,
                         bctx->moe_bucket_scratch->GetGPUVirtualAddress());
+                } else {
+                    return GGML_STATUS_FAILED;
                 }
+            } else {
+                return GGML_STATUS_ALLOC_FAILED;
             }
         }
 
+        if (expert_step && expert_step->phase == 3) {
+            ID3D12Resource * weights = dx12_get_resource(cgraph->nodes[i + 1]->src[1]);
+            bctx->emit_uav_barrier_buffer(weights,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+            bctx->cmd_list->SetComputeRootShaderResourceView(4, weights->GetGPUVirtualAddress());
+            bctx->last_src2_va = weights->GetGPUVirtualAddress();
+        }
+
+        if (node->op == GGML_OP_RMS_NORM && key.flags == 12 && fused_mul_node && bctx->q8_1_scratch) {
+            bctx->emit_uav_barrier_buffer(bctx->q8_1_scratch.Get(), D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        }
+
+        if (g_dx12_flag_sink && pipeline &&
+            (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID ||
+             node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_OUT_PROD ||
+             key.op == GGML_OP_RMS_NORM || node->op == GGML_OP_SOFT_MAX)) {
+            g_dx12_flag_sink->push_back(key.flags);
+        }
         if (dx12_shader_audit_enabled() && pipeline) {
             pipeline->dispatches++;
         }
@@ -12408,13 +17257,16 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             // to the shader as a local row range by advancing src0/dst offsets,
             // so the matvec shaders keep their normal row indexing semantics.
             constexpr uint32_t MATVEC_CHUNK_GROUPS = 32768;
-            const uint32_t rows_per_group = (key.flags == 9 || key.flags == 10 || key.flags == 11 ||
+            const uint32_t rows_per_group = dx12_matvec_rows4(key.flags) ? 4 :
+                                            (key.flags == DX12_Q4K_SHORT_F32_FLAG || key.flags == DX12_Q4K_SHORT_DP4A_FLAG ||
+                                             key.flags == DX12_Q6K_PACKED_MMV_FLAG || key.flags == 9 || key.flags == 10 || key.flags == 11 ||
                                              key.flags == 12 || key.flags == 13 || key.flags == 14 ||
                                              key.flags == 15 || key.flags == 16 || key.flags == 17 ||
                                              key.flags == 18 || key.flags == 19 || key.flags == 20 ||
                                              key.flags == 21 || key.flags == 22 || key.flags == 23 ||
                                              key.flags == 24 || key.flags == 25 || key.flags == 26 ||
                                              key.flags == 27 || key.flags == 31 || key.flags == 32 ||
+                                             key.flags == DX12_Q4K_GLU_WAVE_FLAG || key.flags == DX12_Q4K_GLU_WAVE_RMS_FLAG ||
                                              key.flags == 33 || key.flags == 34 || key.flags == 35 ||
                                              key.flags == 36 || key.flags == 37 || key.flags == 38 ||
                                              key.flags == 44 || key.flags == 47 || key.flags == 48 ||
@@ -12453,6 +17305,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 if (params.op_params[0] == 1u) {
                     params.op_params[1] = bias_offset_base + base_row * sizeof(float);
                 } else if (key.flags == 24 || key.flags == 31 || key.flags == 32 ||
+                           key.flags == DX12_Q4K_GLU_WAVE_FLAG || key.flags == DX12_Q4K_GLU_WAVE_RMS_FLAG ||
                            key.flags == 33 || key.flags == 35 || key.flags == 62 ||
                            key.flags == 73 || key.flags == 74 || key.flags == 89 ||
                            key.flags == 91 || key.flags == 95 || key.flags == 96 ||
@@ -12547,6 +17400,7 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->last_q8_1_src_id  = (uintptr_t)fused_mul_node;
             bctx->last_q8_1_src_off = (uint32_t)dx12_tensor_offset(fused_mul_node);
             bctx->last_q8_1_size    = (uint32_t)q8_1_size;
+            bctx->last_q8_1_kind    = 1;
             ID3D12Resource * fmul_res = dx12_get_resource(fused_mul_node);
             if (fmul_res) {
                 bctx->last_q8_1_src_va = fmul_res->GetGPUVirtualAddress();
@@ -12679,10 +17533,24 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         auto track_write_range = [&](const struct ggml_tensor * t) {
             uintptr_t wlo, whi;
             if (!tensor_range(t, wlo, whi)) return;
-            unsynced_write_ranges.push_back({ (void *) dx12_get_resource(t), wlo,
+            ID3D12Resource * resource = dx12_get_resource(t);
+            if (!fa_masks.empty()) {
+                const uint64_t begin = dx12_tensor_offset(t);
+                const uint64_t end = begin + ggml_nbytes(t);
+                fa_masks.erase(std::remove_if(fa_masks.begin(), fa_masks.end(), [&](const dx12_fa_mask_entry & entry) {
+                    const bool overlaps = entry.resource == resource && begin < entry.offset + entry.bytes && entry.offset < end;
+                    fa_stats.invalidated += overlaps;
+                    return overlaps;
+                }), fa_masks.end());
+            }
+            unsynced_write_ranges.push_back({ (void *) resource, wlo,
                                               whi, tensor_root(t) });
         };
         track_write_range(dst_tensor);
+        if (gdn_cache) {
+            unsynced_writes.insert((uintptr_t)gdn_cache);
+            track_write_range(gdn_cache);
+        }
 
         // Track this dispatch's reads for write-after-read hazard detection.
         for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
@@ -12704,8 +17572,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                            rhi, tensor_root(sr) });
             }
         }
-        if (fused_moe_sum && node->op == GGML_OP_MUL_MAT_ID) {
-            const ggml_tensor * weights = fused_moe_weighted->src[1];
+        if (node->op == GGML_OP_MUL_MAT_ID && (fused_moe_sum || (expert_step && expert_step->phase == 3))) {
+            const ggml_tensor * weights = expert_step ? cgraph->nodes[i + 1]->src[1] : fused_moe_weighted->src[1];
             if (weights && weights->data) {
                 uintptr_t rlo, rhi;
                 tensor_range(weights, rlo, rhi);
@@ -12720,11 +17588,38 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                                        rhi,
                                        tensor_root(fused_mtp_gate_input) });
         }
+        if (fused_norm_bias_node) {
+            const ggml_tensor * weight =
+                fused_norm_mul_node->src[0] == fused_norm_node
+                    ? fused_norm_mul_node->src[1] : fused_norm_mul_node->src[0];
+            const ggml_tensor * bias =
+                fused_norm_bias_node->src[0] == fused_norm_mul_node
+                    ? fused_norm_bias_node->src[1] : fused_norm_bias_node->src[0];
+            const ggml_tensor * hidden_srcs[2] = { weight, bias };
+            for (const ggml_tensor * sr : hidden_srcs) {
+                uintptr_t rlo, rhi;
+                if (!tensor_range(sr, rlo, rhi)) continue;
+                unsynced_reads.push_back({ (void *)dx12_get_resource(sr), rlo,
+                                           rhi, tensor_root(sr) });
+            }
+        }
 
         // For triple fusion, also track the ADD intermediate output as unsynced
         if (fused_add_rms_node) {
             unsynced_writes.insert((uintptr_t)fused_add_rms_node);
             track_write_range(fused_add_rms_node);
+        }
+        if (fused_norm_has_add) {
+            unsynced_writes.insert((uintptr_t)node);
+            track_write_range(node);
+        }
+        // The router also writes the top-k ids (read through the skipped VIEW) and the weights.
+        if (fused_moe_router_out) {
+            unsynced_writes.insert((uintptr_t)cgraph->nodes[i + 2]);
+            unsynced_writes.insert((uintptr_t)cgraph->nodes[i + 3]);
+            unsynced_writes.insert((uintptr_t)fused_moe_router_out);
+            track_write_range(cgraph->nodes[i + 2]);
+            track_write_range(fused_moe_router_out);
         }
 
         // Combined Q/K/V dispatch writes three destinations (Q rope output tracked
@@ -12801,6 +17696,16 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             }
         }
 
+        if (gdn_cache && bctx->dev->is_igpu &&
+            bctx->dev->adapter_desc.VendorId == dx12_vendor::AMD &&
+            !bctx->replay.capturing) {
+            // Keep long fused GDN dispatches in separate queue submissions.
+            // The AMD UMA driver can hang when several share one command list.
+            bctx->close_and_execute();
+            bctx->ensure_cmd_list_open();
+            bctx->reset_binding_cache();
+        }
+
         // DX12_SYNC_PER_OP: close+execute+timed-wait after every node so a TDR
         // can be attributed to the exact op that caused it.  On timeout or
         // device-removed we dump op/flags/shape info and abort.  Very slow.
@@ -12808,7 +17713,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             bctx->close_and_execute();
             // Custom timed wait (wait_for_gpu uses INFINITE which would hang).
             const uint64_t target = bctx->fence_value;
-            if (target > 0 && bctx->fence->GetCompletedValue() < target) {
+            const uint64_t completed = bctx->fence->GetCompletedValue();
+            if (target > 0 && (completed == UINT64_MAX || completed < target)) {
                 HRESULT hr = bctx->fence->SetEventOnCompletion(target, bctx->fence_event);
                 DWORD wait_result = WAIT_TIMEOUT;
                 if (SUCCEEDED(hr)) {
@@ -12865,7 +17771,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         if (dump_name_env && dump_per_dispatch) {
             const ggml_tensor * candidates[8] = { dst_tensor, node,
                 fused_rope_after_rms, fused_5way_set_rows, fused_rope_set_rows,
-                fused_mul_node, fused_add_rms_node, fused_bias_tensor };
+                fused_mul_node, fused_add_rms_node,
+                fused_norm_bias_node ? fused_norm_bias_node : fused_bias_tensor };
             const ggml_tensor * matched = nullptr;
             for (const ggml_tensor * c : candidates) {
                 if (!c || !c->name[0]) continue;
@@ -12896,10 +17803,14 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         }
 
         // Skip fused nodes
-        if (fused_mtp_gate_mul) {
+        if (fused_norm_bias_node) {
+            i += fused_norm_has_add ? 3 : 2;
+        } else if (fused_mtp_gate_mul) {
             i += 2;
         } else if (fused_moe_norm_out) {
             i += 4;
+        } else if (fused_moe_router_out) {
+            i += fused_moe_router_norm ? 8 : 4;
         } else if (fused_moe_sum) {
             i += node->op == GGML_OP_MUL_MAT_ID
                ? 1 : (int)fused_moe_weighted->ne[1] - 2;
@@ -13006,7 +17917,8 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         //   dispatches like Qwen3-VL CLIP with 6600 patches × 16 heads), but
         //   that drained the queue to zero between every flush and produced
         //   a visible 100→0→100 ping-pong on the GPU monitor.  The ring's
-        //   3-deep pipelining keeps each individual submission well under
+        //   ring bounds CPU run-ahead without serializing CPU and GPU work.
+        //   Submission size, not ring depth, must stay within the
         //   the 2s TDR window without serializing CPU↔GPU.  Set
         //   DX12_FLUSH_DRAIN=1 to restore the old drain-after-flush behavior
         //   if a specific workload ever revisits TDR territory.
@@ -13023,20 +17935,28 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
             // Accumulate estimated FLOPs for adaptive streaming over ALL
             // compute-heavy nodes (matmul, conv, attention), matching Vulkan
             // (ggml-vulkan.cpp:16330).  Cheap ops contribute 0.
-            {
-                uint64_t nf = dx12_get_node_flops(node);
-                batch_flops += nf;
-                total_flops += nf;
-            }
+            const uint64_t node_flops = dx12_get_node_flops(node);
+            batch_flops += node_flops;
+            total_flops += node_flops;
 
             bool needs_gen_flush = !is_prompt && cgraph->n_nodes > 500;
-            int flush_threshold = is_prompt ? 24 : 2000;
+            static const int flush_threshold_prompt = []() {
+                const char * s = DX12_GETENV("DX12_FLUSH_THRESHOLD");
+                return s ? atoi(s) : 24;
+            }();
+            static const bool automatic_prompt_flush = DX12_GETENV("DX12_FLUSH_THRESHOLD") == nullptr;
+            // One scalar IQ dispatch can use most of the watchdog interval on Intel UHD.
+            // Submit it separately without a GPU wait; explicit thresholds retain diagnostic control.
+            const bool scalar_iq_flush = is_prompt && automatic_prompt_flush &&
+                bctx->dev->arch_family == DX12_ARCH_INTEL_UHD &&
+                node->op == GGML_OP_MUL_MAT && key.flags == 43 && node_flops >= 1'000'000'000ULL;
+            int flush_threshold = is_prompt ? flush_threshold_prompt : 2000;
             const bool flops_trigger = (flops_per_submit > 0 && batch_flops >= flops_per_submit);
             // During a command-list replay capture the whole graph is recorded
             // into a single dedicated list with no stream submits.
             if (bctx->replay.capturing) {
                 // no-op: keep everything in the dedicated capture list
-            } else if ((is_prompt || needs_gen_flush) && dispatch_weight >= flush_threshold) {
+            } else if (scalar_iq_flush || ((is_prompt || needs_gen_flush) && dispatch_weight >= flush_threshold)) {
                 bctx->close_and_execute();
                 static const bool flush_drain = (getenv("DX12_FLUSH_DRAIN") != nullptr);
                 if (flush_drain && is_prompt && total_groups >= 20000) {
@@ -13184,25 +18104,26 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
     // per generation that were pegging the CPU at 100%.
 
     // Dump profiling results: resolve query heap and aggregate per op
-    if (do_profile && prof_idx > 0) {
+    if (profile_queries && prof_graph_start && prof_idx + 1 <= prof_capacity) {
         // Resolve query data into the readback buffer, then flush+wait so
         // we can map and read the GPU timestamps.
+        bctx->cmd_list->EndQuery(prof_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, prof_idx);
         bctx->cmd_list->ResolveQueryData(prof_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                                          0, prof_idx, prof_readback.Get(), 0);
+                                          0, prof_idx + 1, prof_readback.Get(), 0);
         bctx->close_and_execute();
         bctx->wait_for_gpu();
         bctx->ensure_cmd_list_open();
         bctx->reset_binding_cache();
 
         uint64_t * ts = nullptr;
-        D3D12_RANGE rr = { 0, (size_t)prof_idx * sizeof(uint64_t) };
+        D3D12_RANGE rr = { 0, (size_t)(prof_idx + 1) * sizeof(uint64_t) };
         HRESULT hr = prof_readback->Map(0, &rr, (void **)&ts);
         if (SUCCEEDED(hr) && ts) {
             uint64_t lo = ~0ull, hi = 0;
             double sum_ticks = 0.0;
             for (size_t k = 0; k < prof_keys.size(); k++) {
-                uint64_t t_start = ts[k * 2];
-                uint64_t t_end   = ts[k * 2 + 1];
+                uint64_t t_start = ts[k * 2 + 1];
+                uint64_t t_end   = ts[k * 2 + 2];
                 if (t_end < t_start) continue;
                 double ms = (double)(t_end - t_start) * 1000.0 / (double)prof_freq;
                 op_times[prof_keys[k]] += ms;
@@ -13219,6 +18140,27 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
                 fprintf(stderr, "[GPU_SPAN] dispatches=%zu sum=%.3f ms span=%.3f ms idle=%.3f ms\n",
                         prof_keys.size(), sum_ticks * to_ms, (double)(hi - lo) * to_ms,
                         ((double)(hi - lo) - sum_ticks) * to_ms);
+                fprintf(stderr,
+                        "[GPU_GRAPH] total=%.3f ms before_first=%.3f ms after_last=%.3f ms\n",
+                        (double)(ts[prof_idx] - ts[0]) * to_ms,
+                        (double)(lo - ts[0]) * to_ms,
+                        (double)(ts[prof_idx] - hi) * to_ms);
+            } else {
+                fprintf(stderr, "[GPU_GRAPH] total=%.3f ms\n",
+                        (double)(ts[prof_idx] - ts[0]) * 1000.0 / (double)prof_freq);
+            }
+            {
+                UINT64 cal_gpu = 0;
+                UINT64 cal_cpu = 0;
+                if (SUCCEEDED(bctx->dev->compute_queue->GetClockCalibration(&cal_gpu, &cal_cpu)) &&
+                    prof_cpu_freq.QuadPart > 0) {
+                    const double gpu_start_cpu_qpc =
+                        (double)cal_cpu + ((double)ts[0] - (double)cal_gpu) *
+                        (double)prof_cpu_freq.QuadPart / (double)prof_freq;
+                    fprintf(stderr, "[GPU_QUEUE] cpu_graph_start_to_gpu=%.3f ms\n",
+                            (gpu_start_cpu_qpc - (double)prof_cpu_start_qpc.QuadPart) *
+                            1000.0 / (double)prof_cpu_freq.QuadPart);
+                }
             }
             D3D12_RANGE wr = { 0, 0 };
             prof_readback->Unmap(0, &wr);
@@ -13268,6 +18210,9 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
         fprintf(stderr, "  %8.3f  TOTAL\n", total);
     }
 
+    if (gdn_cache_enabled && getenv("DX12_GDN_CACHE_STATS")) {
+        fprintf(stderr, "[DX12_GDN_CACHE] fused=%u\n", gdn_cache_dispatches);
+    }
     if (dx12_trace) {
         fprintf(stderr, "[DX12_TRACE] graph_compute #%d exit: success\n", trace_call);
         fflush(stderr);
@@ -13308,103 +18253,241 @@ static ggml_status dx12_graph_compute(ggml_backend_t backend, struct ggml_cgraph
 // ---------------------------------------------------------------------------
 
 void dx12_device::run_autotune() {
-    if (tuning_done) return;
+    using namespace ggml_dx12_autotune;
+
+    if (tuning_done) {
+        return;
+    }
     tuning_done = true;
 
-    // Tuner override path: when these envs are set, skip cache+benchmark and use
-    // the supplied values directly. Used by llama-mmv-tune validate-cache to
-    // measure how each cached choice performs on real model shapes vs the
-    // alternative. Each env is optional; unset envs fall through to cache load.
+    const cache_identity identity = {
+        driver_version_raw,
+        dx12_pso_log_stamp(),
+        blob_wave_size,
+        adapter_desc.AdapterLuid.HighPart,
+        adapter_desc.AdapterLuid.LowPart,
+    };
+    cache_values values;
+
+    q4k_dp4a_use_32 = values.q4k_32;
+    q5k_dp4a_use_32 = values.q5k_32;
+    f16_mr_k_256_threshold = values.f16_k_256;
+    bf16_mr_k_256_threshold = values.bf16_k_256;
+    f32_mr_k_256_threshold = values.f32_k_256;
+    q5k_dp4a_m_32_threshold = NEVER;
+
+    const bool autotune_disabled = getenv("DX12_NO_AUTOTUNE") != nullptr;
+
+    char cache_path[512];
+    const char * localappdata = getenv("LOCALAPPDATA");
+    std::snprintf(
+        cache_path, sizeof(cache_path),
+        "%s/.ggml_dx12_tune_%04X_%04X_%08X_%08X.txt",
+        localappdata ? localappdata : ".",
+        adapter_desc.VendorId,
+        adapter_desc.DeviceId,
+        (uint32_t) adapter_desc.AdapterLuid.HighPart,
+        adapter_desc.AdapterLuid.LowPart);
+
+    bool cache_loaded = false;
+    if (!getenv("DX12_TUNE_REFRESH")) {
+        FILE * cache = std::fopen(cache_path, "r");
+        if (cache) {
+            char line[512] = {};
+            if (std::fgets(line, sizeof(line), cache) &&
+                parse_cache(line, identity, values)) {
+                cache_loaded = true;
+            }
+            std::fclose(cache);
+        }
+    }
+
+    if (cache_loaded) {
+        q4k_dp4a_use_32 = values.q4k_32;
+        q5k_dp4a_use_32 = values.q5k_32;
+        f16_mr_k_256_threshold = values.f16_k_256;
+        bf16_mr_k_256_threshold = values.bf16_k_256;
+        f32_mr_k_256_threshold = values.f32_k_256;
+    }
+
+    // All force variables are independent. A partial override starts from a
+    // valid cache when available, otherwise from conservative defaults.
     const char * env_q4k    = getenv("DX12_TUNE_FORCE_Q4K_DP4A_32");
     const char * env_q5k    = getenv("DX12_TUNE_FORCE_Q5K_DP4A_32");
     const char * env_f16    = getenv("DX12_TUNE_FORCE_F16_MR_256");
     const char * env_kthr   = getenv("DX12_TUNE_FORCE_F16_MR_K_THRESH");
+    const char * env_bf16   = getenv("DX12_TUNE_FORCE_BF16_MR_K_THRESH");
+    const char * env_f32    = getenv("DX12_TUNE_FORCE_F32_MR_K_THRESH");
     const char * env_q5kmth = getenv("DX12_TUNE_FORCE_Q5K_DP4A_M_THRESH");
-    if (env_q4k && env_q5k && env_f16 && env_kthr) {
-        q4k_dp4a_use_32        = (atoi(env_q4k) != 0);
-        q5k_dp4a_use_32        = (atoi(env_q5k) != 0);
-        f16_mr_use_256         = (atoi(env_f16) != 0);
-        f16_mr_k_256_threshold = (uint32_t) strtoul(env_kthr, nullptr, 10);
-        // M-threshold env is optional; default UINT32_MAX preserves old behavior.
-        q5k_dp4a_m_32_threshold = env_q5kmth
-            ? (uint32_t) strtoul(env_q5kmth, nullptr, 10)
-            : 0xFFFFFFFFu;
-        DX12_LOG_INFO("Auto-tune FORCED via env: Q4_K_dp4a=%s Q5_K_dp4a=%s F16_mr=%s (K>=%u uses 256t, Q5K M>=%u uses 32t)\n",
+    const bool forced = env_q4k || env_q5k || env_f16 || env_kthr ||
+                        env_bf16 || env_f32 || env_q5kmth;
+    if (forced) {
+        if (env_q4k) {
+            q4k_dp4a_use_32 = std::atoi(env_q4k) != 0;
+        }
+        if (env_q5k) {
+            q5k_dp4a_use_32 = std::atoi(env_q5k) != 0;
+        }
+        if (env_f16) {
+            f16_mr_k_256_threshold = std::atoi(env_f16) != 0 ? 0 : NEVER;
+        }
+        if (env_kthr) {
+            const uint32_t threshold = (uint32_t) std::strtoul(env_kthr, nullptr, 10);
+            f16_mr_k_256_threshold = threshold;
+            if (!env_bf16) {
+                bf16_mr_k_256_threshold = threshold;
+            }
+            if (!env_f32) {
+                f32_mr_k_256_threshold = threshold;
+            }
+        }
+        if (env_bf16) {
+            bf16_mr_k_256_threshold = (uint32_t) std::strtoul(env_bf16, nullptr, 10);
+        }
+        if (env_f32) {
+            f32_mr_k_256_threshold = (uint32_t) std::strtoul(env_f32, nullptr, 10);
+        }
+        if (env_q5kmth) {
+            q5k_dp4a_m_32_threshold = (uint32_t) std::strtoul(env_q5kmth, nullptr, 10);
+        }
+        DX12_LOG_INFO(
+            "Auto-tune forced: Q4_K=%s Q5_K=%s F16_K=%u BF16_K=%u F32_K=%u Q5K_M=%u\n",
                       q4k_dp4a_use_32 ? "32t" : "256t",
                       q5k_dp4a_use_32 ? "32t" : "256t",
-                      f16_mr_use_256  ? "256t" : "32t",
                       (unsigned)f16_mr_k_256_threshold,
+                      (unsigned)bf16_mr_k_256_threshold,
+                      (unsigned)f32_mr_k_256_threshold,
                       (unsigned)q5k_dp4a_m_32_threshold);
         return;
     }
 
-    // Check for cache file first
-    char cache_path[512];
-    const char * localappdata = getenv("LOCALAPPDATA");
-    snprintf(cache_path, sizeof(cache_path), "%s/.ggml_dx12_tune_%04X_%04X.txt",
-             localappdata ? localappdata : ".",
-             adapter_desc.VendorId, adapter_desc.DeviceId);
+    if (cache_loaded) {
+        DX12_LOG_INFO(
+            "Auto-tune v%d loaded: Q4_K=%s Q5_K=%s F16_K=%u BF16_K=%u F32_K=%u\n",
+            CACHE_VERSION,
+            q4k_dp4a_use_32 ? "32t" : "256t",
+            q5k_dp4a_use_32 ? "32t" : "256t",
+            (unsigned) f16_mr_k_256_threshold,
+            (unsigned) bf16_mr_k_256_threshold,
+            (unsigned) f32_mr_k_256_threshold);
+        return;
+    }
 
-    FILE * f = fopen(cache_path, "r");
-    if (f) {
-        int ver = 0, q4kdp = 0, q5kdp = 0, f16mr256 = 0;
-        unsigned int f16mr_kthresh = 0xFFFFFFFFu;
-        unsigned int q5k_m_thresh  = 0xFFFFFFFFu;
-        if (fscanf(f, "v=%d q4k_dp4a_32=%d q5k_dp4a_32=%d f16_mr_256=%d f16_mr_k_thresh=%u q5k_dp4a_m_thresh=%u",
-                   &ver, &q4kdp, &q5kdp, &f16mr256, &f16mr_kthresh, &q5k_m_thresh) == 6
-            && ver == TUNE_VERSION) {
-            q4k_dp4a_use_32 = (q4kdp != 0);
-            q5k_dp4a_use_32 = (q5kdp != 0);
-            f16_mr_use_256  = (f16mr256 != 0);
-            f16_mr_k_256_threshold = (uint32_t)f16mr_kthresh;
-            q5k_dp4a_m_32_threshold = (uint32_t)q5k_m_thresh;
-            fclose(f);
-            DX12_LOG_INFO("Auto-tune v%d loaded: Q4_K_dp4a=%s Q5_K_dp4a=%s F16_mr=%s (K>=%u uses 256t, Q5K M>=%u uses 32t)\n",
-                          ver,
-                          q4k_dp4a_use_32 ? "32t" : "256t",
-                          q5k_dp4a_use_32 ? "32t" : "256t",
-                          f16_mr_use_256  ? "256t" : "32t",
-                          (unsigned)f16_mr_k_256_threshold,
-                          (unsigned)q5k_dp4a_m_32_threshold);
-            return;
-        }
-        fclose(f);
-        // Version mismatch or parse failure — re-benchmark
+    if (autotune_disabled) {
+        DX12_LOG_INFO("Auto-tune benchmark disabled via DX12_NO_AUTOTUNE\n");
+        return;
     }
 
     DX12_LOG_INFO("Running auto-tune benchmark...\n");
 
-    // Create a temporary buffer for benchmarking
-    // Must be large enough for max test: K-sweep N=256 rows × max K stride,
-    // plus M-sweep at M=test_M_large × K=test_K_for_m with fake byte strides
-    // (nb01 = K). At M=32768, K=3072 that's 32768 * 3072 = 96 MB for src0.
-    // 256 MB gives headroom for any future probe expansion.
-    ComPtr<ID3D12Resource> bench_buf;
-    {
+    auto make_buffer = [&](uint64_t size, D3D12_RESOURCE_FLAGS flags,
+                           D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource> & out) {
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = 256ull * 1024 * 1024;  // 256MB
+        rd.Width = size;
         rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
         rd.Format = DXGI_FORMAT_UNKNOWN;
         rd.SampleDesc.Count = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        HRESULT hr = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bench_buf));
-        if (FAILED(hr)) {
-            DX12_LOG_WARN("Auto-tune: failed to create benchmark buffer\n");
-            return;
-        }
+        rd.Flags = flags;
+        return device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd, state,
+            nullptr, IID_PPV_ARGS(&out));
+    };
+
+    ComPtr<ID3D12Resource> bench_src0;
+    ComPtr<ID3D12Resource> bench_src1;
+    ComPtr<ID3D12Resource> bench_dst;
+    if (FAILED(make_buffer(16ull * 1024 * 1024, D3D12_RESOURCE_FLAG_NONE,
+                           D3D12_RESOURCE_STATE_COPY_DEST, bench_src0)) ||
+        FAILED(make_buffer(64ull * 1024, D3D12_RESOURCE_FLAG_NONE,
+                           D3D12_RESOURCE_STATE_COPY_DEST, bench_src1)) ||
+        FAILED(make_buffer(4096, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_COPY_DEST, bench_dst))) {
+        DX12_LOG_WARN("Auto-tune: failed to create benchmark buffers\n");
+        return;
     }
 
-    // Create timestamp query heap
+    {
+        ComPtr<ID3D12Resource> upload;
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 16ull * 1024 * 1024;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&upload));
+        if (FAILED(hr)) {
+            DX12_LOG_WARN("Auto-tune: failed to create initialization buffer\n");
+            return;
+        }
+        void * mapped = nullptr;
+        D3D12_RANGE no_read = { 0, 0 };
+        hr = upload->Map(0, &no_read, &mapped);
+        if (FAILED(hr)) {
+            return;
+        }
+        std::memset(mapped, 0, (size_t) rd.Width);
+        upload->Unmap(0, nullptr);
+
+        ComPtr<ID3D12CommandAllocator> alloc;
+        ComPtr<ID3D12GraphicsCommandList> cl;
+        hr = device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+        if (SUCCEEDED(hr)) {
+            hr = device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), nullptr, IID_PPV_ARGS(&cl));
+        }
+        if (FAILED(hr)) {
+            return;
+        }
+        cl->CopyBufferRegion(bench_src0.Get(), 0, upload.Get(), 0, 16ull * 1024 * 1024);
+        cl->CopyBufferRegion(bench_src1.Get(), 0, upload.Get(), 0, 64ull * 1024);
+        cl->CopyBufferRegion(bench_dst.Get(), 0, upload.Get(), 0, 4096);
+        D3D12_RESOURCE_BARRIER barriers[3] = {};
+        ID3D12Resource * resources[3] = { bench_src0.Get(), bench_src1.Get(), bench_dst.Get() };
+        D3D12_RESOURCE_STATES states[3] = {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        };
+        for (int i = 0; i < 3; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.pResource = resources[i];
+            barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barriers[i].Transition.StateAfter = states[i];
+            barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cl->ResourceBarrier(3, barriers);
+        if (FAILED(cl->Close())) {
+            return;
+        }
+        ID3D12CommandList * lists[] = { cl.Get() };
+        compute_queue->ExecuteCommandLists(1, lists);
+        ComPtr<ID3D12Fence> fence;
+        hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (FAILED(hr) || !event ||
+            FAILED(fence->SetEventOnCompletion(1, event)) ||
+            FAILED(compute_queue->Signal(fence.Get(), 1))) {
+            if (event) CloseHandle(event);
+            return;
+        }
+        WaitForSingleObject(event, INFINITE);
+        CloseHandle(event);
+    }
+
     ComPtr<ID3D12QueryHeap> ts_heap;
     ComPtr<ID3D12Resource> ts_readback;
     {
         D3D12_QUERY_HEAP_DESC qhd = {};
         qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qhd.Count = 4;  // start + end for 2 variants
+        qhd.Count = 4;
         HRESULT hr = device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&ts_heap));
         if (FAILED(hr)) { DX12_LOG_WARN("Auto-tune: failed to create query heap\n"); return; }
 
@@ -13417,44 +18500,61 @@ void dx12_device::run_autotune() {
         rd.SampleDesc.Count = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         hr = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ts_readback));
+                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ts_readback));
         if (FAILED(hr)) { DX12_LOG_WARN("Auto-tune: failed to create readback buffer\n"); return; }
     }
 
-    // Helper: benchmark a pipeline variant
-    // Returns GPU time in ticks, or UINT64_MAX on failure
-    auto bench_pipeline = [&](dx12_pipeline_key key, uint32_t K, uint32_t N, uint32_t ts_start) -> uint64_t {
-        dx12_pipeline * pl = get_or_create_pipeline(key);
-        if (!pl || !pl->pso) return UINT64_MAX;
+    struct probe_layout {
+        uint32_t nb00;
+        uint32_t nb01;
+        uint32_t src0_esize;
+    };
 
-        // Create command allocator + list for benchmarking
+    auto bench_pipeline = [&](
+            dx12_pipeline_key key,
+            uint32_t K,
+            uint32_t rows,
+            const probe_layout & layout,
+            uint32_t ts_start) -> uint64_t {
+        dx12_pipeline * pl = get_or_create_pipeline(key, /* warm */ true);
+        if (!pl || !pl->pso) {
+            return UINT64_MAX;
+        }
+
         ComPtr<ID3D12CommandAllocator> alloc;
         ComPtr<ID3D12GraphicsCommandList> cl;
-        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
-        device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), nullptr, IID_PPV_ARGS(&cl));
+        HRESULT hr = device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&alloc));
+        if (FAILED(hr)) {
+            return UINT64_MAX;
+        }
+        hr = device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc.Get(), nullptr, IID_PPV_ARGS(&cl));
+        if (FAILED(hr)) {
+            return UINT64_MAX;
+        }
 
         cl->SetComputeRootSignature(common_root_sig.Get());
         cl->SetPipelineState(pl->pso.Get());
-        D3D12_GPU_VIRTUAL_ADDRESS va = bench_buf->GetGPUVirtualAddress();
-        cl->SetComputeRootShaderResourceView(1, va);
-        cl->SetComputeRootShaderResourceView(2, va);
-        cl->SetComputeRootUnorderedAccessView(3, va);
-        cl->SetComputeRootShaderResourceView(4, va);
-        cl->SetComputeRootShaderResourceView(5, va);
+        cl->SetComputeRootShaderResourceView(1, bench_src0->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(2, bench_src1->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(3, bench_dst->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(4, bench_src1->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(5, bench_src1->GetGPUVirtualAddress());
 
-        // Set minimal params
         dx12_shader_params params = {};
-        params.ne00 = K; params.ne01 = N;
+        params.ne00 = K; params.ne01 = rows;
         params.ne02 = 1; params.ne03 = 1;
-        params.nb00 = 1; params.nb01 = K;  // fake strides
+        params.nb00 = layout.nb00; params.nb01 = layout.nb01;
         params.ne10 = K; params.ne11 = 1;
         params.ne12 = 1; params.ne13 = 1;
-        params.nb10 = 4;  // F32 stride
-        params.ne0 = N; params.ne1 = 1; params.ne2 = 1; params.ne3 = 1;
-        params.nb0 = 4; params.nb1 = N * 4;
-        params.src0_esize = 2;  // Q5_0/Q8_0 block size doesn't matter for benchmarking
+        params.nb10 = 4;
+        params.ne0 = rows; params.ne1 = 1; params.ne2 = 1; params.ne3 = 1;
+        params.nb0 = 4; params.nb1 = rows * 4;
+        params.src0_esize = layout.src0_esize;
         params.src1_esize = 4;
         params.dst_esize = 4;
+
         ComPtr<ID3D12Resource> param_buffer;
         uint8_t * param_mapped = nullptr;
         if (use_param_cbv) {
@@ -13469,333 +18569,240 @@ void dx12_device::run_autotune() {
             prd.Format = DXGI_FORMAT_UNKNOWN;
             prd.SampleDesc.Count = 1;
             prd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            HRESULT phr = device->CreateCommittedResource(
+            hr = device->CreateCommittedResource(
                 &php, D3D12_HEAP_FLAG_NONE, &prd, D3D12_RESOURCE_STATE_GENERIC_READ,
                 nullptr, IID_PPV_ARGS(&param_buffer));
-            if (FAILED(phr)) return UINT64_MAX;
+            if (FAILED(hr)) return UINT64_MAX;
             D3D12_RANGE read_range = { 0, 0 };
-            phr = param_buffer->Map(0, &read_range, (void **) &param_mapped);
-            if (FAILED(phr)) return UINT64_MAX;
+            hr = param_buffer->Map(0, &read_range, (void **) &param_mapped);
+            if (FAILED(hr)) return UINT64_MAX;
             memcpy(param_mapped, &params, sizeof(params));
             cl->SetComputeRootConstantBufferView(0, param_buffer->GetGPUVirtualAddress());
         } else {
             cl->SetComputeRoot32BitConstants(0, (uint32_t)(sizeof(params)/4), &params, 0);
         }
 
-        // Warmup dispatch
-        cl->Dispatch(N, 1, 1);
+        const uint32_t groups = (rows + 1) / 2;
+        cl->Dispatch(groups, 1, 1);
         D3D12_RESOURCE_BARRIER barrier = {}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         cl->ResourceBarrier(1, &barrier);
 
-        // Timed dispatch
         cl->EndQuery(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_start);
         for (int rep = 0; rep < 10; rep++) {
-            cl->Dispatch(N, 1, 1);
+            cl->Dispatch(groups, 1, 1);
             cl->ResourceBarrier(1, &barrier);
         }
         cl->EndQuery(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_start + 1);
         cl->ResolveQueryData(ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_start, 2, ts_readback.Get(), ts_start * sizeof(uint64_t));
 
-        cl->Close();
+        hr = cl->Close();
+        if (FAILED(hr)) {
+            if (param_buffer && param_mapped) param_buffer->Unmap(0, nullptr);
+            return UINT64_MAX;
+        }
         ID3D12CommandList * lists[] = { cl.Get() };
         compute_queue->ExecuteCommandLists(1, lists);
 
-        // Wait
         ComPtr<ID3D12Fence> fence;
-        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-        // Wait with timeout — GPU hangs should not block indefinitely
+        hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        if (FAILED(hr)) {
+            if (param_buffer && param_mapped) param_buffer->Unmap(0, nullptr);
+            return UINT64_MAX;
+        }
         HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-        fence->SetEventOnCompletion(1, event);
-        compute_queue->Signal(fence.Get(), 1);
+        if (!event || FAILED(fence->SetEventOnCompletion(1, event)) ||
+            FAILED(compute_queue->Signal(fence.Get(), 1))) {
+            if (event) CloseHandle(event);
+            if (param_buffer && param_mapped) param_buffer->Unmap(0, nullptr);
+            return UINT64_MAX;
+        }
         DWORD wait_result = WaitForSingleObject(event, 5000);
+        if (wait_result == WAIT_TIMEOUT) {
+            DX12_LOG_WARN("Auto-tune: GPU benchmark timed out; draining submitted work\n");
+            wait_result = WaitForSingleObject(event, INFINITE);
+        }
         CloseHandle(event);
 
-        if (wait_result == WAIT_TIMEOUT) {
-            DX12_LOG_WARN("Auto-tune: GPU benchmark timed out\n");
+        if (wait_result != WAIT_OBJECT_0) {
+            DX12_LOG_WARN("Auto-tune: GPU benchmark wait failed\n");
             if (param_buffer && param_mapped) param_buffer->Unmap(0, nullptr);
             return UINT64_MAX;
         }
 
-        // Read timestamps
         uint64_t * ts = nullptr;
         D3D12_RANGE range = { ts_start * sizeof(uint64_t), (ts_start + 2) * sizeof(uint64_t) };
-        ts_readback->Map(0, &range, (void**)&ts);
+        hr = ts_readback->Map(0, &range, (void**)&ts);
+        if (FAILED(hr)) {
+            if (param_buffer && param_mapped) param_buffer->Unmap(0, nullptr);
+            return UINT64_MAX;
+        }
         uint64_t dt = ts[ts_start + 1] - ts[ts_start];
         ts_readback->Unmap(0, nullptr);
         if (param_buffer && param_mapped) param_buffer->Unmap(0, nullptr);
         return dt;
     };
 
-    // Benchmark Q5_0 matvec: 32 threads vs 256 threads
-    // Test with K=576 (SmolVLM2-like), K=3072 (Phi-3 attn / Smol FFN), and
-    // K=8192 (Phi-3 FFN-down). Bigger K matters because the per-thread work in
-    // the 256t variant only becomes profitable once K is large enough to
-    // amortize the extra waves' setup; without an 8192 sample the crossover
-    // estimator is extrapolating well past its measured range.
-    uint32_t test_K[] = { 576, 3072, 8192 };
-    uint32_t test_N = 256;  // number of output rows to benchmark
-
-    // Capture per-K timings to write into the cache file as diagnostic comments.
-    // Layout: for each variant we store [K0_256, K0_32, K1_256, K1_32, ...].
-    constexpr size_t NK = sizeof(test_K) / sizeof(test_K[0]);
-    uint64_t q4k_per_k[NK*2]; for (size_t i = 0; i < NK*2; ++i) q4k_per_k[i] = UINT64_MAX;
-    uint64_t q5k_per_k[NK*2]; for (size_t i = 0; i < NK*2; ++i) q5k_per_k[i] = UINT64_MAX;
-    uint64_t f16_per_k[NK*2]; for (size_t i = 0; i < NK*2; ++i) f16_per_k[i] = UINT64_MAX;
-
-    // Benchmark Q4_K dp4a matvec: 256 threads (default) vs 32 threads
-    // Only meaningful if the device supports SM 6.4 / dp4a
-    uint64_t q4k_256_total = 0, q4k_32_total = 0;
-    if (dp4a_supported) {
-        for (size_t ki = 0; ki < NK; ++ki) {
-            uint32_t K = test_K[ki];
-            dx12_pipeline_key key256 = {}; key256.op = GGML_OP_MUL_MAT; key256.src0_type = GGML_TYPE_Q4_K; key256.flags = 10;
-            dx12_pipeline_key key32  = {}; key32.op  = GGML_OP_MUL_MAT; key32.src0_type  = GGML_TYPE_Q4_K; key32.flags  = 13;
-
-            uint64_t t256 = bench_pipeline(key256, K, test_N, 0);
-            uint64_t t32  = bench_pipeline(key32,  K, test_N, 2);
-
-            q4k_per_k[ki*2 + 0] = t256;
-            q4k_per_k[ki*2 + 1] = t32;
-            if (t256 != UINT64_MAX) q4k_256_total += t256;
-            if (t32  != UINT64_MAX) q4k_32_total  += t32;
-
-            DX12_LOG_INFO("  Q4_K_dp4a K=%u: 256t=%llu 32t=%llu ticks\n", K,
-                          (unsigned long long)t256, (unsigned long long)t32);
-        }
-        q4k_dp4a_use_32 = (q4k_32_total < q4k_256_total && q4k_32_total > 0);
-    }
-
-    // Benchmark Q5_K dp4a matvec: 256 threads (default) vs 32 threads.
-    // The K-sweep at fixed test_N feeds the global "always use 32t" fallback
-    // (used when the M-aware crossover degenerates to one variant winning at
-    // both endpoints). A separate M-sweep below (at fixed K) sets the
-    // q5k_dp4a_m_32_threshold for per-dispatch M-aware routing.
-    uint64_t q5k_dp4a_256_total = 0, q5k_dp4a_32_total = 0;
-    if (dp4a_supported) {
-        for (size_t ki = 0; ki < NK; ++ki) {
-            uint32_t K = test_K[ki];
-            dx12_pipeline_key key256 = {}; key256.op = GGML_OP_MUL_MAT; key256.src0_type = GGML_TYPE_Q5_K; key256.flags = 14;
-            dx12_pipeline_key key32  = {}; key32.op  = GGML_OP_MUL_MAT; key32.src0_type  = GGML_TYPE_Q5_K; key32.flags  = 16;
-
-            uint64_t t256 = bench_pipeline(key256, K, test_N, 0);
-            uint64_t t32  = bench_pipeline(key32,  K, test_N, 2);
-
-            q5k_per_k[ki*2 + 0] = t256;
-            q5k_per_k[ki*2 + 1] = t32;
-            if (t256 != UINT64_MAX) q5k_dp4a_256_total += t256;
-            if (t32  != UINT64_MAX) q5k_dp4a_32_total  += t32;
-
-            DX12_LOG_INFO("  Q5_K_dp4a K=%u: 256t=%llu 32t=%llu ticks\n", K,
-                          (unsigned long long)t256, (unsigned long long)t32);
-        }
-        q5k_dp4a_use_32 = (q5k_dp4a_32_total < q5k_dp4a_256_total && q5k_dp4a_32_total > 0);
-    }
-
-    // Q5_K M-aware sweep at fixed K. Determines q5k_dp4a_m_32_threshold by
-    // measuring 256t vs 32t at three M points (test_N, test_M_mid,
-    // test_M_large) at a representative K. Three points let us detect a
-    // crossover in either of two adjacent sub-ranges without losing the
-    // small-M resolution we'd give up by simply pushing the large endpoint
-    // out. Interpolation rule: walk lo->mid then mid->hi looking for the
-    // first 32t-wins transition; linearly interpolate the crossover M inside
-    // that bracket. Non-monotone responses (32t wins only in the middle, or
-    // wins at one endpoint and loses at the other two) fall back to the safe
-    // "never 32t" default so we don't enable the opt-in shader on
-    // unpredictable shapes.
-    uint64_t q5k_m_lo [2] = { UINT64_MAX, UINT64_MAX };  // [256t, 32t] at M=test_N
-    uint64_t q5k_m_mid[2] = { UINT64_MAX, UINT64_MAX };  // [256t, 32t] at M=test_M_mid
-    uint64_t q5k_m_hi [2] = { UINT64_MAX, UINT64_MAX };  // [256t, 32t] at M=test_M_large
-    constexpr uint32_t test_K_for_m  = 3072;
-    constexpr uint32_t test_M_mid    = 4096;
-    constexpr uint32_t test_M_large  = 32768;
-    if (dp4a_supported) {
-        dx12_pipeline_key key256 = {}; key256.op = GGML_OP_MUL_MAT; key256.src0_type = GGML_TYPE_Q5_K; key256.flags = 14;
-        dx12_pipeline_key key32  = {}; key32.op  = GGML_OP_MUL_MAT; key32.src0_type  = GGML_TYPE_Q5_K; key32.flags  = 16;
-
-        // M=test_N point: reuse the corresponding result from q5k_per_k if
-        // we have it (test_K_for_m == one of the test_K entries), otherwise
-        // re-bench. test_K = {576, 3072, 8192} so K=3072 hits index 1.
-        size_t k_idx = NK;
-        for (size_t ki = 0; ki < NK; ++ki) if (test_K[ki] == test_K_for_m) { k_idx = ki; break; }
-        if (k_idx < NK) {
-            q5k_m_lo[0] = q5k_per_k[k_idx*2 + 0];
-            q5k_m_lo[1] = q5k_per_k[k_idx*2 + 1];
-        } else {
-            q5k_m_lo[0] = bench_pipeline(key256, test_K_for_m, test_N, 0);
-            q5k_m_lo[1] = bench_pipeline(key32,  test_K_for_m, test_N, 2);
-        }
-
-        // M=test_M_mid and M=test_M_large points: fresh benches
-        q5k_m_mid[0] = bench_pipeline(key256, test_K_for_m, test_M_mid,   0);
-        q5k_m_mid[1] = bench_pipeline(key32,  test_K_for_m, test_M_mid,   2);
-        q5k_m_hi [0] = bench_pipeline(key256, test_K_for_m, test_M_large, 0);
-        q5k_m_hi [1] = bench_pipeline(key32,  test_K_for_m, test_M_large, 2);
-
-        DX12_LOG_INFO("  Q5_K_dp4a K=%u M=%u: 256t=%llu 32t=%llu ticks\n",
-                      test_K_for_m, test_N,
-                      (unsigned long long)q5k_m_lo[0], (unsigned long long)q5k_m_lo[1]);
-        DX12_LOG_INFO("  Q5_K_dp4a K=%u M=%u: 256t=%llu 32t=%llu ticks\n",
-                      test_K_for_m, test_M_mid,
-                      (unsigned long long)q5k_m_mid[0], (unsigned long long)q5k_m_mid[1]);
-        DX12_LOG_INFO("  Q5_K_dp4a K=%u M=%u: 256t=%llu 32t=%llu ticks\n",
-                      test_K_for_m, test_M_large,
-                      (unsigned long long)q5k_m_hi[0], (unsigned long long)q5k_m_hi[1]);
-
-        // Helper: linearly interpolate the M at which 256t and 32t cost
-        // the same, between two (M, t256, t32) points. Direction-agnostic:
-        // works whether 32t wins at the smaller M (rare) or at the larger M
-        // (typical Q5_K case). Models the cost gap (T32 - T256) as linear
-        // in M and solves for the M where gap == 0. Returns rounded M.
-        auto interp_crossover = [](double Ma, uint64_t a256, uint64_t a32,
-                                   double Mb, uint64_t b256, uint64_t b32) -> uint32_t {
-            double gap_a = (double)a32 - (double)a256;  // > 0 means 256t wins at Ma
-            double gap_b = (double)b32 - (double)b256;  // > 0 means 256t wins at Mb
-            double dg = gap_a - gap_b;                  // change in gap across the interval
-            if (dg == 0.0) return (uint32_t)((Ma + Mb) * 0.5 + 0.5);  // parallel; midpoint
-            double t = gap_a / dg;                      // fraction of [Ma, Mb] at zero-crossing
-            if (t < 0.0) t = 0.0;
-            if (t > 1.0) t = 1.0;
-            double M_cross = Ma + t * (Mb - Ma);
-            return (uint32_t)(M_cross + 0.5);
-        };
-
-        q5k_dp4a_m_32_threshold = 0xFFFFFFFFu;
-        if (q5k_m_lo[0] != UINT64_MAX && q5k_m_lo[1] != UINT64_MAX &&
-            q5k_m_mid[0] != UINT64_MAX && q5k_m_mid[1] != UINT64_MAX &&
-            q5k_m_hi[0] != UINT64_MAX && q5k_m_hi[1] != UINT64_MAX) {
-            bool lo_32_wins  = (q5k_m_lo[1]  < q5k_m_lo[0]);
-            bool mid_32_wins = (q5k_m_mid[1] < q5k_m_mid[0]);
-            bool hi_32_wins  = (q5k_m_hi[1]  < q5k_m_hi[0]);
-
-            if (lo_32_wins && mid_32_wins && hi_32_wins) {
-                q5k_dp4a_m_32_threshold = 0;                // always use 32t
-            } else if (!lo_32_wins && !mid_32_wins && !hi_32_wins) {
-                q5k_dp4a_m_32_threshold = 0xFFFFFFFFu;      // never use 32t
-            } else if (!lo_32_wins && !mid_32_wins && hi_32_wins) {
-                // monotone crossover in [mid, hi]
-                q5k_dp4a_m_32_threshold = interp_crossover(
-                    (double)test_M_mid,   q5k_m_mid[0], q5k_m_mid[1],
-                    (double)test_M_large, q5k_m_hi[0],  q5k_m_hi[1]);
-            } else if (!lo_32_wins && mid_32_wins && hi_32_wins) {
-                // monotone crossover in [lo, mid]
-                q5k_dp4a_m_32_threshold = interp_crossover(
-                    (double)test_N,     q5k_m_lo[0],  q5k_m_lo[1],
-                    (double)test_M_mid, q5k_m_mid[0], q5k_m_mid[1]);
+    struct pair_result {
+        uint64_t t256 = UINT64_MAX;
+        uint64_t t32 = UINT64_MAX;
+    };
+    auto bench_pair = [&](dx12_pipeline_key key256, dx12_pipeline_key key32,
+                          uint32_t K, uint32_t rows,
+                          const probe_layout & layout) {
+        std::vector<uint64_t> samples256;
+        std::vector<uint64_t> samples32;
+        for (int round = 0; round < 5; ++round) {
+            if ((round & 1) == 0) {
+                const uint64_t a = bench_pipeline(key256, K, rows, layout, 0);
+                const uint64_t b = bench_pipeline(key32,  K, rows, layout, 2);
+                if (a != UINT64_MAX) samples256.push_back(a);
+                if (b != UINT64_MAX) samples32.push_back(b);
             } else {
-                // Non-monotone (e.g. 010, 100, 101, 110): treat as unreliable
-                // signal and keep the safe default of never using 32t.
-                q5k_dp4a_m_32_threshold = 0xFFFFFFFFu;
+                const uint64_t b = bench_pipeline(key32,  K, rows, layout, 2);
+                const uint64_t a = bench_pipeline(key256, K, rows, layout, 0);
+                if (a != UINT64_MAX) samples256.push_back(a);
+                if (b != UINT64_MAX) samples32.push_back(b);
             }
         }
-    }
-
-    // Benchmark F16 matvec: 256 threads (mr, flags=11) vs 32 threads (mr32, flags=12).
-    // Default for non-AMD-wave64 is 32t; this autotune may flip to 256t on
-    // NVIDIA wave32 or Intel Arc when their occupancy benefits outweigh the
-    // partial-wave waste at small K.
-    uint64_t f16_mr_256_total = 0, f16_mr_32_total = 0;
-    {
-        for (size_t ki = 0; ki < NK; ++ki) {
-            uint32_t K = test_K[ki];
-            dx12_pipeline_key key256 = {}; key256.op = GGML_OP_MUL_MAT; key256.src0_type = GGML_TYPE_F16; key256.flags = 11;
-            dx12_pipeline_key key32  = {}; key32.op  = GGML_OP_MUL_MAT; key32.src0_type  = GGML_TYPE_F16; key32.flags  = 12;
-
-            uint64_t t256 = bench_pipeline(key256, K, test_N, 0);
-            uint64_t t32  = bench_pipeline(key32,  K, test_N, 2);
-
-            f16_per_k[ki*2 + 0] = t256;
-            f16_per_k[ki*2 + 1] = t32;
-            if (t256 != UINT64_MAX) f16_mr_256_total += t256;
-            if (t32  != UINT64_MAX) f16_mr_32_total  += t32;
-
-            DX12_LOG_INFO("  F16_mr K=%u: 256t=%llu 32t=%llu ticks\n", K,
-                          (unsigned long long)t256, (unsigned long long)t32);
+        if (samples256.size() < 3 || samples32.size() < 3) {
+            return pair_result {};
         }
-        // Pick K-aware threshold via linear-interp crossover between the
-        // smallest and largest tested K (test_K[0] and test_K[NK-1]).
-        // When 256t wins both → threshold=0; when 32t wins both → UINT32_MAX.
-        f16_mr_use_256 = (f16_mr_256_total < f16_mr_32_total && f16_mr_256_total > 0);
-        f16_mr_k_256_threshold = 0xFFFFFFFFu;
-        if (NK >= 2) {
-            constexpr size_t lo = 0;
-            constexpr size_t hi = NK - 1;
-            uint64_t a256 = f16_per_k[lo*2 + 0];
-            uint64_t a32  = f16_per_k[lo*2 + 1];
-            uint64_t b256 = f16_per_k[hi*2 + 0];
-            uint64_t b32  = f16_per_k[hi*2 + 1];
-            if (a256 != UINT64_MAX && a32 != UINT64_MAX &&
-                b256 != UINT64_MAX && b32 != UINT64_MAX) {
-                bool a_256_wins = (a256 < a32);
-                bool b_256_wins = (b256 < b32);
-                if (a_256_wins && b_256_wins) {
-                    f16_mr_k_256_threshold = 0;
-                } else if (!a_256_wins && !b_256_wins) {
-                    f16_mr_k_256_threshold = 0xFFFFFFFFu;
-                } else {
-                    // Split decision — interpolate crossover K. Solve
-                    //   a256 + (b256-a256)*x = a32 + (b32-a32)*x
-                    // for x in [0,1] over K range [test_K[lo], test_K[hi]].
-                    double da = (double)a256 - (double)a32;
-                    double db = (double)b32  - (double)b256;
-                    double denom = da + db;
-                    double x = (denom > 0) ? (da / denom) : 0.5;
-                    if (x < 0.0) x = 0.0;
-                    if (x > 1.0) x = 1.0;
-                    double K_cross = (double)test_K[lo]
-                                   + x * ((double)test_K[hi] - (double)test_K[lo]);
-                    f16_mr_k_256_threshold = b_256_wins
-                        ? (uint32_t)(K_cross + 0.5)   // small-K=32t, large-K=256t
-                        : 0xFFFFFFFFu;                 // small-K=256t, large-K=32t (rare; keep 32t default)
-                }
+        return pair_result { median(samples256), median(samples32) };
+    };
+
+    constexpr uint32_t rows = 256;
+    const std::array<uint32_t, 3> quant_k = { 1536, 3072, 8192 };
+    const std::array<uint32_t, 3> float_k = { 576, 3072, 8192 };
+    std::vector<std::string> diagnostics;
+
+    const bool no_dp4a_wave64 = getenv("DX12_NO_DP4A_WAVE64") && wave_size >= 64;
+    const bool nvidia = adapter_desc.VendorId == dx12_vendor::NVIDIA;
+    const bool nv_igpu = arch_family == DX12_ARCH_NV_PASCAL_PLUS && is_igpu;
+    const char * nv_q4_env = getenv("DX12_NV_Q4K_DP4A");
+    const char * nv_q5_env = getenv("DX12_NV_Q5K_DP4A");
+    const bool q4_live = dp4a_supported && !no_dp4a_wave64 &&
+        (!nvidia || (nv_q4_env ? nv_q4_env[0] != '0' : nv_igpu));
+    const bool q5_live = dp4a_supported && !no_dp4a_wave64 &&
+        (!nvidia || (nv_q5_env && nv_q5_env[0] != '0'));
+
+    auto tune_quant = [&](ggml_type type, uint32_t flag256, uint32_t flag32,
+                          uint32_t block_bytes, bool live, bool & use32,
+                          const char * label) {
+        if (!live) {
+            return;
+        }
+        uint64_t total256 = 0;
+        uint64_t total32 = 0;
+        bool valid = true;
+        for (uint32_t K : quant_k) {
+            dx12_pipeline_key key256 = {};
+            key256.op = GGML_OP_MUL_MAT;
+            key256.src0_type = type;
+            key256.flags = flag256;
+            dx12_pipeline_key key32 = key256;
+            key32.flags = flag32;
+            const probe_layout layout = {
+                block_bytes,
+                (K / 256) * block_bytes,
+                block_bytes,
+            };
+            const pair_result result = bench_pair(key256, key32, K, rows, layout);
+            valid = valid && result.t256 != UINT64_MAX && result.t32 != UINT64_MAX;
+            if (valid) {
+                total256 += result.t256;
+                total32 += result.t32;
             }
+            char line[160];
+            std::snprintf(
+                line, sizeof(line), "# %s K=%u: 256t=%llu 32t=%llu ticks\n",
+                label, K,
+                (unsigned long long) result.t256,
+                (unsigned long long) result.t32);
+            diagnostics.emplace_back(line);
+            DX12_LOG_INFO("%s", line + 2);
         }
-    }
+        if (valid) {
+            use32 = total32 < total256;
+        }
+    };
 
-    DX12_LOG_INFO("Auto-tune result: Q4_K_dp4a=%s Q5_K_dp4a=%s F16_mr=%s (K>=%u uses 256t, Q5K M>=%u uses 32t)\n",
-                  q4k_dp4a_use_32 ? "32t" : "256t",
-                  q5k_dp4a_use_32 ? "32t" : "256t",
-                  f16_mr_use_256  ? "256t" : "32t",
-                  (unsigned)f16_mr_k_256_threshold,
-                  (unsigned)q5k_dp4a_m_32_threshold);
+    tune_quant(GGML_TYPE_Q4_K, 10, 13, 144, q4_live,
+               q4k_dp4a_use_32, "Q4_K_dp4a");
+    tune_quant(GGML_TYPE_Q5_K, 14, 16, 176, q5_live,
+               q5k_dp4a_use_32, "Q5_K_dp4a");
 
-    // Save to cache (with per-K diagnostic comments after the result line)
-    f = fopen(cache_path, "w");
-    if (f) {
-        fprintf(f, "v=%d q4k_dp4a_32=%d q5k_dp4a_32=%d f16_mr_256=%d f16_mr_k_thresh=%u q5k_dp4a_m_thresh=%u\n",
-                TUNE_VERSION,
-                q4k_dp4a_use_32 ? 1 : 0,
-                q5k_dp4a_use_32 ? 1 : 0,
-                f16_mr_use_256  ? 1 : 0,
-                (unsigned)f16_mr_k_256_threshold,
-                (unsigned)q5k_dp4a_m_32_threshold);
-        for (size_t ki = 0; ki < NK; ++ki) {
-            fprintf(f, "# Q4_K_dp4a K=%u: 256t=%llu 32t=%llu ticks\n",
-                    test_K[ki],
-                    (unsigned long long)q4k_per_k[ki*2 + 0],
-                    (unsigned long long)q4k_per_k[ki*2 + 1]);
+    auto tune_float = [&](ggml_type type, uint32_t esize,
+                          uint32_t & threshold, const char * label) {
+        if (wave_size >= 64) {
+            return;
         }
-        for (size_t ki = 0; ki < NK; ++ki) {
-            fprintf(f, "# Q5_K_dp4a K=%u: 256t=%llu 32t=%llu ticks\n",
-                    test_K[ki],
-                    (unsigned long long)q5k_per_k[ki*2 + 0],
-                    (unsigned long long)q5k_per_k[ki*2 + 1]);
+        std::vector<threshold_sample> samples;
+        for (uint32_t K : float_k) {
+            dx12_pipeline_key key256 = {};
+            key256.op = GGML_OP_MUL_MAT;
+            key256.src0_type = type;
+            key256.flags = 11;
+            dx12_pipeline_key key32 = key256;
+            key32.flags = 12;
+            const uint32_t stride = esize == 3 ? 2 : esize;
+            const probe_layout layout = {
+                stride,
+                K * stride,
+                esize,
+            };
+            const pair_result result = bench_pair(key256, key32, K, rows, layout);
+            if (result.t256 != UINT64_MAX && result.t32 != UINT64_MAX) {
+                samples.push_back({ K, result.t256, result.t32 });
+            }
+            char line[160];
+            std::snprintf(
+                line, sizeof(line), "# %s K=%u: 256t=%llu 32t=%llu ticks\n",
+                label, K,
+                (unsigned long long) result.t256,
+                (unsigned long long) result.t32);
+            diagnostics.emplace_back(line);
+            DX12_LOG_INFO("%s", line + 2);
         }
-        for (size_t ki = 0; ki < NK; ++ki) {
-            fprintf(f, "# F16_mr     K=%u: 256t=%llu 32t=%llu ticks\n",
-                    test_K[ki],
-                    (unsigned long long)f16_per_k[ki*2 + 0],
-                    (unsigned long long)f16_per_k[ki*2 + 1]);
+        if (samples.size() == float_k.size()) {
+            threshold = select_256_threshold(samples);
         }
-        fprintf(f, "# Q5_K_dp4a K=%u M=%u: 256t=%llu 32t=%llu ticks\n",
-                test_K_for_m, test_N,
-                (unsigned long long)q5k_m_lo[0], (unsigned long long)q5k_m_lo[1]);
-        fprintf(f, "# Q5_K_dp4a K=%u M=%u: 256t=%llu 32t=%llu ticks\n",
-                test_K_for_m, test_M_mid,
-                (unsigned long long)q5k_m_mid[0], (unsigned long long)q5k_m_mid[1]);
-        fprintf(f, "# Q5_K_dp4a K=%u M=%u: 256t=%llu 32t=%llu ticks\n",
-                test_K_for_m, test_M_large,
-                (unsigned long long)q5k_m_hi[0], (unsigned long long)q5k_m_hi[1]);
-        fclose(f);
+    };
+
+    tune_float(GGML_TYPE_F16, 2, f16_mr_k_256_threshold, "F16_mr");
+    tune_float(GGML_TYPE_BF16, 3, bf16_mr_k_256_threshold, "BF16_mr");
+    tune_float(GGML_TYPE_F32, 4, f32_mr_k_256_threshold, "F32_mr");
+
+    values.q4k_32 = q4k_dp4a_use_32;
+    values.q5k_32 = q5k_dp4a_use_32;
+    values.f16_k_256 = f16_mr_k_256_threshold;
+    values.bf16_k_256 = bf16_mr_k_256_threshold;
+    values.f32_k_256 = f32_mr_k_256_threshold;
+
+    DX12_LOG_INFO(
+        "Auto-tune result: Q4_K=%s Q5_K=%s F16_K=%u BF16_K=%u F32_K=%u\n",
+        q4k_dp4a_use_32 ? "32t" : "256t",
+        q5k_dp4a_use_32 ? "32t" : "256t",
+        (unsigned) f16_mr_k_256_threshold,
+        (unsigned) bf16_mr_k_256_threshold,
+        (unsigned) f32_mr_k_256_threshold);
+
+    char tmp_path[560];
+    std::snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%lu", cache_path, GetCurrentProcessId());
+    FILE * cache = std::fopen(tmp_path, "w");
+    if (cache) {
+        const std::string first_line = serialize_cache(identity, values);
+        bool ok = std::fwrite(first_line.data(), 1, first_line.size(), cache) == first_line.size();
+        for (const std::string & line : diagnostics) {
+            ok = ok && std::fwrite(line.data(), 1, line.size(), cache) == line.size();
+        }
+        ok = std::fclose(cache) == 0 && ok;
+        if (ok) {
+            if (!MoveFileExA(tmp_path, cache_path, MOVEFILE_REPLACE_EXISTING)) {
+                DeleteFileA(tmp_path);
+            }
+        } else {
+            DeleteFileA(tmp_path);
+        }
     }
 }
 
@@ -13869,8 +18876,12 @@ inline bool dx12_node_is_src_of(const ggml_tensor * dst, const ggml_tensor * src
 
 } // anonymous namespace
 
-static void dx12_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph) {
+static void dx12_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph,
+                                struct ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
+    // The reorder below only permutes nodes within a single sequential stream,
+    // so no extra allocation dependencies are needed.
+    GGML_UNUSED(params);
     static const bool enabled = (getenv("DX12_ENABLE_GRAPH_OPTIMIZE") != nullptr);
     if (!enabled || graph->n_nodes <= 1) return;
 
@@ -14116,6 +19127,10 @@ static void dx12_backend_synchronize(ggml_backend_t backend) {
     auto * ctx = (dx12_backend_context *)backend->context;
     const bool phase_profile = DX12_GETENV("DX12_PHASE_PROFILE") != nullptr;
     const uint64_t sync_entry_us = phase_profile ? dx12_qpc_us() : 0;
+    const bool sync_wall = DX12_GETENV("DX12_SYNC_WALL") != nullptr;
+    const uint64_t sync_wall_start_us = sync_wall ? dx12_qpc_us() : 0;
+    const bool sync_had_open = ctx->cmd_list_open;
+    const uint64_t sync_fence = ctx->fence_value;
     if (phase_profile) ctx->phase_sync_calls++;
 
     static const int dx12_trace = (getenv("DX12_TRACE_GRAPH") != nullptr) ? atoi(getenv("DX12_TRACE_GRAPH")) : 0;
@@ -14141,8 +19156,23 @@ static void dx12_backend_synchronize(ggml_backend_t backend) {
     ctx->wait_for_fence(ctx->fence_value);
     const uint64_t wait_end_us = phase_profile ? dx12_qpc_us() : 0;
     ctx->almost_ready_fence = 0;
+    if (sync_wall) {
+        const uint64_t sync_wall_end_us = dx12_qpc_us();
+        fprintf(stderr,
+                "[DX12_SYNC_WALL] prompt=%d open=%d fence=%llu->%llu total=%.3f ms\n",
+                (int)ctx->phase_is_prompt, (int)sync_had_open,
+                (unsigned long long)sync_fence, (unsigned long long)ctx->fence_value,
+                (double)(sync_wall_end_us - sync_wall_start_us) / 1000.0);
+    }
 
-    if (phase_profile && !ctx->phase_is_prompt && ctx->phase_pending &&
+    // Prompt graphs are excluded by default: a decode stream issues one graph
+    // per token, so the running averages stay meaningful. DX12_PHASE_PROFILE=2
+    // includes prompt graphs, which is what exposes one-shot graph shapes
+    // (vision encoders, ragged prefill chunks) that graph replay never covers.
+    static const bool phase_include_prompt =
+        DX12_GETENV("DX12_PHASE_PROFILE") && atoi(DX12_GETENV("DX12_PHASE_PROFILE")) >= 2;
+
+    if (phase_profile && (phase_include_prompt || !ctx->phase_is_prompt) && ctx->phase_pending &&
         ctx->phase_graph_start_us != 0 && ctx->phase_record_start_us != 0 &&
         ctx->phase_graph_return_us >= ctx->phase_record_start_us) {
         ctx->phase_pending = false;
@@ -14264,6 +19294,7 @@ static void dx12_backend_synchronize(ggml_backend_t backend) {
         ctx->phase_sum_gapsync_us += dx12_qpc_us() - sync_entry_us;
     }
     ctx->phase_gap_sync_accounted = false;
+    dx12_log_memory(ctx->dev, "synchronize", ctx);
 
     if (dx12_trace) {
         fprintf(stderr, "[DX12_TRACE] synchronize exit\n");
@@ -14562,8 +19593,9 @@ static const char * dx12_dev_get_description(ggml_backend_dev_t dev) {
 
 static void dx12_dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     auto * d = (dx12_device *)dev->context;
-    if (free)  *free  = d->vram_free;
-    if (total) *total = d->vram_total;
+    const dx12_memory_info info = dx12_query_memory(d);
+    if (free)  *free  = info.free;
+    if (total) *total = info.total;
 }
 
 static enum ggml_backend_dev_type dx12_dev_get_type(ggml_backend_dev_t dev) {
@@ -14575,8 +19607,7 @@ static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
     auto * d = (dx12_device *)dev->context;
     props->name         = d->name.c_str();
     props->description  = d->name.c_str();
-    props->memory_free  = d->vram_free;
-    props->memory_total = d->vram_total;
+    dx12_dev_get_memory(dev, &props->memory_free, &props->memory_total);
     props->type         = d->is_igpu ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
     props->device_id    = d->device_id_str.c_str();
     props->caps = {
@@ -14590,6 +19621,9 @@ static void dx12_dev_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_p
 static ggml_backend_t dx12_dev_init_backend(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
     auto * d = (dx12_device *)dev->context;
+    std::call_once(d->pso_warm_once, [d]() {
+        d->start_pipeline_prewarm();
+    });
 
     auto * ctx = new dx12_backend_context();
     ctx->dev = d;
@@ -14719,11 +19753,217 @@ static ggml_backend_dev_t dx12_reg_get_device(ggml_backend_reg_t reg, size_t ind
     return &g_dx12.backend_devices[index];
 }
 
+static bool dx12_test_route_supported(ggml_backend_t backend, uint32_t flag) {
+    if (!backend || !ggml_guid_matches(backend->guid, dx12_backend_get_guid())) {
+        return false;
+    }
+
+    const auto * bctx = (const dx12_backend_context *)backend->context;
+    const auto * dev  = bctx->dev;
+    if (flag == DX12_MOE_ROUTER_FLAG) {
+        return true;
+    }
+    if (flag == DX12_QK_NORM_PACKED_FLAG) {
+        return dx12_is_rtx5070_wave32(*dev) || dx12_is_b390_wave16(*dev);
+    }
+    if (flag == DX12_ADD_RMS_FIXED_FLAG || flag == DX12_RMS_FIXED_FLAG) {
+        return (!dev->is_igpu && dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev->blob_wave_size == 64) ||
+            dx12_is_rtx5070_wave32(*dev) || dx12_is_b390_wave16(*dev);
+    }
+    if (flag == DX12_MMID_F16_VEC_FLAG) {
+        return (!dev->is_igpu && dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev->blob_wave_size == 64) ||
+            dx12_is_rtx5070_wave32(*dev) || dx12_is_b390_wave16(*dev);
+    }
+    if (flag == DX12_MMID_Q8_ROWS4_FLAG) {
+        return (dx12_is_rtx5070_wave32(*dev) || dx12_is_b390_wave16(*dev)) && dev->dp4a_supported;
+    }
+    if ((flag == DX12_F32_ROUTER_FLAG || flag == DX12_RMS_ROPE_PACKED_FLAG) && dx12_is_b390_wave16(*dev)) {
+        return true;
+    }
+    if (flag == DX12_Q8_SMALL_M_FLAG || flag == DX12_F16_SMALL_M_FLAG || flag == DX12_F32_ROUTER_FLAG) {
+        return !dev->is_igpu &&
+               ((dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev->blob_wave_size == 64) ||
+                dx12_is_rtx5070_wave32(*dev));
+    }
+    if (flag == DX12_RMS_ROPE_PACKED_FLAG || flag == DX12_MMID_F16_WAVE_FLAG ||
+        flag == DX12_Q4K_GLU_WAVE_FLAG || flag == DX12_Q4K_GLU_WAVE_RMS_FLAG ||
+        flag == DX12_Q4K_SHORT_F32_FLAG || flag == DX12_Q4K_SHORT_DP4A_FLAG) {
+        return dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev->is_igpu && dev->blob_wave_size == 64;
+    }
+    if (flag == DX12_Q6K_PACKED_MMV_FLAG || flag == DX12_MMID_Q4K_ROWS4_FLAG || flag == DX12_MMID_Q6K_ROWS4_FLAG) {
+        return dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev->is_igpu &&
+               dev->blob_wave_size == 64 && dev->dp4a_supported;
+    }
+    if (dx12_is_fa_scalar_mask_flag(flag)) {
+        return dx12_is_b390_wave16(*dev);
+    }
+    if (flag == DX12_FA_QREGS_BASE || flag == DX12_FA_QREGS_BASE + 2) {
+        return dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+               dev->adapter_desc.DeviceId == 0xB080 && dev->fp16_supported &&
+               dev->wave_size == 16 && dev->blob_wave_size == 16;
+    }
+
+#ifdef GGML_DX12_LINALG_PREVIEW
+    const bool xe3_wave =
+        dev->arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS &&
+        dev->linalg_matrix_supported &&
+        dev->linalg_wave_f16_8x16x16_supported &&
+        dev->fp16_supported &&
+        dev->wave_size == 16;
+
+    switch (flag) {
+        case DX12_MMID_BUCKET_WIDE_FLAG:
+            return !dev->is_igpu && dev->linalg_matrix_supported &&
+                   dev->linalg_wave_f16_16x16_supported && dev->fp16_supported &&
+                   dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS && dev->adapter_desc.DeviceId == 0x2F04 &&
+                   dev->wave_size == 32 && dev->blob_wave_size == 32;
+        case DX12_LINALG_FA_PV_F16_D128_FLAG:
+        case DX12_LINALG_FA_PV_F16_RDNA4_D128_FLAG:
+        case DX12_LINALG_FA_PV_F16_COMPACT_D128_FLAG:
+            return dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev->is_igpu &&
+                   dev->blob_wave_size == 64 && dev->linalg_matrix_supported &&
+                   dev->linalg_wave_f16_16x16_supported && dev->fp16_supported &&
+                   dev->linalg_wave_f16_acc16_16x16_w64_supported;
+        case DX12_FA_PIPELINE_D128_FLAG:
+        case DX12_FA_PIPELINE_INTERLEAVED_D128_FLAG:
+        case DX12_FA_PIPELINE_D64_BASE + 2:
+        case DX12_FA_PIPELINE_D96_BASE + 1:
+        case DX12_FA_PIPELINE_D96_BR32_FLAG:
+        case DX12_MMID_BUCKET_FLAG:
+        case DX12_MMID_BUCKET_TALL_FLAG:
+            return !dev->is_igpu && dev->linalg_matrix_supported &&
+                   dev->linalg_wave_f16_16x16_supported && dev->fp16_supported &&
+                   ((dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && dev->blob_wave_size == 64) ||
+                    (dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS && dev->adapter_desc.DeviceId == 0x2F04 &&
+                     dev->wave_size == 32 && dev->blob_wave_size == 32));
+        case DX12_LINALG_Q8_ALIGNED_128X64_FLAG:
+        case DX12_Q8_PIPELINE_FLAG:
+        case DX12_F16_PIPELINE_FLAG:
+        case DX12_F16_PIPELINE_SMALL_FLAG:
+        case DX12_LINALG_FA_COMPACT_D128_FLAG:
+        case DX12_FA_PIPELINE_D64_BASE + 0:
+        case DX12_FA_PIPELINE_D64_BASE + 1:
+        case DX12_FA_PIPELINE_D64_BASE + 3:
+        case DX12_FA_PIPELINE_D96_BASE:
+        case DX12_LINALG_Q50_PACKED_BASE + 0:
+        case DX12_LINALG_Q50_PACKED_BASE + 1:
+        case DX12_LINALG_Q50_PACKED_BASE + 2:
+        case DX12_LINALG_Q50_PACKED_BASE + 3:
+        case DX12_MMID_EXPERT_MAJOR_FLAG:
+        case DX12_MMID_EXPERT_MAJOR_TALL_FLAG:
+        case DX12_MMID_EXPERT_WIDE_FLAG:
+            return dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev->is_igpu &&
+                   dev->blob_wave_size == 64 && dev->linalg_matrix_supported &&
+                   dev->linalg_wave_f16_16x16_supported && dev->fp16_supported;
+        case DX12_AMD_COMPOSED_FLAG:
+            return dev->sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS && !dev->is_igpu &&
+                   dev->linalg_matrix_supported && dev->linalg_wave_f16_16x16_w32_supported && dev->fp16_supported;
+        case DX12_NV_COMPOSED_FLAG:
+            return dev->arch_family == DX12_ARCH_NV_PASCAL_PLUS &&
+                   dev->adapter_desc.DeviceId == 0x2F04 && dev->wave_size == 32 &&
+                   dev->linalg_matrix_supported && dev->linalg_wave_f16_16x16_supported &&
+                   dev->fp16_supported;
+        case DX12_IW_VKPORT_BASE + 2:
+        case DX12_IW_VKPORT_BASE + 3:
+            return xe3_wave && !dev->linalg_wave_f16_16x16_supported &&
+                   dev->linalg_wave_f16_8x16x16_w32_supported;
+        case DX12_IW_VKPORT_BASE + 0:
+        case DX12_IW_VKPORT_BASE + 1:
+        case 265:
+        case 266:
+        case DX12_IW_Q50_FLAG:
+        case DX12_IW_Q6K_FLAG:
+        case DX12_IW_Q5K_FLAG:
+        case DX12_IW_Q40_FLAG:
+        case DX12_IW_Q41_FLAG:
+        case DX12_IW_Q51_FLAG:
+        case DX12_IW_IQ4NL_FLAG:
+        case DX12_IW_MXFP4_FLAG:
+        case DX12_IW_STAGED_FLAG:
+        case DX12_IW_OUT_PROD_FLAG:
+        case DX12_IW_FA_F16_BASE + 0:
+        case DX12_IW_FA_F16_BASE + 1:
+        case DX12_IW_FA_F16_BASE + 2:
+        case DX12_IW_FA_Q8_BASE + 0:
+        case DX12_IW_FA_Q8_BASE + 1:
+        case DX12_IW_FA_Q8_BASE + 2:
+        case DX12_IW_FA_Q4_BASE + 0:
+        case DX12_IW_FA_Q4_BASE + 1:
+        case DX12_IW_FA_Q4_BASE + 2:
+        case DX12_MMID_IW_FLAG:
+            return xe3_wave && !dev->linalg_wave_f16_16x16_supported;
+        default:
+            return false;
+    }
+#else
+    return false;
+#endif
+}
+
+static bool dx12_test_get_decision_cache_stats(ggml_backend_t backend, uint64_t * stats) {
+    if (!backend || !stats || !ggml_guid_matches(backend->guid, dx12_backend_get_guid())) {
+        return false;
+    }
+    const auto & cache = ((const dx12_backend_context *)backend->context)->replay_cache;
+    stats[0] = cache.hits;
+    stats[1] = cache.misses;
+    stats[2] = cache.rebuilds;
+    return true;
+}
+
+static bool dx12_test_get_fa_mask_stats(ggml_backend_t backend, uint64_t * stats) {
+    if (!backend || !stats || !ggml_guid_matches(backend->guid, dx12_backend_get_guid())) {
+        return false;
+    }
+    const auto & ctx = *(const dx12_backend_context *)backend->context;
+    std::copy(ctx.fa_mask_stats, ctx.fa_mask_stats + 3, stats);
+    stats[3] = ctx.replay.captures;
+    stats[4] = ctx.replay.replays;
+    return true;
+}
+
+static bool dx12_test_fa_mask_geometry_matches(uint32_t rows, uint32_t columns, uint32_t other_rows, uint32_t other_columns) {
+    dx12_fa_mask_entry a, b;
+    a.rows = rows;
+    a.columns = columns;
+    b.rows = other_rows;
+    b.columns = other_columns;
+    return a.matches(b);
+}
+
+// defined near the bottom of this file; declared here for dx12_reg_get_proc_address
+void ggml_backend_dx12_set_env_refresh(bool on);
+void ggml_backend_dx12_set_flag_sink(void * sink);
+
+static void * dx12_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+
+    if (strcmp(name, "ggml_backend_dx12_set_env_refresh") == 0) {
+        return (void *)ggml_backend_dx12_set_env_refresh;
+    }
+    if (strcmp(name, "ggml_backend_dx12_set_flag_sink") == 0) {
+        return (void *)ggml_backend_dx12_set_flag_sink;
+    }
+    if (strcmp(name, "ggml_backend_dx12_test_route_supported") == 0) {
+        return (void *)dx12_test_route_supported;
+    }
+    if (strcmp(name, "ggml_backend_dx12_test_get_decision_cache_stats") == 0) {
+        return (void *)dx12_test_get_decision_cache_stats;
+    }
+    if (strcmp(name, "ggml_backend_dx12_test_get_fa_mask_stats") == 0) {
+        return (void *)dx12_test_get_fa_mask_stats;
+    }
+    if (strcmp(name, "ggml_backend_dx12_test_fa_mask_geometry_matches") == 0) {
+        return (void *)dx12_test_fa_mask_geometry_matches;
+    }
+    return nullptr;
+}
+
 static const ggml_backend_reg_i dx12_reg_interface = {
     /* .get_name         = */ dx12_reg_get_name,
     /* .get_device_count = */ dx12_reg_get_device_count,
     /* .get_device       = */ dx12_reg_get_device,
-    /* .get_proc_address = */ nullptr,
+    /* .get_proc_address = */ dx12_reg_get_proc_address,
 };
 
 // ---------------------------------------------------------------------------
@@ -14817,6 +20057,8 @@ void dx12_device::init_shader_blobs() {
             { GGML_OP_REPEAT,        WB(repeat, WS)        }, \
             { GGML_OP_SUM_ROWS,      WB(sum_rows, WS)      }, \
             { GGML_OP_PAD,           WB(pad, WS)           }, \
+    { GGML_OP_PAD_REFLECT_1D, WB(pad_reflect_1d, WS) }, \
+    { GGML_OP_COL2IM_1D,    WB(col2im_1d, WS)     }, \
             { GGML_OP_ROLL,          WB(roll, WS)          }, \
             { GGML_OP_SSM_CONV,      WB(ssm_conv, WS)      }, \
             { GGML_OP_UPSCALE,       WB(upscale, WS)       }, \
@@ -14835,8 +20077,13 @@ void dx12_device::init_shader_blobs() {
             { GGML_OP_L2_NORM,       WB(l2_norm, WS)       }, \
             { GGML_OP_GATED_DELTA_NET, WB(gated_delta_net, WS) }, \
             { GGML_OP_SSM_SCAN,      WB(ssm_scan, WS)      }, \
+            { GGML_OP_DSV4_HC_COMB,  WB(dsv4_hc_comb, WS)  }, \
+            { GGML_OP_DSV4_HC_PRE,   WB(dsv4_hc_pre, WS)   }, \
+            { GGML_OP_DSV4_HC_POST,  WB(dsv4_hc_post, WS)  }, \
+            { GGML_OP_LIGHTNING_INDEXER, WB(lightning_indexer, WS) }, \
             { GGML_OP_RWKV_WKV6,     WB(wkv6, WS)          }, \
             { GGML_OP_RWKV_WKV7,     WB(wkv7, WS)          }, \
+    { GGML_OP_GATED_LINEAR_ATTN, WB(gla, WS)       }, \
         }; \
         unary_shader_blobs = { \
             { GGML_UNARY_OP_SILU,       WB(silu, WS)       }, \
@@ -14847,6 +20094,7 @@ void dx12_device::init_shader_blobs() {
             { GGML_UNARY_OP_TANH,       WB(tanh_, WS)      }, \
             { GGML_UNARY_OP_SIGMOID,    WB(sigmoid, WS)    }, \
             { GGML_UNARY_OP_EXP,        WB(exp, WS)        }, \
+    { GGML_UNARY_OP_EXPM1,      WB(expm1, WS)      }, \
             { GGML_UNARY_OP_SOFTPLUS,   WB(softplus, WS)   }, \
             { GGML_UNARY_OP_ABS,        WB(abs, WS)        }, \
             { GGML_UNARY_OP_NEG,        WB(neg, WS)        }, \
@@ -14886,9 +20134,9 @@ void dx12_device::init_shader_blobs() {
 // Pipeline creation
 // ---------------------------------------------------------------------------
 
-dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & key) {
+dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & key, bool warm) {
     // Fast path: skip mutex + map lookup for repeated pipeline keys
-    if (key == last_pipeline_key && last_pipeline_ptr) {
+    if (!warm && key == last_pipeline_key && last_pipeline_ptr) {
         return last_pipeline_ptr;
     }
 
@@ -14896,6 +20144,9 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
 
     auto it = pipeline_cache.find(key);
     if (it != pipeline_cache.end()) {
+        if (warm) {
+            return &it->second;
+        }
         last_pipeline_key = key;
         last_pipeline_ptr = &it->second;
         return last_pipeline_ptr;
@@ -14916,6 +20167,7 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         g_##name##_w16_dxil, sizeof(g_##name##_w16_dxil), \
         g_##name##_w32_dxil, sizeof(g_##name##_w32_dxil), \
         g_##name##_w64_dxil, sizeof(g_##name##_w64_dxil))
+    #define WBLOB_IW(name) dx12_shader_blob{g_##name##_w16_dxil, sizeof(g_##name##_w16_dxil), #name}
 
     // FP16 variant selector: pick the `_fp16_dxil` blob when the device
     // supports native 16-bit shader ops (D3D12_OPTIONS4) AND the user opts in
@@ -14977,6 +20229,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     // interchangeable at the same pf_var.br. Intel UHD benefits from the smaller
     // Q/K tiles, while Ada measured 12% faster with the f32 blob.
     // DX12_FA_PF_FP16=0/1 overrides the architecture default.
+    // Strix Point also benefits: +2.8% to +6.5% prefill across SmolLM2,
+    // Phi-3 and Qwen3.5, with unchanged backend tolerances and perplexity.
     //
     // Also default on for Intel Xe-HPG+, which was never measured because
     // llama.cpp prefill spends little time in FA - the quadratic term only
@@ -14995,7 +20249,9 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         const bool fa_pf_fp16 = env
             ? env[0] != '0'
             : (arch_family == DX12_ARCH_INTEL_UHD ||
-               arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS);
+               arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ||
+               (adapter_desc.VendorId == dx12_vendor::AMD &&
+                adapter_desc.DeviceId == 0x150E));
         const bool use_fp16 = fp16_supported && fa_pf_fp16;
         if (blob_wave_size <= 16) return use_fp16 ? dx12_shader_blob{ d16_fp16, s16_fp16, nm } : dx12_shader_blob{ d16, s16, nm };
         if (blob_wave_size <= 32) return use_fp16 ? dx12_shader_blob{ d32_fp16, s32_fp16, nm } : dx12_shader_blob{ d32, s32, nm };
@@ -15093,6 +20349,10 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     const int q6k_mmv_gs = q6k_mmv_gs_env ? q6k_mmv_gs_env :
         (arch_family == DX12_ARCH_INTEL_XE_HPG_PLUS ? 32 :
          arch_family == DX12_ARCH_NV_PASCAL_PLUS    ? 128 : 256);
+    static const bool q6k_nv_wide_loads = [] {
+        const char * v = getenv("DX12_NV_Q6K_WIDE_LOADS");
+        return v && v[0] && v[0] != '0';
+    }();
     static const int glu_q4k_gs = gs_env("DX12_GLU_Q4K_GS", 64);
     #define WBLOB_TUNE(name, gs) ( \
         (gs) == 16  ? WBLOB(name##_g16)  : \
@@ -15113,6 +20373,26 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             selected = value;
             return true;
         };
+#ifdef GGML_DX12_LINALG_PREVIEW
+        if (dx12_is_iw_gemm(key.flags) && (key.flags & DX12_IW_BIAS_BIT)) {
+            switch (dx12_iw_base_flag(key.flags)) {
+                case 264: return pick(WBLOB_IW(mul_mat_linalg_wave_f16_bias_i));
+                case 265: return pick(WBLOB_IW(mul_mat_linalg_wave_q8_0_bias_i));
+                case 266: return pick(WBLOB_IW(mul_mat_linalg_wave_q4_k_bias_i));
+                case 270: return pick(WBLOB_IW(mul_mat_linalg_wave_q5_0_bias_i));
+                case 271: return pick(WBLOB_IW(mul_mat_linalg_wave_q6_k_bias_i));
+                case 272: return pick(WBLOB_IW(mul_mat_linalg_wave_q5_k_bias_i));
+                case 273: return pick(WBLOB_IW(mul_mat_linalg_wave_q4_0_bias_i));
+                case 274: return pick(WBLOB_IW(mul_mat_linalg_wave_q4_1_bias_i));
+                case 275: return pick(WBLOB_IW(mul_mat_linalg_wave_q5_1_bias_i));
+                case 276: return pick(WBLOB_IW(mul_mat_linalg_wave_iq4_nl_bias_i));
+                case 277: return pick(WBLOB_IW(mul_mat_linalg_wave_mxfp4_bias_i));
+                default: return false;
+            }
+        }
+#endif
+        const bool use_nv_128x64 =
+            arch_family == DX12_ARCH_NV_PASCAL_PLUS && !getenv("DX12_LINALG_NV_128X64_OFF");
 
         switch (key.flags) {
             case 1:
@@ -15180,7 +20460,15 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 20: return pick(WBLOB(mul_mat_vec_q3k_mr));
             case 21: return pick(WBLOB(mul_mat_vec_q5_0_dp4a));
             case 22: return pick(WBLOB(mul_mat_vec_q5_1_dp4a));
-            case 23: return pick(WBLOB_TUNE(mul_mat_vec_q6k_dp4a, q6k_mmv_gs));
+            case 23: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS && !q6k_nv_wide_loads
+                ? WBLOB_TUNE(mul_mat_vec_q6k_dp4a_nvidia, q6k_mmv_gs)
+                : WBLOB_TUNE(mul_mat_vec_q6k_dp4a, q6k_mmv_gs));
+            case DX12_Q6K_PACKED_MMV_FLAG: return pick(WBLOB(mul_mat_vec_q6k_dp4a_packed));
+            case DX12_Q8_SMALL_M_FLAG: return pick(WBLOB(mul_mat_q8_0_f32_small_m));
+            case DX12_F16_SMALL_M_FLAG: return pick(WBLOB(mul_mat_f16_f32_small_m));
+            case DX12_Q4K_SHORT_F32_FLAG: return pick(WBLOB(mul_mat_vec_q4k_mr_g64));
+            case DX12_Q4K_SHORT_DP4A_FLAG: return pick(WBLOB(mul_mat_vec_q4k_dp4a_64));
+            case DX12_F32_ROUTER_FLAG: return pick(WBLOB(mul_mat_f32_router));
             case 24: return pick(WBLOB_FP16(mul_mat_vec_glu));
             case 25: return pick(WBLOB(mul_mat_vec_q6k_mr_blocked));
             case 26: return pick(WBLOB(mul_mat_vec_q3k_mr_blocked));
@@ -15201,13 +20489,19 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 101: return pick(WBLOB(mul_mat_vec_q4_1_dp4a_mr256));
             case 102: return pick(WBLOB_Q4K(mul_mat_vec_q4k_mr_rms));
             case 103: return pick(WBLOB_Q4K(mul_mat_vec_q4k_qk));
-            case 131:
+            case 104: return pick(WBLOB(mul_mat_q8_0_q8_1_mmq));
+            case 127: return pick(WBLOB(mul_mat_q4k_q8_1_mmq));
+            case 128: return pick(WBLOB(mul_mat_q5k_q8_1_mmq));
+            case 129: return pick(WBLOB(mul_mat_q6k_q8_1_mmq));
+            case 157:
                 switch (key.src0_type) {
                     case GGML_TYPE_Q2_0:  return pick(WBLOB(mul_mat_vec_q2_0));
                     case GGML_TYPE_TQ1_0: return pick(WBLOB(mul_mat_vec_tq1_0));
                     case GGML_TYPE_TQ2_0: return pick(WBLOB(mul_mat_vec_tq2_0));
                     default:              return false;
                 }
+            case 145: return pick(WBLOB(mul_mat_vec_q2_0_dp4a_mr64));
+            case 146: return pick(WBLOB(mul_mat_vec_q2_0_dp4a_portable));
             case 105: return pick(WBLOB(mul_mat_wmma64));
             case 106: return pick(WBLOB(mul_mat_q4k_wmma_lds64));
             case 121:
@@ -15229,6 +20523,223 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                     default: break;
                 }
                 break;
+#ifdef GGML_DX12_LINALG_PREVIEW
+            case DX12_LINALG_FULL_TILE_BASE + 0: return pick({g_mul_mat_linalg_full_f16_128x64_s0_w64_dxil, sizeof(g_mul_mat_linalg_full_f16_128x64_s0_w64_dxil)});
+            case DX12_LINALG_FULL_TILE_BASE + 3: return pick({g_mul_mat_linalg_full_q8_32x32_s0_w64_dxil, sizeof(g_mul_mat_linalg_full_q8_32x32_s0_w64_dxil)});
+            case DX12_LINALG_FULL_TILE_BASE + 4: return pick({g_mul_mat_linalg_full_q8_32x16_s0_w64_dxil, sizeof(g_mul_mat_linalg_full_q8_32x16_s0_w64_dxil)});
+            case DX12_LINALG_FULL_TILE_BASE + 5: return pick({g_mul_mat_linalg_full_f16_128x64_s1_w64_dxil, sizeof(g_mul_mat_linalg_full_f16_128x64_s1_w64_dxil)});
+            case 261:
+                return pick(
+                    linalg_tg_f16_64x128_threads == 64
+                        ? WBLOB(mul_mat_linalg_tg_f16_64x128_t64)
+                    : linalg_tg_f16_64x128_threads == 128
+                        ? WBLOB(mul_mat_linalg_tg_f16_64x128_t128)
+                    : linalg_tg_f16_64x128_threads == 256
+                        ? WBLOB(mul_mat_linalg_tg_f16_64x128_t256)
+                        : dx12_shader_blob{});
+            case 207: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_f16_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_f16_128x64));
+            case 208: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_f16_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_f16_128x128));
+            case 209: return pick(WBLOB(mul_mat_linalg_f16_32x32));
+            case 210: return pick(WBLOB(mul_mat_linalg_f16_32x16));
+            case 211: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q8_0_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q8_0_128x64));
+            case 212: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q8_0_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q8_0_128x128));
+            case DX12_Q8_PIPELINE_FLAG:
+                return pick({g_mul_mat_linalg_pipeline_q8_dxil, sizeof(g_mul_mat_linalg_pipeline_q8_dxil)});
+            case DX12_F16_PIPELINE_FLAG:
+                return pick({g_mul_mat_linalg_pipeline_f16_dxil, sizeof(g_mul_mat_linalg_pipeline_f16_dxil)});
+            case DX12_F16_PIPELINE_SMALL_FLAG:
+                return pick({g_mul_mat_linalg_pipeline_f16_small_dxil, sizeof(g_mul_mat_linalg_pipeline_f16_small_dxil)});
+            case DX12_LINALG_Q8_ALIGNED_FLAG:
+                return pick({g_mul_mat_linalg_q8_0_aligned_128x128_w64_dxil,
+                             sizeof(g_mul_mat_linalg_q8_0_aligned_128x128_w64_dxil)});
+            case DX12_LINALG_Q8_ALIGNED_128X64_FLAG:
+                return pick({g_mul_mat_linalg_q8_0_aligned_128x64_w64_dxil,
+                             sizeof(g_mul_mat_linalg_q8_0_aligned_128x64_w64_dxil)});
+            case 213: return pick(WBLOB(mul_mat_linalg_q8_0_32x32));
+            case 214: return pick(WBLOB(mul_mat_linalg_q8_0_32x16));
+            case 215: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q4_k_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q4_k_128x64));
+            case 216: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q4_k_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q4_k_128x128));
+            case 217: return pick(WBLOB(mul_mat_linalg_q4_k_32x32));
+            case 218: return pick(WBLOB(mul_mat_linalg_q4_k_32x16));
+            case 219: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q5_k_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q5_k_128x64));
+            case 220: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q5_k_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q5_k_128x128));
+            case 221: return pick(WBLOB(mul_mat_linalg_q5_k_32x32));
+            case 222: return pick(WBLOB(mul_mat_linalg_q5_k_32x16));
+            case 223: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q6_k_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q6_k_128x64));
+            case 224: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q6_k_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q6_k_128x128));
+            case 225: return pick(WBLOB(mul_mat_linalg_q6_k_32x32));
+            case 226: return pick(WBLOB(mul_mat_linalg_q6_k_32x16));
+            case 230: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q5_0_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q5_0_128x64));
+            case 231: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q5_0_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q5_0_128x128));
+            case 232: return pick(WBLOB(mul_mat_linalg_q5_0_32x32));
+            case 233: return pick(WBLOB(mul_mat_linalg_q5_0_32x16));
+#define Q50_PACKED_BLOB(shape_) dx12_shader_blob{g_mul_mat_linalg_q5_0_packed_##shape_##_w64_dxil, sizeof(g_mul_mat_linalg_q5_0_packed_##shape_##_w64_dxil), "mul_mat_linalg_q5_0_packed_" #shape_}
+            case DX12_LINALG_Q50_PACKED_BASE + 0: return pick(Q50_PACKED_BLOB(128x64));
+            case DX12_LINALG_Q50_PACKED_BASE + 1: return pick(Q50_PACKED_BLOB(128x128));
+            case DX12_LINALG_Q50_PACKED_BASE + 2: return pick(Q50_PACKED_BLOB(32x32));
+            case DX12_LINALG_Q50_PACKED_BASE + 3: return pick(Q50_PACKED_BLOB(32x16));
+#undef Q50_PACKED_BLOB
+            case 234: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q4_0_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q4_0_128x64));
+            case 235: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q4_0_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q4_0_128x128));
+            case 236: return pick(WBLOB(mul_mat_linalg_q4_0_32x32));
+            case 237: return pick(WBLOB(mul_mat_linalg_q4_0_32x16));
+            case 238: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q4_1_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q4_1_128x64));
+            case 239: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q4_1_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q4_1_128x128));
+            case 240: return pick(WBLOB(mul_mat_linalg_q4_1_32x32));
+            case 241: return pick(WBLOB(mul_mat_linalg_q4_1_32x16));
+            case 242: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_q5_1_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_q5_1_128x64));
+            case 243: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_q5_1_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_q5_1_128x128));
+            case 244: return pick(WBLOB(mul_mat_linalg_q5_1_32x32));
+            case 245: return pick(WBLOB(mul_mat_linalg_q5_1_32x16));
+            case 246: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_iq4_nl_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_iq4_nl_128x64));
+            case 247: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_iq4_nl_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_iq4_nl_128x128));
+            case 248: return pick(WBLOB(mul_mat_linalg_iq4_nl_32x32));
+            case 249: return pick(WBLOB(mul_mat_linalg_iq4_nl_32x16));
+            case 250: return pick(use_nv_128x64
+                                      ? WBLOB(mul_mat_linalg_mxfp4_128x64_nv)
+                                      : WBLOB(mul_mat_linalg_mxfp4_128x64));
+            case 251: return pick(arch_family == DX12_ARCH_NV_PASCAL_PLUS
+                                      ? WBLOB(mul_mat_linalg_mxfp4_128x128_nv)
+                                      : WBLOB(mul_mat_linalg_mxfp4_128x128));
+            case 252: return pick(WBLOB(mul_mat_linalg_mxfp4_32x32));
+            case 253: return pick(WBLOB(mul_mat_linalg_mxfp4_32x16));
+            case 262: return pick(WBLOB(mul_mat_linalg_q8_0_16x16));
+            case 264: return pick(WBLOB(mul_mat_linalg_wave_f16_i));
+            case 265: return pick(WBLOB(mul_mat_linalg_wave_q8_0_i));
+            case 266: return pick(WBLOB(mul_mat_linalg_wave_q4_k_i));
+            case DX12_AMD_COMPOSED_FLAG:
+                if (key.src0_type == GGML_TYPE_Q4_K) {
+                    return pick({ g_mul_mat_composed_q4_k_128x64_lds_w32_dxil, sizeof(g_mul_mat_composed_q4_k_128x64_lds_w32_dxil) });
+                }
+                if (key.src0_type == GGML_TYPE_Q6_K) {
+                    return pick({ g_mul_mat_composed_q6_k_128x64_lds_w32_dxil, sizeof(g_mul_mat_composed_q6_k_128x64_lds_w32_dxil) });
+                }
+                break;
+            case DX12_NV_COMPOSED_FLAG:
+                switch (key.src0_type) {
+#define NV_COMPOSED_PICK(type, name) \
+                    case type: return pick({ g_mul_mat_composed_##name##_128x64_w32_dxil, \
+                                            sizeof(g_mul_mat_composed_##name##_128x64_w32_dxil) });
+                    NV_COMPOSED_PICK(GGML_TYPE_F16, f16)
+                    NV_COMPOSED_PICK(GGML_TYPE_BF16, bf16)
+                    NV_COMPOSED_PICK(GGML_TYPE_Q8_0, q8_0)
+                    NV_COMPOSED_PICK(GGML_TYPE_Q4_K, q4_k)
+                    NV_COMPOSED_PICK(GGML_TYPE_Q5_K, q5_k)
+                    NV_COMPOSED_PICK(GGML_TYPE_Q6_K, q6_k)
+                    NV_COMPOSED_PICK(GGML_TYPE_Q4_0, q4_0)
+#undef NV_COMPOSED_PICK
+                    default: break;
+                }
+                break;
+            case DX12_IW_VKPORT_BASE + 0:
+            case DX12_IW_VKPORT_BASE + 1:
+            case DX12_IW_VKPORT_BASE + 2:
+            case DX12_IW_VKPORT_BASE + 3:
+#define TILED_BLOB(name_, full_, wave_) {g_mul_mat_linalg_tiled_##name_##_##full_##_w##wave_##_dxil, sizeof(g_mul_mat_linalg_tiled_##name_##_##full_##_w##wave_##_dxil)}
+#define TILED_CASE(type_, name_) case type_: { \
+                    static const dx12_shader_blob blobs[] = {TILED_BLOB(name_, 0, 16), TILED_BLOB(name_, 1, 16), TILED_BLOB(name_, 0, 32), TILED_BLOB(name_, 1, 32), \
+                        {g_mul_mat_linalg_tiled_##name_##_0_w16_bf16_dxil, sizeof(g_mul_mat_linalg_tiled_##name_##_0_w16_bf16_dxil)}, \
+                        {g_mul_mat_linalg_tiled_##name_##_1_w16_bf16_dxil, sizeof(g_mul_mat_linalg_tiled_##name_##_1_w16_bf16_dxil)}}; \
+                    return pick(blobs[key.flags - DX12_IW_VKPORT_BASE + (dx12_tiled_b_f16(key.flags) ? 4 : 0)]); \
+                }
+                switch (key.src0_type) {
+                    TILED_CASE(GGML_TYPE_F16, f16);
+                    TILED_CASE(GGML_TYPE_Q8_0, q8_0);
+                    TILED_CASE(GGML_TYPE_Q4_K, q4_k);
+                    TILED_CASE(GGML_TYPE_Q5_K, q5_k);
+                    TILED_CASE(GGML_TYPE_Q6_K, q6_k);
+                    TILED_CASE(GGML_TYPE_Q4_0, q4_0);
+                    TILED_CASE(GGML_TYPE_Q4_1, q4_1);
+                    TILED_CASE(GGML_TYPE_Q5_0, q5_0);
+                    TILED_CASE(GGML_TYPE_Q5_1, q5_1);
+                    TILED_CASE(GGML_TYPE_IQ4_NL, iq4_nl);
+                    TILED_CASE(GGML_TYPE_MXFP4, mxfp4);
+                    default: break;
+                }
+#undef TILED_CASE
+#undef TILED_BLOB
+                break;
+            case DX12_IW_Q50_FLAG: return pick(WBLOB(mul_mat_linalg_wave_q5_0_i));
+            case DX12_IW_Q6K_FLAG: return pick(WBLOB(mul_mat_linalg_wave_q6_k_i));
+            case DX12_IW_Q5K_FLAG: return pick(WBLOB(mul_mat_linalg_wave_q5_k_i));
+            case DX12_IW_Q40_FLAG: return pick(WBLOB(mul_mat_linalg_wave_q4_0_i));
+            case DX12_IW_Q41_FLAG: return pick(WBLOB(mul_mat_linalg_wave_q4_1_i));
+            case DX12_IW_Q51_FLAG: return pick(WBLOB(mul_mat_linalg_wave_q5_1_i));
+            case DX12_IW_IQ4NL_FLAG: return pick(WBLOB(mul_mat_linalg_wave_iq4_nl_i));
+            case DX12_IW_MXFP4_FLAG: return pick(WBLOB(mul_mat_linalg_wave_mxfp4_i));
+            case DX12_IW_STAGED_FLAG:
+#define IW_STAGE_CASE(type_, name_) case type_: return pick(WBLOB(mul_mat_stage_wave_##name_##_i))
+                switch (key.src0_type) {
+                    IW_STAGE_CASE(GGML_TYPE_F16, f16);
+                    IW_STAGE_CASE(GGML_TYPE_Q8_0, q8_0);
+                    IW_STAGE_CASE(GGML_TYPE_Q4_K, q4k);
+                    IW_STAGE_CASE(GGML_TYPE_Q5_K, q5k);
+                    IW_STAGE_CASE(GGML_TYPE_Q6_K, q6k);
+                    IW_STAGE_CASE(GGML_TYPE_Q4_0, q4_0);
+                    IW_STAGE_CASE(GGML_TYPE_Q4_1, q4_1);
+                    IW_STAGE_CASE(GGML_TYPE_Q5_0, q5_0);
+                    IW_STAGE_CASE(GGML_TYPE_Q5_1, q5_1);
+                    IW_STAGE_CASE(GGML_TYPE_IQ4_NL, iq4_nl);
+                    IW_STAGE_CASE(GGML_TYPE_IQ4_XS, iq4_xs);
+                    IW_STAGE_CASE(GGML_TYPE_Q2_K, q2k);
+                    IW_STAGE_CASE(GGML_TYPE_Q3_K, q3k);
+                    IW_STAGE_CASE(GGML_TYPE_MXFP4, mxfp4);
+                    IW_STAGE_CASE(GGML_TYPE_NVFP4, nvfp4);
+                    IW_STAGE_CASE(GGML_TYPE_Q1_0, q1_0);
+                    IW_STAGE_CASE(GGML_TYPE_Q2_0, q2_0);
+                    IW_STAGE_CASE(GGML_TYPE_TQ1_0, tq1_0);
+                    IW_STAGE_CASE(GGML_TYPE_TQ2_0, tq2_0);
+                    IW_STAGE_CASE(GGML_TYPE_IQ2_XXS, iq2_xxs);
+                    IW_STAGE_CASE(GGML_TYPE_IQ2_XS, iq2_xs);
+                    IW_STAGE_CASE(GGML_TYPE_IQ2_S, iq2_s);
+                    IW_STAGE_CASE(GGML_TYPE_IQ3_XXS, iq3_xxs);
+                    IW_STAGE_CASE(GGML_TYPE_IQ3_S, iq3_s);
+                    IW_STAGE_CASE(GGML_TYPE_IQ1_S, iq1_s);
+                    IW_STAGE_CASE(GGML_TYPE_IQ1_M, iq1_m);
+                    default: return false;
+                }
+#undef IW_STAGE_CASE
+#endif
             case 43:
                 switch (key.src0_type) {
                     case GGML_TYPE_IQ2_XXS: return pick(WBLOB(mul_mat_iq2_xxs_quant));
@@ -15268,6 +20779,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 140: return pick(WBLOB(mul_mat_vec_q4k_dp4a_nc32));
             case 141: return pick(WBLOB(mul_mat_vec_q5k_dp4a_nc32));
             case 142: return pick(WBLOB(mul_mat_vec_q6k_dp4a_nc32));
+            case 143: return pick(WBLOB(mul_mat_vec_q4k_dp4a_nc2_r4));
+            case 144: return pick(WBLOB(mul_mat_vec_q4k_dp4a_nc4_r4));
             case 53: return pick(WBLOB(mul_mat_wmma_fp16));
             case 54: return pick(WBLOB(mul_mat_wmma_kfull));
             case 55: return pick(WBLOB(mul_mat_vec_iq4_nl_mr256));
@@ -15283,17 +20796,29 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                     default:             return false;
                 }
             case 59: return pick(WBLOB(mul_mat_q8_0_q8_1_tiled_intel));
-            case 114: return pick(WBLOB(mul_mat_q5_0_q8_1_tiled_64));
-            case 115: return pick(WBLOB(mul_mat_q4k_q8_1_tiled_64));
-            case 116: return pick(WBLOB(mul_mat_q6k_q8_1_tiled_64));
-            case 104: return pick(WBLOB(mul_mat_q8_0_q8_1_mmq));
-            case 127: return pick(WBLOB(mul_mat_q4k_q8_1_mmq));
-            case 128: return pick(WBLOB(mul_mat_q5k_q8_1_mmq));
-            case 129: return pick(WBLOB(mul_mat_q6k_q8_1_mmq));
-            case 130: return pick(WBLOB(mul_mat_vec_iq1_s));
+            case 154: return pick(WBLOB(mul_mat_q5_0_q8_1_tiled_64));
+            case 155: return pick(WBLOB(mul_mat_q4k_q8_1_tiled_64));
+            case 156: return pick(WBLOB(mul_mat_q6k_q8_1_tiled_64));
+            case 158: return pick(WBLOB(mul_mat_vec_iq1_s));
+            case 160: return pick(WBLOB(mul_mat_q2k_q8_1_mmq));
+            case 162: return pick(WBLOB(mul_mat_q8_0_q8_1_mmq_64));
+            case 163: return pick(WBLOB(mul_mat_q4k_q8_1_mmq_64));
+            case 164: return pick(WBLOB(mul_mat_q5k_q8_1_mmq_64));
+            case 165: return pick(WBLOB(mul_mat_q6k_q8_1_mmq_64));
+            case 147: return pick(WBLOB(mul_mat_q5_0_q8_1_mmq));
+            case 149: return pick(WBLOB(mul_mat_q5_0_q8_1_mmq_wave_share));
             case 60: return pick(WBLOB_GS(mul_mat_vec_q5_0_subgroup));
             case 61: return pick(WBLOB_GS(mul_mat_vec_q6k_subgroup));
-            case 62: return pick(WBLOB_GS(mul_mat_vec_glu_q8_0_dp4a_mr64));
+            case 62: {
+                const char * block64_env = DX12_GETENV("DX12_Q80_GLU_BLOCK64");
+                const bool block64 = block64_env
+                    ? block64_env[0] != '0'
+                    : sub_family == DX12_SUBARCH_AMD_RDNA4_PLUS;
+                if (block64 && wave_size == 64) {
+                    return pick(WBLOB(mul_mat_vec_glu_q8_0_dp4a_block64));
+                }
+                return pick(WBLOB_GS(mul_mat_vec_glu_q8_0_dp4a_mr64));
+            }
             case 63: return pick(WBLOB_FP16(mul_mat_vec_f16_wave64));
             case 64: return pick(WBLOB(mul_mat_vec_q8_0_wave64));
             case 66: return pick(WBLOB_GS(mul_mat_vec_glu_q5_0_subgroup));
@@ -15309,9 +20834,16 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case 82: return pick(WBLOB(mul_mat_vec_q6k_subgroup));
             case 83: return pick(WBLOB(mul_mat_vec_q5_0_nc8));
             case 84: return pick(WBLOB(mul_mat_vec_qkv_q8_0_mr256));
-            case 88: return pick(WBLOB_FP16(mul_mat_vec_qkv_f16_wave64_rms));
+            case 88: {
+                if (arch_family == DX12_ARCH_NV_PASCAL_PLUS && dx12_qkv_f16_rows2_enabled()) {
+                    return pick(WBLOB_FP16(mul_mat_vec_qkv_f16_wave64_rms_rows2));
+                }
+                return pick(WBLOB_FP16(mul_mat_vec_qkv_f16_wave64_rms));
+            }
             case 89: return pick(WBLOB_FP16(mul_mat_vec_glu_rms));
             case 90: return pick(WBLOB(mul_mat_vec_qkv_q8_0_mr256_rms));
+            case DX12_Q4K_GLU_WAVE_FLAG: return pick(WBLOB(mul_mat_vec_glu_q4_k_wave64));
+            case DX12_Q4K_GLU_WAVE_RMS_FLAG: return pick(WBLOB(mul_mat_vec_glu_q4_k_wave64_rms));
             case 91: return pick(WBLOB_TUNE(mul_mat_vec_glu_q4_k_rms, glu_q4k_gs));
             case 92: return pick(WBLOB_GS(mul_mat_vec_glu_q5_0_subgroup_rms));
             case 93: return pick(WBLOB(mul_mat_vec_qkv_q8_0_wave64_rms));
@@ -15419,6 +20951,106 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             }
         }
 
+#ifdef GGML_DX12_LINALG_PREVIEW
+        if (key.flags == DX12_MMID_IW_FLAG) {
+            switch (key.src0_type) {
+                case GGML_TYPE_F16:  return pick(WBLOB(mul_mat_id_wave_f16_i));
+                case GGML_TYPE_Q8_0: return pick(WBLOB(mul_mat_id_wave_q8_0_i));
+                case GGML_TYPE_Q4_K: return pick(WBLOB(mul_mat_id_wave_q4k_i));
+                case GGML_TYPE_Q6_K: return pick(WBLOB(mul_mat_id_wave_q6k_i));
+                case GGML_TYPE_Q5_K: return pick(WBLOB(mul_mat_id_wave_q5k_i));
+                case GGML_TYPE_Q4_0: return pick(WBLOB(mul_mat_id_wave_q4_0_i));
+                case GGML_TYPE_Q4_1: return pick(WBLOB(mul_mat_id_wave_q4_1_i));
+                case GGML_TYPE_Q5_0: return pick(WBLOB(mul_mat_id_wave_q5_0_i));
+                case GGML_TYPE_Q5_1: return pick(WBLOB(mul_mat_id_wave_q5_1_i));
+                case GGML_TYPE_IQ4_NL: return pick(WBLOB(mul_mat_id_wave_iq4_nl_i));
+                case GGML_TYPE_IQ4_XS: return pick(WBLOB(mul_mat_id_wave_iq4_xs_i));
+                case GGML_TYPE_Q2_K: return pick(WBLOB(mul_mat_id_wave_q2k_i));
+                case GGML_TYPE_Q3_K: return pick(WBLOB(mul_mat_id_wave_q3k_i));
+                case GGML_TYPE_MXFP4: return pick(WBLOB(mul_mat_id_wave_mxfp4_i));
+                case GGML_TYPE_NVFP4: return pick(WBLOB(mul_mat_id_wave_nvfp4_i));
+                case GGML_TYPE_Q1_0: return pick(WBLOB(mul_mat_id_wave_q1_0_i));
+                case GGML_TYPE_Q2_0: return pick(WBLOB(mul_mat_id_wave_q2_0_i));
+                case GGML_TYPE_TQ1_0: return pick(WBLOB(mul_mat_id_wave_tq1_0_i));
+                case GGML_TYPE_TQ2_0: return pick(WBLOB(mul_mat_id_wave_tq2_0_i));
+                case GGML_TYPE_IQ2_XXS: return pick(WBLOB(mul_mat_id_wave_iq2_xxs_i));
+                case GGML_TYPE_IQ2_XS: return pick(WBLOB(mul_mat_id_wave_iq2_xs_i));
+                case GGML_TYPE_IQ2_S: return pick(WBLOB(mul_mat_id_wave_iq2_s_i));
+                case GGML_TYPE_IQ3_XXS: return pick(WBLOB(mul_mat_id_wave_iq3_xxs_i));
+                case GGML_TYPE_IQ3_S: return pick(WBLOB(mul_mat_id_wave_iq3_s_i));
+                case GGML_TYPE_IQ1_S: return pick(WBLOB(mul_mat_id_wave_iq1_s_i));
+                case GGML_TYPE_IQ1_M: return pick(WBLOB(mul_mat_id_wave_iq1_m_i));
+                default: return false;
+            }
+        }
+
+        // 200 and 202 are the wave-matrix MoE GEMM at two tile shapes; the
+        // group builds its own expert routing, so the variants differ only in
+        // the dequant.
+        if (key.flags == 200 || key.flags == 202 || dx12_is_bucket_linalg_mmid(key.flags)) {
+#define MMID_EXPERT_WIDE_BLOB(name_) dx12_shader_blob{g_mul_mat_id_linalg_##name_##_expert_128x128_w64_dxil, sizeof(g_mul_mat_id_linalg_##name_##_expert_128x128_w64_dxil), "mul_mat_id_linalg_" #name_ "_expert_128x128_w64"}
+            if (key.flags == DX12_MMID_EXPERT_WIDE_FLAG) {
+                switch (key.src0_type) {
+                    case GGML_TYPE_F16:  return pick(MMID_EXPERT_WIDE_BLOB(f16));
+                    case GGML_TYPE_Q8_0: return pick(MMID_EXPERT_WIDE_BLOB(q8_0));
+                    case GGML_TYPE_Q4_K: return pick(MMID_EXPERT_WIDE_BLOB(q4_k));
+                    case GGML_TYPE_Q6_K: return pick(MMID_EXPERT_WIDE_BLOB(q6_k));
+                    default: return false;
+                }
+            }
+#undef MMID_EXPERT_WIDE_BLOB
+#define MMID_BUCKET_WBLOB(name_, shape_, wave_) dx12_shader_blob{g_mul_mat_id_linalg_##name_##_bucket_##shape_##_w##wave_##_dxil, sizeof(g_mul_mat_id_linalg_##name_##_bucket_##shape_##_w##wave_##_dxil), "mul_mat_id_linalg_" #name_ "_bucket_" #shape_ "_w" #wave_}
+            if (key.flags == DX12_MMID_BUCKET_WIDE_FLAG) {
+                switch (key.src0_type) {
+                    case GGML_TYPE_F16:  return pick(MMID_BUCKET_WBLOB(f16, 128x128, 32));
+                    case GGML_TYPE_Q4_K: return pick(MMID_BUCKET_WBLOB(q4_k, 128x128, 32));
+                    case GGML_TYPE_Q6_K: return pick(MMID_BUCKET_WBLOB(q6_k, 128x128, 32));
+                    case GGML_TYPE_Q8_0: return pick(MMID_BUCKET_WBLOB(q8_0, 128x128, 32));
+                    default:            return false;
+                }
+            }
+            const bool tall = key.flags == 202 || key.flags == DX12_MMID_BUCKET_TALL_FLAG ||
+                              key.flags == DX12_MMID_EXPERT_MAJOR_TALL_FLAG;
+#define MMID_BUCKET_BLOB(name_, shape_) (dx12_is_expert_major_mmid(key.flags) \
+    ? dx12_shader_blob{g_mul_mat_id_linalg_##name_##_expert_##shape_##_w64_dxil, sizeof(g_mul_mat_id_linalg_##name_##_expert_##shape_##_w64_dxil), "mul_mat_id_linalg_" #name_ "_expert_" #shape_} \
+    : (blob_wave_size == 32 ? MMID_BUCKET_WBLOB(name_, shape_, 32) : MMID_BUCKET_WBLOB(name_, shape_, 64)))
+#define MMID_BLOB(name_) (dx12_is_bucket_linalg_mmid(key.flags) \
+                            ? (tall ? MMID_BUCKET_BLOB(name_, 128x64) : MMID_BUCKET_BLOB(name_, 32x32)) \
+                            : (tall ? WBLOB(mul_mat_id_linalg_##name_##_128x64) : WBLOB(mul_mat_id_linalg_##name_##_32x32)))
+            switch (key.src0_type) {
+                case GGML_TYPE_F16:    return pick(MMID_BLOB(f16));
+                case GGML_TYPE_BF16:   return pick(MMID_BLOB(f16));
+                case GGML_TYPE_Q8_0:   return pick(MMID_BLOB(q8_0));
+                case GGML_TYPE_Q4_K:   return pick(MMID_BLOB(q4_k));
+                case GGML_TYPE_Q5_K:   return pick(MMID_BLOB(q5_k));
+                case GGML_TYPE_Q6_K:   return pick(MMID_BLOB(q6_k));
+                case GGML_TYPE_Q5_0:   return pick(MMID_BLOB(q5_0));
+                case GGML_TYPE_Q4_0:   return pick(MMID_BLOB(q4_0));
+                case GGML_TYPE_Q4_1:   return pick(MMID_BLOB(q4_1));
+                case GGML_TYPE_Q5_1:   return pick(MMID_BLOB(q5_1));
+                case GGML_TYPE_IQ4_NL: return pick(MMID_BLOB(iq4_nl));
+                case GGML_TYPE_MXFP4:  return pick(MMID_BLOB(mxfp4));
+                default:               return false;
+            }
+#undef MMID_BLOB
+#undef MMID_BUCKET_BLOB
+#undef MMID_BUCKET_WBLOB
+        }
+#endif
+
+        if (key.flags == 203) {
+            return pick(WBLOB(mul_mat_id_q8_0_q8_1_mmq));
+        }
+
+        if (key.src0_type == GGML_TYPE_F16 && key.flags == DX12_MMID_F16_VEC_FLAG) {
+            return pick(WBLOB(mul_mat_id_f16_vec_rows4));
+        }
+        if (key.src0_type == GGML_TYPE_Q8_0 && key.flags == DX12_MMID_Q8_ROWS4_FLAG) {
+            return pick(WBLOB(mul_mat_id_q8_0_dp4a_rows4));
+        }
+        if (key.src0_type == GGML_TYPE_F16 && key.flags == DX12_MMID_F16_WAVE_FLAG) {
+            return pick(WBLOB(mul_mat_id_f16_vec_wave64));
+        }
         switch (key.src0_type) {
             case GGML_TYPE_F32:
             case GGML_TYPE_F16:
@@ -15443,7 +21075,10 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                                     WBLOB(mul_mat_id_q8_0_dp4a)) :
                                 WBLOB(mul_mat_id_q8_0));
             case GGML_TYPE_Q4_K:
-                if (key.flags == 117) {
+                if (key.flags == DX12_MMID_Q4K_ROWS4_FLAG) {
+                    return pick(WBLOB(mul_mat_id_q4k_dp4a_rows4));
+                }
+                if (key.flags == 159) {
                     return pick(WBLOB(mul_mat_id_q4k_dp4a));
                 }
                 if (key.flags == 51) {
@@ -15453,6 +21088,9 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             case GGML_TYPE_Q5_K:
                 return pick((key.flags == 1 || key.flags == 18) ? WBLOB(mul_mat_id_q5k_coop) : WBLOB(mul_mat_id_q5k));
             case GGML_TYPE_Q6_K:
+                if (key.flags == DX12_MMID_Q6K_ROWS4_FLAG) {
+                    return pick(WBLOB(mul_mat_id_q6k_dp4a_rows4));
+                }
                 return pick(key.flags == 53 ? WBLOB(mul_mat_id_q6k_coop_wide) :
                             (key.flags == 1 || key.flags == 18) ? WBLOB(mul_mat_id_q6k_coop) : WBLOB(mul_mat_id_q6k));
             case GGML_TYPE_IQ4_NL:
@@ -15561,6 +21199,8 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             set_selected_blob(WBLOB(moe_sum));
         } else if (key.op == GGML_OP_CONT && key.flags == 61) {
             set_selected_blob(WBLOB(mul_sigmoid_gate));
+        } else if (key.op == GGML_OP_CONT && key.flags == 62) {
+            set_selected_blob(WBLOB(cpy_transpose_02));
         } else if (key.op == GGML_OP_UNARY) {
             auto uit = unary_shader_blobs.find((int)key.flags);
             if (uit != unary_shader_blobs.end()) {
@@ -15582,12 +21222,50 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                    key.dst_type == key.src0_type &&
                    (ggml_is_quantized(key.dst_type) || key.dst_type == GGML_TYPE_I16)) {
             set_selected_blob(WBLOB(cpy_quant_block));
+        } else if ((key.op == GGML_OP_CPY || key.op == GGML_OP_DUP) &&
+                   ggml_is_quantized(key.src0_type) &&
+                   (key.dst_type == GGML_TYPE_F32 || key.dst_type == GGML_TYPE_F16 ||
+                    key.dst_type == GGML_TYPE_BF16)) {
+            switch (key.src0_type) {
+                case GGML_TYPE_Q4_0:    set_selected_blob(WBLOB(cpy_dq_q4_0));    break;
+                case GGML_TYPE_Q4_1:    set_selected_blob(WBLOB(cpy_dq_q4_1));    break;
+                case GGML_TYPE_Q5_0:    set_selected_blob(WBLOB(cpy_dq_q5_0));    break;
+                case GGML_TYPE_Q5_1:    set_selected_blob(WBLOB(cpy_dq_q5_1));    break;
+                case GGML_TYPE_Q8_0:    set_selected_blob(WBLOB(cpy_dq_q8_0));    break;
+                case GGML_TYPE_Q4_K:    set_selected_blob(WBLOB(cpy_dq_q4_k));    break;
+                case GGML_TYPE_Q5_K:    set_selected_blob(WBLOB(cpy_dq_q5_k));    break;
+                case GGML_TYPE_Q6_K:    set_selected_blob(WBLOB(cpy_dq_q6_k));    break;
+                case GGML_TYPE_IQ4_NL:  set_selected_blob(WBLOB(cpy_dq_iq4_nl));  break;
+                case GGML_TYPE_MXFP4:   set_selected_blob(WBLOB(cpy_dq_mxfp4));   break;
+                case GGML_TYPE_NVFP4:   set_selected_blob(WBLOB(cpy_dq_nvfp4));   break;
+                case GGML_TYPE_Q1_0:    set_selected_blob(WBLOB(cpy_dq_q1_0));    break;
+                case GGML_TYPE_Q2_0:    set_selected_blob(WBLOB(cpy_dq_q2_0));    break;
+                case GGML_TYPE_TQ1_0:   set_selected_blob(WBLOB(cpy_dq_tq1_0));   break;
+                case GGML_TYPE_TQ2_0:   set_selected_blob(WBLOB(cpy_dq_tq2_0));   break;
+                case GGML_TYPE_Q2_K:    set_selected_blob(WBLOB(cpy_dq_q2_k));    break;
+                case GGML_TYPE_Q3_K:    set_selected_blob(WBLOB(cpy_dq_q3_k));    break;
+                case GGML_TYPE_IQ4_XS:  set_selected_blob(WBLOB(cpy_dq_iq4_xs));  break;
+                case GGML_TYPE_IQ2_XXS: set_selected_blob(WBLOB(cpy_dq_iq2_xxs)); break;
+                case GGML_TYPE_IQ2_XS:  set_selected_blob(WBLOB(cpy_dq_iq2_xs));  break;
+                case GGML_TYPE_IQ2_S:   set_selected_blob(WBLOB(cpy_dq_iq2_s));   break;
+                case GGML_TYPE_IQ3_XXS: set_selected_blob(WBLOB(cpy_dq_iq3_xxs)); break;
+                case GGML_TYPE_IQ3_S:   set_selected_blob(WBLOB(cpy_dq_iq3_s));   break;
+                case GGML_TYPE_IQ1_S:   set_selected_blob(WBLOB(cpy_dq_iq1_s));   break;
+                case GGML_TYPE_IQ1_M:   set_selected_blob(WBLOB(cpy_dq_iq1_m));   break;
+                default: break;
+            }
+        } else if (key.op == GGML_OP_CONCAT && dx12_block_copy_type_ok(key.dst_type)) {
+            set_selected_blob(WBLOB(concat_block));
+        } else if (key.op == GGML_OP_REPEAT && dx12_block_copy_type_ok(key.dst_type)) {
+            set_selected_blob(WBLOB(repeat_block));
         } else if ((key.op == GGML_OP_ARGSORT || key.op == GGML_OP_TOP_K) && key.flags == 50) {
             set_selected_blob(WBLOB(argsort_large));
         } else if (key.op == GGML_OP_ARGSORT && key.flags == 52) {
             set_selected_blob(WBLOB(argsort_top_k_small));
         } else if (key.op == GGML_OP_TOP_K && key.flags == 51) {
             set_selected_blob(WBLOB(top_k_large));
+        } else if (key.op == GGML_OP_TOP_K && key.flags == 63) {
+            set_selected_blob(WBLOB(top_k_radix));
         } else if (key.op == GGML_OP_GATED_DELTA_NET && key.flags == 16) {
             set_selected_blob(WBLOB(gated_delta_net_sv16));
         } else if (key.op == GGML_OP_GATED_DELTA_NET && key.flags == 32) {
@@ -15602,32 +21280,68 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
             set_selected_blob(WBLOB(gated_delta_net_sv32_kda));
         } else if (key.op == GGML_OP_GATED_DELTA_NET && key.flags == (0x100 | 64)) {
             set_selected_blob(WBLOB(gated_delta_net_sv64_kda));
+        } else if (key.op == GGML_OP_LIGHTNING_INDEXER) {
+            switch ((enum ggml_type)key.flags) {
+                case GGML_TYPE_Q4_0:   set_selected_blob(WBLOB(lightning_indexer_q4_0));   break;
+                case GGML_TYPE_Q4_1:   set_selected_blob(WBLOB(lightning_indexer_q4_1));   break;
+                case GGML_TYPE_Q5_0:   set_selected_blob(WBLOB(lightning_indexer_q5_0));   break;
+                case GGML_TYPE_Q5_1:   set_selected_blob(WBLOB(lightning_indexer_q5_1));   break;
+                case GGML_TYPE_Q8_0:   set_selected_blob(WBLOB(lightning_indexer_q8_0));   break;
+                case GGML_TYPE_IQ4_NL: set_selected_blob(WBLOB(lightning_indexer_iq4_nl)); break;
+                default: break;  // float K uses the default blob
+            }
+        } else if (key.op == GGML_OP_SSM_SCAN && key.flags == 96) {
+            set_selected_blob(WBLOB(ssm_scan_d96));
         } else if (key.op == GGML_OP_SSM_SCAN && key.flags == 256) {
             set_selected_blob(WBLOB(ssm_scan_d256));
         } else if (key.op == GGML_OP_SSM_CONV && key.flags == 1) {
             set_selected_blob(WBLOB(ssm_conv_silu));
         } else if (key.op == GGML_OP_SSM_CONV && key.flags == 2) {
             set_selected_blob(WBLOB(ssm_conv_bias_silu));
+        } else if (key.op == GGML_OP_NORM && key.flags == 1) {
+            set_selected_blob(WBLOB(norm_mul_add));
+        } else if (key.op == GGML_OP_NORM && key.flags == 2) {
+            set_selected_blob(WBLOB(norm_1024));
+        } else if (key.op == GGML_OP_L2_NORM && key.flags == 1) {
+            set_selected_blob(WBLOB(l2_norm_1024));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 2) {
             set_selected_blob(WBLOB(rms_norm_mul));
+        } else if (key.op == GGML_OP_RMS_NORM && key.flags == DX12_RMS_FIXED_FLAG) {
+            set_selected_blob(WBLOB(rms_norm_mul_fixed));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 85) {
             set_selected_blob(WBLOB(rms_norm_mul_1024));
+        } else if (key.op == GGML_OP_RMS_NORM && key.flags == 86) {
+            set_selected_blob(WBLOB(rms_norm_1024));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 12) {
             set_selected_blob(WBLOB(rms_norm_mul_quantize_q8_1));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 3) {
             set_selected_blob(WBLOB(add_rms_norm_mul));
+        } else if (key.op == GGML_OP_RMS_NORM && key.flags == DX12_ADD_RMS_FIXED_FLAG) {
+            set_selected_blob(WBLOB(add_rms_norm_mul_fixed));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 7) {
             set_selected_blob(WBLOB(rms_norm_mul_rope));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 8) {
             set_selected_blob(WBLOB(rms_norm_mul_rope_set_rows));
+        } else if (key.op == GGML_OP_RMS_NORM && key.flags == DX12_RMS_ROPE_PACKED_FLAG) {
+            set_selected_blob(WBLOB(rms_norm_mul_rope_set_rows_packed));
         } else if (key.op == GGML_OP_RMS_NORM && key.flags == 104) {
             set_selected_blob(WBLOB(rms_norm_mul_rope_qk));
+        } else if (key.op == GGML_OP_RMS_NORM && key.flags == DX12_QK_NORM_PACKED_FLAG) {
+            if (blob_wave_size == 16) {
+                set_selected_blob(dx12_shader_blob{g_rms_norm_mul_rope_qk_packed_w16_dxil, sizeof(g_rms_norm_mul_rope_qk_packed_w16_dxil), "rms_norm_mul_rope_qk_packed_w16"});
+            } else {
+                set_selected_blob(dx12_shader_blob{g_rms_norm_mul_rope_qk_packed_w32_dxil, sizeof(g_rms_norm_mul_rope_qk_packed_w32_dxil), "rms_norm_mul_rope_qk_packed_w32"});
+            }
         } else if (key.op == GGML_OP_ROPE && key.flags == 6) {
             set_selected_blob(WBLOB(rope_set_rows));
         } else if (key.op == GGML_OP_ROPE && key.flags == 87) {
             set_selected_blob(WBLOB(rope_scale_k_set_rows));
         } else if (key.op == GGML_OP_ROPE && key.flags == 13) {
             set_selected_blob(WBLOB(rope_multi));
+        } else if (key.op == GGML_OP_NONE && key.flags == DX12_FA_SPARSE_COMPACT_FLAG) {
+            set_selected_blob(WBLOB(flash_attn_sparse_compact));
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == DX12_FA_SPARSE_FLAG) {
+            set_selected_blob(WBLOB(flash_attn_sparse));
         } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 1) {
             set_selected_blob(WBLOB_FP16(flash_attn_gqa));
         } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 2) {
@@ -15637,7 +21351,20 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         } else if (key.op == GGML_OP_FLASH_ATTN_EXT && key.flags == 8) {
             set_selected_blob(WBLOB(flash_attn_reduce));
         } else if (key.op == GGML_OP_FLASH_ATTN_EXT &&
-                   ((key.flags >= 20 && key.flags <= 33) || (key.flags >= 107 && key.flags <= 115))) {
+                   key.flags >= DX12_FA_CD_GQA_BASE && key.flags < DX12_FA_CD_GQA_BASE + 6) {
+            switch (key.flags - DX12_FA_CD_GQA_BASE) {
+                case 0: set_selected_blob(WBLOB(flash_attn_cd_gqa_64));       break;
+                case 1: set_selected_blob(WBLOB(flash_attn_cd_gqa_96));       break;
+                case 2: set_selected_blob(WBLOB(flash_attn_cd_gqa_128));      break;
+                case 3: set_selected_blob(WBLOB(flash_attn_cd_gqa_q8_0_64));  break;
+                case 4: set_selected_blob(WBLOB(flash_attn_cd_gqa_q8_0_96));  break;
+                case 5: set_selected_blob(WBLOB(flash_attn_cd_gqa_q8_0_128)); break;
+                default: break;
+            }
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT &&
+                   ((key.flags >= 20 && key.flags <= 34) ||
+                    (key.flags >= 43 && key.flags <= 47) ||
+                    (key.flags >= 107 && key.flags <= 115))) {
             switch (key.flags) {
                 case 20: set_selected_blob(WBLOB(flash_attn_q4_0));    break;
                 case 21: set_selected_blob(WBLOB(flash_attn_q4_1));    break;
@@ -15653,21 +21380,235 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
                 case 31: set_selected_blob(WBLOB(flash_attn_cd_q8_0_64));  break;
                 case 32: set_selected_blob(WBLOB(flash_attn_cd_q8_0_96));  break;
                 case 33: set_selected_blob(WBLOB(flash_attn_cd_q8_0_128)); break;
+                case 34: set_selected_blob(WBLOB(flash_attn_kvmix));       break;
+                case 43: set_selected_blob(WBLOB(flash_attn_tiled_192)); break;
+                case 44: set_selected_blob(WBLOB(flash_attn_tiled_256)); break;
+                case 45: set_selected_blob(WBLOB(flash_attn_tiled_320)); break;
+                case 46: set_selected_blob(WBLOB(flash_attn_tiled_512)); break;
+                case 47: set_selected_blob(WBLOB(flash_attn_tiled_576)); break;
                 case 107: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_64));  break;
                 case 108: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_96));  break;
                 case 109: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_128)); break;
                 case 110: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_64_wide)); break;
+                case 111: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_96_br16)); break;
+                case 112: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_96_br16_prescan)); break;
                 case 113: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_64_wide_prescan_relaxed_maskclass)); break;
                 case 114: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_96_prescan));  break;
                 case 115: set_selected_blob(WBLOB_FA_PF16(flash_attn_pf_128_prescan)); break;
                 default: break;
             }
+#ifdef GGML_DX12_LINALG_PREVIEW
+        } else if ((key.op == GGML_OP_CONV_2D ||
+                    key.op == GGML_OP_CONV_TRANSPOSE_2D ||
+                    key.op == GGML_OP_CONV_3D) &&
+                   (key.flags == DX12_LINALG_CONV_FLAG ||
+                    key.flags == DX12_LINALG_CONV_WIDE_FLAG ||
+                    key.flags == DX12_LINALG_CONV_XWIDE_FLAG)) {
+            const bool wide = key.flags == DX12_LINALG_CONV_WIDE_FLAG;
+            const bool xwide = key.flags == DX12_LINALG_CONV_XWIDE_FLAG;
+            switch (key.op) {
+                case GGML_OP_CONV_2D:
+                    set_selected_blob(xwide ? WBLOB(conv_2d_linalg_128x32)
+                                            : wide ? WBLOB(conv_2d_linalg_64x32)
+                                                   : WBLOB(conv_2d_linalg));
+                    break;
+                case GGML_OP_CONV_TRANSPOSE_2D:
+                    set_selected_blob(xwide ? WBLOB(conv_transpose_2d_linalg_128x32)
+                                            : wide ? WBLOB(conv_transpose_2d_linalg_64x32)
+                                                   : WBLOB(conv_transpose_2d_linalg));
+                    break;
+                case GGML_OP_CONV_3D:
+                    set_selected_blob(xwide ? WBLOB(conv_3d_linalg_128x32)
+                                            : wide ? WBLOB(conv_3d_linalg_64x32)
+                                                   : WBLOB(conv_3d_linalg));
+                    break;
+                default: break;
+            }
+        } else if ((key.op == GGML_OP_CONV_2D || key.op == GGML_OP_CONV_TRANSPOSE_2D || key.op == GGML_OP_CONV_3D) &&
+                   key.flags >= DX12_IW_CONV_FLAG && key.flags <= DX12_IW_CONV_XWIDE_FLAG) {
+#define IW_CONV_BLOB(name_) (key.flags == DX12_IW_CONV_XWIDE_FLAG ? WBLOB_IW(name_##_linalg_wave_128_i) : \
+                            key.flags == DX12_IW_CONV_WIDE_FLAG ? WBLOB_IW(name_##_linalg_wave_64_i) : \
+                                                                 WBLOB_IW(name_##_linalg_wave_32_i))
+            switch (key.op) {
+                case GGML_OP_CONV_2D: set_selected_blob(IW_CONV_BLOB(conv_2d)); break;
+                case GGML_OP_CONV_TRANSPOSE_2D: set_selected_blob(IW_CONV_BLOB(conv_transpose_2d)); break;
+                case GGML_OP_CONV_3D: set_selected_blob(IW_CONV_BLOB(conv_3d)); break;
+                default: break;
+            }
+#undef IW_CONV_BLOB
+        } else if (key.op == GGML_OP_OUT_PROD && key.flags == DX12_IW_OUT_PROD_FLAG) {
+            set_selected_blob(WBLOB_IW(out_prod_linalg_wave_32_i));
+        } else if (key.op == GGML_OP_OUT_PROD && key.flags == DX12_LINALG_OUT_PROD_FLAG) {
+            set_selected_blob(WBLOB(out_prod_linalg));
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT &&
+                   key.flags >= DX12_IW_FA_F16_BASE && key.flags <= DX12_IW_FA_Q4_BASE + 2) {
+            switch (key.flags) {
+                case DX12_IW_FA_F16_BASE + 0: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_f16_64_i)); break;
+                case DX12_IW_FA_F16_BASE + 1: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_f16_96_i)); break;
+                case DX12_IW_FA_F16_BASE + 2: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_f16_128_i)); break;
+                case DX12_IW_FA_Q8_BASE + 0: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_q8_0_64_i)); break;
+                case DX12_IW_FA_Q8_BASE + 1: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_q8_0_96_i)); break;
+                case DX12_IW_FA_Q8_BASE + 2: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_q8_0_128_i)); break;
+                case DX12_IW_FA_Q4_BASE + 0: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_q4_0_64_i)); break;
+                case DX12_IW_FA_Q4_BASE + 1: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_q4_0_96_i)); break;
+                case DX12_IW_FA_Q4_BASE + 2: set_selected_blob(WBLOB_IW(flash_attn_linalg_wave_q4_0_128_i)); break;
+                default: break;
+            }
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT &&
+                   ((key.flags >= DX12_LINALG_FA_F16_BASE &&
+                     key.flags <= DX12_LINALG_FA_Q4_0_BASE + 2) ||
+                    key.flags == DX12_LINALG_FA_NV_D64_FLAG ||
+                    key.flags == DX12_LINALG_FA_NV_D96_FLAG ||
+                    key.flags == DX12_LINALG_FA_NV_D128_W8_FLAG ||
+                    key.flags == DX12_LINALG_FA_RDNA4_D128_FLAG ||
+                    key.flags == DX12_LINALG_FA_PV_F16_D128_FLAG ||
+                    key.flags == DX12_LINALG_FA_PV_F16_RDNA4_D128_FLAG ||
+                    key.flags == DX12_LINALG_FA_COMPACT_D128_FLAG ||
+                    key.flags == DX12_LINALG_FA_PV_F16_COMPACT_D128_FLAG ||
+                    dx12_is_fa_pipeline_flag(key.flags) ||
+                    key.flags == DX12_LINALG_FA_NV_D64_QKT_FLAG ||
+                    key.flags == DX12_LINALG_FA_NV_D96_QKT_FLAG)) {
+            switch (key.flags) {
+                case DX12_LINALG_FA_F16_BASE + 0: set_selected_blob(WBLOB(flash_attn_linalg_64));  break;
+                case DX12_LINALG_FA_F16_BASE + 1: set_selected_blob(WBLOB(flash_attn_linalg_96));  break;
+                case DX12_LINALG_FA_F16_BASE + 2: set_selected_blob(WBLOB(flash_attn_linalg_128)); break;
+                case DX12_LINALG_FA_RDNA4_D128_FLAG:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_linalg_rdna4_128_w64_dxil, sizeof(g_flash_attn_linalg_rdna4_128_w64_dxil), "flash_attn_linalg_rdna4_128"});
+                    break;
+                case DX12_LINALG_FA_PV_F16_D128_FLAG:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_linalg_pv_f16_128_w64_dxil, sizeof(g_flash_attn_linalg_pv_f16_128_w64_dxil), "flash_attn_linalg_pv_f16_128"});
+                    break;
+                case DX12_LINALG_FA_PV_F16_RDNA4_D128_FLAG:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_linalg_pv_f16_rdna4_128_w64_dxil, sizeof(g_flash_attn_linalg_pv_f16_rdna4_128_w64_dxil), "flash_attn_linalg_pv_f16_rdna4_128"});
+                    break;
+                case DX12_LINALG_FA_COMPACT_D128_FLAG:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_linalg_compact_128_w64_dxil, sizeof(g_flash_attn_linalg_compact_128_w64_dxil), "flash_attn_linalg_compact_128"});
+                    break;
+                case DX12_FA_PIPELINE_D128_FLAG:
+                    if (blob_wave_size == 32) {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_128_k256_w32_dxil, sizeof(g_flash_attn_pipeline_128_k256_w32_dxil), "flash_attn_pipeline_128_w32"});
+                    } else {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_128_w64_dxil, sizeof(g_flash_attn_pipeline_128_w64_dxil), "flash_attn_pipeline_128"});
+                    }
+                    break;
+                case DX12_FA_PIPELINE_INTERLEAVED_D128_FLAG:
+                    if (blob_wave_size == 32) {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_128_k2048_w32_dxil, sizeof(g_flash_attn_pipeline_128_k2048_w32_dxil), "flash_attn_pipeline_128_k2048_w32"});
+                    } else {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_128_k2048_w64_dxil, sizeof(g_flash_attn_pipeline_128_k2048_w64_dxil), "flash_attn_pipeline_128_k2048"});
+                    }
+                    break;
+                case DX12_FA_PIPELINE_D64_BASE + 0:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_64_k128_w64_dxil, sizeof(g_flash_attn_pipeline_64_k128_w64_dxil), "flash_attn_pipeline_64_k128"});
+                    break;
+                case DX12_FA_PIPELINE_D64_BASE + 1:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_64_k384_w64_dxil, sizeof(g_flash_attn_pipeline_64_k384_w64_dxil), "flash_attn_pipeline_64_k384"});
+                    break;
+                case DX12_FA_PIPELINE_D64_BASE + 2:
+                    if (blob_wave_size == 32) {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_64_k1024_w32_dxil, sizeof(g_flash_attn_pipeline_64_k1024_w32_dxil), "flash_attn_pipeline_64_k1024_w32"});
+                    } else {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_64_k1024_w64_dxil, sizeof(g_flash_attn_pipeline_64_k1024_w64_dxil), "flash_attn_pipeline_64_k1024"});
+                    }
+                    break;
+                case DX12_FA_PIPELINE_D64_BASE + 3:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_64_k1536_w64_dxil, sizeof(g_flash_attn_pipeline_64_k1536_w64_dxil), "flash_attn_pipeline_64_k1536"});
+                    break;
+                case DX12_FA_PIPELINE_D96_BASE:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_96_k192_w64_dxil, sizeof(g_flash_attn_pipeline_96_k192_w64_dxil), "flash_attn_pipeline_96_k192"});
+                    break;
+                case DX12_FA_PIPELINE_D96_BR32_FLAG:
+                    if (blob_wave_size == 32) {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_96_br32_k6144_w32_dxil, sizeof(g_flash_attn_pipeline_96_br32_k6144_w32_dxil), "flash_attn_pipeline_96_br32_k6144_w32"});
+                    } else {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_96_br32_k6144_w64_dxil, sizeof(g_flash_attn_pipeline_96_br32_k6144_w64_dxil), "flash_attn_pipeline_96_br32_k6144_w64"});
+                    }
+                    break;
+                case DX12_FA_PIPELINE_D96_BASE + 1:
+                    if (blob_wave_size == 32) {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_96_k6144_w32_dxil, sizeof(g_flash_attn_pipeline_96_k6144_w32_dxil), "flash_attn_pipeline_96_k6144_w32"});
+                    } else {
+                        set_selected_blob(dx12_shader_blob{g_flash_attn_pipeline_96_k6144_w64_dxil, sizeof(g_flash_attn_pipeline_96_k6144_w64_dxil), "flash_attn_pipeline_96_k6144"});
+                    }
+                    break;
+                case DX12_LINALG_FA_PV_F16_COMPACT_D128_FLAG:
+                    set_selected_blob(dx12_shader_blob{g_flash_attn_linalg_pv_f16_compact_128_w64_dxil, sizeof(g_flash_attn_linalg_pv_f16_compact_128_w64_dxil), "flash_attn_linalg_pv_f16_compact_128"});
+                    break;
+                case DX12_LINALG_FA_Q8_0_BASE + 0: set_selected_blob(WBLOB(flash_attn_linalg_q8_0_64));  break;
+                case DX12_LINALG_FA_Q8_0_BASE + 1: set_selected_blob(WBLOB(flash_attn_linalg_q8_0_96));  break;
+                case DX12_LINALG_FA_Q8_0_BASE + 2: set_selected_blob(WBLOB(flash_attn_linalg_q8_0_128)); break;
+                case DX12_LINALG_FA_Q4_0_BASE + 0: set_selected_blob(WBLOB(flash_attn_linalg_q4_0_64));  break;
+                case DX12_LINALG_FA_Q4_0_BASE + 1: set_selected_blob(WBLOB(flash_attn_linalg_q4_0_96));  break;
+                case DX12_LINALG_FA_Q4_0_BASE + 2: set_selected_blob(WBLOB(flash_attn_linalg_q4_0_128)); break;
+                case DX12_LINALG_FA_NV_D64_FLAG:
+                    set_selected_blob(WBLOB(flash_attn_linalg_64_br32_tpw1));
+                    break;
+                case DX12_LINALG_FA_NV_D96_FLAG:
+                    set_selected_blob(WBLOB(flash_attn_linalg_96_br32_tpw1));
+                    break;
+                case DX12_LINALG_FA_NV_D128_W8_FLAG:
+                    set_selected_blob(WBLOB(flash_attn_linalg_128_w8_pv1));
+                    break;
+                case DX12_LINALG_FA_NV_D64_QKT_FLAG:
+                    set_selected_blob(WBLOB(flash_attn_linalg_64_br32_tpw1_qkt));
+                    break;
+                case DX12_LINALG_FA_NV_D96_QKT_FLAG:
+                    set_selected_blob(WBLOB(flash_attn_linalg_96_br32_tpw1_qkt));
+                    break;
+                default: break;
+            }
+#endif
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT && dx12_is_fa_scalar_mask_flag(key.flags)) {
+#define SCALAR_MASK_BLOB(n) dx12_shader_blob{g_flash_attn_pf_mask_##n##_dxil, sizeof(g_flash_attn_pf_mask_##n##_dxil), "flash_attn_pf_mask_" #n}
+            switch (key.flags - DX12_FA_SCALAR_MASK_BASE) {
+                case 0: set_selected_blob(SCALAR_MASK_BLOB(0)); break;
+                case 1: set_selected_blob(SCALAR_MASK_BLOB(1)); break;
+                case 2: set_selected_blob(SCALAR_MASK_BLOB(2)); break;
+                case 3: set_selected_blob(SCALAR_MASK_BLOB(3)); break;
+                case 4: set_selected_blob(SCALAR_MASK_BLOB(4)); break;
+                default: break;
+            }
+#undef SCALAR_MASK_BLOB
+        } else if (key.op == GGML_OP_NONE &&
+                   (key.flags == DX12_FA_SCALAR_MASK_PACKED_BASE || key.flags == DX12_FA_SCALAR_MASK_PACKED_BASE + 1)) {
+            if (key.flags == DX12_FA_SCALAR_MASK_PACKED_BASE) {
+                set_selected_blob(dx12_shader_blob{g_flash_attn_mask_packed_br16_bc32_w16_dxil, sizeof(g_flash_attn_mask_packed_br16_bc32_w16_dxil), "flash_attn_mask_packed_br16_bc32_w16"});
+            } else {
+                set_selected_blob(dx12_shader_blob{g_flash_attn_mask_packed_br32_bc32_w16_dxil, sizeof(g_flash_attn_mask_packed_br32_bc32_w16_dxil), "flash_attn_mask_packed_br32_bc32_w16"});
+            }
+        } else if (key.op == GGML_OP_FLASH_ATTN_EXT &&
+                   (key.flags == DX12_FA_QREGS_BASE || key.flags == DX12_FA_QREGS_BASE + 2)) {
+#define QREGS_BLOB(d) dx12_shader_blob{g_flash_attn_pf_qregs_##d##_dxil, sizeof(g_flash_attn_pf_qregs_##d##_dxil), "flash_attn_pf_qregs"}
+            switch (key.flags - DX12_FA_QREGS_BASE) {
+                case 0: set_selected_blob(QREGS_BLOB(64)); break;
+                case 2: set_selected_blob(QREGS_BLOB(128)); break;
+                default: break;
+            }
+#undef QREGS_BLOB
+        } else if (key.op == GGML_OP_SOFT_MAX && key.flags == DX12_MOE_ROUTER_FLAG) {
+            set_selected_blob(WBLOB(moe_router));
         } else if (key.op == GGML_OP_SOFT_MAX && key.flags == 1) {
             set_selected_blob(WBLOB(soft_max_cached));
         } else if (key.op == GGML_OP_NONE && key.flags == 99) {
             set_selected_blob(WBLOB(quantize_q8_1));
         } else if (key.op == GGML_OP_NONE && key.flags == 120) {
             set_selected_blob(WBLOB(moe_expert_bucket));
+#ifdef GGML_DX12_LINALG_PREVIEW
+        } else if (key.op == GGML_OP_NONE && key.flags == DX12_FA_MASK_PACKED_BR32_FLAG) {
+            if (blob_wave_size == 32) {
+                set_selected_blob(dx12_shader_blob{g_flash_attn_mask_packed_br32_w32_dxil, sizeof(g_flash_attn_mask_packed_br32_w32_dxil), "flash_attn_mask_packed_br32_w32"});
+            } else {
+                set_selected_blob(dx12_shader_blob{g_flash_attn_mask_packed_br32_w64_dxil, sizeof(g_flash_attn_mask_packed_br32_w64_dxil), "flash_attn_mask_packed_br32"});
+            }
+        } else if (key.op == GGML_OP_NONE && key.flags == DX12_FA_MASK_PACKED_FLAG) {
+            if (blob_wave_size == 32) {
+                set_selected_blob(dx12_shader_blob{g_flash_attn_mask_packed_128_k256_w32_dxil, sizeof(g_flash_attn_mask_packed_128_k256_w32_dxil), "flash_attn_mask_packed_w32"});
+            } else {
+                set_selected_blob(dx12_shader_blob{g_flash_attn_mask_packed_128_w64_dxil, sizeof(g_flash_attn_mask_packed_128_w64_dxil), "flash_attn_mask_packed"});
+            }
+        } else if (key.op == GGML_OP_NONE && key.flags == 263) {
+            set_selected_blob(WBLOB(cvt_f32_f16_flat));
+#endif
         }
     }
 
@@ -15715,15 +21656,20 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
         const double at = std::chrono::duration<double, std::milli>(pso_ta - pso_t0).count();
         pso_n++;
         pso_total += ms;
-        fprintf(stderr, "[PSO] #%d at=%.1fms cost=%.3fms total=%.1fms op=%d flags=%u src0=%d shader=%s\n",
+        fprintf(stderr, "[PSO] #%d at=%.1fms cost=%.3fms total=%.1fms op=%d flags=%u src0=%d src1=%d dst=%d shader=%s\n",
                 pso_n, at, ms, pso_total,
                 (int)key.op, key.flags, (int)key.src0_type,
+                (int)key.src1_type, (int)key.dst_type,
                 blob->name ? blob->name : "?");
     }
 
     if (FAILED(hr)) {
         DX12_LOG_ERROR("Failed to create PSO for op %d (%s, flags=%u) (HRESULT 0x%08X)\n",
                        key.op, ggml_op_name((enum ggml_op)key.op), (unsigned)key.flags, (unsigned)hr);
+        DX12_LOG_ERROR("PSO device removed reason: 0x%08X\n", (unsigned)device->GetDeviceRemovedReason());
+        if (getenv("DX12_DRED")) {
+            dx12_dred_report(device.Get());
+        }
         pipeline_cache[key] = {};
         return &pipeline_cache[key];
     }
@@ -15735,6 +21681,11 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     pipeline.audit_src0  = (int)key.src0_type;
     pipeline.generic     = from_generic_blob;
     pipeline_cache[key] = std::move(pipeline);
+    pso_used_keys.push_back(key);
+    pso_log_dirty = true;
+    if (warm) {
+        return &pipeline_cache[key];
+    }
     last_pipeline_key = key;
     last_pipeline_ptr = &pipeline_cache[key];
     return last_pipeline_ptr;
@@ -15743,6 +21694,235 @@ dx12_pipeline * dx12_device::get_or_create_pipeline(const dx12_pipeline_key & ke
     pipeline_cache[key] = {};
     return &pipeline_cache[key];
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline prewarm
+// ---------------------------------------------------------------------------
+//
+// Creating a PSO makes the driver compile (or at least look up and
+// instantiate) a shader, which costs anywhere from 0.2 ms warm to tens of ms
+// with a cold driver shader cache. Because PSOs are created on first use, that
+// cost lands on the critical path of the first graph that needs each shader.
+// Repeated graph shapes hide it behind command-list replay, but a one-shot
+// graph - a vision encoder runs exactly once per image - pays it in full.
+//
+// The keys a model actually uses are a small, stable set, so they are logged
+// to disk and replayed on a background thread during device init, where they
+// overlap model load. The log is advisory: a miss just restores the old lazy
+// behaviour, and a stale entry costs one wasted PSO.
+
+// Bump when the on-disk record layout changes.
+static const uint32_t DX12_PSO_LOG_MAGIC   = 0x4F535044u; // "PSO D"
+static const uint32_t DX12_PSO_LOG_VERSION = 1;
+
+struct dx12_pso_log_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t stamp;       // build stamp - shaders are embedded, so a shader
+                          // change rebuilds this TU and invalidates the log
+    uint32_t wave_size;   // blob selection depends on it
+    uint32_t count;
+    uint32_t reserved;
+};
+
+static std::mutex                 g_pso_log_devs_mutex;
+static std::vector<dx12_device *> g_pso_log_devs;
+
+static uint32_t dx12_pso_log_stamp() {    // FNV-1a over the compiler's build timestamp for this TU.
+    const char * s = __DATE__ __TIME__;
+    uint32_t h = 2166136261u;
+    for (; *s; ++s) {
+        h = (h ^ (uint8_t)*s) * 16777619u;
+    }
+    return h;
+}
+
+// %LOCALAPPDATA%\ggml-dx12\pso-<vendor>-<device>-<stamp>.bin, or empty when the
+// location cannot be determined.
+static std::string dx12_pso_log_path(const dx12_device & dev) {
+    char base[MAX_PATH];
+    if (GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH) == 0) {
+        return {};
+    }
+    std::string dir = std::string(base) + "\\ggml-dx12";
+    if (!CreateDirectoryA(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return {};
+    }
+    char name[128];
+    snprintf(name, sizeof(name), "\\pso-%04x-%04x-%08x.bin",
+             (unsigned)dev.adapter_desc.VendorId, (unsigned)dev.adapter_desc.DeviceId,
+             (unsigned)dx12_pso_log_stamp());
+    return dir + name;
+}
+
+void dx12_device::start_pipeline_prewarm() {
+    // The globals are deliberately leaked (see dx12_globals_t), so ~dx12_device
+    // never runs and the log has to be written from an atexit hook instead.
+    // Only CPU state is touched there, which is safe even mid-UMD-teardown.
+    {
+        std::lock_guard<std::mutex> lock(g_pso_log_devs_mutex);
+        g_pso_log_devs.push_back(this);
+        if (g_pso_log_devs.size() == 1) {
+            std::atexit([]() {
+                std::lock_guard<std::mutex> lock(g_pso_log_devs_mutex);
+                for (dx12_device * d : g_pso_log_devs) {
+                    d->stop_pipeline_prewarm();
+                    d->save_pipeline_log();
+                }
+            });
+        }
+    }
+
+    if (DX12_GETENV("DX12_NO_PSO_PREWARM")) {
+        return;
+    }
+    const std::string path = dx12_pso_log_path(*this);
+    if (path.empty()) {
+        return;
+    }
+
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return;   // first run for this device/build - the log writes itself out
+    }
+    dx12_pso_log_header hdr = {};
+    std::vector<dx12_pipeline_key> keys;
+    if (fread(&hdr, sizeof(hdr), 1, f) == 1 &&
+        hdr.magic == DX12_PSO_LOG_MAGIC && hdr.version == DX12_PSO_LOG_VERSION &&
+        hdr.stamp == dx12_pso_log_stamp() && hdr.wave_size == blob_wave_size &&
+        hdr.count > 0 && hdr.count <= 8192) {
+        keys.resize(hdr.count);
+        if (fread(keys.data(), sizeof(dx12_pipeline_key), hdr.count, f) != hdr.count) {
+            keys.clear();
+        }
+    }
+    fclose(f);
+    if (keys.empty()) {
+        return;
+    }
+
+    // One worker: PSO creation is serialized by pipeline_mutex anyway, and the
+    // point is to move it off the critical path, not to run it in parallel.
+    pso_warm_thread = std::thread([this, keys]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t n = 0;
+        for (const auto & k : keys) {
+            if (pso_warm_stop.load(std::memory_order_relaxed)) {
+                break;
+            }
+            // Never hold pipeline_mutex against a live graph; see exec_inflight.
+            while (exec_inflight.load(std::memory_order_acquire) > 0 &&
+                   !pso_warm_stop.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+            if (pso_warm_stop.load(std::memory_order_relaxed)) {
+                break;
+            }
+            get_or_create_pipeline(k, /* warm */ true);
+            n++;
+        }
+        if (DX12_GETENV("DX12_PSO_TRACE")) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "[PSO] prewarm: %zu/%zu keys in %.1f ms\n", n, keys.size(), ms);
+        }
+    });
+}
+
+void dx12_device::stop_pipeline_prewarm() {
+    pso_warm_stop.store(true, std::memory_order_relaxed);
+    if (pso_warm_thread.joinable()) {
+        pso_warm_thread.join();
+    }
+}
+
+void dx12_device::save_pipeline_log() {
+    if (DX12_GETENV("DX12_NO_PSO_PREWARM")) {
+        return;
+    }
+    std::vector<dx12_pipeline_key> keys;
+    {
+        std::lock_guard<std::mutex> lock(pipeline_mutex);
+        if (!pso_log_dirty || pso_used_keys.empty() || pso_used_keys.size() > 8192) {
+            return;
+        }
+        keys = pso_used_keys;
+    }
+    const std::string path = dx12_pso_log_path(*this);
+    if (path.empty()) {
+        return;
+    }
+    // A model with a vision encoder runs two devices on one adapter, and both
+    // resolve to this same path. Overwriting would let whichever exits last
+    // drop the other's keys - in practice the language model won, so the
+    // vision PSOs were never prewarmed and a one-shot encode paid ~16 ms of
+    // compiles on every run. Merge with whatever is already on disk instead.
+    {
+        FILE * fin = fopen(path.c_str(), "rb");
+        if (fin) {
+            dx12_pso_log_header old = {};
+            if (fread(&old, sizeof(old), 1, fin) == 1 &&
+                old.magic == DX12_PSO_LOG_MAGIC && old.version == DX12_PSO_LOG_VERSION &&
+                old.stamp == dx12_pso_log_stamp() && old.wave_size == blob_wave_size &&
+                old.count > 0 && old.count <= 8192) {
+                std::vector<dx12_pipeline_key> prev(old.count);
+                if (fread(prev.data(), sizeof(dx12_pipeline_key), old.count, fin) == old.count) {
+                    for (const auto & k : prev) {
+                        if (std::find(keys.begin(), keys.end(), k) == keys.end()) {
+                            keys.push_back(k);
+                        }
+                    }
+                }
+            }
+            fclose(fin);
+        }
+    }
+    if (keys.size() > 8192) {
+        keys.resize(8192);
+    }
+    // Write to a temp file and rename, so a crash or a second process racing
+    // here cannot leave a truncated log behind.
+    const std::string tmp = path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        return;
+    }
+    dx12_pso_log_header hdr = {};
+    hdr.magic     = DX12_PSO_LOG_MAGIC;
+    hdr.version   = DX12_PSO_LOG_VERSION;
+    hdr.stamp     = dx12_pso_log_stamp();
+    hdr.wave_size = blob_wave_size;
+    hdr.count     = (uint32_t)keys.size();
+    const bool ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
+                    fwrite(keys.data(), sizeof(dx12_pipeline_key), keys.size(), f) == keys.size();
+    fclose(f);
+    if (ok) {
+        MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        // Drop logs left behind by earlier builds - they can never be read
+        // again, since the stamp is part of the file name.
+        char base[MAX_PATH];
+        if (GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH) != 0) {
+            const std::string dir = std::string(base) + "\\ggml-dx12";
+            char pat[64];
+            snprintf(pat, sizeof(pat), "\\pso-%04x-%04x-*.bin",
+                     (unsigned)adapter_desc.VendorId, (unsigned)adapter_desc.DeviceId);
+            const std::string glob = dir + pat;
+            WIN32_FIND_DATAA fd = {};
+            HANDLE h = FindFirstFileA(glob.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    const std::string old = dir + "\\" + fd.cFileName;
+                    if (old != path) {
+                        DeleteFileA(old.c_str());
+                    }
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+        }
+    } else {
+        DeleteFileA(tmp.c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -15888,8 +22068,9 @@ void ggml_backend_dx12_get_device_memory(int device, size_t * free, size_t * tot
         if (total) *total = 0;
         return;
     }
-    if (free)  *free  = g_dx12.devices[device]->vram_free;
-    if (total) *total = g_dx12.devices[device]->vram_total;
+    const dx12_memory_info info = dx12_query_memory(g_dx12.devices[device].get());
+    if (free)  *free  = info.free;
+    if (total) *total = info.total;
 }
 
 ggml_backend_buffer_type_t ggml_backend_dx12_buffer_type(size_t dev_num) {

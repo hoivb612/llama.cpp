@@ -5,12 +5,16 @@
 // Uses wave intrinsics (SM 6.0) for efficient reduction
 #include "ggml_common.hlsli"
 
+#ifndef GROUP_SIZE
+#define GROUP_SIZE 256
+#endif
+
 // Wave-level reduction: one entry per wave. At the smallest supported wave
 // width (8) a 256-thread group has 32 waves, so size for 32.
-groupshared float wave_sums[32];
+groupshared float wave_sums[GROUP_SIZE / 8];
 
 WAVE_SIZE_ATTR
-[numthreads(256, 1, 1)]
+[numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
     uint total_rows = ne1 * ne2 * ne3;
@@ -29,12 +33,12 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     // SIMD, which would alias multiple hardware waves onto one wave_sums
     // slot and race. WaveGetLaneCount() gives the true wave width.
     uint lane_count = WaveGetLaneCount();
-    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_count = (GROUP_SIZE + lane_count - 1) / lane_count;
     uint wave_id = local_id / lane_count;
 
     // Compute sum of squares for this row
     precise float local_sum = 0.0f;
-    for (uint i0 = local_id; i0 < ne00; i0 += 256) {
+    for (uint i0 = local_id; i0 < ne00; i0 += GROUP_SIZE) {
         uint off = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
         float val = load_auto(src0, off, src0_esize);
         local_sum += val * val;
@@ -63,7 +67,7 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     float scale_val = 1.0f / rms;
 
     // Normalize
-    for (uint i0 = local_id; i0 < ne0; i0 += 256) {
+    for (uint i0 = local_id; i0 < ne0; i0 += GROUP_SIZE) {
         uint off_src = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
         uint off_dst = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         float val = load_auto(src0, off_src, src0_esize);

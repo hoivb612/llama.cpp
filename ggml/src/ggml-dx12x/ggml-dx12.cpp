@@ -2311,12 +2311,14 @@ static bool dx12_buft_is_host(ggml_backend_buffer_type_t buft) {
 }
 
 static const ggml_backend_buffer_type_i dx12_buffer_type_interface = {
-    /* .get_name      = */ dx12_buft_get_name,
-    /* .alloc_buffer  = */ dx12_buft_alloc_buffer,
-    /* .get_alignment = */ dx12_buft_get_alignment,
-    /* .get_max_size  = */ dx12_buft_get_max_size,
-    /* .get_alloc_size = */ nullptr,
-    /* .is_host       = */ dx12_buft_is_host,
+    /* .get_name          = */ dx12_buft_get_name,
+    /* .alloc_buffer      = */ dx12_buft_alloc_buffer,
+    /* .alloc_buffer_n    = */ nullptr,
+    /* .get_alignment     = */ dx12_buft_get_alignment,
+    /* .get_max_size      = */ dx12_buft_get_max_size,
+    /* .get_alloc_size    = */ nullptr,
+    /* .get_alloc_size_n  = */ nullptr,
+    /* .is_host           = */ dx12_buft_is_host,
 };
 
 static ggml_backend_buffer_type g_dx12_buffer_types[GGML_DX12_MAX_DEVICES];

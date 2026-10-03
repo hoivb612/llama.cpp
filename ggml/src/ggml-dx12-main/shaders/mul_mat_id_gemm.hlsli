@@ -12,7 +12,8 @@
 //
 // Tile shape mirrors mul_mat_wmma_fp16.hlsl: 64x64 output tile, 4x4 register
 // blocking, half LDS tiles, fp16 multiply promoted into an fp32 accumulator
-// once per K-tile.
+// once per K-tile. MMID_LINALG_WAVE uses the Xe3 8x16x16 matrix shape instead
+// of scalar multiply-adds, with the same bucket scratch and F32 inputs.
 //
 // Wrapper shaders either define nothing (dense F32/F16/BF16 weights) or
 // exactly one MMID_<TYPE> macro before including this file, which selects the
@@ -52,7 +53,19 @@
 #define BK      16
 #define TM      (BM / 16)
 #define TN      4
+#ifdef MMID_LINALG_WAVE
+#include <dx/linalg.h>
+using namespace dx::linalg;
+
+#define THREADS (16 * WAVE_SIZE)
+#define MTILE   (BM / 32)
+#define ACC_E   (128 / WAVE_SIZE)
+typedef Matrix<ComponentType::F16, 8, 16, MatrixUse::A, MatrixScope::Wave> MatA;
+typedef Matrix<ComponentType::F16, 16, 16, MatrixUse::B, MatrixScope::Wave> MatB;
+typedef Matrix<ComponentType::F16, 8, 16, MatrixUse::Accumulator, MatrixScope::Wave> MatAcc;
+#else
 #define THREADS 256
+#endif
 
 // Elements each thread moves into LDS per K-tile.
 #define A_PER_THREAD ((BM * BK) / THREADS)
@@ -60,19 +73,35 @@
 
 #define PAIR_INVALID 0xFFFFFFFFu
 
+#ifdef MMID_LINALG_WAVE
+groupshared float16_t tile_a[BM * BK];
+groupshared float16_t tile_b[BN * BK];
+#else
 groupshared float16_t tile_a[BM][BK]; // activations: pairs x K
 groupshared float16_t tile_b[BK][BN]; // weights:     K x outputs
+#endif
 
 // Resolved once per tile so the K-loop costs no integer divides.
 groupshared uint g_rowoff[BM];  // activation row byte offset
 groupshared uint g_slot[BM];    // dst expert slot  (PAIR_INVALID = padding row)
 groupshared uint g_token[BM];   // dst token
 
+#ifdef MMID_LINALG_WAVE
+WAVE_SIZE_ATTR
+[numthreads(THREADS, 1, 1)]
+#else
 [numthreads(16, 16, 1)]
+#endif
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+#ifdef MMID_LINALG_WAVE
+    const uint flat_id = gtid.x;
+    const uint wave_m = (flat_id / WAVE_SIZE) / 4;
+    const uint wave_n = (flat_id / WAVE_SIZE) % 4;
+#else
     const uint tx      = gtid.x; // 0..15 -> output column within tile
     const uint ty      = gtid.y; // 0..15 -> pair row within tile
     const uint flat_id = ty * 16 + tx;
+#endif
 
     const uint col_block = gid.x;
     const uint pair_tile = gid.y;
@@ -118,12 +147,21 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint b_col = col_block * BN + b_n;
     const uint b_row_off = src0_base + b_col * nb01;
 
+#ifdef MMID_LINALG_WAVE
+    float acc[MTILE][ACC_E];
+    [unroll] for (uint im = 0; im < MTILE; im++) {
+        [unroll] for (uint e = 0; e < ACC_E; e++) {
+            acc[im][e] = 0.0f;
+        }
+    }
+#else
     precise float acc[TM][TN];
     [unroll] for (uint im = 0; im < TM; im++) {
         [unroll] for (uint in_ = 0; in_ < TN; in_++) {
             acc[im][in_] = 0.0f;
         }
     }
+#endif
 
     for (uint kt = 0; kt < num_k_tiles; kt++) {
         uint k_start = kt * BK;
@@ -138,7 +176,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             if (g_slot[m] != PAIR_INVALID && global_k < K) {
                 val = (float16_t)load_auto(src1, g_rowoff[m] + global_k * nb10, src1_esize);
             }
+#ifdef MMID_LINALG_WAVE
+            tile_a[m * BK + k] = val;
+#else
             tile_a[m][k] = val;
+#endif
         }
 
         // tile_b: BK x BN expert weights.
@@ -153,11 +195,26 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 val = (float16_t)load_auto(src0, b_row_off + global_k * nb00, src0_esize);
 #endif
             }
+#ifdef MMID_LINALG_WAVE
+            tile_b[b_n * BK + k] = val;
+#else
             tile_b[k][b_n] = val;
+#endif
         }
 
         GroupMemoryBarrierWithGroupSync();
 
+#ifdef MMID_LINALG_WAVE
+        MatB b = MatB::Load(tile_b, wave_n * 16 * BK, BK, MatrixLayout::ColMajor);
+        [unroll] for (uint im = 0; im < MTILE; im++) {
+            MatA a = MatA::Load(tile_a, (wave_m * MTILE + im) * 8 * BK, BK, MatrixLayout::RowMajor);
+            MatAcc partial = MatAcc::Splat((float16_t)0);
+            partial.MultiplyAccumulate(a, b);
+            [unroll] for (uint e = 0; e < ACC_E; e++) {
+                acc[im][e] += (float)partial.Get(e);
+            }
+        }
+#else
         float16_t tacc[TM][TN];
         [unroll] for (uint im = 0; im < TM; im++) {
             [unroll] for (uint in_ = 0; in_ < TN; in_++) {
@@ -185,10 +242,25 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 acc[im][in_] += (float)tacc[im][in_];
             }
         }
+#endif
 
         GroupMemoryBarrierWithGroupSync();
     }
 
+#ifdef MMID_LINALG_WAVE
+    MatAcc coords = MatAcc::Splat((float16_t)0);
+    [unroll] for (uint im = 0; im < MTILE; im++) {
+        [unroll] for (uint e = 0; e < ACC_E; e++) {
+            const uint2 rc = coords.GetCoordinate(e);
+            const uint m = (wave_m * MTILE + im) * 8 + rc.x;
+            const uint global_n = col_block * BN + wave_n * 16 + rc.y;
+            if (g_slot[m] != PAIR_INVALID && global_n < ne0) {
+                const uint off = offset_4d(global_n, g_slot[m], g_token[m], 0, nb0, nb1, nb2, nb3, dst_offset);
+                store_auto(dst, off, acc[im][e], dst_esize);
+            }
+        }
+    }
+#else
     [unroll] for (uint im = 0; im < TM; im++) {
         uint m = ty * TM + im;
         uint slot = g_slot[m];
@@ -201,4 +273,5 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             store_auto(dst, off, acc[im][in_], dst_esize);
         }
     }
+#endif
 }

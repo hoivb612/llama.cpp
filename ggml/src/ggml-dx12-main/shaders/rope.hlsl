@@ -22,7 +22,7 @@
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint n_pairs = ne0 / 2;
     uint total_pairs = n_pairs * ne1 * ne2 * ne3;
     if (idx >= total_pairs) return;
@@ -43,15 +43,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float beta_fast   = op_param_f32(9);
     float beta_slow   = op_param_f32(10);
     uint  n_ctx_orig  = op_param_uint(4);
-    uint  has_ff      = op_param_uint(15);
+    uint  ff_offs     = op_param_uint(15);
+    uint  has_ff      = ff_offs >> 31;
+    uint  n_offs      = ff_offs & 0x7fffffffu;
 
     bool is_neox = (mode & 2u) != 0;
 
     uint half_dims = n_dims / 2;
 
-    // Passthrough: elements beyond n_dims are copied as-is (esize-aware)
+    // Passthrough: element pairs outside the rotated window [n_offs, n_offs+n_dims)
+    // are copied as-is (esize-aware). n_offs is even, so the untouched even
+    // indices are 0..n_offs-2 followed by n_offs+n_dims..ne0-2.
     if (pair >= half_dims) {
-        uint pass_idx = n_dims + 2 * (pair - half_dims);
+        uint j = pair - half_dims;
+        uint lo_pairs = n_offs / 2;
+        uint pass_idx = (j < lo_pairs) ? (2 * j) : (n_offs + n_dims + 2 * (j - lo_pairs));
         uint pass_a = pass_idx;
         uint pass_b = pass_idx + 1;
         if (pass_a < ne0) {
@@ -69,14 +75,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    // Rotation pair: compute element indices
+    // Rotation pair: compute element indices within the [n_offs, n_offs+n_dims) window
     uint idx_a, idx_b;
     if (is_neox) {
-        idx_a = pair;
-        idx_b = pair + half_dims;
+        idx_a = n_offs + pair;
+        idx_b = n_offs + pair + half_dims;
     } else {
-        idx_a = pair * 2;
-        idx_b = pair * 2 + 1;
+        idx_a = n_offs + pair * 2;
+        idx_b = n_offs + pair * 2 + 1;
     }
 
     // Position from src1 (int32)

@@ -14,7 +14,7 @@ groupshared float s_w[CONV2D_LDS_W];
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint total = ne0 * ne1 * ne2 * ne3;
 
     int stride_x   = asint(op0);

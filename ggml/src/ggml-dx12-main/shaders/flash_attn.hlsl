@@ -47,6 +47,13 @@
 #include "quant_dequant.hlsli"
 #endif
 
+#ifdef KV_MIXED
+#include "quant_dequant_kv.hlsli"
+// Runtime K/V type ids live in the spare bits of op8 (see dx12_fill_params).
+uint kv_ktype() { return (op8 >> 1) & 0x1Fu; }
+uint kv_vtype() { return (op8 >> 25) & 0x1Fu; }
+#endif
+
 #ifndef TILE_KV
 #define TILE_KV 256
 #endif
@@ -59,6 +66,14 @@ groupshared float s_reduce[GROUP_SIZE];
 
 float load_mask(uint byte_offset, uint elem_stride) {
     return load_auto(src3, byte_offset, elem_stride);
+}
+
+uint fa_kv_position(uint index, uint sparse_base) {
+#ifdef FA_SPARSE
+    return src6.Load(sparse_base + (index + 1u) * 4u);
+#else
+    return index;
+#endif
 }
 
 #if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
@@ -134,6 +149,12 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint D    = ne00;
     uint N_kv = ne11;
     uint kv_head = head_idx * n_kv_heads / ne02;
+    uint sparse_base = 0u;
+#ifdef FA_SPARSE
+    sparse_base = (((batch_idx % mask_ne3) * mask_ne2 + head_idx % mask_ne2) * ne01 + query_idx)
+                * (ne11 + 1u) * 4u;
+    N_kv = src6.Load(sparse_base);
+#endif
 
     // Split-KV: compute this group's KV range.
     // The inner loop already handles partial last tiles via min(tile_end, kv_end),
@@ -145,14 +166,24 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint kv_end   = min(kv_start + kv_per_split, N_kv);
     if (kv_start >= N_kv) {
         // This split has no work — can happen with rounding
-        if (n_splits > 1 && local_id == 0) {
+        if (n_splits > 1) {
             // Write zero partial to temp buffer
             uint n_heads = ne02;
-            uint partial_stride = (D + 2) * 4;  // bytes per partial: D floats + max + sum
+            uint partial_stride = (D_v + 2) * 4;
             uint partial_off = ((batch_idx * n_heads + head_idx) * (uint)ne01 + query_idx) * n_splits + split_id;
             partial_off *= partial_stride;
-            temp.Store(partial_off, asuint(-3.402823466e+38f));  // max
-            temp.Store(partial_off + 4, asuint(0.0f));            // sum
+            if (local_id == 0) {
+                temp.Store(partial_off, asuint(-3.402823466e+38f));
+                temp.Store(partial_off + 4, asuint(0.0f));
+            }
+            for (uint d = local_id; d < D_v; d += GROUP_SIZE) {
+                temp.Store(partial_off + 8u + d * 4u, asuint(0.0f));
+            }
+        } else {
+            for (uint d = local_id; d < D_v; d += GROUP_SIZE) {
+                store_auto(dst, dst_offset + d * nb0 + head_idx * nb1 + query_idx * nb2 + batch_idx * nb3,
+                           0.0f, dst_esize);
+            }
         }
         return;
     }
@@ -179,7 +210,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         // Pass 1: Each thread computes one Q·K dot product
         float my_score = -3.402823466e+38f;
         if (local_id < tile_size) {
-            uint kv = tile_start + local_id;
+            uint kv = fa_kv_position(tile_start + local_id, sparse_base);
 
             float mv = 0.0f;
             if (has_mask) {
@@ -219,7 +250,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                     }
 #endif
                 } else {
-#ifdef KV_QUANT
+#if defined(KV_MIXED)
+                    uint kt = kv_ktype();
+                    for (uint d = 0; d < D; d++) {
+                        float q = load_auto(src0, q_base + d * nb00, src0_esize);
+                        float k = (kt == 0u) ? load_auto(src1, k_base + d * nb10, src1_esize)
+                                             : kvq_dequant(src1, k_base, d, kt);
+                        dot = mad(q, k, dot);
+                    }
+#elif defined(KV_QUANT)
                     // Per-element dequant: K row starts at k_base, element d
                     // decoded via mmid_dequant (handles block decode internally).
                     // Q is F32 contiguous in all tested cases (src0_esize == 4).
@@ -306,8 +345,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             if (d_out < D_v) {
                 precise float tile_acc = 0.0f;
                 for (uint t = 0; t < tile_size; t++) {
-                    uint kv = tile_start + t;
-#ifdef KV_QUANT
+                    uint kv = fa_kv_position(tile_start + t, sparse_base);
+#if defined(KV_MIXED)
+                    uint vt = kv_vtype();
+                    uint v_row_base = src2_off + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;
+                    tile_acc += s_scores[t] *
+                        ((vt == 0u) ? load_auto(src2, v_row_base + d_out * src2_nb0, src2_es)
+                                    : kvq_dequant(src2, v_row_base, d_out, vt));
+#elif defined(KV_QUANT)
                     // V row (head_dim contiguous along dim 0). Per-token row
                     // base is fixed; element d_out is decoded out of the block.
                     uint v_row_base = src2_off + kv * src2_nb1 + kv_head * src2_nb2 + batch_idx * src2_nb3;

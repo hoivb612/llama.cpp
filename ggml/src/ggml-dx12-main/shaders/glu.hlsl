@@ -1,8 +1,9 @@
 // glu.hlsl - Gated Linear Unit: supports SWIGLU, REGLU, GEGLU variants
-// op0 = glu_op type (0=REGLU, 1=GEGLU, 2=SWIGLU, 3=SWIGLU_OAI, 4=GEGLU_ERF, 5=GEGLU_QUICK)
+// op0 = glu_op type (0=REGLU, 1=GEGLU, 2=SWIGLU, 3=SWIGLU_OAI, 4=GEGLU_ERF,
+//                    5=GEGLU_QUICK, 6=SWIGLU_CLAMP)
 // op1 = swapped flag
 // op2 = alpha (for SWIGLU_OAI)
-// op3 = limit (for SWIGLU_OAI)
+// op3 = limit (for SWIGLU_OAI and SWIGLU_CLAMP)
 
 #include "ggml_common.hlsli"
 
@@ -11,6 +12,7 @@ float glu_activation(float x, uint glu_op, float alpha, float limit) {
         case 0: return max(x, 0.0f);  // REGLU
         case 2: return x / (1.0f + exp(-x));  // SWIGLU
         case 3: { float cx = min(x, limit); return cx / (1.0f + exp(alpha * (-cx))); }  // SWIGLU_OAI
+        case 6: { float cx = min(x, limit); return cx / (1.0f + exp(-cx)); }  // SWIGLU_CLAMP
         case 5: return x / (1.0f + exp(-1.702f * x));  // GEGLU_QUICK
         case 1: {  // GEGLU
             // Numerically robust formulation (matches Vulkan reference):
@@ -34,7 +36,7 @@ float glu_activation(float x, uint glu_op, float alpha, float limit) {
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint total = ne0 * ne1 * ne2 * ne3;
     if (idx >= total) return;
 
@@ -68,7 +70,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     float activated = glu_activation(gate_val, glu_op, asfloat(op2), asfloat(op3));
-    float result = (glu_op == 3) ? activated * (clamp(up_val, -asfloat(op3), asfloat(op3)) + 1.0f) : activated * up_val;
+    float result;
+    if (glu_op == 3) {          // SWIGLU_OAI
+        result = activated * (clamp(up_val, -asfloat(op3), asfloat(op3)) + 1.0f);
+    } else if (glu_op == 6) {   // SWIGLU_CLAMP
+        result = activated * clamp(up_val, -asfloat(op3), asfloat(op3));
+    } else {
+        result = activated * up_val;
+    }
 
     uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
     store_auto(dst, off_d, result, dst_esize);

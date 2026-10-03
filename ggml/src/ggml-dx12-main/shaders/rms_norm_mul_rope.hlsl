@@ -98,7 +98,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint  pos_offset    = op_param_uint(10);
     uint  pos_nb0       = op_param_uint(12);
     float attn_factor   = op_param_f32(14);
-    uint  has_ff        = op_param_uint(15);
+    uint  has_ff        = op_param_uint(15) >> 31;   // n_offs rides the low bits
 
     bool is_neox = (mode & 2u) != 0;
     uint half_dims = n_dims / 2;

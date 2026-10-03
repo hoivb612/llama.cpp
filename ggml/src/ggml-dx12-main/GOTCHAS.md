@@ -31,14 +31,28 @@ DX12 wave size varies by vendor: NVIDIA=32, AMD=64, Intel UHD=8–16. Two-level 
 
 ## Integer-dot GEMMs (`mul_mat_*_q8_1_mmq.hlsl`) — cross-vendor status
 
-`mul_mat_q8_0_q8_1_mmq`, `mul_mat_q4k_q8_1_mmq`, `mul_mat_q5k_q8_1_mmq` and
-`mul_mat_q6k_q8_1_mmq` are register-blocked prefill GEMMs (128x64 tile, 32
+`mul_mat_q8_0_q8_1_mmq`, `mul_mat_q5_0_q8_1_mmq`, `mul_mat_q4k_q8_1_mmq`,
+`mul_mat_q5k_q8_1_mmq` and `mul_mat_q6k_q8_1_mmq` are register-blocked prefill GEMMs (128x64 tile, 32
 accumulators per thread, quad-major groupshared tiles) that replace the 32x32
-integer tile for wide outputs. They need only SM 6.6 `dot4add_i8packed`.
+integer tile for wide outputs. The formats other than Q5_0 need only SM 6.6
+`dot4add_i8packed`.
+
+Q5_0 uses exact 16-bit raw loads because its 22-byte blocks cannot safely load
+the final quant dword through an aligned 32-bit root-SRV access. The shader
+therefore also requires native 16-bit shader operations. On wave64, paired
+lanes share each packed Q5_0 block to avoid loading the nibble and high-bit
+planes twice.
 
 Selection: automatic when the output width `ne[0] >= 256` and `ne[1] >= 64`.
 `DX12_MMQ_MIN_N` overrides the width threshold; `DX12_MMQ_MIN_N=0` disables the
 path entirely, which is the A/B switch.
+
+The Q5_0 route defaults on only for AMD device `0x150E`, uses `ne[0] >= 128`,
+and requires native 16-bit shader operations. `DX12_Q50_MMQ=0` disables it.
+
+This replaces the existing Q5_0 integer-dot GEMM, not a selected LinAlg route. The wave-share variant uses a linear threadgroup for its paired-lane loads. The original 16x16 group produced incorrect results on B390; changing the group shape fixed it without changing the logical tile. Both variants remain opt-in on Intel because they regressed B390 model prefill; see TUNING.md section 51.
+
+Q5_0 also has an Intel LinAlg route, flag 270, separate from MMQ. It is default-on under the same hardware gates as the Intel Q8_0/Q4_K wave paths. `DX12_LINALG_Q50_WAVE=0` restores the existing fallback; `DX12_LINALG_F16_WAVE=0` disables the whole Intel dense wave family. The route requires contiguous F32 activations, at least 64 tokens, K divisible by 64, output channels divisible by 16, and the existing four-byte weight alignment constraints. Unsupported shapes retain their previous routes. See TUNING.md section 52.
 
 **Measured on AMD** (RX 9070 XT and an RDNA2 iGPU): Phi-3-mini
 pp4096 Q8_0 1186->2801, Q4_K_M 1124->2569, Q6_K 1108->2192, Qwen2.5-3B Q5_K_M
@@ -96,6 +110,12 @@ Rule: any `Load` whose address is only valid under a condition must be made
 unconditionally in-bounds. When touching these helpers, grep the shader tree
 for `Load(aligned +` / `Load(base +` rather than assuming one call site.
 
+## Activation scratch reuse needs a barrier before writes
+
+Q8_1 quantization and the Intel wave GEMM F16 conversion share `q8_1_scratch`. The tensor hazard tracker does not track this buffer. A barrier after conversion protects the next GEMM's reads, but does not stop a later conversion from overwriting data that an earlier GEMM still reads. Each scratch writer needs a barrier before writing as well, including fused RMS normalization.
+
+On Intel Arc B390, missing this ordering caused SmolLM2 Q4_K_M perplexity to become NaN and Granite/Qwen Q4_K_M perplexity to reach millions. Single-op tests and same-input GEMMs can pass because they do not overwrite live scratch. The mixed-type, independent-input `test_mul_mat` cases exercise this dependency.
+
 ## Never size a root-descriptor scratch buffer to an exact fit
 
 The same missing bounds check bites allocations, not just shader addressing.
@@ -124,3 +144,11 @@ Intel's driver reports the resulting page fault as `DEVICE_HUNG (0x887A0006)`,
 whose D3D12 message blames a slow kernel. Time the dispatch before believing
 it: the ARGSORT case that produced this message ran in 0.59 s against a 2 s
 watchdog.
+
+## Native LinAlg coverage is not a precision or performance guarantee
+
+The B390 wave8x16x16 path has F16 inputs and an F16 accumulator. Draining partials into F32 limits accumulation length; it does not turn the operation into an F32-accumulator matrix multiply. Keep F32/BF16 weights on their existing paths. The installed preview LinAlg headers do not expose a BF16 matrix component type.
+
+`DX12_FA_LINALG_WAVE=1` respects an explicit `GGML_PREC_F32` attention request. Mode `2` deliberately overrides that request and is an experimental reduced-precision option, not a normal default. Native attention checks the original Q/K range before conversion and keeps F32 fallback/scaled-PV handling for large V. Removing those safeguards can turn finite inputs into infinities.
+
+Use `test-backend-ops.exe test -b DX120 -o DX12_ROUTES` for the native route fixture. It includes numerical comparisons, opt-outs, tails, mixed scratch consumers and attention modifiers. Its ordinary-case count is zero because this selector runs the fixture only. Environment settings read by the fixture must use the refresh-aware `DX12_GETENV` cache, not an additional function-local static initializer.

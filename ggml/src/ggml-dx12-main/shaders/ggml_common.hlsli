@@ -89,6 +89,10 @@ uint flat_idx_2d(uint3 group_id, uint local_id) {
     return (group_id.y * 65535u + group_id.x) * 256u + local_id;
 }
 
+uint flat_idx_2d_256(uint3 dispatch_id) {
+    return dispatch_id.x + dispatch_id.y * 65535u * 256u;
+}
+
 // Matvec row-group index. Supports 2D dispatches that exceed the D3D12
 // per-dimension group limit; chunked matvecs keep op15 at zero and advance
 // buffer offsets so shaders still see a local row range.

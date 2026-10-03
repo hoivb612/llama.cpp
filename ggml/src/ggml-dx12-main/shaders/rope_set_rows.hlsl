@@ -23,7 +23,7 @@
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint n_pairs = ne00 / 2;
     uint total_pairs = n_pairs * ne01 * ne02 * ne03;
     if (idx >= total_pairs) return;
@@ -45,7 +45,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint  set_rows_stride = op_param_uint(8);  // elements per KV cache row
     uint  set_rows_nb1    = op_param_uint(9);  // byte stride between KV rows
     float attn_factor     = op_param_f32(14);
-    uint  has_ff          = op_param_uint(15);
+    uint  has_ff          = op_param_uint(15) >> 31;   // n_offs rides the low bits
 
     bool is_neox = (mode & 2u) != 0;
     uint half_dims = n_dims / 2;

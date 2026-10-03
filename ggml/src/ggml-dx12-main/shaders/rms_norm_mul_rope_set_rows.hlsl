@@ -98,7 +98,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint  pos_nb0       = op_param_uint(12);
     uint  row_nb0       = op_param_uint(13);
     float attn_factor   = op_param_f32(14);
-    uint  has_ff        = op_param_uint(15);
+    uint  has_ff        = op_param_uint(15) >> 31;   // n_offs rides the low bits
 
     bool is_neox = (mode & 2u) != 0;
     uint half_dims = n_dims / 2;
@@ -152,7 +152,17 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         uint dst_off_a = dst_offset + flat_a * nb0 + (uint)row_idx * set_rows_nb1 + i3 * nb3;
         uint dst_off_b = dst_offset + flat_b * nb0 + (uint)row_idx * set_rows_nb1 + i3 * nb3;
 
+#if defined(RMS_ROPE_PACKED) && (WAVE_SIZE == 16 || WAVE_SIZE == 64)
+        // The host requires aligned F16 output and a full 128-element NEOX head.
+        float next_a = WaveReadLaneAt(rot_a, WaveGetLaneIndex() ^ 1u);
+        float next_b = WaveReadLaneAt(rot_b, WaveGetLaneIndex() ^ 1u);
+        if ((local_id & 1u) == 0u) {
+            store_f16_pair(dst, dst_off_a, rot_a, next_a);
+            store_f16_pair(dst, dst_off_b, rot_b, next_b);
+        }
+#else
         store_auto(dst, dst_off_a, rot_a, dst_esize);
         store_auto(dst, dst_off_b, rot_b, dst_esize);
+#endif
     }
 }
