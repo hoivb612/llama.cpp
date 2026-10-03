@@ -64,6 +64,11 @@ typedef float16_t4 fa_pf_vec4;
 // V is read one scalar per thread in the PV pass, so it is stored flat rather
 // than as half4 to keep that a plain index. Two halves of padding rotate the
 // bank the same way the f32 tile's single float does.
+//
+// That plain index is a scalar 16-bit LDS read, which this part issues slower
+// than a 32-bit one, but widening the tile back to f32 measured as a wash -
+// FA_PF_ACC is 16 at D=96, so the V read is only 1 LDS op in 17. See TUNING.md
+// section 28.
 #define FA_PF_VSTRIDE (FA_D + 2)
 
 float fa_pf_dot4(fa_pf_vec4 q, fa_pf_vec4 k, float acc) {
@@ -113,9 +118,20 @@ float fa_pf_dot4(fa_pf_vec4 q, fa_pf_vec4 k, float acc) {
 #define FA_PF_MCLASS_MAX_KV   (FA_PF_MCLASS_TILES * FA_PF_BC)
 #endif
 
+#if defined(FA_PF_GRAPH_MASK) && (!defined(FA_PF_MASK_CLASS) || FA_PF_BC != 32 || WAVE_SIZE != 16)
+#error "Graph mask metadata requires wave16, Bc32 and mask classification"
+#endif
+
 // QK: rows covered per thread, and the row group it starts from.
 #define FA_PF_CGROUPS (FA_PF_THREADS / FA_PF_BC)
 #define FA_PF_QK_PER  (FA_PF_BR / FA_PF_CGROUPS)
+
+#if defined(FA_PF_Q_REGS)
+#if !defined(NATIVE_FP16) || (FA_PF_BC % WAVE_SIZE) != 0
+#error "Register Q requires half staging and wave-uniform query rows"
+#endif
+#define FA_PF_Q_BLOCKS ((FA_PF_DVEC + WAVE_SIZE - 1) / WAVE_SIZE)
+#endif
 
 // PV: D-sized groups that fit in the threadgroup. When FA_D does not divide
 // FA_PF_THREADS the tail threads sit out the PV pass (D=96: 192 of 256 active).
@@ -149,6 +165,11 @@ float fa_pf_dot4(fa_pf_vec4 q, fa_pf_vec4 k, float acc) {
 //   D=96  BR=16 BC=32: 3200 +  6400 +  6272 + 2048 + 1024 + 260 = 19204
 //   D=128 BR=16 BC=32: 4224 +  8448 +  8320 + 2048 + 1024 + 260 = 24324
 // FA_PF_MASK_CLASS adds 512 B of tile classes.
+//
+// D=96 now runs BR=32, which is the tightest of these:
+//   D=96  BR=32 BC=32: 6400 +  6400 +  6272 + 4096 + 1024 + 516 = 24708
+// Neither BR nor BC can go up from there: BR=64 needs 35716 B and BC=64
+// needs 41988 B, both over the 32768 limit. The tile is at its maximum.
 #if defined(NATIVE_FP16)
 groupshared fa_pf_vec4 s_qh[FA_PF_BR][FA_PF_HSTRIDE];
 groupshared fa_pf_vec4 s_kh[FA_PF_BC][FA_PF_HSTRIDE];
@@ -390,6 +411,19 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 #endif
     GroupMemoryBarrierWithGroupSync();
 
+#if defined(FA_PF_Q_REGS)
+    // Distribute Q across wave lanes instead of caching every dimension in each lane.
+    uint2 q_reg[FA_PF_QK_PER][FA_PF_Q_BLOCKS];
+    [unroll] for (uint qr = 0; qr < FA_PF_QK_PER; ++qr) {
+        [unroll] for (uint qb = 0; qb < FA_PF_Q_BLOCKS; ++qb) {
+            const uint dv = min(qb * WAVE_SIZE + WaveGetLaneIndex(), (uint)FA_PF_DVEC - 1u);
+            const fa_pf_vec4 q = s_qh[qk_r0 + qr * FA_PF_CGROUPS][dv];
+            q_reg[qr][qb] = uint2((uint)asuint16(q.x) | ((uint)asuint16(q.y) << 16),
+                                  (uint)asuint16(q.z) | ((uint)asuint16(q.w) << 16));
+        }
+    }
+#endif
+
 #if defined(FA_PF_PRESCAN)
     uint kv_first = 0u;
     uint kv_end   = N_kv;
@@ -404,6 +438,28 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     if (has_mask != 0u) {
         uint loc_lo = N_kv;
         uint loc_hi = 0u;
+#if defined(FA_PF_GRAPH_MASK)
+        // The producer stores native tile codes; keep the scalar classes and rounded bounds.
+        const uint key_words = (n_tiles + FA_PF_MCLASS_PER_WORD - 1u) / FA_PF_MCLASS_PER_WORD;
+        const uint mask_plane = (batch_idx % mask_ne3) * mask_ne2 + head_idx % mask_ne2;
+        const uint word_base = (mask_plane * n_qgroups + q_start / FA_PF_BR) * key_words;
+        for (uint mw = tid; mw < key_words; mw += FA_PF_THREADS) {
+            const uint packed = temp.Load((word_base + mw) * 4u);
+            uint classes = 0u;
+            [unroll] for (uint slot = 0u; slot < FA_PF_MCLASS_PER_WORD; ++slot) {
+                const uint tile = mw * FA_PF_MCLASS_PER_WORD + slot;
+                const uint code = (packed >> (slot * 2u)) & 3u;
+                const uint bits = code == 1u ? FA_PF_MC_LOAD :
+                                  code == 2u ? FA_PF_MC_FINITE : FA_PF_MC_FINITE | FA_PF_MC_LOAD;
+                classes |= bits << (slot * 2u);
+                if (tile < n_tiles && code != 1u) {
+                    loc_lo = min(loc_lo, tile * FA_PF_BC);
+                    loc_hi = max(loc_hi, min((tile + 1u) * FA_PF_BC, N_kv) - 1u);
+                }
+            }
+            s_mclass[mw] = classes;
+        }
+#else
 #if defined(FA_PF_MASK_CLASS)
         uint cls_wi   = 0u;
         uint cls_word = 0u;
@@ -453,6 +509,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
 #if defined(FA_PF_MASK_CLASS)
         fa_pf_mclass_flush(cls_wi, cls_word);
+#endif
 #endif
         if (loc_lo < N_kv) {
             InterlockedMin(s_kv_lo, loc_lo);
@@ -607,7 +664,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             fa_pf_vec4 kvec = s_kh[qk_c][dv2];
             [unroll]
             for (uint j1 = 0; j1 < FA_PF_QK_PER; ++j1) {
+#if defined(FA_PF_Q_REGS)
+                const uint2 bits = WaveReadLaneAt(q_reg[j1][dv2 / WAVE_SIZE], dv2 % WAVE_SIZE);
+                const fa_pf_vec4 q = fa_pf_vec4(asfloat16((uint16_t)bits.x), asfloat16((uint16_t)(bits.x >> 16)),
+                                                asfloat16((uint16_t)bits.y), asfloat16((uint16_t)(bits.y >> 16)));
+                sc[j1] = fa_pf_dot4(q, kvec, sc[j1]);
+#else
                 sc[j1] = fa_pf_dot4(s_qh[qk_r0 + j1 * FA_PF_CGROUPS][dv2], kvec, sc[j1]);
+#endif
             }
         }
 #else

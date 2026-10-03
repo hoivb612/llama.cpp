@@ -15,16 +15,38 @@
 // FA_BR threads while the rest of the group waits at a barrier.
 // Without native fp16 the tile stays f32, so keep the original 32-column tile:
 // a wave64 device would otherwise double an f32 K/V tile and lose occupancy.
+#ifndef FA_BC
 #if defined(WAVE_SIZE) && defined(NATIVE_FP16)
 #define FA_BC WAVE_SIZE
 #else
 #define FA_BC 32
 #endif
+#endif
+#ifndef FA_MAX_D
 #define FA_MAX_D 128
-#define FA_DVEC (FA_MAX_D / 4)
+#endif
+#ifndef FA_MAX_DV
+#define FA_MAX_DV FA_MAX_D
+#endif
+#ifndef FA_THREADS
 #define FA_THREADS 128
+#endif
+#if FA_MAX_DV > FA_MAX_D
+#error "flash_attn_tiled requires FA_MAX_DV <= FA_MAX_D"
+#endif
+#if (FA_MAX_D % 4) != 0 || (FA_MAX_DV % 4) != 0
+#error "flash_attn_tiled dimensions must be multiples of 4"
+#endif
+#if (FA_BC & (FA_BC - 1)) != 0 || (FA_THREADS % FA_BC) != 0
+#error "flash_attn_tiled requires power-of-two FA_BC dividing FA_THREADS"
+#endif
+#define FA_DVEC (FA_MAX_D / 4)
+#define FA_VBLOCKS ((FA_MAX_DV + FA_THREADS - 1) / FA_THREADS)
 #define FA_ROW_GROUPS (FA_THREADS / FA_BC)
 #define FA_ROW_SETS (FA_BR / FA_ROW_GROUPS)
+#if (FA_BR % FA_ROW_GROUPS) != 0
+#error "flash_attn_tiled requires FA_ROW_GROUPS to divide FA_BR"
+#endif
 
 // Q/K/V tiles are staged as half4 when the device has native 16-bit ops. K/V
 // arrive as f16 in the common case, so this is lossless for them, and it keeps
@@ -108,6 +130,26 @@ float fa_lane(fa_vec4 v, uint lane) {
     return (float)v.w;
 }
 
+float fa_subwave_max(float v) {
+    const uint lane = WaveGetLaneIndex();
+    const uint base = lane & ~(FA_BC - 1u);
+    [unroll]
+    for (uint delta = (uint)FA_BC >> 1u; delta > 0u; delta >>= 1u) {
+        v = max(v, WaveReadLaneAt(v, base | ((lane - base) ^ delta)));
+    }
+    return v;
+}
+
+float fa_subwave_sum(float v) {
+    const uint lane = WaveGetLaneIndex();
+    const uint base = lane & ~(FA_BC - 1u);
+    [unroll]
+    for (uint delta = (uint)FA_BC >> 1u; delta > 0u; delta >>= 1u) {
+        v += WaveReadLaneAt(v, base | ((lane - base) ^ delta));
+    }
+    return v;
+}
+
 WAVE_SIZE_ATTR
 [numthreads(FA_THREADS, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
@@ -182,6 +224,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     if (tid < FA_BR) {
         s_global_max[tid] = neg_max;
         s_global_sum[tid] = 0.0f;
+        s_correction[tid] = 1.0f;
     }
 
     // The PV pass gives each thread one output element, so D_v threads are busy
@@ -192,7 +235,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     // dead by then, so this costs no extra LDS - important, because another
     // 2 KB drops the group from 3 to 2 per CU and more than undoes the gain.
 #if FA_BC * 2 >= FA_THREADS
-    const uint pv_split = (D_v * 2u <= FA_THREADS) ? 2u : 1u;
+    const uint pv_split = (FA_VBLOCKS == 1 && D_v * 2u <= FA_THREADS) ? 2u : 1u;
 #else
     const uint pv_split = 1u;
 #endif
@@ -200,10 +243,13 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     const uint pv_sub     = pv_split == 1u ? 0u : tid / D_v;
     const uint pv_shift   = pv_split == 1u ? 0u : 1u;
 
-    precise float acc[FA_BR];
+    precise float acc[FA_VBLOCKS][FA_BR];
     [unroll]
-    for (uint r = 0; r < FA_BR; ++r) {
-        acc[r] = 0.0f;
+    for (uint vb = 0; vb < FA_VBLOCKS; ++vb) {
+        [unroll]
+        for (uint r = 0; r < FA_BR; ++r) {
+            acc[vb][r] = 0.0f;
+        }
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -333,12 +379,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         // holds a distinct column of the same row, so this is a pure wave
         // reduction. The LDS scan is kept for drivers that widen the wave past
         // the requested [WaveSize(N)].
-        const bool wave_exact = (WaveGetLaneCount() == FA_BC);
-        if (wave_exact) {
+        const uint wave_lanes = WaveGetLaneCount();
+        const bool wave_compatible =
+            wave_lanes >= FA_BC && (wave_lanes % FA_BC) == 0u;
+        if (wave_compatible) {
             [unroll]
             for (uint rr = 0; rr < FA_ROW_SETS; ++rr) {
-                float m = WaveActiveMax(score_local[rr]);
-                if (WaveIsFirstLane()) {
+                float m = fa_subwave_max(score_local[rr]);
+                if ((WaveGetLaneIndex() & (FA_BC - 1u)) == 0u) {
                     s_tile_max[base_r + rr * FA_ROW_GROUPS] = m;
                 }
             }
@@ -349,7 +397,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         if (tid < FA_BR) {
             uint r = tid;
             float tile_max = neg_max;
-            if (wave_exact) {
+            if (wave_compatible) {
                 tile_max = s_tile_max[r];
             } else {
                 for (uint c = 0; c < tile_size; ++c) {
@@ -372,10 +420,21 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < pv_threads) {
+        if (pv_split == 1u) {
+            [unroll]
+            for (uint vb = 0; vb < FA_VBLOCKS; ++vb) {
+                const uint d_out = tid + vb * FA_THREADS;
+                if (d_out < D_v) {
+                    [unroll]
+                    for (uint r = 0; r < FA_BR; ++r) {
+                        acc[vb][r] *= s_correction[r];
+                    }
+                }
+            }
+        } else if (tid < pv_threads) {
             [unroll]
             for (uint r = 0; r < FA_BR; ++r) {
-                acc[r] *= s_correction[r];
+                acc[0][r] *= s_correction[r];
             }
         }
 
@@ -387,16 +446,17 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 p = exp(score_local[rr] - s_global_max[r]);
             }
             s_scores[r][c] = p;
-            if (wave_exact) {
-                float row_sum = WaveActiveSum(p);
-                if (WaveIsFirstLane() && s_tile_active[r] != 0u) {
+            if (wave_compatible) {
+                float row_sum = fa_subwave_sum(p);
+                if ((WaveGetLaneIndex() & (FA_BC - 1u)) == 0u &&
+                    s_tile_active[r] != 0u) {
                     s_global_sum[r] += row_sum;
                 }
             }
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (!wave_exact) {
+        if (!wave_compatible) {
             if (tid < FA_BR && s_tile_active[tid] != 0u) {
                 float tile_sum = 0.0f;
                 for (uint c = 0; c < tile_size; ++c) {
@@ -422,7 +482,26 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         }
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < pv_threads) {
+        if (pv_split == 1u) {
+            [unroll]
+            for (uint vb = 0; vb < FA_VBLOCKS; ++vb) {
+                const uint d_out = tid + vb * FA_THREADS;
+                if (d_out >= D_v) {
+                    continue;
+                }
+                const uint dv = d_out / 4u;
+                const uint lane = d_out & 3u;
+                for (uint vc = 0; vc < tile_size; ++vc) {
+                    float vval = fa_lane(s_kv[vc][dv], lane);
+                    [unroll]
+                    for (uint r = 0; r < FA_BR; ++r) {
+                        if (q_start + r < N_queries) {
+                            acc[vb][r] += s_scores[r][vc] * vval;
+                        }
+                    }
+                }
+            }
+        } else if (tid < pv_threads) {
             uint dv = (tid - pv_sub * D_v) / 4;
             uint lane = tid & 3u;
             // Contiguous column range per sub-group, so the loop keeps a stride
@@ -433,7 +512,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                 [unroll]
                 for (uint r = 0; r < FA_BR; ++r) {
                     if (q_start + r < N_queries) {
-                        acc[r] += s_scores[r][vc] * vval;
+                        acc[0][r] += s_scores[r][vc] * vval;
                     }
                 }
             }
@@ -446,14 +525,14 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         if (tid >= D_v && tid < pv_threads) {
             [unroll]
             for (uint r = 0; r < FA_BR; ++r) {
-                s_scores[r][tid - D_v] = acc[r];
+                s_scores[r][tid - D_v] = acc[0][r];
             }
         }
         GroupMemoryBarrierWithGroupSync();
         if (tid < D_v) {
             [unroll]
             for (uint r = 0; r < FA_BR; ++r) {
-                acc[r] += s_scores[r][tid];
+                acc[0][r] += s_scores[r][tid];
             }
         }
     }
@@ -470,23 +549,31 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             s_correction[tid] = correction;
         }
         GroupMemoryBarrierWithGroupSync();
-        if (tid < D_v) {
-            [unroll]
-            for (uint r = 0; r < FA_BR; ++r) {
-                acc[r] *= s_correction[r];
+        [unroll]
+        for (uint vb = 0; vb < FA_VBLOCKS; ++vb) {
+            const uint d_out = tid + vb * FA_THREADS;
+            if (d_out < D_v) {
+                [unroll]
+                for (uint r = 0; r < FA_BR; ++r) {
+                    acc[vb][r] *= s_correction[r];
+                }
             }
         }
     }
 
-    if (tid < D_v) {
-        [unroll]
-        for (uint r = 0; r < FA_BR; ++r) {
-            uint query_idx = q_start + r;
-            if (query_idx < N_queries) {
-                float inv_sum = s_global_sum[r] > 0.0f ? (1.0f / s_global_sum[r]) : 0.0f;
-                uint out_off = dst_offset + tid * nb0 + head_idx * nb1
-                             + query_idx * nb2 + batch_idx * nb3;
-                store_auto(dst, out_off, acc[r] * inv_sum, dst_esize);
+    [unroll]
+    for (uint vb = 0; vb < FA_VBLOCKS; ++vb) {
+        const uint d_out = tid + vb * FA_THREADS;
+        if (d_out < D_v) {
+            [unroll]
+            for (uint r = 0; r < FA_BR; ++r) {
+                uint query_idx = q_start + r;
+                if (query_idx < N_queries) {
+                    float inv_sum = s_global_sum[r] > 0.0f ? (1.0f / s_global_sum[r]) : 0.0f;
+                    uint out_off = dst_offset + d_out * nb0 + head_idx * nb1
+                                 + query_idx * nb2 + batch_idx * nb3;
+                    store_auto(dst, out_off, acc[vb][r] * inv_sum, dst_esize);
+                }
             }
         }
     }

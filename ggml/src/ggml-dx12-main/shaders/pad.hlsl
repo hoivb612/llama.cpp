@@ -1,11 +1,10 @@
 // pad.hlsl - Pad tensor (constant=0 fill or circular wrap)
 // op_params: [0]=lp0 [1]=rp0 [2]=lp1 [3]=rp1 [4]=lp2 [5]=rp2 [6]=lp3 [7]=rp3 [8]=circular
-// dst is contiguous F32
 #include "ggml_common.hlsli"
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint total = ne0 * ne1 * ne2 * ne3;
     if (idx >= total) return;
 
@@ -19,8 +18,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int lp3 = asint(op6); int rp3 = asint(op7);
     int circular = asint(op8);
 
-    // dst is contiguous — use flat index
-    uint off_d = dst_offset + idx * 4;
+    uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
 
     if (circular != 0) {
         // Circular (torus) wrap: ((coord % size) + size) % size — handles
@@ -36,7 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         uint si3 = (uint)(((c3 % (int)ne03) + (int)ne03) % (int)ne03);
         uint off0 = offset_4d(si0, si1, si2, si3, nb00, nb01, nb02, nb03, src0_offset);
         float val = load_auto(src0, off0, src0_esize);
-        dst.Store(off_d, asuint(val));
+        store_auto(dst, off_d, val, dst_esize);
         return;
     }
 
@@ -50,8 +48,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
         uint si3 = (uint)((int)i3 - lp3);
         uint off0 = offset_4d(si0, si1, si2, si3, nb00, nb01, nb02, nb03, src0_offset);
         float val = load_auto(src0, off0, src0_esize);
-        dst.Store(off_d, asuint(val));
+        store_auto(dst, off_d, val, dst_esize);
     } else {
-        dst.Store(off_d, asuint(0.0f));
+        store_auto(dst, off_d, 0.0f, dst_esize);
     }
 }

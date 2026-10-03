@@ -2,8 +2,8 @@
 //
 // src0: kernel  [KW=ne00, KH=ne01, KD=ne02, c*oc=ne03]
 //                element stride src0_esize (2=F16, 4=F32)
-// src1: input   [IW=ne10, IH=ne11, ID=ne12, c*n=ne13]  (F32)
-// dst:  output  [OW=ne0, OH=ne1, OD=ne2, oc*n=ne3]     (F32)
+// src1: input   [IW=ne10, IH=ne11, ID=ne12, c*n=ne13]
+// dst:  output  [OW=ne0, OH=ne1, OD=ne2, oc*n=ne3]
 //
 // op_params: [0]=s0 [1]=s1 [2]=s2 [3]=p0 [4]=p1 [5]=p2
 //            [6]=d0 [7]=d1 [8]=d2 [9]=c  [10]=n [11]=oc
@@ -90,7 +90,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint lt : SV
                     float src_val = 0.0f;
                     if (yz_in && sx >= 0 && sx < (int)IW) {
                         uint src_off = src_y_off + (uint)sx * nb10;
-                        src_val = asfloat(src1.Load(src_off));
+                        src_val = load_auto(src1, src_off, src1_esize);
                     }
                     uint knl_off = knl_y_off + kx * nb00;
                     float knl_val = load_auto(src0, knl_off, src0_esize);
@@ -101,5 +101,5 @@ void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint lt : SV
     }
 
     uint dst_off = dst_offset + dst_x * nb0 + dst_y * nb1 + dst_z * nb2 + ocn * nb3;
-    dst.Store(dst_off, asuint(acc));
+    store_auto(dst, dst_off, acc, dst_esize);
 }

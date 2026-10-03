@@ -38,7 +38,7 @@ static void rope_yarn(float theta_extrap, float freq_scale, float corr_low, floa
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint n_pairs = ne0 / 2;
     uint total_pairs = n_pairs * ne1 * ne2 * ne3;
     if (idx >= total_pairs) return;
@@ -67,17 +67,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint mode = op_param_uint(2);
     bool is_vision = (mode & 16u) != 0;  // GGML_ROPE_TYPE_VISION = 24 (bit 4)
     bool is_imrope = (mode & 32u) != 0;  // GGML_ROPE_TYPE_IMROPE = 40 (bit 5)
-    uint has_ff = op_param_uint(15);
+    uint ff_offs = op_param_uint(15);
+    uint has_ff  = ff_offs >> 31;
+    uint n_offs  = ff_offs & 0x7fffffffu;   // always 0 for vision (ggml asserts it)
 
     // Vision ROPE uses n_dims as pair offset; mrope uses n_dims/2
     uint half_dims = is_vision ? n_dims : (n_dims / 2);
 
-    // Passthrough: elements beyond the rotated range are copied unchanged.
-    // For mrope/imrope: rotated indices are [0, n_dims); copy [n_dims, ne0).
-    // For vision: rotated indices are [0, 2*n_dims); copy [2*n_dims, ne0).
+    // Passthrough: elements outside the rotated window are copied unchanged.
+    // For mrope/imrope: rotated indices are [n_offs, n_offs+n_dims).
+    // For vision: rotated indices are [0, 2*n_dims) (n_offs is always 0).
     uint rot_dims = is_vision ? (n_dims * 2) : n_dims;
     if (pair >= half_dims) {
-        uint pass_idx = rot_dims + 2 * (pair - half_dims);
+        uint j = pair - half_dims;
+        uint lo_pairs = n_offs / 2;
+        uint pass_idx = (j < lo_pairs) ? (2 * j) : (n_offs + rot_dims + 2 * (j - lo_pairs));
         uint pass_a = pass_idx;
         uint pass_b = pass_idx + 1;
         if (pass_a < ne0) {
@@ -95,9 +99,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    // Neox-style pair mapping: (pair, pair + offset)
-    uint idx_a = pair;
-    uint idx_b = pair + half_dims;
+    // Neox-style pair mapping: (pair, pair + offset), shifted by n_offs
+    uint idx_a = n_offs + pair;
+    uint idx_b = n_offs + pair + half_dims;
 
     // ne02 from src0 — used as stride between position planes in src1
     uint ne02_pos = ne02;

@@ -4,7 +4,7 @@
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     bool paired = can_pair_f16();
-    uint idx = tid.x * (paired ? 2u : 1u);
+    uint idx = flat_idx_2d_256(tid) * (paired ? 2u : 1u);
     uint total = ne0 * ne1 * ne2 * ne3;
     if (idx >= total) return;
 

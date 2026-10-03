@@ -111,7 +111,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
 
     uint src0_base = src0_offset + i2_src0 * nb02 + i3_src0 * nb03;
     uint src0_row0 = src0_base + row0 * nb01;
-    uint src0_row1 = src0_base + (row0 + 1) * nb01;
+    uint src0_row1 = src0_base + min(row0 + 1, ne0 - 1) * nb01;
 
     uint i2_q8 = i2 * ne12 / ne2;
     uint i3_q8 = i3 * ne13 / ne3;
@@ -200,6 +200,7 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     // is ≤64 adds — negligible vs the dp4a accumulation upstream.
     float wave_sum0 = WaveActiveSum(acc0);
     float wave_sum1 = WaveActiveSum(acc1);
+#if !defined(WAVE_SIZE) || GROUP_SIZE != WAVE_SIZE
     uint wave_lanes = WaveGetLaneCount();
     uint wave_id = tid / wave_lanes;
     uint num_waves = (GROUP_SIZE + wave_lanes - 1) / wave_lanes;
@@ -210,17 +211,23 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
         shared_acc1[wave_id] = wave_sum1;
     }
     GroupMemoryBarrierWithGroupSync();
+#endif
 
     if (tid == 0) {
+#if defined(WAVE_SIZE) && GROUP_SIZE == WAVE_SIZE
+        float result0 = wave_sum0;
+        float result1 = wave_sum1;
+#else
         float result0 = shared_acc0[0];
         for (uint w = 1; w < num_waves; w++) result0 += shared_acc0[w];
+        float result1 = shared_acc1[0];
+        for (uint w = 1; w < num_waves; w++) result1 += shared_acc1[w];
+#endif
         result0 += load_fused_bias(row0, i2, i3);
         uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
 
         if (row0 + 1 < ne0) {
-            float result1 = shared_acc1[0];
-            for (uint w = 1; w < num_waves; w++) result1 += shared_acc1[w];
             result1 += load_fused_bias(row0 + 1, i2, i3);
             uint off_d1 = offset_4d(row0 + 1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

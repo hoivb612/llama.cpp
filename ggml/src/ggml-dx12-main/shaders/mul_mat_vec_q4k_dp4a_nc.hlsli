@@ -20,7 +20,9 @@
 #define QK_K        256
 #define Q4K_BSIZE   144
 #define Q8_1_BSIZE  36
+#ifndef NUM_ROWS
 #define NUM_ROWS    2
+#endif
 #ifndef NUM_COLS
 #define NUM_COLS    4
 #endif
@@ -28,9 +30,7 @@
 groupshared float shared_acc[NUM_ROWS * NUM_COLS * 64];
 
 void decode_q4k_row(uint block_off, uint v_im, uint q_offset,
-                    out float dall, out float dmin,
-                    out float sc0, out float sc1, out float sc2, out float sc3,
-                    out float sc4, out float sc5, out float sc6, out float sc7,
+                    out float dall, out float dmin, out float sc[8],
                     out uint qs0_out, out uint qs64_out) {
     uint dm_raw = src0.Load(block_off);
     dall = f16_to_f32(dm_raw & 0xFFFFu);
@@ -51,25 +51,23 @@ void decode_q4k_row(uint block_off, uint v_im, uint q_offset,
     uint scale_0_4_l = (s_raw4 << 16) | s_raw0;
     uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2;
 
-    sc0 = float((scale_0_4_l >>  0) & 0x3Fu);
-    sc1 = float((scale_0_4_l >>  8) & 0x3Fu);
-    sc2 = float((scale_0_4_l >> 16) & 0x3Fu);
-    sc3 = float((scale_0_4_l >> 24) & 0x3Fu);
+    sc[0] = float((scale_0_4_l >>  0) & 0x3Fu);
+    sc[1] = float((scale_0_4_l >>  8) & 0x3Fu);
+    sc[2] = float((scale_0_4_l >> 16) & 0x3Fu);
+    sc[3] = float((scale_0_4_l >> 24) & 0x3Fu);
 
     uint combined_8 = (((s_raw8 << 12) | s_raw8) & 0x0F0F0F0Fu) | scale_0_4_h;
-    sc4 = float((combined_8 >>  0) & 0xFFu);
-    sc5 = float((combined_8 >>  8) & 0xFFu);
-    sc6 = float((combined_8 >> 16) & 0xFFu);
-    sc7 = float((combined_8 >> 24) & 0xFFu);
+    sc[4] = float((combined_8 >>  0) & 0xFFu);
+    sc[5] = float((combined_8 >>  8) & 0xFFu);
+    sc[6] = float((combined_8 >> 16) & 0xFFu);
+    sc[7] = float((combined_8 >> 24) & 0xFFu);
 
     uint qs_off = block_off + 16;
     qs0_out  = src0.Load(qs_off + q_offset);
     qs64_out = src0.Load(qs_off + q_offset + 64);
 }
 
-float compute_dp4a_row(float dall, float dmin,
-                       float sc0, float sc1, float sc2, float sc3,
-                       float sc4, float sc5, float sc6, float sc7,
+float compute_dp4a_row(float dall, float dmin, float sc[8],
                        uint qs0, uint qs64,
                        float q8d0, float q8d1, float q8d2, float q8d3,
                        uint q8_qs0, uint q8_qs1, uint q8_qs2, uint q8_qs3,
@@ -84,10 +82,10 @@ float compute_dp4a_row(float dall, float dmin,
     int isz = 0; isz = dot4add_i8packed(q4_lo64, q8_qs2, isz);
     int isw = 0; isw = dot4add_i8packed(q4_hi64, q8_qs3, isw);
 
-    float dot_term = mad(sc0 * q8d0, float(isx), mad(sc1 * q8d1, float(isy),
-                    mad(sc4 * q8d2, float(isz), sc5 * q8d3 * float(isw))));
-    float min_term = mad(sc2 * q8d0, float(q8_psum0), mad(sc3 * q8d1, float(q8_psum1),
-                    mad(sc6 * q8d2, float(q8_psum2), sc7 * q8d3 * float(q8_psum3))));
+    float dot_term = mad(sc[0] * q8d0, float(isx), mad(sc[1] * q8d1, float(isy),
+                    mad(sc[4] * q8d2, float(isz), sc[5] * q8d3 * float(isw))));
+    float min_term = mad(sc[2] * q8d0, float(q8_psum0), mad(sc[3] * q8d1, float(q8_psum1),
+                    mad(sc[6] * q8d2, float(q8_psum2), sc[7] * q8d3 * float(q8_psum3))));
 
     return dall * dot_term - dmin * min_term;
 }
@@ -111,8 +109,12 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint num_q8_per_vec = K / 32;
 
     uint src0_base = src0_offset + i2_src0 * nb02 + i3_src0 * nb03;
-    uint src0_row0 = src0_base + row0 * nb01;
-    uint src0_row1 = src0_base + (row0 + 1) * nb01;
+    uint src0_rows[NUM_ROWS];
+    [unroll] for (uint ri = 0; ri < NUM_ROWS; ri++) {
+        uint rw = row0 + ri;
+        if (rw >= ne0) rw = ne0 - 1;
+        src0_rows[ri] = src0_base + rw * nb01;
+    }
 
     uint i2_q8 = i2 * ne12 / ne2;
     uint i3_q8 = i3 * ne13 / ne3;
@@ -144,17 +146,14 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     }
 
     for (uint block_idx = ix; block_idx < num_blocks; block_idx += it_size) {
-        float dall0, dmin0, sc00, sc01, sc02, sc03, sc04, sc05, sc06, sc07;
-        uint qs0_0, qs64_0;
-        decode_q4k_row(src0_row0 + block_idx * Q4K_BSIZE, v_im, q_offset,
-                       dall0, dmin0, sc00, sc01, sc02, sc03, sc04, sc05, sc06, sc07,
-                       qs0_0, qs64_0);
-
-        float dall1, dmin1, sc10, sc11, sc12, sc13, sc14, sc15, sc16, sc17;
-        uint qs0_1, qs64_1;
-        decode_q4k_row(src0_row1 + block_idx * Q4K_BSIZE, v_im, q_offset,
-                       dall1, dmin1, sc10, sc11, sc12, sc13, sc14, sc15, sc16, sc17,
-                       qs0_1, qs64_1);
+        float w_dall[NUM_ROWS], w_dmin[NUM_ROWS], w_sc[NUM_ROWS][8];
+        uint  w_qs0[NUM_ROWS], w_qs64[NUM_ROWS];
+        [unroll] for (uint rd = 0; rd < NUM_ROWS; rd++) {
+            float sc_tmp[8];
+            decode_q4k_row(src0_rows[rd] + block_idx * Q4K_BSIZE, v_im, q_offset,
+                           w_dall[rd], w_dmin[rd], sc_tmp, w_qs0[rd], w_qs64[rd]);
+            [unroll] for (uint sj = 0; sj < 8; sj++) w_sc[rd][sj] = sc_tmp[sj];
+        }
 
         [unroll] for (uint c = 0; c < NUM_COLS; c++) {
             if (c >= ne11) break;
@@ -185,14 +184,14 @@ void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
             int q8_psum2 = 0; q8_psum2 = dot4add_i8packed(0x01010101u, q8_qs2, q8_psum2);
             int q8_psum3 = 0; q8_psum3 = dot4add_i8packed(0x01010101u, q8_qs3, q8_psum3);
 
-            acc[0][c] += compute_dp4a_row(dall0, dmin0, sc00, sc01, sc02, sc03, sc04, sc05, sc06, sc07,
-                                          qs0_0, qs64_0, q8d0, q8d1, q8d2, q8d3,
-                                          q8_qs0, q8_qs1, q8_qs2, q8_qs3,
-                                          q8_psum0, q8_psum1, q8_psum2, q8_psum3);
-            acc[1][c] += compute_dp4a_row(dall1, dmin1, sc10, sc11, sc12, sc13, sc14, sc15, sc16, sc17,
-                                          qs0_1, qs64_1, q8d0, q8d1, q8d2, q8d3,
-                                          q8_qs0, q8_qs1, q8_qs2, q8_qs3,
-                                          q8_psum0, q8_psum1, q8_psum2, q8_psum3);
+            [unroll] for (uint rc = 0; rc < NUM_ROWS; rc++) {
+                float sc_use[8];
+                [unroll] for (uint sk = 0; sk < 8; sk++) sc_use[sk] = w_sc[rc][sk];
+                acc[rc][c] += compute_dp4a_row(w_dall[rc], w_dmin[rc], sc_use,
+                                               w_qs0[rc], w_qs64[rc], q8d0, q8d1, q8d2, q8d3,
+                                               q8_qs0, q8_qs1, q8_qs2, q8_qs3,
+                                               q8_psum0, q8_psum1, q8_psum2, q8_psum3);
+            }
         }
     }
 

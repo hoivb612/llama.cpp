@@ -21,7 +21,7 @@ uint read_u32_gr(ByteAddressBuffer buf, uint byte_off) {
 
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
+    uint idx = flat_idx_2d_256(tid);
     uint total = ne0 * ne1 * ne2 * ne3;
     if (idx >= total) return;
 
