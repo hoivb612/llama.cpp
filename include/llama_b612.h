@@ -89,6 +89,11 @@ LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, 
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Select which appended NextN block the DECODER_MTP graph runs (offset past
+// the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+// chain multiple trained NextN heads. Default 0 (first head).
+LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -113,6 +118,14 @@ LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx)
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
 
 // Phi3 Phase C: skip the lm_head matmul (and logits buffer write) on each decode.
 // When enabled, the standard graph's output tensor (post-final-norm hidden state)

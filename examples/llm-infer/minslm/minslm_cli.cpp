@@ -397,7 +397,7 @@ int main(int argc, char ** argv) {
         model_params.split_mode = (enum llama_split_mode)p.split_mode;
     }
     if (p.no_mmap) {
-        model_params.use_mmap = false;
+        model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     }
     // Layer-window streaming on a GPU is fastest when weights are mmap-aliased
     // into the device buffer (buffer_from_host_ptr): residency is then managed
@@ -411,7 +411,7 @@ int main(int argc, char ** argv) {
                "(enables zero-copy weight aliasing on UMA)\n");
     }
     if (p.direct_io) {
-        model_params.use_direct_io = true;
+        model_params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
     }
 
     llama_model * model = llama_model_load_from_file(p.model_path.c_str(), model_params);
@@ -469,8 +469,7 @@ int main(int argc, char ** argv) {
             dft_mparams.n_gpu_layers = model_params.n_gpu_layers;
             dft_mparams.main_gpu     = model_params.main_gpu;
             dft_mparams.split_mode   = model_params.split_mode;
-            dft_mparams.use_mmap     = model_params.use_mmap;
-            dft_mparams.use_direct_io = model_params.use_direct_io;
+            dft_mparams.load_mode    = model_params.load_mode;
 
             model_dft = llama_model_load_from_file(p.spec_draft_model_path.c_str(), dft_mparams);
             if (!model_dft) {
@@ -586,20 +585,19 @@ int main(int argc, char ** argv) {
             const llama_seq_id pref_seq_id = 0;
 
             int64_t t1 = timer_us();
-            // common_speculative_process requires a fully-populated llama_batch
+            // common_speculative_process requires a fully-populated batch
             // (n_seq_id/seq_id/pos arrays present). llama_batch_get_one returns
             // a minimal batch that crashes the spec impl, so build a proper
-            // batch via common_batch_add for the entire prefill.
-            llama_batch pref_batch = llama_batch_init(p.n_batch, 0, 1);
+            // common_batch for the entire prefill.
+            common_batch pref_batch(ctx);
             for (int i = 0; i < n_pref; i += p.n_batch) {
                 int n_eval = std::min(n_pref - i, p.n_batch);
-                common_batch_clear(pref_batch);
+                pref_batch.clear();
                 for (int k = 0; k < n_eval; ++k) {
-                    common_batch_add(pref_batch, tokens[i + k], i + k, { pref_seq_id }, false);
+                    pref_batch.add(tokens[i + k], i + k, pref_seq_id, false);
                 }
-                if (llama_decode(ctx, pref_batch)) {
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, pref_batch.get()) < 0) {
                     fprintf(stderr, "Error: llama_decode failed during target prefill (spec)\n");
-                    llama_batch_free(pref_batch);
                     goto cleanup;
                 }
                 // Drives draft-context prefill internally (decodes dft for
@@ -607,11 +605,9 @@ int main(int argc, char ** argv) {
                 // into the impl's pending buffer to seed the next draft).
                 if (!common_speculative_process(spec, pref_batch)) {
                     fprintf(stderr, "Error: common_speculative_process failed during prefill\n");
-                    llama_batch_free(pref_batch);
                     goto cleanup;
                 }
             }
-            llama_batch_free(pref_batch);
             llama_synchronize(ctx);
             if (ctx_dft) llama_synchronize(ctx_dft);
             int64_t t2 = timer_us();
@@ -655,7 +651,7 @@ int main(int argc, char ** argv) {
 
             common_speculative_begin(spec, seq_id, prompt_tgt);
 
-            llama_batch  batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+            common_batch batch_tgt(ctx);
             llama_tokens draft;
 
             int max_gen = std::min(p.n_len - (int)tokens.size(), 128);
@@ -692,15 +688,14 @@ int main(int argc, char ** argv) {
                 }
 
                 // Target batch: [id_last, draft[0..N)]
-                common_batch_clear(batch_tgt);
-                common_batch_add(batch_tgt, id_last, n_past, { seq_id }, true);
+                batch_tgt.clear();
+                batch_tgt.add(id_last, n_past, seq_id, true);
                 for (size_t i = 0; i < draft.size(); ++i) {
-                    common_batch_add(batch_tgt, draft[i], n_past + 1 + (int)i, { seq_id }, true);
+                    batch_tgt.add(draft[i], n_past + 1 + (int)i, seq_id, true);
                 }
 
-                if (llama_decode(ctx, batch_tgt)) {
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) < 0) {
                     fprintf(stderr, "Error: target llama_decode failed during spec round\n");
-                    llama_batch_free(batch_tgt);
                     common_sampler_free(smpl);
                     goto cleanup;
                 }
@@ -710,7 +705,6 @@ int main(int argc, char ** argv) {
                 // they generate from the target's NEXTN embeddings instead).
                 if (!common_speculative_process(spec, batch_tgt)) {
                     fprintf(stderr, "Error: common_speculative_process failed during spec round\n");
-                    llama_batch_free(batch_tgt);
                     common_sampler_free(smpl);
                     goto cleanup;
                 }
@@ -786,7 +780,6 @@ int main(int argc, char ** argv) {
             total_tg_core_us       += tg_core_us;
             total_ttft_us          += ttft_us;
 
-            llama_batch_free(batch_tgt);
             common_sampler_free(smpl);
 
             if (!p.streaming) {
@@ -868,10 +861,10 @@ int main(int argc, char ** argv) {
             auto sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
             llama_sampler * smpl = llama_sampler_chain_init(sparams);
-            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(128, 1.3f, 0.1f, 0.1f));
+            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 128, 1.3f, 0.1f, 0.1f));
             // DRY: penalizes repeated n-gram sequences
             const char * dry_breakers[] = { "\n", ":", "\"", "*" };
-            llama_sampler_chain_add(smpl, llama_sampler_init_dry(vocab, 2048, 0.8f, 1.75f, 2, 128,
+            llama_sampler_chain_add(smpl, llama_sampler_init_dry(vocab, 0.8f, 1.75f, 2, 128,
                                           dry_breakers, 4));
             llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
             llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1.0f));
