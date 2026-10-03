@@ -27,8 +27,10 @@ uint read_u32_fast(ByteAddressBuffer buf, uint byte_off) {
     uint aligned = byte_off & ~3u;
     uint shift = (byte_off & 3u) * 8u;
     uint lo = buf.Load(aligned);
-    if (shift == 0u) return lo;
-    uint hi = buf.Load(aligned + 4u);
+    uint hi = buf.Load(aligned + (shift == 0u ? 0u : 4u));
+    if (shift == 0u) {
+        return lo;
+    }
     return (lo >> shift) | (hi << (32u - shift));
 }
 
@@ -43,6 +45,9 @@ float dot4_q8(uint packed_q, float x0, float x1, float x2, float x3) {
     return float(q0) * x0 + float(q1) * x1 + float(q2) * x2 + float(q3) * x3;
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint tid : SV_GroupIndex) {
     uint row0 = group_x_2d(group_id) * 2;

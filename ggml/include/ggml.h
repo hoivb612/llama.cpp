@@ -375,10 +375,9 @@ extern "C" {
              void        ggml_fp32_to_fp16_row_cpu(const float *, ggml_fp16_t *, int64_t);
     GGML_API void        ggml_fp16_to_fp32_row_org(const ggml_fp16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_fp16_row_org(const float *, ggml_fp16_t *, int64_t);
-#else
+#endif // GGML_B612
     GGML_API void        ggml_fp16_to_fp32_row(const ggml_fp16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
-#endif // GGML_B612
 
     // google brain half-precision bfloat16
     typedef struct { uint16_t bits; } ggml_bf16_t;
@@ -389,10 +388,9 @@ extern "C" {
              void        ggml_fp32_to_bf16_row_cpu(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_bf16_to_fp32_row_org(const ggml_bf16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row_org(const float *, ggml_bf16_t *, int64_t);
-#else
+#endif // GGML_B612
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
-#endif // GGML_B612
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
 
     struct ggml_object;
@@ -443,37 +441,46 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-
-        //
-        // Xbox repack specific quant types.
-        //
-        GGML_TYPE_Q8_0_x8 = 42,         // - dummy linkage type
-        GGML_TYPE_Q8_0_Q8_0_x8 = 43,    // repacked type
-        GGML_TYPE_Q2_K_x8 = 44,
-        GGML_TYPE_Q2_K_Q8_K_x8 = 45,
-        GGML_TYPE_Q3_K_x8 = 46,
-        GGML_TYPE_Q3_K_Q8_K_x8 = 47,
-        GGML_TYPE_Q4_K_x8 = 48,         // - dummy linkage type
-        GGML_TYPE_Q4_K_Q8_K_x8 = 49,    // repacked type
-        GGML_TYPE_Q6_K_x8 = 50,         // - dummy linkage type
-        GGML_TYPE_Q6_K_Q8_K_x8 = 51,    // repacked type
-        GGML_TYPE_Q4_0_x8 = 52,         // - dummy linkage type
-        GGML_TYPE_Q4_0_Q8_0_x8 = 53,    // repacked type
-        //
-        // GGML repack types
-        //
-        GGML_TYPE_Q2_K_8_8 = 54,
-        GGML_TYPE_Q3_K_8_8 = 55, // Future
-        GGML_TYPE_Q4_K_8_8 = 56,
-        GGML_TYPE_Q8_0_8_8 = 57, // Future
-        
-        GGML_TYPE_COUNT   = 58,
+        GGML_TYPE_Q2_0    = 42,
+        // Xbox repack specific quant types (merged into ggml_type)
+        // NOTE: these are RUNTIME-ONLY repack types (never written to GGUF),
+        // so their numeric values may be shifted to make room for upstream
+        // on-disk types such as GGML_TYPE_Q2_0 above.
+        GGML_TYPE_Q8_0_x8        = 43, // linkage type
+        GGML_TYPE_Q8_0_Q8_0_x8   = 44, // repacked type
+        GGML_TYPE_Q2_K_x8        = 45,
+        GGML_TYPE_Q2_K_Q8_K_x8   = 46,
+        GGML_TYPE_Q3_K_x8        = 47,
+        GGML_TYPE_Q3_K_Q8_K_x8   = 48,
+        GGML_TYPE_Q4_K_x8        = 49, // linkage type
+        GGML_TYPE_Q4_K_Q8_K_x8   = 50, // repacked type
+        GGML_TYPE_Q6_K_x8        = 51, // linkage type
+        GGML_TYPE_Q6_K_Q8_K_x8   = 52, // repacked type
+        GGML_TYPE_Q4_0_x8        = 53, // linkage type
+        GGML_TYPE_Q4_0_Q8_0_x8   = 54, // repacked type
+        // GGML repack types used for stats/tracing
+        GGML_TYPE_Q2_K_8_8       = 55,
+        GGML_TYPE_Q3_K_8_8       = 56,
+        GGML_TYPE_Q4_K_8_8       = 57,
+        GGML_TYPE_Q8_0_8_8       = 58,
+        GGML_TYPE_COUNT          = 59,
     };
 
-    // precision
+    // [TAG_GGML_PREC]
+    // this enum is used to declare the allowed numerical precision/data-types types that can be used during the compute of an op
+    // the declared types can be:
+    //  - result accumulation type
+    //  - source tensor data representation type
+    //  - etc.
+    // the precision parameters are stored as ggml_tensor.op_params to the respective ops
     enum ggml_prec {
-        GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
-        GGML_PREC_F32     = 10,
+        GGML_PREC_UNDEFINED = 0,
+        GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
+        GGML_PREC_F32       = 10,
+        GGML_PREC_BF16      = 15,
+        GGML_PREC_F16       = 20,
+        GGML_PREC_Q8        = 30,
+        GGML_PREC_Q4        = 40,
     };
 
     // op hint
@@ -511,6 +518,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
     };
 
     // available tensor operations:
@@ -606,6 +614,10 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_PRE,
+        GGML_OP_DSV4_HC_POST,
 
         GGML_OP_UNARY,
 
@@ -659,6 +671,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
 
         GGML_GLU_OP_COUNT,
     };
@@ -685,10 +698,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-#ifdef GGML_B612
-        GGML_TENSOR_FLAG_DUP       = 32, // ...data is duplicated for mutable transforms
-        GGML_TENSOR_FLAG_NO_REPACK = 64, // ...must not be repacked / have type switched to repack variants
-#endif  
+        GGML_TENSOR_FLAG_DUP       = 32, // ...data is duplicated for mutable transforms (b612 repack)
+        GGML_TENSOR_FLAG_NO_REPACK = 64, // ...must not be repacked / have type switched to repack variants (b612 repack)
     };
 
     enum ggml_tri_type {
@@ -828,6 +839,10 @@ extern "C" {
     GGML_API bool ggml_is_contiguous_1(const struct ggml_tensor * tensor); // contiguous for dims >= 1
     GGML_API bool ggml_is_contiguous_2(const struct ggml_tensor * tensor); // contiguous for dims >= 2
 
+    GGML_API bool ggml_is_contiguous_to_1(const struct ggml_tensor * tensor); // contiguous for dims < 1
+    GGML_API bool ggml_is_contiguous_to_2(const struct ggml_tensor * tensor); // contiguous for dims < 2
+    GGML_API bool ggml_is_contiguous_to_3(const struct ggml_tensor * tensor); // contiguous for dims < 3
+
     // returns whether the tensor elements are allocated as one contiguous block of memory (no gaps, but permutation ok)
     GGML_API bool ggml_is_contiguously_allocated(const struct ggml_tensor * tensor);
 
@@ -923,10 +938,8 @@ extern "C" {
     GGML_API void ggml_set_output(struct ggml_tensor * tensor);
     GGML_API void ggml_set_param(struct ggml_tensor * tensor);
     GGML_API void ggml_set_loss(struct ggml_tensor * tensor);
-#ifdef GGML_B612
     GGML_API void ggml_set_duplicated(struct ggml_tensor * tensor);
     GGML_API void ggml_set_no_repack(struct ggml_tensor * tensor);
-#endif
 
     //
     // operations on tensors with backpropagation
@@ -1412,6 +1425,12 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1467,6 +1486,42 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_GGML_PREC]
+    // set the minimum required accumulator type for the implementation to use during the compute
+    // for example:
+    //  - GGML_PREC_F32  - requires accumulation of the results in F32
+    //  - GGML_PREC_BF16 - can accumulate the results in BF16, F32
+    //  - GGML_PREC_F16  - can accumulate the results in F16, F32
+    //  - GGML_PREC_Q8   - not allowed
+    //  - GGML_PREC_Q4   - not allowed
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // [TAG_GGML_PREC]
+    // set the smallest rank that the implementation can use to internally convert the src[idx] data to
+    // ranks in decreasing order:
+    //  - GGML_PREC_F32  - GGML_TYPE_F32
+    //  - GGML_PREC_BF16 - GGML_TYPE_BF16
+    //  - GGML_PREC_F16  - GGML_TYPE_F16,
+    //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
+    //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //
+    // for example:
+    //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to GGML_TYPE_Q8_0
+    //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
+    //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1477,9 +1532,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
-    GGML_API void ggml_mul_mat_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -1769,6 +1825,19 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+    GGML_API struct ggml_tensor * ggml_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_clamp_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 min,
+            float                 max);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2026,14 +2095,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
-
-    // clamp
-    // in-place, returns view(a)
-    GGML_API struct ggml_tensor * ggml_clamp(
-            struct ggml_context * ctx,
+    // set the offset dims for RoPE
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
             struct ggml_tensor  * a,
-            float                 min,
-            float                 max);
+            int                   n_offs);
 
     // im2col
     // converts data into a format that effectively results in a convolution when combined with matrix multiplication
@@ -2471,12 +2540,19 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    GGML_API void ggml_flash_attn_ext_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
@@ -2504,7 +2580,8 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids);
+            struct ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2627,6 +2704,73 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // DSA lightning indexer
+    //
+    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
+    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
+    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    // broadcast:
+    //   ne3 % ne33 == 0
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask);
+
+    // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
+    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
+    // using a richer representation through streams.
+    //
+    // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //          -> [dst_hc, src_hc, n_tokens]
+    // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
+    //                         + base[2*hc + dst + hc*src]
+    // Softmax over dst, add eps, normalize over src, then repeat normalization
+    // over dst followed by src for iterations 1 through n_iter - 1.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
+    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    //          -> [n_embd, hc, n_tokens]
+    //   result[i, dst, t] = x[i, t]*post[dst, t]
+    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
 
     // custom operators
 
@@ -2776,6 +2920,12 @@ extern "C" {
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,
@@ -2918,31 +3068,22 @@ extern "C" {
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
 
+    //
+    // tensor repack mode
+    //
+    typedef enum {
+        GGML_TENSOR_REPACK_MODE_NONE               = 0,
+        GGML_TENSOR_REPACK_MODE_GGML               = 1, // upstream GGML repack path
+        GGML_TENSOR_REPACK_MODE_XBOX               = 2, // b612 repack path
+        GGML_TENSOR_REPACK_MODE_XBCG               = 3, // b612 callgraph repack path
+        GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 4, // b612 single-thread repack
+        GGML_TENSOR_MULMAT_MODE_XBOX               = 5, // b612 mulmat path without repack
+        GGML_TENSOR_REPACK_MODE_MAX                = 6
+    } ggml_tensor_repack_mode_t;
+
 #ifdef GGML_XBOX_PERF
-
-//
-// for tensor repacking
-//
-
-typedef enum {
-    GGML_TENSOR_REPACK_MODE_NONE               = 0,
-    GGML_TENSOR_REPACK_MODE_GGML               = 1, // forward_mul_mat()
-    GGML_TENSOR_REPACK_MODE_XBOX               = 2, // forward_mul_mat_xbox() with repack
-    GGML_TENSOR_REPACK_MODE_XBCG               = 3, // repack callgraph pre-compute phase
-    GGML_TENSOR_REPACK_MODE_XBOX_SINGLE_THREAD = 4, // forward_mul_mat_xbox() with single-thread repack
-    GGML_TENSOR_MULMAT_MODE_XBOX               = 5, // forward_mul_mat_xbox() no repack
-    GGML_TENSOR_REPACK_MODE_MAX                = 6
-} ggml_tensor_repack_mode_t;
-
-//extern int mul_mat_repack_callgraph_count;
-//extern int64_t mul_mat_repack_early_time_us;
-//extern int mul_mat_repack_early_count;
-//extern int mul_mat_repack_early_failed_count;
-//extern int mul_mat_repack_failed_count;
-
     GGML_API void ggml_repack_tensor_callgraph(struct ggml_cgraph *gf);
-
-#endif // GGML_XBOX_PERF
+#endif
 
 #ifdef  __cplusplus
 }

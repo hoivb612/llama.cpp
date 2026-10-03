@@ -17,13 +17,15 @@
 // op_params[7]: weight ne11 (for broadcast modulo)
 // op_params[8]: weight ne12
 // op_params[9]: weight ne13
+// op_params[10]: weight ne10 (for dim0 broadcast modulo)
 
 #include "ggml_common.hlsli"
 
 #define MAX_CACHED 32  // max elements per thread (ne00/256, covers up to 8192)
 
-groupshared float wave_sums[16];
+groupshared float wave_sums[32];
 
+WAVE_SIZE_ATTR
 [numthreads(256, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
@@ -36,8 +38,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint i1 = rem % ne1;
 
     uint local_id = gtid.x;
-    uint wave_count = 256 / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     uint add_dst_off = op0;
     uint wt_offset = op1;
@@ -49,6 +52,7 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint wt_ne11 = op7;
     uint wt_ne12 = op8;
     uint wt_ne13 = op9;
+    uint wt_ne10 = op10;
 
     // Pre-compute the per-row weight base offset (broadcast-aware).  Weight
     // dim0 is always F32 contiguous (4 bytes/element), so we add i0*4 in the
@@ -59,6 +63,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                     + (i2 % wt_ne12) * wt_nb12
                     + (i3 % wt_ne13) * wt_nb13;
 
+    // src1 (ADD's second input) may also be broadcast over any of the four
+    // dims (e.g. a [N,1,1,1] bias added to a [N,B,H,T] residual).  The
+    // shader's iteration range is src0's shape (== dst shape); for each
+    // dst element we wrap src1 indices into src1's own shape using modulo.
+    // When src1 matches src0 fully (no broadcast), the modulo is a no-op.
+    uint b1 = i1 % ne11;
+    uint b2 = i2 % ne12;
+    uint b3 = i3 % ne13;
+
     // Pass 1: Compute sum, store ADD intermediate, cache in registers
     float cached[MAX_CACHED];
     uint n_cached = 0;
@@ -66,7 +79,8 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     for (uint i0 = local_id; i0 < ne00; i0 += 256) {
         uint off_a = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
-        uint off_b = offset_4d(i0, i1, i2, i3, nb10, nb11, nb12, nb13, src1_offset);
+        uint b0 = i0 % ne10;
+        uint off_b = offset_4d(b0, b1, b2, b3, nb10, nb11, nb12, nb13, src1_offset);
         float a = load_auto(src0, off_a, src0_esize);
         float b = load_auto(src1, off_b, src1_esize);
         float sum = a + b;
@@ -87,19 +101,29 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     GroupMemoryBarrierWithGroupSync();
 
     float total = 0.0f;
-    if (local_id < wave_count) total = wave_sums[local_id];
-    total = WaveActiveSum(total);
-    if (local_id == 0) wave_sums[0] = total;
+    if (local_id == 0) {
+        float acc = wave_sums[0];
+        for (uint w = 1; w < wave_count; ++w) acc += wave_sums[w];
+        wave_sums[0] = acc;
+    }
     GroupMemoryBarrierWithGroupSync();
     total = wave_sums[0];
 
     float scale_val = rsqrt(total / (float)ne00 + eps);
 
-    // Pass 2: Normalize and multiply by weight, using cached sums
+    // Pass 2: Normalize and multiply by weight, using cached sums (fallback
+    // to the stored ADD intermediate for i0 beyond MAX_CACHED, which happens
+    // when ne00 > MAX_CACHED * 256).
     uint ci = 0;
     for (uint i0 = local_id; i0 < ne0; i0 += 256) {
-        float sum = (ci < n_cached) ? cached[ci++] : 0.0f;
-        float wt = asfloat(src2.Load(wt_row_off + i0 * 4));
+        float sum;
+        if (ci < n_cached) {
+            sum = cached[ci++];
+        } else {
+            uint off_add = offset_4d(i0, i1, i2, i3, nb00, nb01, nb02, nb03, add_dst_off);
+            sum = load_auto_rw(dst, off_add, add_dst_esize);
+        }
+        float wt = asfloat(src2.Load(wt_row_off + (i0 % wt_ne10) * 4));
         uint off_dst = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_dst, sum * scale_val * wt, dst_esize);
     }

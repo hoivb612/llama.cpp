@@ -13,31 +13,7 @@
 //   nc = kernel width                          nc  = ne10
 //
 // F32 only; src0->nb[0] = src1->nb[0] = 4.
-#include "ggml_common.hlsli"
-
-[numthreads(256, 1, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    uint idx = tid.x;
-    uint total = ne0 * ne1 * ne2;
-    if (idx >= total) return;
-
-    uint i1 = idx % ne0;
-    uint rem = idx / ne0;
-    uint i2 = rem % ne1;
-    uint i3 = rem / ne1;
-
-    uint nc = ne10;
-
-    uint s_base = src0_offset + i3 * nb02 + i1 * nb01 + i2 * nb00;
-    uint c_base = src1_offset + i1 * nb11;
-
-    float sum = 0.0f;
-    for (uint i0 = 0; i0 < nc; ++i0) {
-        float s_val = asfloat(src0.Load(s_base + i0 * nb00));
-        float c_val = asfloat(src1.Load(c_base + i0 * nb10));
-        sum += s_val * c_val;
-    }
-
-    uint d_off = dst_offset + i3 * nb2 + i2 * nb1 + i1 * nb0;
-    dst.Store(d_off, asuint(sum));
-}
+//
+// Plain SSM_CONV body is implemented in ssm_conv_impl.hlsli and shared with
+// the fused variants (ssm_conv_silu, ssm_conv_bias_silu).
+#include "ssm_conv_impl.hlsli"

@@ -16,6 +16,38 @@
 #include <sys/mman.h>
 #endif
 
+// ---- MoE expert-streaming residency split ----
+//
+// When GGML_LW_MOE_STREAM=1, the big per-expert weight matrices
+// (blk.N.ffn_{gate,gate_up,up,down}_exps.weight) are NEVER made resident by the
+// layer-window: they are served token-by-token by the CPU gather custom-op
+// (src/llama-moe-stream.cpp) which reads their quantized bytes directly from the
+// mmap'd GGUF. Excluding them here means (a) they are skipped in the per-layer
+// VA reserve/commit/fill/import, so a layer's resident footprint shrinks to just
+// its attention + norms + router + dense-MLP + expert *scales*, and (b) the
+// weight budget only ever gates that small non-expert residency (which always
+// fits), eliminating the whole-layer expert thrash that killed decode throughput.
+// The expert *scale* tensors (..._exps.scale) are tiny and consumed as real graph
+// nodes via get_rows(selected_experts), so they MUST stay resident and are NOT
+// matched here (only "_exps.weight" is).
+// Enabled by default whenever a weight budget is active (--weight-budget). The
+// GGML_LW_MOE_STREAM env var is an explicit override: set to 0 to force off, or
+// to 1 to force on without a budget (e.g. for isolated testing).
+static bool lw_moe_expert_stream() {
+    static const int env = []() {
+        const char * v = getenv("GGML_LW_MOE_STREAM");
+        if (!v || !v[0]) return -1;           // unset -> follow the weight budget
+        return (v[0] != '0') ? 1 : 0;         // explicit override
+    }();
+    if (env >= 0) return env != 0;
+    const layer_window_manager * m = llama_get_layer_window_manager();
+    return m && m->budget_bytes > 0;
+}
+
+static inline bool lw_is_streamed_expert_weight(const std::string & name) {
+    return name.find("_exps.weight") != std::string::npos;
+}
+
 // Global instance pointer
 static layer_window_manager * g_layer_window_mgr = nullptr;
 
@@ -51,12 +83,50 @@ void layer_window_manager::set_layer_size(int layer_idx, size_t bytes) {
     }
 }
 
+void layer_window_manager::set_source_file(uint16_t file_idx, const std::string & path) {
+    if (src_file_paths.size() <= file_idx) {
+        src_file_paths.resize(file_idx + 1);
+        src_file_handles.resize(file_idx + 1, nullptr);
+    }
+    src_file_paths[file_idx] = path;
+}
+
+bool layer_window_manager::read_tensor_bytes(uint16_t file_idx, size_t file_offset, size_t n_bytes, void * dst) {
+    if (file_idx >= src_file_paths.size() || src_file_paths[file_idx].empty()) {
+        return false;
+    }
+    FILE * f = (FILE *) src_file_handles[file_idx];
+    if (!f) {
+        f = fopen(src_file_paths[file_idx].c_str(), "rb");
+        if (!f) {
+            fprintf(stderr, "LW: failed to open source file '%s' for streaming\n",
+                    src_file_paths[file_idx].c_str());
+            return false;
+        }
+        src_file_handles[file_idx] = f;
+    }
+#ifdef _WIN32
+    if (_fseeki64(f, (long long) file_offset, SEEK_SET) != 0) return false;
+#else
+    if (fseeko(f, (off_t) file_offset, SEEK_SET) != 0) return false;
+#endif
+    return fread(dst, 1, n_bytes, f) == n_bytes;
+}
+
 bool layer_window_manager::should_load_layer(int layer_idx) const {
     if (budget_bytes == 0) {
         return true;  // unlimited — load everything
     }
     if (layer_idx < 0 || layer_idx >= total_layers) {
         return true;  // safety: always load unknown
+    }
+
+    // MoE expert-streaming: expert weight matrices are never resident (gather
+    // serves them), so the only thing residency costs is each layer's small
+    // non-expert set, which fits any usable budget. Keep every layer's
+    // non-expert part resident and let the gather honor the budget for experts.
+    if (lw_moe_expert_stream()) {
+        return true;
     }
 
     // Strategy: load the first N layers that fit within the budget.
@@ -193,16 +263,88 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
         return false;
     }
 
+    // Stage 2b-2: aliased-stream mode — build this layer's imported anonymous
+    // buffer on demand (re-pointing its tensors off the dummy buffer). Eviction
+    // is handled separately (deferred to ask=false) so allow_evict mirrors the
+    // non-aliased path: build here, free evicted layers post-compute.
+    if (aliased_streaming) {
+        if (allow_evict) {
+            evict_to_budget(layer_idx);
+        }
+        if (!build_layer_aliased(layer_idx)) {
+            fprintf(stderr, "LW-ALIAS: failed to build layer %d on demand\n", layer_idx);
+            return false;
+        }
+        entries[layer_idx].resident = true;
+        entries[layer_idx].last_access = ++access_counter;
+        resident_bytes += entries[layer_idx].memory_size;
+        return true;
+    }
+
     // Evict BEFORE committing tiles — make room for the incoming layer
     if (allow_evict) {
         evict_to_budget(layer_idx);
     }
 
-    // For mmap: the data pointer is already valid (points into mmap).
-    // We just need to "touch" the pages to ensure they're paged in.
+    // Determine where this layer's weights physically live.
+    // A deferred layer must be re-populated on residency UNLESS its tensors are
+    // aliased directly onto the mmap (buffer_from_host_ptr: CPU, DX12-UMA) -- in
+    // which case paging the mmap back in is enough. is_host() is NOT a reliable
+    // test: a Vulkan/CUDA UMA buffer can be DEVICE_LOCAL|HOST_VISIBLE (reports
+    // host) yet still be a SEPARATE allocation the loader copied weights into,
+    // which the windowing skip-load left unfilled -> garbage. Detect the true
+    // alias by comparing the tensor data pointer to its mmap source address.
+    bool layer_needs_upload = false;
+    for (const auto & loc : it->second) {
+        if (!loc.tensor) continue;
+        const uint8_t * mmap_src =
+            (loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx])
+            ? mmap_bases[loc.file_idx] + loc.file_offset : nullptr;
+        if ((const void *) loc.tensor->data != (const void *) mmap_src) {
+            layer_needs_upload = true;
+            break;
+        }
+    }
+    {
+        // One-shot decisive diagnostic: dump the actual residency state for the
+        // first deferred layer we're asked to make resident. This disambiguates
+        // the Vulkan garbage-output bug (upload vs alias vs not-recorded).
+        static bool dumped = false;
+        if (!dumped && lw_diag_enabled()) {
+            dumped = true;
+            const tensor_location * l0 = nullptr;
+            for (const auto & loc : it->second) { if (loc.tensor) { l0 = &loc; break; } }
+            const uint8_t * mmap_src0 = (l0 && l0->file_idx < mmap_bases.size() && mmap_bases[l0->file_idx])
+                ? mmap_bases[l0->file_idx] + l0->file_offset : nullptr;
+            ggml_backend_buffer_t buf = l0 && l0->tensor ? l0->tensor->buffer : nullptr;
+            fprintf(stderr,
+                "LW-DIAG: first deferred layer=%d n_tensors=%zu use_mmap=%d mmap_bases=%zu\n"
+                "         needs_upload=%d tensor0=%s data=%p mmap_src=%p equal=%d\n"
+                "         buffer=%p is_host=%d buft=%s\n",
+                layer_idx, it->second.size(), (int)use_mmap, mmap_bases.size(),
+                (int)layer_needs_upload,
+                l0 ? l0->name.c_str() : "(none)",
+                l0 && l0->tensor ? l0->tensor->data : nullptr, (const void *)mmap_src0,
+                (int)(l0 && l0->tensor && (const void*)l0->tensor->data == (const void*)mmap_src0),
+                (void *)buf,
+                buf ? (int)ggml_backend_buffer_is_host(buf) : -1,
+                buf ? ggml_backend_buffer_name(buf) : "(none)");
+            fflush(stderr);
+        }
+    }
+    if (use_mmap && layer_needs_upload) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            printf("layer_window: weights are NOT mmap-aliased (separate device/host-visible "
+                   "buffer) — streaming deferred layers via upload (mmap = byte source)\n");
+        }
+    }
+    // For mmap-aliased weights: the data pointer already points into the mmap.
+    // We just "touch" the pages to ensure they're paged in.
     // On Windows: VirtualLock pins pages in physical RAM.
     // On Linux: madvise(WILLNEED) + mlock.
-    if (use_mmap) {
+    if (use_mmap && !layer_needs_upload) {
         for (const auto & loc : it->second) {
             if (!loc.tensor || !loc.tensor->data) continue;
 #ifdef _WIN32
@@ -224,13 +366,29 @@ bool layer_window_manager::ensure_layer_resident(int layer_idx, bool allow_evict
                 fprintf(stderr, "LW: SOFT_NOUP layer=%d — skipping upload (tiles retained)\n", layer_idx);
             }
         } else {
-            // Non-mmap: batch upload all tensors for this layer to GPU in one submission
+            // Non-mmap: batch upload all tensors for this layer to GPU in one submission.
+            // Byte source is the mmap (when aliased/available) OR an on-demand file read
+            // (direct_io / GPU offload disables mmap — the layer bytes are streamed from
+            // the GGUF at the recorded file_offset). File-read tensors are uploaded
+            // immediately (their scratch buffer is transient); mmap tensors are batched.
             std::vector<ggml_tensor *> batch_tensors;
             std::vector<const void *>  batch_data;
             std::vector<size_t>        batch_sizes;
             for (const auto & loc : it->second) {
                 if (!loc.tensor) continue;
-                if (loc.file_idx >= mmap_bases.size() || !mmap_bases[loc.file_idx]) continue;
+                const bool have_mmap =
+                    loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
+                if (!have_mmap) {
+                    // Stream this tensor's bytes from the backing GGUF file.
+                    if (reload_scratch.size() < loc.n_bytes) reload_scratch.resize(loc.n_bytes);
+                    if (!read_tensor_bytes(loc.file_idx, loc.file_offset, loc.n_bytes, reload_scratch.data())) {
+                        fprintf(stderr, "LW: FAILED to stream layer=%d tensor=%s (%zu bytes @ off=%zu file=%u)\n",
+                                layer_idx, loc.name.c_str(), loc.n_bytes, loc.file_offset, (unsigned)loc.file_idx);
+                        continue;
+                    }
+                    ggml_backend_tensor_set(loc.tensor, reload_scratch.data(), 0, loc.n_bytes);
+                    continue;
+                }
 
                 // Verify mmap data integrity before upload (GGML_LW_DIAG)
                 if (lw_diag_enabled() && loc.checksum != 0) {
@@ -284,8 +442,38 @@ void layer_window_manager::evict_layer(int layer_idx) {
     auto it = layer_tensors.find(layer_idx);
     if (it == layer_tensors.end()) return;  // no recorded tensors — can't reload
 
-    // For mmap: release physical pages back to OS
-    if (use_mmap) {
+    // Stage 2b-2: aliased-stream mode — free this layer's imported buffer and
+    // decommit its pages to reclaim RAM. free_layer_aliased re-points the layer's
+    // tensors back at the dummy buffer while keeping their stable data pointer, so
+    // the graph allocator stays happy and the layer can be rebuilt in place.
+    if (aliased_streaming) {
+        free_layer_aliased(layer_idx);
+        entries[layer_idx].resident = false;
+        if (resident_bytes >= entries[layer_idx].memory_size) {
+            resident_bytes -= entries[layer_idx].memory_size;
+        }
+        return;
+    }
+
+    // Mirror ensure_layer_resident: mmap-aliased weights freed their pages via
+    // the mmap release below; separate device/host-visible buffers (Vulkan/CUDA,
+    // incl. under mmap) need their tiles decommitted to free physical memory.
+    bool layer_needs_upload = false;
+    for (const auto & loc : it->second) {
+        if (!loc.tensor) continue;
+        const uint8_t * mmap_src =
+            (loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx])
+            ? mmap_bases[loc.file_idx] + loc.file_offset : nullptr;
+        if ((const void *) loc.tensor->data != (const void *) mmap_src) {
+            layer_needs_upload = true;
+            break;
+        }
+    }
+
+    // For mmap-aliased weights: release physical pages back to OS.
+    // (Non-aliased/device-buffer layers already discarded their mmap source
+    // pages right after the upload in ensure_layer_resident, so skip them here.)
+    if (use_mmap && !layer_needs_upload) {
         for (const auto & loc : it->second) {
             if (!loc.tensor || !loc.tensor->data) continue;
 #ifdef _WIN32
@@ -297,9 +485,11 @@ void layer_window_manager::evict_layer(int layer_idx) {
 #endif
         }
     }
-    // For non-mmap: decommit GPU tiles (reserved resource) to free physical memory
+    // For separate device/host-visible buffers (Vulkan/CUDA, including under
+    // mmap): decommit tiles to free physical memory (no-op if the backend has
+    // no decommit fn registered).
     // SOFT_EVICT: skip the GPU unmap but still do bookkeeping — isolates tile unmap bugs
-    if (!use_mmap && !lw_soft_evict()) {
+    if (layer_needs_upload && !lw_soft_evict()) {
         for (const auto & loc : it->second) {
             if (!loc.tensor) continue;
             ggml_backend_tensor_decommit(loc.tensor);
@@ -364,6 +554,11 @@ void layer_window_manager::evict_to_budget(int protected_layer) {
 bool layer_window_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     layer_window_manager * lwm = (layer_window_manager *)user_data;
     if (!lwm || lwm->budget_bytes == 0) return false;
+    // Stage 1: aliased cache keeps every layer resident in imported anonymous
+    // buffers, so compute reads them directly — no per-token load/evict. In
+    // Stage 2b-2 streaming mode the cache is partial, so DON'T early-return:
+    // fall through to on-demand build/evict.
+    if (lwm->aliased_cache && !lwm->aliased_streaming) return false;
 
     int layer = layer_window_manager::get_layer_from_tensor(t);
 
@@ -498,6 +693,374 @@ void layer_window_manager::mark_initially_resident() {
             resident_bytes += entries[i].memory_size;
         }
     }
+}
+
+// Stage 1: convert each layer's weights into a per-layer ANONYMOUS host buffer
+// that is imported (zero-copy) into the backend, then re-point the layer's
+// tensors at the imported buffer. Used when the backend cannot alias the
+// file-backed mmap directly and has no sparse residency (AMD Vulkan/Windows).
+bool layer_window_manager::convert_layers_to_aliased_cache() {
+#ifdef _WIN32
+    if (budget_bytes == 0 || layer_tensors.empty()) return false;
+
+    // Stage 2b-2: in aliased-stream load mode with a real budget that doesn't fit
+    // every layer, build ONLY the initially-resident (should_load) layers and leave
+    // the rest on the dummy buffer to be streamed on demand. Capture the dummy
+    // buffer so evicted layers can be re-pointed at it (valid buft for graph_reserve).
+    bool streaming = false;
+    if (aliased_load_mode) {
+        for (auto & [layer_idx, locs] : layer_tensors) {
+            for (auto & loc : locs) {
+                if (loc.tensor && loc.tensor->buffer) { alias_dummy_buf = (void *) loc.tensor->buffer; break; }
+            }
+            if (alias_dummy_buf) break;
+        }
+        int fit = get_initial_resident_count();
+        streaming = (fit < total_layers);
+    }
+
+    size_t converted_layers = 0;
+    for (auto & [layer_idx, locs] : layer_tensors) {
+        if (locs.empty()) continue;
+        if (streaming && !should_load_layer(layer_idx)) {
+            // Deferred: reserve a stable VA + set data pointers so the graph
+            // allocator treats these weights as pre-allocated (skips them). No
+            // physical/commit cost until the layer is streamed in on demand.
+            alloc_layer_va(layer_idx);
+            continue;
+        }
+        if (build_layer_aliased(layer_idx)) converted_layers++;
+    }
+
+    if (converted_layers > 0) {
+        aliased_cache     = true;
+        aliased_streaming = streaming;
+        if (streaming) {
+            printf("layer_window: aliased-cache active (streaming) — %zu of %d layers built into "
+                   "imported anonymous buffers; %d deferred (stream on demand)\n",
+                   converted_layers, total_layers, total_layers - (int)converted_layers);
+        } else {
+            printf("layer_window: aliased-cache active — %zu layers converted to imported "
+                   "anonymous buffers, zero-copy compute\n", converted_layers);
+        }
+        fflush(stdout);
+    }
+    return aliased_cache;
+#else
+    return false;
+#endif
+}
+
+// Stage 2b-2: reserve a stable per-layer VA (no physical/commit cost) and point
+// each of the layer's weight tensors' data into it. Deferred weights then look
+// "pre-allocated" to the graph allocator (data != NULL) so gallocr skips them,
+// yet cost no RAM until the layer is committed (build_layer_aliased). Idempotent.
+bool layer_window_manager::alloc_layer_va(int layer_idx) {
+#ifdef _WIN32
+    if (layer_alias_anon.count(layer_idx)) return true;  // already reserved
+
+    auto it = layer_tensors.find(layer_idx);
+    if (it == layer_tensors.end() || it->second.empty()) return false;
+    auto & locs = it->second;
+
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+
+    // Derive alignment from the first tensor's buffer (dummy Vulkan buffer at load).
+    ggml_tensor * t0 = nullptr;
+    for (auto & loc : locs) { if (loc.tensor && loc.tensor->buffer) { t0 = loc.tensor; break; } }
+    if (!t0) return false;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t0->buffer);
+    size_t align = ggml_backend_buft_get_alignment(buft);
+    if (align == 0) align = 256;
+
+    // Pack tensors densely with buft alignment; compute the total reserved size.
+    // Under MoE expert-streaming, expert weight matrices are excluded here (kept
+    // non-resident on the dummy buffer); the gather serves them from mmap.
+    const bool moe_stream = lw_moe_expert_stream();
+    std::vector<size_t> packed_off(locs.size(), 0);
+    size_t packed = 0;
+    for (size_t i = 0; i < locs.size(); i++) {
+        if (!locs[i].tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(locs[i].name)) continue;
+        packed = (packed + align - 1) & ~(align - 1);
+        packed_off[i] = packed;
+        packed += locs[i].n_bytes;
+    }
+    const size_t total = (packed + align - 1) & ~(align - 1);
+    if (total == 0) return false;
+
+    // Reserve VA only — no physical pages, no commit charge until committed.
+    void * anon = VirtualAlloc(nullptr, total, MEM_RESERVE_, PAGE_RW_);
+    if (!anon) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(RESERVE %zu) failed for layer %d\n", total, layer_idx);
+        return false;
+    }
+
+    // Set each tensor's data into the reserved VA (stable across residency cycles).
+    for (size_t i = 0; i < locs.size(); i++) {
+        if (!locs[i].tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(locs[i].name)) continue;
+        locs[i].tensor->data = (uint8_t *) anon + packed_off[i];
+    }
+
+    layer_alias_anon[layer_idx] = anon;
+    layer_alias_size[layer_idx] = total;
+    return true;
+#else
+    (void) layer_idx;
+    return false;
+#endif
+}
+
+// Build one layer's aliased buffer: ensure its VA is reserved, COMMIT the pages,
+// fill from mmap/file, import zero-copy, and re-point the layer's tensors' buffer
+// at the imported buffer (data is already set by alloc_layer_va). Idempotent — if
+// the layer is already resident (has an imported buffer), returns true.
+bool layer_window_manager::build_layer_aliased(int layer_idx) {
+#ifdef _WIN32
+    if (layer_alias_buf.count(layer_idx)) return true;  // already resident
+    if (!alloc_layer_va(layer_idx)) return false;
+
+    auto it = layer_tensors.find(layer_idx);
+    if (it == layer_tensors.end() || it->second.empty()) return false;
+    auto & locs = it->second;
+
+    const unsigned long MEM_COMMIT_   = 0x00001000;
+    const unsigned long MEM_DECOMMIT_ = 0x00004000;
+    const unsigned long PAGE_RW_      = 0x04;
+
+    void * anon  = layer_alias_anon[layer_idx];
+    size_t total = layer_alias_size[layer_idx];
+
+    // Derive device from the first tensor's (dummy) buffer.
+    ggml_tensor * t0 = nullptr;
+    for (auto & loc : locs) { if (loc.tensor && loc.tensor->buffer) { t0 = loc.tensor; break; } }
+    if (!t0) return false;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t0->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (!dev) return false;
+
+    // Commit the reserved pages (physical RAM allocated here).
+    if (!VirtualAlloc(anon, total, MEM_COMMIT_, PAGE_RW_)) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(COMMIT %zu) failed for layer %d\n", total, layer_idx);
+        return false;
+    }
+
+    // Fill each tensor from mmap (preferred) or by streaming from the GGUF file,
+    // writing directly to the stable data pointer set by alloc_layer_va. Under
+    // MoE expert-streaming, expert weight matrices are skipped (never resident;
+    // the gather serves them from mmap) and excluded from the imported buffer.
+    const bool moe_stream = lw_moe_expert_stream();
+    size_t max_tsize = 0;
+    bool fill_ok = true;
+    for (auto & loc : locs) {
+        if (!loc.tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(loc.name)) continue;
+        if (loc.n_bytes > max_tsize) max_tsize = loc.n_bytes;
+        void * dst = loc.tensor->data;
+        const bool have_mmap = loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
+        if (have_mmap) {
+            memcpy(dst, mmap_bases[loc.file_idx] + loc.file_offset, loc.n_bytes);
+        } else if (!read_tensor_bytes(loc.file_idx, loc.file_offset, loc.n_bytes, dst)) {
+            fprintf(stderr, "LW-ALIAS: failed to fill layer %d tensor %s\n", layer_idx, loc.name.c_str());
+            fill_ok = false;
+            break;
+        }
+    }
+    if (!fill_ok) { VirtualFree(anon, total, MEM_DECOMMIT_); return false; }
+
+    // Import the committed anonymous buffer into the backend (zero-copy alias).
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, max_tsize);
+    if (!buf) {
+        fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed for layer %d (%zu bytes)\n", layer_idx, total);
+        VirtualFree(anon, total, MEM_DECOMMIT_);
+        return false;
+    }
+
+    // Re-point the layer's weight tensors at the imported buffer (data unchanged).
+    for (auto & loc : locs) {
+        if (!loc.tensor) continue;
+        if (moe_stream && lw_is_streamed_expert_weight(loc.name)) continue;
+        loc.tensor->buffer = buf;
+    }
+
+    layer_alias_buf[layer_idx] = (void *) buf;
+    return true;
+#else
+    (void) layer_idx;
+    return false;
+#endif
+}
+
+// Evict one layer: destroy the imported backend buffer, re-point the layer's
+// tensors back at the dummy 0-size buffer (keeping their stable data pointer),
+// then DECOMMIT the pages to reclaim physical RAM. The VA stays reserved so the
+// data pointer remains valid for the graph allocator; it is never dereferenced
+// while the layer is non-resident (windowing guarantees ops run only when it is).
+void layer_window_manager::free_layer_aliased(int layer_idx) {
+#ifdef _WIN32
+    const unsigned long MEM_DECOMMIT_ = 0x00004000;
+
+    // Re-point tensors off the imported buffer BEFORE freeing it (data stays).
+    auto it = layer_tensors.find(layer_idx);
+    if (it != layer_tensors.end()) {
+        for (auto & loc : it->second) {
+            if (loc.tensor) loc.tensor->buffer = (ggml_backend_buffer_t) alias_dummy_buf;
+        }
+    }
+    auto bit = layer_alias_buf.find(layer_idx);
+    if (bit != layer_alias_buf.end()) {
+        ggml_backend_buffer_free((ggml_backend_buffer_t) bit->second);
+        layer_alias_buf.erase(bit);
+    }
+    // Decommit physical pages but keep the VA reserved (data pointer stays valid).
+    auto ait = layer_alias_anon.find(layer_idx);
+    auto sit = layer_alias_size.find(layer_idx);
+    if (ait != layer_alias_anon.end() && sit != layer_alias_size.end()) {
+        VirtualFree(ait->second, sit->second, MEM_DECOMMIT_);
+    }
+#else
+    (void) layer_idx;
+#endif
+}
+
+
+// Stage 2a: migrate one residual GPU-resident weight (non-blk.* tensor sharing the
+// big layer buffer, e.g. output.weight) into its own imported anonymous buffer.
+bool layer_window_manager::migrate_residual_tensor(ggml_tensor * t) {
+#ifdef _WIN32
+    if (!t || !t->buffer) return false;
+
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+    const unsigned long MEM_RELEASE_ = 0x8000;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    if (!dev) return false;
+    size_t align = ggml_backend_buft_get_alignment(buft);
+    if (align == 0) align = 256;
+
+    const size_t nbytes = ggml_nbytes(t);
+    if (nbytes == 0) return false;
+    const size_t total = (nbytes + align - 1) & ~(align - 1);
+
+    void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+    if (!anon) {
+        fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed migrating residual %s\n", total, t->name);
+        return false;
+    }
+
+    // Pull the tensor's current bytes back from the device into host memory.
+    ggml_backend_tensor_get(t, anon, 0, nbytes);
+
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, nbytes);
+    if (!buf) {
+        fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed migrating residual %s (%zu bytes)\n",
+                t->name, total);
+        VirtualFree(anon, 0, MEM_RELEASE_);
+        return false;
+    }
+
+    t->buffer = buf;
+    t->data   = anon;
+
+    alias_anon.push_back(anon);
+    alias_bufs.push_back((void *) buf);
+    return true;
+#else
+    (void) t;
+    return false;
+#endif
+}
+
+// ---- Stage 2b: load-time aliased streaming ----
+
+bool layer_window_manager::alias_stream_enabled() {
+    // Default ON; the caller additionally gates on a non-zero weight budget, so
+    // this only takes effect under --weight-budget. GGML_LW_ALIAS_STREAM=0 forces
+    // it off (non-alias path OOMs under a budget, so this is an escape hatch only).
+    static const int v = []() {
+        const char * e = getenv("GGML_LW_ALIAS_STREAM");
+        if (!e || !e[0]) return 1;            // unset -> default ON
+        return (e[0] != '0') ? 1 : 0;         // explicit override
+    }();
+    return v != 0;
+}
+
+bool layer_window_manager::aliased_load_pending = false;
+
+void layer_window_manager::record_non_layer_location(const std::string & name, uint16_t file_idx,
+                                                     size_t offset, size_t n_bytes, ggml_tensor * tensor) {
+    non_layer_locs.push_back({name, file_idx, offset, n_bytes, tensor, 0});
+}
+
+// Build imported anonymous buffers for every recorded non-layer GPU weight
+// (e.g. output.weight), filling from mmap/file. Each tensor gets its own buffer.
+// Returns the number successfully built.
+int layer_window_manager::build_non_layer_aliased() {
+#ifdef _WIN32
+    const unsigned long MEM_COMMIT_  = 0x00001000;
+    const unsigned long MEM_RESERVE_ = 0x00002000;
+    const unsigned long PAGE_RW_     = 0x04;
+    const unsigned long MEM_RELEASE_ = 0x8000;
+
+    int    built = 0;
+    size_t built_bytes = 0;
+    for (auto & loc : non_layer_locs) {
+        ggml_tensor * t = loc.tensor;
+        if (!t || !t->buffer) continue;
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+        if (!dev) continue;
+        size_t align = ggml_backend_buft_get_alignment(buft);
+        if (align == 0) align = 256;
+
+        const size_t total = (loc.n_bytes + align - 1) & ~(align - 1);
+        if (total == 0) continue;
+
+        void * anon = VirtualAlloc(nullptr, total, MEM_COMMIT_ | MEM_RESERVE_, PAGE_RW_);
+        if (!anon) {
+            fprintf(stderr, "LW-ALIAS: VirtualAlloc(%zu) failed for non-layer %s\n", total, loc.name.c_str());
+            continue;
+        }
+
+        const bool have_mmap = loc.file_idx < mmap_bases.size() && mmap_bases[loc.file_idx];
+        if (have_mmap) {
+            memcpy(anon, mmap_bases[loc.file_idx] + loc.file_offset, loc.n_bytes);
+        } else if (!read_tensor_bytes(loc.file_idx, loc.file_offset, loc.n_bytes, anon)) {
+            fprintf(stderr, "LW-ALIAS: failed to fill non-layer %s\n", loc.name.c_str());
+            VirtualFree(anon, 0, MEM_RELEASE_);
+            continue;
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, anon, total, loc.n_bytes);
+        if (!buf) {
+            fprintf(stderr, "LW-ALIAS: buffer_from_host_ptr failed for non-layer %s (%zu bytes)\n",
+                    loc.name.c_str(), total);
+            VirtualFree(anon, 0, MEM_RELEASE_);
+            continue;
+        }
+
+        t->buffer = buf;
+        t->data   = anon;
+        alias_anon.push_back(anon);
+        alias_bufs.push_back((void *) buf);
+        built++;
+        built_bytes += total;
+    }
+    if (built > 0) {
+        printf("layer_window: built %d non-layer weight(s) (%.1f MiB) into imported anonymous buffers\n",
+               built, built_bytes / (1024.0 * 1024.0));
+        fflush(stdout);
+    }
+    return built;
+#else
+    return 0;
+#endif
 }
 
 void layer_window_manager::release_mmap_pages() {

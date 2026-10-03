@@ -13,6 +13,9 @@
 
 groupshared float partial[GROUP_SIZE];
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tid = gtid.x;
@@ -30,10 +33,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint src0_base = src0_offset + row * nb01 + i2_src0 * nb02 + i3_src0 * nb03;
     uint src1_base = src1_offset + i2 * nb12 + i3 * nb13;
     bool src0_pair_aligned = (src0_base & 3u) == 0;
+    bool src0_k_contig = (nb00 == src0_esize);
 
     precise float acc = 0.0f;
 
-    if (src0_esize == 2 && nb10 == 4 && src0_pair_aligned) {
+    if (!src0_k_contig) {
+        // Permuted src0 (e.g. V-cache permuted view for V·softmax(QK^T) when
+        // -fa 0): per-element scalar loads using nb00 / nb10.
+        for (uint k = tid; k < K; k += GROUP_SIZE) {
+            float w = load_auto(src0, src0_base + k * nb00, src0_esize);
+            float x = load_auto(src1, src1_base + k * nb10, src1_esize);
+            acc = mad(w, x, acc);
+        }
+    } else if (src0_esize == 2 && nb10 == 4 && src0_pair_aligned) {
         // F16 weights + contiguous F32 input: paired loads + mad()
         uint k = tid * 2;
         for (; k + 1 < K; k += GROUP_SIZE * 2) {
@@ -134,15 +146,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // Hybrid reduction: wave intrinsics first, then cross-wave via shared memory
     float wave_sum = WaveActiveSum(acc);
 
-    uint wave_id = tid / WARP_SIZE;
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
+    uint lane_count = WaveGetLaneCount();
+    uint wave_id = tid / lane_count;
+    uint num_waves = (GROUP_SIZE + lane_count - 1) / lane_count;
 
     if (WaveIsFirstLane()) {
         partial[wave_id] = wave_sum;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (num_waves <= WARP_SIZE) {
+    if (num_waves <= lane_count) {
         if (tid < num_waves) {
             float v = partial[tid];
             v = WaveActiveSum(v);

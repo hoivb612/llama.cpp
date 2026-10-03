@@ -3,8 +3,9 @@
 // One thread group per row over (ne1, ne2, ne3); ne0 elements per row.
 #include "ggml_common.hlsli"
 
-groupshared float wave_sums[16];
+groupshared float wave_sums[32];
 
+WAVE_SIZE_ATTR
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
@@ -18,8 +19,9 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
 
     float eps = op_param_f32(0);
     uint local_id = gtid.x;
-    uint wave_count = 256 / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     precise float local_sum = 0.0f;
     for (uint i0 = local_id; i0 < ne00; i0 += 256) {
@@ -35,12 +37,10 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     GroupMemoryBarrierWithGroupSync();
 
     float total = 0.0f;
-    if (local_id < wave_count) {
-        total = wave_sums[local_id];
-    }
-    total = WaveActiveSum(total);
     if (local_id == 0) {
-        wave_sums[0] = total;
+        float acc = wave_sums[0];
+        for (uint w = 1; w < wave_count; ++w) acc += wave_sums[w];
+        wave_sums[0] = acc;
     }
     GroupMemoryBarrierWithGroupSync();
     total = wave_sums[0];

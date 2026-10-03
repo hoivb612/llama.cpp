@@ -11,8 +11,12 @@
 
 #include "ggml_common.hlsli"
 
+#ifndef TILE_KV
 #define TILE_KV 256
+#endif
+#ifndef GROUP_SIZE
 #define GROUP_SIZE 256
+#endif
 
 groupshared float s_scores[TILE_KV];
 groupshared float s_reduce[GROUP_SIZE];

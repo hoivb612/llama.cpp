@@ -37,8 +37,10 @@ uint read_u32_fast(ByteAddressBuffer buf, uint byte_off) {
     uint aligned = byte_off & ~3u;
     uint shift = (byte_off & 3u) * 8u;
     uint lo = buf.Load(aligned);
-    if (shift == 0u) return lo;
-    uint hi = buf.Load(aligned + 4u);
+    uint hi = buf.Load(aligned + (shift == 0u ? 0u : 4u));
+    if (shift == 0u) {
+        return lo;
+    }
     return (lo >> shift) | (hi << (32u - shift));
 }
 
@@ -47,6 +49,9 @@ float read_f16_v(ByteAddressBuffer buf, uint byte_off) {
     return f16_to_f32((word >> ((byte_off & 2u) * 8u)) & 0xFFFFu);
 }
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     uint i0 = group_x_2d(group_id);

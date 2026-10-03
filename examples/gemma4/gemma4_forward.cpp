@@ -1,0 +1,2575 @@
+#include "gemma4_forward.h"
+#include "gemma4_kernels.h"
+#include "gemma4_kvcache.h"
+#include "gemma4_moe.h"
+#include "gemma4_expert_store.h"
+#include "gemma4_weights.h"
+
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "llama.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <random>
+#include <sstream>
+#include <vector>
+
+namespace gemma4 {
+
+// ---------------------------------------------------------------------
+// G6.1 - threshold-guarded data-parallel for over the persistent attn pool.
+// ---------------------------------------------------------------------
+// Splits an index space [0,n) into W contiguous [lo,hi) sub-ranges (one per
+// pool worker, main-as-worker) and runs `body(lo,hi)` on each. Falls back to
+// an inline serial call when n*work_per_unit is below the pool wakeup
+// break-even, so the single-token decode path is never slowed. The body must
+// be data-parallel over the index (no cross-index reduction) so the result is
+// bit-identical to the equivalent serial loop.
+namespace {
+struct ParForCtx {
+    std::size_t n;
+    const std::function<void(std::size_t, std::size_t)> * body;
+};
+void parfor_trampoline(int wid, int W, void * ud) {
+    auto * c = static_cast<ParForCtx *>(ud);
+    const std::size_t n     = c->n;
+    const std::size_t chunk = (n + (std::size_t) W - 1) / (std::size_t) W;
+    const std::size_t lo    = std::min((std::size_t) wid * chunk, n);
+    const std::size_t hi    = std::min(lo + chunk, n);
+    if (lo < hi) (*c->body)(lo, hi);
+}
+} // namespace
+
+static inline void parallel_for(MatmulCtx * mm, std::size_t n,
+                                std::size_t work_per_unit,
+                                const std::function<void(std::size_t, std::size_t)> & body) {
+    if (n == 0) return;
+    constexpr std::size_t kParWork = 1u << 15;  // ~32K element-ops break-even
+    if (!mm || n * work_per_unit < kParWork) { body(0, n); return; }
+    ParForCtx c{ n, &body };
+    attn_pool_run(*mm, &parfor_trampoline, &c);
+}
+
+// ---------------------------------------------------------------------
+// Profiling (opt-in; zero overhead in the disabled fast path)
+// ---------------------------------------------------------------------
+//
+// Single-thread, gemma4-namespace-local counters. Each accumulator is
+// a sum of wall-clock nanoseconds spent in that stage across all
+// network_step calls since the last reset.
+namespace prof {
+
+struct Accum {
+    int64_t embed_ns      = 0;   // tok_embd lookup + sqrt(n_embd) scale
+    int64_t ple_ns        = 0;   // compute_per_layer_inputs
+    int64_t lf_total_ns   = 0;   // sum of layer_forward_f32_cached
+    int64_t lf_attn_norm_ns = 0;
+    int64_t lf_qproj_ns   = 0;
+    int64_t lf_kproj_ns   = 0;   // (skipped on reuse layers)
+    int64_t lf_vproj_ns   = 0;   // (skipped on reuse layers)
+    int64_t lf_qknv_norm_ns = 0; // q/k/v rms-per-head
+    int64_t lf_rope_ns    = 0;   // RoPE on Q + K
+    int64_t lf_attn_ns    = 0;   // softmax + Q.K + scores.V
+    int64_t lf_wo_ns      = 0;
+    int64_t lf_post_attn_ns = 0; // post_attn_norm + residual
+    int64_t lf_ffn_norm_ns  = 0;
+    int64_t lf_gate_ns    = 0;
+    int64_t lf_up_ns      = 0;
+    int64_t lf_gelu_mul_ns = 0;
+    int64_t lf_ffn_down_ns = 0;
+    int64_t lf_post_ffw_ns = 0;
+    int64_t lf_ple_ns     = 0;   // PLE inp_gate + proj + post_norm
+    int64_t lf_out_scale_ns = 0;
+    int64_t out_norm_ns   = 0;   // final output rmsnorm
+    int64_t lm_head_ns    = 0;   // tok_embd^T @ hidden
+    int64_t softcap_ns    = 0;   // 30 * tanh(x/30)
+};
+
+static bool  g_enabled = false;
+static Accum g_acc;
+
+using clk = std::chrono::steady_clock;
+
+struct Scope {
+    int64_t * counter;
+    clk::time_point t0;
+    Scope(int64_t * c) : counter(c) {
+        if (g_enabled && counter) t0 = clk::now();
+    }
+    ~Scope() {
+        if (g_enabled && counter) {
+            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clk::now() - t0).count();
+            *counter += dt;
+        }
+    }
+};
+
+} // namespace prof
+
+void profile_set_enabled(bool on) { prof::g_enabled = on; }
+void profile_reset()              { prof::g_acc = prof::Accum{}; }
+
+void profile_print(const char * tag, int n_step, int n_total_tokens) {
+    const auto & a = prof::g_acc;
+    auto ms = [](int64_t ns){ return (double) ns / 1.0e6; };
+    auto pct = [](int64_t part, int64_t whole){
+        return whole > 0 ? 100.0 * (double) part / (double) whole : 0.0;
+    };
+    const int64_t lf_sum = a.lf_attn_norm_ns + a.lf_qproj_ns + a.lf_kproj_ns
+        + a.lf_vproj_ns + a.lf_qknv_norm_ns + a.lf_rope_ns + a.lf_attn_ns
+        + a.lf_wo_ns + a.lf_post_attn_ns + a.lf_ffn_norm_ns + a.lf_gate_ns
+        + a.lf_up_ns + a.lf_gelu_mul_ns + a.lf_ffn_down_ns + a.lf_post_ffw_ns
+        + a.lf_ple_ns + a.lf_out_scale_ns;
+    const int64_t total = a.embed_ns + a.ple_ns + a.lf_total_ns
+        + a.out_norm_ns + a.lm_head_ns + a.softcap_ns;
+    std::fprintf(stderr,
+        "\ngemma4 profile [%s] over %d step(s), %d total token(s):\n",
+        tag, n_step, n_total_tokens);
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "embed",       ms(a.embed_ns),    pct(a.embed_ns,    total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "ple",         ms(a.ple_ns),      pct(a.ple_ns,      total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "layer_loop",  ms(a.lf_total_ns), pct(a.lf_total_ns, total));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "attn_norm",     ms(a.lf_attn_norm_ns),  pct(a.lf_attn_norm_ns,  lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "Q proj (wq)",   ms(a.lf_qproj_ns),      pct(a.lf_qproj_ns,      lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "K proj (wk)",   ms(a.lf_kproj_ns),      pct(a.lf_kproj_ns,      lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "V proj (wv)",   ms(a.lf_vproj_ns),      pct(a.lf_vproj_ns,      lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "q/k/v rms-norm", ms(a.lf_qknv_norm_ns),  pct(a.lf_qknv_norm_ns,  lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "RoPE (Q+K)",    ms(a.lf_rope_ns),       pct(a.lf_rope_ns,       lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "attention",     ms(a.lf_attn_ns),       pct(a.lf_attn_ns,       lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "wo",            ms(a.lf_wo_ns),         pct(a.lf_wo_ns,         lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "post_attn+res", ms(a.lf_post_attn_ns),  pct(a.lf_post_attn_ns,  lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_norm",      ms(a.lf_ffn_norm_ns),   pct(a.lf_ffn_norm_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_gate",      ms(a.lf_gate_ns),       pct(a.lf_gate_ns,       lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_up",        ms(a.lf_up_ns),         pct(a.lf_up_ns,         lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "gelu*up",       ms(a.lf_gelu_mul_ns),   pct(a.lf_gelu_mul_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "ffn_down",      ms(a.lf_ffn_down_ns),   pct(a.lf_ffn_down_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "post_ffw+res",  ms(a.lf_post_ffw_ns),   pct(a.lf_post_ffw_ns,   lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "PLE merge",     ms(a.lf_ple_ns),        pct(a.lf_ple_ns,        lf_sum));
+    std::fprintf(stderr, "    %-20s %10.2f ms  (%5.1f%%)\n", "out_scale",     ms(a.lf_out_scale_ns),  pct(a.lf_out_scale_ns,  lf_sum));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "out_norm",    ms(a.out_norm_ns), pct(a.out_norm_ns, total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "lm_head",     ms(a.lm_head_ns),  pct(a.lm_head_ns,  total));
+    std::fprintf(stderr, "  %-22s %10.2f ms  (%5.1f%%)\n", "softcap",     ms(a.softcap_ns),  pct(a.softcap_ns,  total));
+    std::fprintf(stderr, "  ---------------------- %10.2f ms\n", ms(total));
+    if (n_total_tokens > 0 && n_step > 0) {
+        std::fprintf(stderr, "  per token (mean)       %10.2f ms\n",
+                     ms(total) / (double) n_total_tokens);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Copy an F32 tensor's contents into a std::vector<float>.
+bool copy_f32(const ggml_tensor * t, std::vector<float> & out, std::string & err) {
+    if (!t) { err = "copy_f32: tensor is null"; return false; }
+    if (t->type != GGML_TYPE_F32) {
+        std::ostringstream ss;
+        ss << "copy_f32: tensor '" << (t->name[0] ? t->name : "?") << "' has type "
+           << ggml_type_name(t->type) << ", expected F32";
+        err = ss.str();
+        return false;
+    }
+    const int64_t n = ggml_nelements(t);
+    out.assign((size_t) n, 0.0f);
+    std::memcpy(out.data(), t->data, (size_t) n * sizeof(float));
+    return true;
+}
+
+// Dequantize a (possibly K-quant) tensor into a contiguous F32 buffer of
+// ggml_nelements(t) elements.
+bool dequant_f32(const ggml_tensor * t, std::vector<float> & out, std::string & err) {
+    if (!t) { err = "dequant_f32: tensor is null"; return false; }
+    const int64_t n = ggml_nelements(t);
+    out.assign((size_t) n, 0.0f);
+
+    if (t->type == GGML_TYPE_F32) {
+        std::memcpy(out.data(), t->data, (size_t) n * sizeof(float));
+        return true;
+    }
+
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    if (!traits || !traits->to_float) {
+        std::ostringstream ss;
+        ss << "dequant_f32: no to_float for type " << ggml_type_name(t->type);
+        err = ss.str();
+        return false;
+    }
+
+    // Dequant row-by-row using row stride from ggml.
+    const int64_t ne0 = t->ne[0];
+    const int64_t n_rows = n / ne0;
+    const size_t  row_bytes_src = ggml_row_size(t->type, ne0);
+    const uint8_t * src = (const uint8_t *) t->data;
+    float * dst = out.data();
+    for (int64_t r = 0; r < n_rows; ++r) {
+        traits->to_float(src + (size_t) r * row_bytes_src,
+                         dst + (size_t) r * ne0,
+                         (int) ne0);
+    }
+    return true;
+}
+
+// Hand-coded matmul matching ggml_mul_mat semantics.
+//   W: [K, M]   stored row-major in std::vector with W[m*K + k]
+//   x: [K, N]   x[n*K + k]
+//   out: [M, N] out[n*M + m] = sum_k W[m*K+k] * x[n*K+k]
+void matmul_f32(const float * W, const float * x, float * out,
+                int K, int M, int N) {
+    for (int n = 0; n < N; ++n) {
+        const float * xn = x + (size_t) n * K;
+        float * outn = out + (size_t) n * M;
+        for (int m = 0; m < M; ++m) {
+            const float * wm = W + (size_t) m * K;
+            double s = 0.0;  // accumulate in double for numeric stability
+            for (int k = 0; k < K; ++k) {
+                s += (double) wm[k] * (double) xn[k];
+            }
+            outn[m] = (float) s;
+        }
+    }
+}
+
+// Convenience to create+init an F32 ggml tensor inside an oracle context.
+ggml_tensor * new_f32_2d(ggml_context * gctx, int64_t d0, int64_t d1, const float * src) {
+    ggml_tensor * t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d0, d1);
+    if (src) std::memcpy(t->data, src, (size_t) d0 * d1 * sizeof(float));
+    return t;
+}
+ggml_tensor * new_f32_1d(ggml_context * gctx, int64_t d0, const float * src) {
+    ggml_tensor * t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, d0);
+    if (src) std::memcpy(t->data, src, (size_t) d0 * sizeof(float));
+    return t;
+}
+
+// First-mismatch diagnostic.
+bool compare_f32(const char * tag, const float * a, const float * b, size_t n,
+                 float atol, float rtol, std::string & err) {
+    float max_abs = 0.0f;
+    size_t worst_i = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float ai = a[i], bi = b[i];
+        const float d = std::fabs(ai - bi);
+        if (d > max_abs) { max_abs = d; worst_i = i; }
+        const float tol = atol + rtol * std::fabs(bi);
+        if (!(d <= tol)) {
+            std::ostringstream ss;
+            ss << tag << ": mismatch @i=" << i
+               << " hand=" << ai << " oracle=" << bi
+               << " |delta|=" << d << " tol=" << tol;
+            err = ss.str();
+            return false;
+        }
+    }
+    std::fprintf(stderr, "  %-24s OK  max_abs=%.3e (i=%zu)\n", tag, max_abs, worst_i);
+    return true;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------
+// dequant_layer
+// ---------------------------------------------------------------------
+
+bool dequant_layer(const llama_model * model, const Weights & w_global,
+                   int il, LayerF32 & out, std::string & error,
+                   bool dequant_to_f32) {
+    (void) model;
+    if (il < 0 || il >= (int) w_global.layers.size()) {
+        error = "dequant_layer: il out of range";
+        return false;
+    }
+    const LayerWeights & L = w_global.layers[il];
+    // Gemma-4 shared-KV layers (kv_reuse_il >= 0) still have wk/wv tensors in
+    // the GGUF; we just won't dequant or use them. The earlier check that
+    // required has_kv has been removed -- shared-KV layers are now legal.
+
+    out = LayerF32{};
+    out.il        = il;
+    out.n_embd    = w_global.n_embd;
+    out.n_head    = w_global.n_head;
+    out.n_head_kv = L.n_head_kv;
+    out.head_dim  = L.head_dim;
+    out.n_ff      = L.n_ff;
+    out.n_embd_per_layer = w_global.n_embd_per_layer;
+    out.is_swa    = L.is_swa;
+    out.rms_eps   = w_global.rms_eps;
+    out.rope_base = L.is_swa ? w_global.rope_freq_base_swa : w_global.rope_freq_base;
+    out.rope_dim  = L.head_dim;
+    out.kv_reuse_il = L.kv_reuse_il;
+
+    // freq_factors: gemma4 uses rope_freqs only for non-SWA full-attn layers.
+    if (!L.is_swa && w_global.rope_freqs && w_global.rope_freqs->type == GGML_TYPE_F32) {
+        out.freq_factors = (const float *) w_global.rope_freqs->data;
+    } else {
+        out.freq_factors = nullptr;
+    }
+
+    if (!copy_f32(L.attn_norm,      out.attn_norm,      error)) return false;
+    if (!copy_f32(L.attn_q_norm,    out.attn_q_norm,    error)) return false;
+    if (!copy_f32(L.attn_k_norm,    out.attn_k_norm,    error)) return false;
+    if (!copy_f32(L.post_attn_norm, out.post_attn_norm, error)) return false;
+    if (!copy_f32(L.ffn_norm,       out.ffn_norm,       error)) return false;
+    if (!copy_f32(L.post_ffw_norm,  out.post_ffw_norm,  error)) return false;
+    // post_norm is a per-layer-embedding (PLE) tensor; absent on the 26B-A4B
+    // MoE variant (no PLE). Optional -- only consumed by the guarded PLE block.
+    if (L.post_norm) {
+        if (!copy_f32(L.post_norm,  out.post_norm,      error)) return false;
+    }
+
+    // Tensor pointers are ALWAYS populated -- the qquant path needs them
+    // even when the F32 vectors are skipped. Shared-KV layers also
+    // populate wk_t/wv_t for completeness (the forward never reads them).
+    out.wq_t       = L.wq;
+    out.wk_t       = L.wk;
+    out.wv_t       = L.wv;
+    out.wo_t       = L.wo;
+    out.ffn_gate_t = L.ffn_gate;
+    out.ffn_up_t   = L.ffn_up;
+    out.ffn_down_t = L.ffn_down;
+    out.inp_gate_t = L.inp_gate;
+    out.proj_t     = L.proj;
+
+    // MoE tensor pointers (populated for both dequant modes; the network
+    // path reads them directly, the F32 self-test path ignores them since
+    // it only exercises dense layers).
+    out.is_moe_layer  = L.is_moe_layer;
+    if (L.is_moe_layer) {
+        out.n_ff_exp      = w_global.n_ff_exp;
+        out.n_expert      = w_global.n_expert;
+        out.n_expert_used = w_global.n_expert_used;
+        out.moe_gate_inp     = L.ffn_gate_inp;
+        out.moe_gate_inp_s   = L.ffn_gate_inp_s;
+        out.moe_pre_norm_2   = L.ffn_pre_norm_2;
+        out.moe_post_norm_1  = L.ffn_post_norm_1;
+        out.moe_post_norm_2  = L.ffn_post_norm_2;
+        out.moe_gate_up_exps = L.ffn_gate_up_exps;
+        out.moe_gate_exps    = L.ffn_gate_exps;
+        out.moe_up_exps      = L.ffn_up_exps;
+        out.moe_down_exps    = L.ffn_down_exps;
+        out.moe_down_exps_s  = L.ffn_down_exps_s;
+    }
+
+    if (dequant_to_f32) {
+        if (!dequant_f32(L.wq,       out.wq,       error)) return false;
+        if (out.kv_reuse_il < 0) {
+            // Own KV: dequant K and (optional) V projection.
+            if (!dequant_f32(L.wk, out.wk, error)) return false;
+            if (L.has_v_proj) {
+                if (!dequant_f32(L.wv, out.wv, error)) return false;
+            }
+        }
+        // else: shared-KV layer -- skip wk/wv dequant (memory saver; they
+        // exist in the GGUF but upstream graph never reads them for these
+        // layers).
+        if (!dequant_f32(L.wo,       out.wo,       error)) return false;
+        if (!dequant_f32(L.ffn_gate, out.ffn_gate, error)) return false;
+        if (!dequant_f32(L.ffn_up,   out.ffn_up,   error)) return false;
+        if (!dequant_f32(L.ffn_down, out.ffn_down, error)) return false;
+        if (!copy_f32(L.inp_gate,    out.inp_gate, error)) return false;
+        if (!copy_f32(L.proj,        out.proj,     error)) return false;
+    }
+
+    if (L.layer_output_scale) {
+        std::vector<float> s;
+        if (!copy_f32(L.layer_output_scale, s, error)) return false;
+        if (s.size() == 1) {
+            out.has_layer_output_scale = true;
+            out.layer_output_scale     = s[0];
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Hand-coded F32 layer forward (cached version is the source of truth)
+// ---------------------------------------------------------------------
+//
+// Conventions for layer_forward_f32_cached:
+//   n_new          = number of new tokens this call (n_prompt for prefill,
+//                    1 for a decode step).
+//   n_past         = number of tokens already in K_cache (0 for prefill).
+//   n_total        = n_past + n_new
+//   pos_all[i]     = position of cached token i (i in [0..n_total))
+//   K_cache,V_cache: size [n_kv * n_total]. For an owning layer, this call
+//                    writes the new K (post-norm + post-RoPE) and V
+//                    (post-norm) at offset n_past * n_kv. For a reuse layer
+//                    (reuse_kv==true), the buffer is assumed already
+//                    populated by the earlier owning layer.
+//   n_swa          = SWA window. Only consulted for L.is_swa layers.
+//                    Pass INT32_MAX to disable (no SWA mask).
+//   mm             = optional matmul shim. When non-null, the four large
+//                    matmuls (Q proj, K proj, V proj, wo, FFN gate/up/down,
+//                    PLE inp_gate/proj) dispatch to matmul_qf32 using the
+//                    layer's raw (possibly quantized) ggml tensors. When
+//                    null (default; used by layer_self_test) the F32
+//                    matmul_f32 path runs against L.wq.data() etc.
+
+// Helper: dispatch a single (n_in -> n_out) @ n_cols matmul to either
+// matmul_qf32 (qquant path) or matmul_f32 (F32 fallback). Asserts that
+// the chosen back-end has its inputs populated.
+static bool dispatch_matmul(MatmulCtx * mm,
+                            const ggml_tensor * W_t,
+                            const float * W_f32,
+                            const float * x_in, float * y_out,
+                            int n_in, int n_out, int n_cols,
+                            const char * tag, std::string & error) {
+    if (mm) {
+        if (!W_t) {
+            error = std::string("dispatch_matmul: ") + tag + ": W_t is null in qquant path";
+            return false;
+        }
+        return matmul_qf32(*mm, W_t, x_in, y_out, n_in, n_out, n_cols, error);
+    }
+    if (!W_f32) {
+        error = std::string("dispatch_matmul: ") + tag + ": F32 weights empty in F32 path";
+        return false;
+    }
+    matmul_f32(W_f32, x_in, y_out, n_in, n_out, n_cols);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// G5.1 - parallelised per-head attention worker.
+//
+// Splits the n_new * n_head (t, h) pair space across W workers. Each worker
+// processes a disjoint contiguous range [lo, hi) in row-major order
+// (t-major, h-minor), so a serial run with W=1 enumerates pairs in exactly
+// the same order as the original nested loop -- bit-identical math.
+//
+// Each (t, h) reads shared read-only Q / K_cache / V_cache / pos_all and
+// writes ONLY to attn_ctx[t, h*head_dim : (h+1)*head_dim], so there is no
+// cross-worker data race on the output. The softmax scores buffer is
+// per-call local (one allocation per shard, reused across all pairs the
+// shard owns).
+// ---------------------------------------------------------------------------
+struct AttnJob {
+    int n_new;
+    int n_total;
+    int n_past;
+    int n_head;
+    int n_head_kv;
+    int head_dim;
+    int n_q;
+    int n_kv;
+    int n_swa;
+    bool apply_swa;
+    const int32_t * pos_all;
+    const float *   Q_data;
+    const float *   K_cache;
+    const float *   V_cache;
+    float *         attn_ctx;
+};
+
+static void attn_compute_shard(int wid, int W, void * ud) {
+    const AttnJob & j = *(const AttnJob *) ud;
+    // Reuse ggml's SIMD F32 dot for Q.K (same helper ggml_mul_mat would use),
+    // matching upstream's F32 attention accumulation instead of a scalar
+    // double-precision loop.
+    const struct ggml_type_traits_cpu * f32tr = ggml_get_type_traits_cpu(GGML_TYPE_F32);
+    const ggml_vec_dot_t f32_dot = f32tr ? f32tr->vec_dot : nullptr;
+    const long long total = (long long) j.n_new * (long long) j.n_head;
+    const int lo = (int) ((long long) wid       * total / W);
+    const int hi = (int) ((long long) (wid + 1) * total / W);
+    if (lo >= hi) return;
+
+    std::vector<float> scores((size_t) j.n_total, 0.0f);
+    std::vector<double> vacc((size_t) j.head_dim, 0.0);
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+
+    for (int idx = lo; idx < hi; ++idx) {
+        const int t = idx / j.n_head;
+        const int h = idx % j.n_head;
+        const int p_t = j.pos_all[j.n_past + t];
+        const int h_kv = h * j.n_head_kv / j.n_head;
+        const float * q_th = j.Q_data + (size_t) t * j.n_q + (size_t) h * j.head_dim;
+
+        float max_s = neg_inf;
+        for (int k = 0; k < j.n_total; ++k) {
+            const int p_k = j.pos_all[k];
+            const bool masked = (p_k > p_t) ||
+                                (j.apply_swa && (p_t - p_k >= j.n_swa));
+            if (masked) {
+                scores[k] = neg_inf;
+                continue;
+            }
+            const float * k_th = j.K_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
+            float sf;
+            if (f32_dot) {
+                f32_dot(j.head_dim, &sf, 0, k_th, 0, q_th, 0, 1);
+            } else {
+                double s = 0.0;
+                for (int d = 0; d < j.head_dim; ++d) s += (double) q_th[d] * (double) k_th[d];
+                sf = (float) s;
+            }
+            scores[k] = sf;
+            if (sf > max_s) max_s = sf;
+        }
+        double sum = 0.0;
+        for (int k = 0; k < j.n_total; ++k) {
+            if (scores[k] == neg_inf) {
+                scores[k] = 0.0f;
+            } else {
+                scores[k] = std::exp(scores[k] - max_s);
+                sum += (double) scores[k];
+            }
+        }
+        const float inv_sum = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+        for (int k = 0; k < j.n_total; ++k) scores[k] *= inv_sum;
+
+        // out[d] = sum_k scores[k] * V[k][d]. Accumulate with k outermost so
+        // the inner d-loop walks V[k] contiguously (cache-friendly, and the
+        // compiler auto-vectorizes the fma), instead of the transposed layout
+        // that strided V by n_kv on every element. The per-d double accumulator
+        // keeps the summation bit-identical to the original transposed loop
+        // (same ascending-k order per output element). Masked positions have
+        // scores[k] == 0 (set exactly in the softmax pass) so they are skipped.
+        float * out_th = j.attn_ctx + (size_t) t * j.n_q + (size_t) h * j.head_dim;
+        std::fill(vacc.begin(), vacc.end(), 0.0);
+        for (int k = 0; k < j.n_total; ++k) {
+            const float sc = scores[k];
+            if (sc == 0.0f) continue;
+            const float * v_th = j.V_cache + (size_t) k * j.n_kv + (size_t) h_kv * j.head_dim;
+            for (int d = 0; d < j.head_dim; ++d) vacc[d] += (double) sc * (double) v_th[d];
+        }
+        for (int d = 0; d < j.head_dim; ++d) out_th[d] = (float) vacc[d];
+    }
+}
+
+bool layer_forward_f32_cached(const LayerF32 & L,
+                              int n_new, int n_past, int n_swa,
+                              const float * hidden_in,
+                              const int32_t * pos_all,
+                              const float * per_layer_input,
+                              float * hidden_out,
+                              float * K_cache, float * V_cache,
+                              bool reuse_kv,
+                              MatmulCtx * mm,
+                              std::string & error) {
+    if (n_new <= 0) { error = "layer_forward_f32_cached: n_new<=0"; return false; }
+    if (n_past < 0) { error = "layer_forward_f32_cached: n_past<0"; return false; }
+    if (!K_cache || !V_cache) { error = "layer_forward_f32_cached: null K/V cache"; return false; }
+    if (reuse_kv && L.kv_reuse_il < 0) {
+        error = "layer_forward_f32_cached: reuse_kv=true for an own-KV layer";
+        return false;
+    }
+    if (!reuse_kv && L.kv_reuse_il >= 0) {
+        error = "layer_forward_f32_cached: shared-KV layer requires reuse_kv=true";
+        return false;
+    }
+
+    const int n_embd    = L.n_embd;
+    const int n_head    = L.n_head;
+    const int n_head_kv = L.n_head_kv;
+    const int head_dim  = L.head_dim;
+    const int n_ff      = L.n_ff;
+    const int n_epl     = L.n_embd_per_layer;
+    const int n_q       = n_head * head_dim;
+    const int n_kv      = n_head_kv * head_dim;
+    const int n_total   = n_past + n_new;
+    const float eps     = L.rms_eps;
+
+    // -------- attn_norm: norm1[t,:] = rmsnorm(hidden_in[t,:]) * attn_norm --
+    std::vector<float> norm1((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_attn_norm_ns);
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            rmsnorm_mul_f32(norm1.data() + t * n_embd,
+                            hidden_in + t * n_embd,
+                            L.attn_norm.data(), n_embd, eps);
+        }
+    });
+    }
+
+    // -------- Q = wq @ norm1, then q_norm + RoPE (always own) --------
+    std::vector<float> Q((size_t) n_q * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_qproj_ns);
+    if (!dispatch_matmul(mm, L.wq_t, L.wq.empty() ? nullptr : L.wq.data(),
+                         norm1.data(), Q.data(), n_embd, n_q, n_new,
+                         "wq", error)) return false;
+    }
+    { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
+    parallel_for(mm, (size_t) n_new, (size_t) n_q, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            rmsnorm_per_head_f32(Q.data() + t * n_q,
+                                 Q.data() + t * n_q,
+                                 L.attn_q_norm.data(), head_dim, n_head, eps);
+        }
+    });
+    }
+    { prof::Scope _s(&prof::g_acc.lf_rope_ns);
+    parallel_for(mm, (size_t) n_new, (size_t) n_q, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            const int p = pos_all[n_past + (int) t];
+            for (int h = 0; h < n_head; ++h) {
+                float * q_th = Q.data() + t * n_q + (size_t) h * head_dim;
+                rope_neox_f32(q_th, q_th, L.freq_factors,
+                              L.rope_dim, head_dim, p, L.rope_base);
+            }
+        }
+    });
+    }
+
+    // -------- K, V for new tokens (skip entirely on reuse layers) --------
+    if (!reuse_kv) {
+        float * K_new = K_cache + (size_t) n_past * n_kv;
+        float * V_new = V_cache + (size_t) n_past * n_kv;
+
+        { prof::Scope _s(&prof::g_acc.lf_kproj_ns);
+        if (!dispatch_matmul(mm, L.wk_t, L.wk.empty() ? nullptr : L.wk.data(),
+                             norm1.data(), K_new, n_embd, n_kv, n_new,
+                             "wk", error)) return false;
+        }
+
+        { prof::Scope _s(&prof::g_acc.lf_vproj_ns);
+        const bool has_wv = (L.wv_t != nullptr);
+        if (has_wv) {
+            if (!dispatch_matmul(mm, L.wv_t, L.wv.empty() ? nullptr : L.wv.data(),
+                                 norm1.data(), V_new, n_embd, n_kv, n_new,
+                                 "wv", error)) return false;
+        } else {
+            // V = K when wv missing; copy K_new -> V_new.
+            std::memcpy(V_new, K_new, (size_t) n_kv * n_new * sizeof(float));
+        }
+        }
+
+        { prof::Scope _s(&prof::g_acc.lf_qknv_norm_ns);
+        parallel_for(mm, (size_t) n_new, (size_t) n_kv * 2, [&](size_t lo, size_t hi){
+            for (size_t t = lo; t < hi; ++t) {
+                // K norm (per kv-head)
+                rmsnorm_per_head_f32(K_new + t * n_kv,
+                                     K_new + t * n_kv,
+                                     L.attn_k_norm.data(), head_dim, n_head_kv, eps);
+                // V norm (no weight, gemma4 quirk)
+                rmsnorm_per_head_f32(V_new + t * n_kv,
+                                     V_new + t * n_kv,
+                                     /*w=*/nullptr, head_dim, n_head_kv, eps);
+            }
+        });
+        }
+        // RoPE on K (new positions only)
+        { prof::Scope _s(&prof::g_acc.lf_rope_ns);
+        parallel_for(mm, (size_t) n_new, (size_t) n_kv, [&](size_t lo, size_t hi){
+            for (size_t t = lo; t < hi; ++t) {
+                const int p = pos_all[n_past + (int) t];
+                for (int h = 0; h < n_head_kv; ++h) {
+                    float * k_th = K_new + t * n_kv + (size_t) h * head_dim;
+                    rope_neox_f32(k_th, k_th, L.freq_factors,
+                                  L.rope_dim, head_dim, p, L.rope_base);
+                }
+            }
+        });
+        }
+    }
+
+    // -------- Self-attention over n_total cached positions --------
+    // scale = 1.0 (gemma4 hparams.f_attention_scale = 1.0).
+    std::vector<float> attn_ctx((size_t) n_q * n_new, 0.0f);
+    const bool apply_swa = L.is_swa;
+    { prof::Scope _s(&prof::g_acc.lf_attn_ns);
+    AttnJob job;
+    job.n_new      = n_new;
+    job.n_total    = n_total;
+    job.n_past     = n_past;
+    job.n_head     = n_head;
+    job.n_head_kv  = n_head_kv;
+    job.head_dim   = head_dim;
+    job.n_q        = n_q;
+    job.n_kv       = n_kv;
+    job.n_swa      = n_swa;
+    job.apply_swa  = apply_swa;
+    job.pos_all    = pos_all;
+    job.Q_data     = Q.data();
+    job.K_cache    = K_cache;
+    job.V_cache    = V_cache;
+    job.attn_ctx   = attn_ctx.data();
+    if (mm && get_attn_parallel()) {
+        // G5.1 - dispatch (t, h) pairs across mm.attn_pool. Each worker
+        // gets a disjoint slice of the n_new * n_head job space and writes
+        // to a disjoint slice of attn_ctx; the scores buffer is per-worker
+        // (stack-local inside attn_compute_shard). Bit-identical to the
+        // serial path: same dot-product / softmax / V-accum order per (t,h).
+        attn_pool_run(*mm, &attn_compute_shard, &job);
+    } else {
+        // Serial fallback (also exercised when --gemma4-attn-parallel 0):
+        // wid=0 covers the entire job space exactly like the original loop.
+        attn_compute_shard(0, 1, &job);
+    }
+    } // close attn scope
+
+    // -------- wo: attn_out = wo @ attn_ctx --------
+    std::vector<float> attn_out((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_wo_ns);
+    if (!dispatch_matmul(mm, L.wo_t, L.wo.empty() ? nullptr : L.wo.data(),
+                         attn_ctx.data(), attn_out.data(), n_q, n_embd, n_new,
+                         "wo", error)) return false;
+    }
+
+    // -------- post_attn_norm + residual1 --------
+    std::vector<float> attn_out2((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_post_attn_ns);
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            float * o = attn_out2.data() + t * n_embd;
+            rmsnorm_mul_f32(o, attn_out.data() + t * n_embd,
+                            L.post_attn_norm.data(), n_embd, eps);
+            const float * hin = hidden_in + t * n_embd;
+            for (int i = 0; i < n_embd; ++i) o[i] += hin[i];
+        }
+    });
+    }
+
+    // -------- FFN (dense) or MoE block --------
+    // Both produce ff_out [n_embd, n_new] = the pre-post_ffw_norm FFN result
+    // (dense: ffn_down output; MoE: cur_mlp + cur_moe). The shared
+    // post_ffw_norm + residual block below then finishes the layer.
+    std::vector<float> ff_out((size_t) n_embd * n_new, 0.0f);
+
+    if (L.is_moe_layer) {
+        if (!mm) { error = "layer_forward_f32_cached: MoE layer requires MatmulCtx"; return false; }
+        MoeInputs in;
+        in.il            = L.il;
+        in.n_embd        = n_embd;
+        in.n_ff          = n_ff;
+        in.n_ff_exp      = L.n_ff_exp;
+        in.n_expert      = L.n_expert;
+        in.n_expert_used = L.n_expert_used;
+        in.ffn_norm         = L.ffn_norm.data();
+        in.ffn_gate         = L.ffn_gate_t;
+        in.ffn_up           = L.ffn_up_t;
+        in.ffn_down         = L.ffn_down_t;
+        in.ffn_post_norm_1  = L.moe_post_norm_1;
+        in.ffn_pre_norm_2   = L.moe_pre_norm_2;
+        in.ffn_post_norm_2  = L.moe_post_norm_2;
+        in.ffn_gate_inp     = L.moe_gate_inp;
+        in.ffn_gate_inp_s   = L.moe_gate_inp_s;
+        in.ffn_gate_up_exps = L.moe_gate_up_exps;
+        in.ffn_gate_exps    = L.moe_gate_exps;
+        in.ffn_up_exps      = L.moe_up_exps;
+        in.ffn_down_exps    = L.moe_down_exps;
+        in.ffn_down_exps_s  = L.moe_down_exps_s;
+        prof::Scope _s(&prof::g_acc.lf_gate_ns);
+        if (!moe_ffn(*mm, in, attn_out2.data(), ff_out.data(), n_new, eps, error)) {
+            return false;
+        }
+    } else {
+        // -------- ffn_norm --------
+        std::vector<float> ff_in((size_t) n_embd * n_new, 0.0f);
+        { prof::Scope _s(&prof::g_acc.lf_ffn_norm_ns);
+        parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+            for (size_t t = lo; t < hi; ++t) {
+                rmsnorm_mul_f32(ff_in.data() + t * n_embd,
+                                attn_out2.data() + t * n_embd,
+                                L.ffn_norm.data(), n_embd, eps);
+            }
+        });
+        }
+
+        // -------- gate, up, gelu(gate)*up --------
+        std::vector<float> gate((size_t) n_ff * n_new, 0.0f);
+        std::vector<float> up  ((size_t) n_ff * n_new, 0.0f);
+        { prof::Scope _s(&prof::g_acc.lf_gate_ns);
+        if (!dispatch_matmul(mm, L.ffn_gate_t, L.ffn_gate.empty() ? nullptr : L.ffn_gate.data(),
+                             ff_in.data(), gate.data(), n_embd, n_ff, n_new,
+                             "ffn_gate", error)) return false;
+        }
+        { prof::Scope _s(&prof::g_acc.lf_up_ns);
+        if (!dispatch_matmul(mm, L.ffn_up_t, L.ffn_up.empty() ? nullptr : L.ffn_up.data(),
+                             ff_in.data(), up.data(), n_embd, n_ff, n_new,
+                             "ffn_up", error)) return false;
+        }
+        { prof::Scope _s(&prof::g_acc.lf_gelu_mul_ns);
+        float * g = gate.data(); const float * u = up.data();
+        parallel_for(mm, (size_t) n_ff * n_new, 1, [&](size_t lo, size_t hi){
+            gelu_f32(g + lo, g + lo, (int) (hi - lo));
+            for (size_t i = lo; i < hi; ++i) g[i] *= u[i];
+        });
+        }
+
+        // -------- ffn_down --------
+        { prof::Scope _s(&prof::g_acc.lf_ffn_down_ns);
+        if (!dispatch_matmul(mm, L.ffn_down_t, L.ffn_down.empty() ? nullptr : L.ffn_down.data(),
+                             gate.data(), ff_out.data(), n_ff, n_embd, n_new,
+                             "ffn_down", error)) return false;
+        }
+    }
+
+    // -------- post_ffw_norm + residual2 --------
+    std::vector<float> pe_in((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_post_ffw_ns);
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            float * o = pe_in.data() + t * n_embd;
+            rmsnorm_mul_f32(o, ff_out.data() + t * n_embd,
+                            L.post_ffw_norm.data(), n_embd, eps);
+            const float * a = attn_out2.data() + t * n_embd;
+            for (int i = 0; i < n_embd; ++i) o[i] += a[i];
+        }
+    });
+    }
+
+    // -------- PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice)) --
+    // Only present when the model has per-layer embeddings (E2B/E4B). The
+    // 26B-A4B MoE variant has no PLE (n_epl == 0, inp_gate/proj absent), so
+    // this whole block is skipped and pe_in flows straight to out_scale.
+    if (n_epl > 0 && L.inp_gate_t) {
+    prof::Scope _s(&prof::g_acc.lf_ple_ns);
+    std::vector<float> ple_a((size_t) n_epl * n_new, 0.0f);
+    if (!dispatch_matmul(mm, L.inp_gate_t, L.inp_gate.empty() ? nullptr : L.inp_gate.data(),
+                         pe_in.data(), ple_a.data(), n_embd, n_epl, n_new,
+                         "inp_gate", error)) return false;
+    { float * a = ple_a.data(); const float * s = per_layer_input;
+      parallel_for(mm, (size_t) n_epl * n_new, 1, [&](size_t lo, size_t hi){
+          gelu_f32(a + lo, a + lo, (int) (hi - lo));
+          for (size_t i = lo; i < hi; ++i) a[i] *= s[i];
+      });
+    }
+    std::vector<float> ple_b((size_t) n_embd * n_new, 0.0f);
+    if (!dispatch_matmul(mm, L.proj_t, L.proj.empty() ? nullptr : L.proj.data(),
+                         ple_a.data(), ple_b.data(), n_epl, n_embd, n_new,
+                         "proj", error)) return false;
+    parallel_for(mm, (size_t) n_new, (size_t) n_embd, [&](size_t lo, size_t hi){
+        for (size_t t = lo; t < hi; ++t) {
+            float * o = ple_b.data() + t * n_embd;
+            rmsnorm_mul_f32(o, o, L.post_norm.data(), n_embd, eps);
+            float * d = pe_in.data() + t * n_embd;
+            for (int i = 0; i < n_embd; ++i) d[i] += o[i];
+        }
+    });
+    }
+
+    // -------- layer_output_scale --------
+    { prof::Scope _s(&prof::g_acc.lf_out_scale_ns);
+    if (L.has_layer_output_scale) {
+        const float s = L.layer_output_scale;
+        for (size_t i = 0; i < (size_t) n_embd * n_new; ++i) {
+            pe_in[i] *= s;
+        }
+    }
+    }
+
+    std::memcpy(hidden_out, pe_in.data(), (size_t) n_embd * n_new * sizeof(float));
+    return true;
+}
+
+// Backwards-compatible G3.3 / G3.4a API: prefill-only (no past KV), no
+// SWA mask. Delegates to layer_forward_f32_cached with n_past=0 and
+// n_swa=INT32_MAX. The four optional KV pointers select between
+// "compute K/V into caller-supplied buffer" and "reuse caller-supplied K/V".
+bool layer_forward_f32(const LayerF32 & L,
+                       int n_tokens,
+                       const float * hidden_in,
+                       const int32_t * pos,
+                       const float * per_layer_input,
+                       float * hidden_out,
+                       std::string & error,
+                       float * kv_K_self_out,
+                       float * kv_V_self_out,
+                       const float * kv_K_reuse,
+                       const float * kv_V_reuse) {
+    const int n_kv = L.n_head_kv * L.head_dim;
+    const bool reuse = (kv_K_reuse != nullptr) && (kv_V_reuse != nullptr);
+
+    float * K_buf = nullptr;
+    float * V_buf = nullptr;
+    std::vector<float> K_local, V_local;
+
+    if (reuse) {
+        // Reuse path: caller already populated the buffer.
+        K_buf = const_cast<float *>(kv_K_reuse);
+        V_buf = const_cast<float *>(kv_V_reuse);
+    } else if (kv_K_self_out) {
+        K_buf = kv_K_self_out;
+        V_buf = kv_V_self_out;
+    } else {
+        K_local.assign((size_t) n_kv * n_tokens, 0.0f);
+        V_local.assign((size_t) n_kv * n_tokens, 0.0f);
+        K_buf = K_local.data();
+        V_buf = V_local.data();
+    }
+
+    return layer_forward_f32_cached(L, n_tokens, /*n_past=*/0,
+                                    /*n_swa=*/std::numeric_limits<int>::max(),
+                                    hidden_in, pos, per_layer_input,
+                                    hidden_out, K_buf, V_buf, reuse,
+                                    /*mm=*/nullptr, error);
+}
+
+// ---------------------------------------------------------------------
+// ggml-graph oracle
+// ---------------------------------------------------------------------
+
+bool oracle_layer_forward_f32(const LayerF32 & L,
+                              int n_tokens,
+                              const float * hidden_in,
+                              const int32_t * pos,
+                              const float * per_layer_input,
+                              float * hidden_out,
+                              std::string & error) {
+    if (n_tokens <= 0) { error = "oracle: n_tokens<=0"; return false; }
+    const int n_embd    = L.n_embd;
+    const int n_head    = L.n_head;
+    const int n_head_kv = L.n_head_kv;
+    const int head_dim  = L.head_dim;
+    const int n_ff      = L.n_ff;
+    const int n_epl     = L.n_embd_per_layer;
+    const int n_q       = n_head * head_dim;
+    const int n_kv      = n_head_kv * head_dim;
+    const float eps     = L.rms_eps;
+
+    // Generous arena: per-test, allocate ~1 GiB on heap.
+    std::vector<uint8_t> arena((size_t) 1ULL << 30);
+    ggml_init_params ip{ arena.size(), arena.data(), false };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) { error = "oracle: ggml_init failed"; return false; }
+
+    // Inputs.
+    ggml_tensor * t_x  = new_f32_2d(gctx, n_embd, n_tokens, hidden_in);
+    ggml_tensor * t_pl = new_f32_2d(gctx, n_epl,  n_tokens, per_layer_input);
+    ggml_tensor * t_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_tokens);
+    std::memcpy(t_pos->data, pos, (size_t) n_tokens * sizeof(int32_t));
+
+    // Weights.
+    ggml_tensor * t_attn_norm      = new_f32_1d(gctx, n_embd,  L.attn_norm.data());
+    ggml_tensor * t_attn_q_norm    = new_f32_1d(gctx, head_dim, L.attn_q_norm.data());
+    ggml_tensor * t_attn_k_norm    = new_f32_1d(gctx, head_dim, L.attn_k_norm.data());
+    ggml_tensor * t_post_attn_norm = new_f32_1d(gctx, n_embd,  L.post_attn_norm.data());
+    ggml_tensor * t_ffn_norm       = new_f32_1d(gctx, n_embd,  L.ffn_norm.data());
+    ggml_tensor * t_post_ffw_norm  = new_f32_1d(gctx, n_embd,  L.post_ffw_norm.data());
+    ggml_tensor * t_post_norm      = new_f32_1d(gctx, n_embd,  L.post_norm.data());
+
+    ggml_tensor * t_wq    = new_f32_2d(gctx, n_embd, n_q, L.wq.data());
+    ggml_tensor * t_wk    = new_f32_2d(gctx, n_embd, n_kv, L.wk.data());
+    ggml_tensor * t_wv    = nullptr;
+    if (!L.wv.empty()) t_wv = new_f32_2d(gctx, n_embd, n_kv, L.wv.data());
+    ggml_tensor * t_wo    = new_f32_2d(gctx, n_q,    n_embd, L.wo.data());
+    ggml_tensor * t_ffn_gate = new_f32_2d(gctx, n_embd, n_ff, L.ffn_gate.data());
+    ggml_tensor * t_ffn_up   = new_f32_2d(gctx, n_embd, n_ff, L.ffn_up.data());
+    ggml_tensor * t_ffn_down = new_f32_2d(gctx, n_ff,   n_embd, L.ffn_down.data());
+    ggml_tensor * t_inp_gate = new_f32_2d(gctx, n_embd, n_epl, L.inp_gate.data());
+    ggml_tensor * t_proj     = new_f32_2d(gctx, n_epl,  n_embd, L.proj.data());
+
+    ggml_tensor * t_freq_factors = nullptr;
+    if (L.freq_factors) {
+        t_freq_factors = new_f32_1d(gctx, L.rope_dim / 2, L.freq_factors);
+    }
+
+    // Causal mask: F32 [n_tokens, n_tokens]. mask[k, t] = 0 if pos[k]<=pos[t] else -INF.
+    ggml_tensor * t_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    {
+        float * m = (float *) t_mask->data;
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int k = 0; k < n_tokens; ++k) {
+                m[(size_t) t * n_tokens + k] = (pos[k] <= pos[t])
+                    ? 0.0f
+                    : -std::numeric_limits<float>::infinity();
+            }
+        }
+    }
+
+    // ---------------- Build graph mirroring src/models/gemma4.cpp::graph ----
+    // norm1 = rms_norm(x) * attn_norm
+    ggml_tensor * norm1 = ggml_rms_norm(gctx, t_x, eps);
+    norm1 = ggml_mul(gctx, norm1, t_attn_norm);
+
+    // Q = wq @ norm1 -> reshape [head_dim, n_head, n_tokens]
+    ggml_tensor * Q = ggml_mul_mat(gctx, t_wq, norm1);
+    Q = ggml_reshape_3d(gctx, Q, head_dim, n_head, n_tokens);
+    Q = ggml_rms_norm(gctx, Q, eps);
+    Q = ggml_mul(gctx, Q, t_attn_q_norm);
+    Q = ggml_rope_ext(gctx, Q, t_pos, t_freq_factors, L.rope_dim,
+                      GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
+                      L.rope_base, /*freq_scale=*/1.0f,
+                      /*ext=*/0.0f, /*att=*/1.0f, /*bf=*/0.0f, /*bs=*/0.0f);
+
+    // K = wk @ norm1 -> reshape [head_dim, n_head_kv, n_tokens]
+    ggml_tensor * Kc = ggml_mul_mat(gctx, t_wk, norm1);
+    Kc = ggml_reshape_3d(gctx, Kc, head_dim, n_head_kv, n_tokens);
+
+    // V = wv @ norm1 (or K)
+    ggml_tensor * Vc;
+    if (t_wv) {
+        Vc = ggml_mul_mat(gctx, t_wv, norm1);
+        Vc = ggml_reshape_3d(gctx, Vc, head_dim, n_head_kv, n_tokens);
+    } else {
+        Vc = Kc;
+    }
+
+    Kc = ggml_rms_norm(gctx, Kc, eps);
+    Kc = ggml_mul(gctx, Kc, t_attn_k_norm);
+    Vc = ggml_rms_norm(gctx, Vc, eps);   // gemma4 V: rms_norm WITHOUT weight
+
+    Kc = ggml_rope_ext(gctx, Kc, t_pos, t_freq_factors, L.rope_dim,
+                       GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
+                       L.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    // Attention: scale=1.0 (gemma4), causal mask provided as F32.
+    // permute to [head_dim, n_tokens, n_head*] for K^T @ Q -> [n_tokens, n_tokens, n_head]
+    ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q,  0, 2, 1, 3));
+    ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, Kc, 0, 2, 1, 3));
+    ggml_tensor * Vp = ggml_cont(gctx, ggml_permute(gctx, Vc, 0, 2, 1, 3));
+
+    // GQA broadcast: if n_head != n_head_kv, ggml_mul_mat broadcasts dim-2 of Kp/Vp
+    // automatically when n_head is a multiple of n_head_kv (matches upstream).
+    ggml_tensor * kq = ggml_mul_mat(gctx, Kp, Qp);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    kq = ggml_soft_max_ext(gctx, kq, t_mask, /*scale=*/1.0f, /*max_bias=*/0.0f);
+
+    ggml_tensor * Vt  = ggml_cont(gctx, ggml_transpose(gctx, Vp));
+    ggml_tensor * kqv = ggml_mul_mat(gctx, Vt, kq);
+    kqv = ggml_cont(gctx, ggml_permute(gctx, kqv, 0, 2, 1, 3));
+    // attn_ctx shape: [n_head * head_dim, n_tokens]. For gemma4 SWA
+    // layers this is NOT n_embd (e.g. E2B SWA: 8*256=2048 vs n_embd=1536).
+    ggml_tensor * attn_ctx_t = ggml_reshape_2d(gctx, kqv, n_q, n_tokens);
+
+    ggml_tensor * attn_out = ggml_mul_mat(gctx, t_wo, attn_ctx_t);
+
+    ggml_tensor * post_attn = ggml_rms_norm(gctx, attn_out, eps);
+    post_attn = ggml_mul(gctx, post_attn, t_post_attn_norm);
+    ggml_tensor * attn_out2 = ggml_add(gctx, post_attn, t_x);
+
+    // FFN: gelu(gate(x)) * up(x) -> down
+    ggml_tensor * ff_in = ggml_rms_norm(gctx, attn_out2, eps);
+    ff_in = ggml_mul(gctx, ff_in, t_ffn_norm);
+
+    ggml_tensor * gate = ggml_mul_mat(gctx, t_ffn_gate, ff_in);
+    ggml_tensor * up   = ggml_mul_mat(gctx, t_ffn_up,   ff_in);
+    gate = ggml_gelu(gctx, gate);
+    ggml_tensor * mid  = ggml_mul(gctx, gate, up);
+    ggml_tensor * ff_out = ggml_mul_mat(gctx, t_ffn_down, mid);
+
+    ggml_tensor * post_ffw = ggml_rms_norm(gctx, ff_out, eps);
+    post_ffw = ggml_mul(gctx, post_ffw, t_post_ffw_norm);
+    ggml_tensor * pe_in = ggml_add(gctx, post_ffw, attn_out2);
+
+    // PLE: cur = pe_in + post_norm(proj(gelu(inp_gate @ pe_in) * slice))
+    ggml_tensor * ple = ggml_mul_mat(gctx, t_inp_gate, pe_in);
+    ple = ggml_gelu(gctx, ple);
+    ple = ggml_mul(gctx, ple, t_pl);
+    ple = ggml_mul_mat(gctx, t_proj, ple);
+    ple = ggml_rms_norm(gctx, ple, eps);
+    ple = ggml_mul(gctx, ple, t_post_norm);
+    ggml_tensor * cur = ggml_add(gctx, pe_in, ple);
+
+    if (L.has_layer_output_scale) {
+        cur = ggml_scale(gctx, cur, L.layer_output_scale);
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, 1024, false);
+    ggml_build_forward_expand(gf, cur);
+
+    const ggml_status status = ggml_graph_compute_with_ctx(gctx, gf, /*n_threads=*/1);
+    if (status != GGML_STATUS_SUCCESS) {
+        error = "oracle: ggml_graph_compute_with_ctx failed";
+        ggml_free(gctx);
+        return false;
+    }
+
+    std::memcpy(hidden_out, cur->data, (size_t) n_embd * n_tokens * sizeof(float));
+    ggml_free(gctx);
+    return true;
+}
+
+// =====================================================================
+// G7 (prototype) - fused per-layer prefill graph.
+//
+// Same ggml graph as oracle_layer_forward_f32, but:
+//   * consumes the QUANTIZED weight handles (L.wq_t etc.) as graph leaves
+//     (cross-context references into the model loader's ggml context, exactly
+//     as matmul_qf32 does) -- no F32 dequant of the big matmul weights;
+//   * runs multithreaded on the persistent mm.pool (ggml_graph_plan +
+//     ggml_graph_compute) instead of a single thread;
+//   * reuses a persistent arena across calls (no 1 GiB malloc/free per layer);
+//   * applies an SWA-aware causal mask when L.is_swa (window = n_swa_model);
+//   * persists the roped/normed K and rms-normed V into the external
+//     K_cache / V_cache so the subsequent hand decode path reads them.
+//
+// Prefill only: n_past is assumed 0 (network_step calls this only when
+// n_new > 1 and the layer does not reuse another layer's KV). The output
+// hidden state matches the hand path's layer output modulo SIMD-reduction
+// order (F32 ggml reductions vs the hand path's double accumulators), which
+// is the same numerical relationship the oracle already validates.
+// =====================================================================
+bool layer_forward_fused_prefill(MatmulCtx & mm,
+                                 const LayerF32 & L,
+                                 int n_tokens,
+                                 int n_swa_model,
+                                 const float * hidden_in,
+                                 const int32_t * pos,
+                                 const float * per_layer_input,
+                                 float * hidden_out,
+                                 float * K_cache,
+                                 float * V_cache,
+                                 std::string & error) {
+    if (n_tokens <= 0) { error = "fused_prefill: n_tokens<=0"; return false; }
+    if (!K_cache || !V_cache) { error = "fused_prefill: null KV cache"; return false; }
+    const int n_embd    = L.n_embd;
+    const int n_head    = L.n_head;
+    const int n_head_kv = L.n_head_kv;
+    const int head_dim  = L.head_dim;
+    const int n_ff      = L.n_ff;
+    const int n_epl     = L.n_embd_per_layer;
+    const int n_q       = n_head * head_dim;
+    const int n_kv      = n_head_kv * head_dim;
+    const float eps     = L.rms_eps;
+
+    // Persistent arena reused across calls. Grow to fit the largest layer/
+    // prompt seen so far. Dominant buffers: FFN gate/up/mid (n_ff*n_tokens)
+    // and the attention scores (n_tokens*n_tokens*n_head). Generous 8x/3x
+    // multipliers + slack cover every intermediate + ggml tensor overhead.
+    static std::vector<uint8_t> arena;
+    const size_t big = std::max<size_t>(n_ff, std::max<size_t>(n_q, n_embd));
+    const size_t need =
+        (size_t) 8 * big * n_tokens * sizeof(float) +
+        (size_t) 3 * (size_t) n_tokens * n_tokens * n_head * sizeof(float) +
+        (size_t) 8 * (size_t) (n_kv + n_epl) * n_tokens * sizeof(float) +
+        ((size_t) 64 << 20);
+    if (arena.size() < need) arena.assign(need, 0);
+
+    ggml_init_params ip{ arena.size(), arena.data(), /*no_alloc=*/false };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) { error = "fused_prefill: ggml_init failed"; return false; }
+
+    // Inputs.
+    ggml_tensor * t_x  = new_f32_2d(gctx, n_embd, n_tokens, hidden_in);
+    ggml_tensor * t_pl = (n_epl > 0)
+                       ? new_f32_2d(gctx, n_epl, n_tokens, per_layer_input)
+                       : nullptr;
+    ggml_tensor * t_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_tokens);
+    std::memcpy(t_pos->data, pos, (size_t) n_tokens * sizeof(int32_t));
+
+    // Small F32 norm weights (always resident).
+    ggml_tensor * t_attn_norm      = new_f32_1d(gctx, n_embd,   L.attn_norm.data());
+    ggml_tensor * t_attn_q_norm    = new_f32_1d(gctx, head_dim, L.attn_q_norm.data());
+    ggml_tensor * t_attn_k_norm    = new_f32_1d(gctx, head_dim, L.attn_k_norm.data());
+    ggml_tensor * t_post_attn_norm = new_f32_1d(gctx, n_embd,   L.post_attn_norm.data());
+    ggml_tensor * t_ffn_norm       = new_f32_1d(gctx, n_embd,   L.ffn_norm.data());
+    ggml_tensor * t_post_ffw_norm  = new_f32_1d(gctx, n_embd,   L.post_ffw_norm.data());
+    ggml_tensor * t_post_norm      = (n_epl > 0)
+                                   ? new_f32_1d(gctx, n_embd, L.post_norm.data())
+                                   : nullptr;
+
+    ggml_tensor * t_freq_factors = nullptr;
+    if (L.freq_factors) {
+        t_freq_factors = new_f32_1d(gctx, L.rope_dim / 2, L.freq_factors);
+    }
+
+    // Quantized weight leaves (cross-context references into model loader ctx).
+    auto W = [](const ggml_tensor * t) { return const_cast<ggml_tensor *>(t); };
+
+    // SWA-aware causal mask: mask[k, t] = 0 if attended else -INF.
+    // masked = (pos[k] > pos[t]) || (is_swa && pos[t]-pos[k] >= n_swa).
+    ggml_tensor * t_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    {
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        float * m = (float *) t_mask->data;
+        for (int t = 0; t < n_tokens; ++t) {
+            const int p_t = pos[t];
+            for (int k = 0; k < n_tokens; ++k) {
+                const int p_k = pos[k];
+                const bool masked = (p_k > p_t) ||
+                    (L.is_swa && (p_t - p_k >= n_swa_model));
+                m[(size_t) t * n_tokens + k] = masked ? neg_inf : 0.0f;
+            }
+        }
+    }
+
+    // ---- graph (mirrors oracle_layer_forward_f32) ----
+    ggml_tensor * norm1 = ggml_rms_norm(gctx, t_x, eps);
+    norm1 = ggml_mul(gctx, norm1, t_attn_norm);
+
+    ggml_tensor * Q = ggml_mul_mat(gctx, W(L.wq_t), norm1);
+    Q = ggml_reshape_3d(gctx, Q, head_dim, n_head, n_tokens);
+    Q = ggml_rms_norm(gctx, Q, eps);
+    Q = ggml_mul(gctx, Q, t_attn_q_norm);
+    Q = ggml_rope_ext(gctx, Q, t_pos, t_freq_factors, L.rope_dim,
+                      GGML_ROPE_TYPE_NEOX, 0, L.rope_base,
+                      1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    ggml_tensor * Kc = ggml_mul_mat(gctx, W(L.wk_t), norm1);
+    Kc = ggml_reshape_3d(gctx, Kc, head_dim, n_head_kv, n_tokens);
+
+    ggml_tensor * Vc;
+    if (L.wv_t) {
+        Vc = ggml_mul_mat(gctx, W(L.wv_t), norm1);
+        Vc = ggml_reshape_3d(gctx, Vc, head_dim, n_head_kv, n_tokens);
+    } else {
+        Vc = Kc;
+    }
+
+    Kc = ggml_rms_norm(gctx, Kc, eps);
+    Kc = ggml_mul(gctx, Kc, t_attn_k_norm);
+    Vc = ggml_rms_norm(gctx, Vc, eps);   // gemma4 V: rms_norm WITHOUT weight
+
+    Kc = ggml_rope_ext(gctx, Kc, t_pos, t_freq_factors, L.rope_dim,
+                       GGML_ROPE_TYPE_NEOX, 0, L.rope_base,
+                       1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    // Kc / Vc are now exactly the per-token cache rows we must persist.
+    ggml_tensor * Kc_final = Kc;
+    ggml_tensor * Vc_final = Vc;
+
+    ggml_tensor * Qp = ggml_cont(gctx, ggml_permute(gctx, Q,  0, 2, 1, 3));
+    ggml_tensor * Kp = ggml_cont(gctx, ggml_permute(gctx, Kc, 0, 2, 1, 3));
+    ggml_tensor * Vp = ggml_cont(gctx, ggml_permute(gctx, Vc, 0, 2, 1, 3));
+
+    ggml_tensor * kq = ggml_mul_mat(gctx, Kp, Qp);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    kq = ggml_soft_max_ext(gctx, kq, t_mask, 1.0f, 0.0f);
+
+    ggml_tensor * Vt  = ggml_cont(gctx, ggml_transpose(gctx, Vp));
+    ggml_tensor * kqv = ggml_mul_mat(gctx, Vt, kq);
+    kqv = ggml_cont(gctx, ggml_permute(gctx, kqv, 0, 2, 1, 3));
+    ggml_tensor * attn_ctx_t = ggml_reshape_2d(gctx, kqv, n_q, n_tokens);
+
+    ggml_tensor * attn_out = ggml_mul_mat(gctx, W(L.wo_t), attn_ctx_t);
+    ggml_tensor * post_attn = ggml_rms_norm(gctx, attn_out, eps);
+    post_attn = ggml_mul(gctx, post_attn, t_post_attn_norm);
+    ggml_tensor * attn_out2 = ggml_add(gctx, post_attn, t_x);
+
+    ggml_tensor * ff_in = ggml_rms_norm(gctx, attn_out2, eps);
+    ff_in = ggml_mul(gctx, ff_in, t_ffn_norm);
+    ggml_tensor * gate = ggml_mul_mat(gctx, W(L.ffn_gate_t), ff_in);
+    ggml_tensor * up   = ggml_mul_mat(gctx, W(L.ffn_up_t),   ff_in);
+    gate = ggml_gelu(gctx, gate);
+    ggml_tensor * mid  = ggml_mul(gctx, gate, up);
+    ggml_tensor * ff_out = ggml_mul_mat(gctx, W(L.ffn_down_t), mid);
+
+    ggml_tensor * post_ffw = ggml_rms_norm(gctx, ff_out, eps);
+    post_ffw = ggml_mul(gctx, post_ffw, t_post_ffw_norm);
+    ggml_tensor * cur = ggml_add(gctx, post_ffw, attn_out2);
+
+    // PLE merge (skipped when n_epl == 0, e.g. MoE variant).
+    if (n_epl > 0) {
+        ggml_tensor * ple = ggml_mul_mat(gctx, W(L.inp_gate_t), cur);
+        ple = ggml_gelu(gctx, ple);
+        ple = ggml_mul(gctx, ple, t_pl);
+        ple = ggml_mul_mat(gctx, W(L.proj_t), ple);
+        ple = ggml_rms_norm(gctx, ple, eps);
+        ple = ggml_mul(gctx, ple, t_post_norm);
+        cur = ggml_add(gctx, cur, ple);
+    }
+
+    if (L.has_layer_output_scale) {
+        cur = ggml_scale(gctx, cur, L.layer_output_scale);
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, 1024, false);
+    ggml_build_forward_expand(gf, cur);
+    // Ensure the roped K / normed V are materialized (they already feed cur
+    // through attention, but expand explicitly so a future graph reorder
+    // cannot drop them before we memcpy).
+    ggml_build_forward_expand(gf, Kc_final);
+    ggml_build_forward_expand(gf, Vc_final);
+
+    ggml_status status;
+    if (mm.pool) {
+        ggml_cplan cplan = ggml_graph_plan(gf, mm.n_threads, mm.pool.get());
+        if (cplan.work_size > mm.work_buf.size()) {
+            mm.work_buf.assign(cplan.work_size, 0);
+        }
+        cplan.work_data = mm.work_buf.empty() ? nullptr : mm.work_buf.data();
+        status = ggml_graph_compute(gf, &cplan);
+    } else {
+        status = ggml_graph_compute_with_ctx(gctx, gf, mm.n_threads);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        error = "fused_prefill: graph compute failed";
+        ggml_free(gctx);
+        return false;
+    }
+
+    // Persist K/V (n_past==0 => cache offset 0). Layout of Kc_final/Vc_final
+    // is [head_dim, n_head_kv, n_tokens] => linear index t*n_kv + h*head_dim + d,
+    // exactly the hand cache row layout.
+    std::memcpy(K_cache, Kc_final->data, (size_t) n_tokens * n_kv * sizeof(float));
+    std::memcpy(V_cache, Vc_final->data, (size_t) n_tokens * n_kv * sizeof(float));
+    std::memcpy(hidden_out, cur->data, (size_t) n_embd * n_tokens * sizeof(float));
+    ggml_free(gctx);
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Self-test
+// ---------------------------------------------------------------------
+
+bool layer_self_test(const llama_model * model, const Weights & w,
+                     int il, int n_tokens, std::string & error) {
+    LayerF32 L;
+    if (!dequant_layer(model, w, il, L, error)) return false;
+
+    std::fprintf(stderr,
+        "gemma4 layer_self_test: il=%d n_tokens=%d n_embd=%d n_head=%d "
+        "n_head_kv=%d head_dim=%d n_ff=%d n_epl=%d is_swa=%d rope_base=%.0f "
+        "freq_factors=%s rms_eps=%g out_scale=%s%.6g\n",
+        il, n_tokens, L.n_embd, L.n_head, L.n_head_kv, L.head_dim, L.n_ff,
+        L.n_embd_per_layer, (int) L.is_swa, (double) L.rope_base,
+        L.freq_factors ? "yes" : "no", (double) L.rms_eps,
+        L.has_layer_output_scale ? "" : "none ",
+        L.has_layer_output_scale ? (double) L.layer_output_scale : 1.0);
+
+    // Random inputs. Seed deterministically for repro.
+    std::mt19937 rng(0xC4F4u + (uint32_t) il * 7919u + (uint32_t) n_tokens);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    std::vector<float>   hidden_in((size_t) L.n_embd * n_tokens);
+    std::vector<float>   per_layer_input((size_t) L.n_embd_per_layer * n_tokens);
+    std::vector<int32_t> pos(n_tokens);
+    for (auto & v : hidden_in)       v = nd(rng) * 0.1f;
+    for (auto & v : per_layer_input) v = nd(rng) * 0.1f;
+    for (int t = 0; t < n_tokens; ++t) pos[t] = t;
+
+    std::vector<float> out_hand  ((size_t) L.n_embd * n_tokens, 0.0f);
+    std::vector<float> out_oracle((size_t) L.n_embd * n_tokens, 0.0f);
+
+    if (!layer_forward_f32(L, n_tokens, hidden_in.data(), pos.data(),
+                           per_layer_input.data(), out_hand.data(), error)) {
+        return false;
+    }
+    if (!oracle_layer_forward_f32(L, n_tokens, hidden_in.data(), pos.data(),
+                                  per_layer_input.data(), out_oracle.data(), error)) {
+        return false;
+    }
+
+    // Stage-end tolerance: hand path accumulates in double, oracle in
+    // ggml's vec_dot (SIMD F32 reductions). For one full layer this is
+    // typically ~1e-3 absolute. Start a touch looser; tighten in G3.4.
+    return compare_f32("layer_forward",
+                       out_hand.data(), out_oracle.data(),
+                       out_hand.size(), /*atol=*/2e-2f, /*rtol=*/2e-2f, error);
+}
+
+// =====================================================================
+// G3.4 -- whole-network F32 forward.
+// =====================================================================
+
+bool dequant_model(const llama_model * model, const Weights & w,
+                   ModelF32 & out, std::string & error,
+                   int n_threads) {
+    out = ModelF32{};
+    out.n_layer            = w.n_layer;
+    out.n_embd             = w.n_embd;
+    out.n_head             = w.n_head;
+    out.n_head_kv          = w.n_head_kv;
+    out.n_vocab            = w.n_vocab;
+    out.n_embd_per_layer   = w.n_embd_per_layer;
+    out.n_swa              = w.n_swa;
+    out.rms_eps            = w.rms_eps;
+    out.final_logit_softcap = w.final_logit_softcap;
+    out.output_tied_to_embd = w.output_tied_to_embd;
+
+    if (!w.tok_embd) { error = "dequant_model: tok_embd missing"; return false; }
+    if (!w.output_norm) { error = "dequant_model: output_norm missing"; return false; }
+    if (!copy_f32(w.output_norm, out.output_norm, error)) return false;
+
+    if (w.per_layer_model_proj) {
+        if (!dequant_f32(w.per_layer_model_proj, out.per_layer_model_proj, error)) return false;
+    }
+    if (w.per_layer_proj_norm) {
+        if (!copy_f32(w.per_layer_proj_norm, out.per_layer_proj_norm, error)) return false;
+    }
+    if (w.rope_freqs && w.rope_freqs->type == GGML_TYPE_F32) {
+        const int64_t n = ggml_nelements(w.rope_freqs);
+        out.freq_factors_data.assign((size_t) n, 0.0f);
+        std::memcpy(out.freq_factors_data.data(), w.rope_freqs->data, (size_t) n * sizeof(float));
+    }
+
+    out.tok_embd_quant           = w.tok_embd;
+    out.per_layer_tok_embd_quant = w.per_layer_tok_embd;
+    out.per_layer_model_proj_quant = w.per_layer_model_proj;
+
+    // Phase 1 dense-weight repack safety: tok_embd is dual-use -- it is read
+    // row-by-row via dequant_row() for per-token input embeddings (assuming
+    // its original K-quant layout) AND used as the tied lm_head via
+    // matmul_qf32(). In-place XBCG repack would flip its type/layout and
+    // corrupt the embedding lookup (crash on the next token). per_layer_tok_embd
+    // is likewise read via dequant_row. Mark both NO_REPACK so the callgraph
+    // repack pass skips them. (The dense attn/MLP weights are matmul-only and
+    // remain repackable.)
+    if (out.tok_embd_quant) {
+        const_cast<ggml_tensor *>(out.tok_embd_quant)->flags |= GGML_TENSOR_FLAG_NO_REPACK;
+    }
+    if (out.per_layer_tok_embd_quant) {
+        const_cast<ggml_tensor *>(out.per_layer_tok_embd_quant)->flags |= GGML_TENSOR_FLAG_NO_REPACK;
+    }
+
+    // Dequant every layer. layer_forward_f32 needs LayerF32.freq_factors
+    // pointing at OUR freq_factors_data (so the original model could in
+    // principle be unloaded). We rebuild this pointer after dequant.
+    // Skip F32 dequant of the large matmul weights -- the network path
+    // routes those through MatmulCtx + ggml_mul_mat on the raw quant
+    // tensors (which keeps memory comparable to the source model).
+    out.layers.resize(w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (!dequant_layer(model, w, il, out.layers[il], error,
+                           /*dequant_to_f32=*/false)) {
+            std::ostringstream ss;
+            ss << "dequant_model: layer " << il << ": " << error;
+            error = ss.str();
+            return false;
+        }
+        // Repoint freq_factors into our self-owned buffer if non-SWA.
+        if (!out.layers[il].is_swa && !out.freq_factors_data.empty()) {
+            out.layers[il].freq_factors = out.freq_factors_data.data();
+        } else {
+            out.layers[il].freq_factors = nullptr;
+        }
+    }
+
+    // Phase 2 - resident MoE expert repack. When a repack mode is active and
+    // this is a MoE model running resident (no streaming ExpertStore), repack
+    // the gate/up expert banks to their _x8 layout up-front and force the
+    // fused mul_mat_id path off: mul_mat_id has no _x8 kernel, so experts must
+    // go through the per-expert matmul_expert_qf32 view, which inherits the
+    // repacked bank type. The down bank (n_in = n_ff_exp) is not 256-aligned
+    // and stays as-is. Streaming reads raw blocks from the ExpertStore, so the
+    // resident bank is unused there and left untouched.
+    if (get_repack_active()) {
+        ExpertStore * store = get_expert_store();
+        const bool streaming = (store && store->ready());
+        bool any_moe = false;
+        for (int il = 0; il < w.n_layer; ++il) any_moe |= out.layers[il].is_moe_layer;
+        if (any_moe && !streaming) {
+            for (int il = 0; il < w.n_layer; ++il) {
+                LayerF32 & L = out.layers[il];
+                if (!L.is_moe_layer) continue;
+                if (!repack_expert_bank(L.moe_gate_up_exps, error)) return false;
+                if (!repack_expert_bank(L.moe_gate_exps,    error)) return false;
+                if (!repack_expert_bank(L.moe_up_exps,      error)) return false;
+                // moe_down_exps: n_in = n_ff_exp (e.g. 704), not 256-aligned.
+            }
+            set_moe_fused(false);
+            std::fprintf(stderr,
+                "gemma4 repack: resident MoE gate/up expert banks repacked to "
+                "_x8; forcing --gemma4-moe-fused 0 (mul_mat_id has no _x8 "
+                "kernel). down_exps left unrepacked (n_ff_exp not 256-aligned).\n");
+        }
+    }
+
+    // Initialise the shared matmul shim. Single ggml arena must hold:
+    //   * one F32 activation copy (worst case lm_head input: n_embd*1 = 6 KiB on E4B)
+    //   * one F32 result (worst case lm_head output: n_vocab = 262 144 * 4 = 1 MiB)
+    //   * ggml's per-call work buffer (Q8_K activation quant + scratch),
+    //     dominated by intermediate per-row partials. Empirically a few MiB.
+    //   * tensor metadata + graph nodes (~kilobytes).
+    // 32 MiB gives comfortable headroom and one-time allocation cost.
+    // The threadpool is sized for n_threads and reused across every
+    // subsequent matmul_qf32 call.
+    const std::size_t arena_bytes = 32ull << 20;
+    if (!matmul_ctx_init(out.mm, arena_bytes, n_threads, error)) {
+        return false;
+    }
+
+    std::fprintf(stderr,
+        "gemma4 dequant_model: n_layer=%d n_embd=%d n_vocab=%d n_embd_per_layer=%d "
+        "n_swa=%d softcap=%.1f tok_embd.type=%s per_layer_tok_embd.type=%s\n",
+        out.n_layer, out.n_embd, out.n_vocab, out.n_embd_per_layer, out.n_swa,
+        (double) out.final_logit_softcap,
+        ggml_type_name(out.tok_embd_quant->type),
+        out.per_layer_tok_embd_quant ? ggml_type_name(out.per_layer_tok_embd_quant->type) : "(none)");
+    return true;
+}
+
+// Dequant one row of a 2D weight (shape [n_inner, n_outer]) into dst.
+// Used for tok_embd lookups (per-token) and per-vocab-row lm_head matmul.
+static void dequant_row(const ggml_tensor * t, int row_idx, float * dst) {
+    if (t->type == GGML_TYPE_F32) {
+        const float * base = (const float *) t->data;
+        std::memcpy(dst, base + (size_t) row_idx * t->ne[0], (size_t) t->ne[0] * sizeof(float));
+        return;
+    }
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+    const uint8_t * base   = (const uint8_t *) t->data;
+    traits->to_float(base + (size_t) row_idx * row_bytes, dst, (int) t->ne[0]);
+}
+
+// PLE preprocessing (project_per_layer_inputs in upstream).
+// Outputs per_layer_final laid out as [n_embd_per_layer, n_tokens, n_layer]
+// in contiguous memory, so slice for layer il is
+//   per_layer_final.data() + (size_t) il * n_tokens * n_embd_per_layer
+// and within that slice, token t starts at offset t * n_embd_per_layer.
+static bool compute_per_layer_inputs(const ModelF32 & m,
+                              int n_tokens,
+                              const int32_t * token_ids,
+                              const float * inpL,            // [n_embd, n_tokens]
+                              std::vector<float> & per_layer_final,
+                              std::string & error) {
+    const int n_layer = m.n_layer;
+    const int n_embd  = m.n_embd;
+    const int n_epl   = m.n_embd_per_layer;
+    const float eps   = m.rms_eps;
+    if (m.per_layer_model_proj.empty()) {
+        error = "compute_per_layer_inputs: per_layer_model_proj missing";
+        return false;
+    }
+    if (m.per_layer_proj_norm.empty()) {
+        error = "compute_per_layer_inputs: per_layer_proj_norm missing";
+        return false;
+    }
+    if (!m.per_layer_tok_embd_quant) {
+        error = "compute_per_layer_inputs: per_layer_tok_embd missing";
+        return false;
+    }
+
+    // 1. per_layer_proj = (per_layer_model_proj @ inpL) / sqrt(n_embd)
+    //    per_layer_model_proj: [n_embd, n_epl * n_layer]
+    //    inpL:                 [n_embd, n_tokens]
+    //    out:                  [n_epl * n_layer, n_tokens]
+    // Upstream projects through the quantized weight (ggml_mul_mat on the
+    // Q-typed per_layer_model_proj); route this M=n_epl*n_layer projection
+    // (the second-largest matmul after lm_head) through the same SIMD +
+    // threaded qquant shim instead of the scalar double-accumulate
+    // matmul_f32. Bit-closer to upstream and ~10x faster. Falls back to the
+    // F32 path when the quant tensor / shim is unavailable (e.g. tests).
+    const int M = n_epl * n_layer;
+    std::vector<float> proj_out((size_t) M * n_tokens, 0.0f);
+    if (m.per_layer_model_proj_quant) {
+        if (!matmul_qf32(m.mm, m.per_layer_model_proj_quant, inpL, proj_out.data(),
+                         n_embd, M, n_tokens, error)) return false;
+    } else {
+        matmul_f32(m.per_layer_model_proj.data(), inpL, proj_out.data(),
+                   n_embd, M, n_tokens);
+    }
+    const float inv_sqrt_nembd = 1.0f / std::sqrt((float) n_embd);
+    for (auto & v : proj_out) v *= inv_sqrt_nembd;
+
+    // 2. RMSnorm per (l, t) group along n_embd_per_layer with per_layer_proj_norm
+    //    Logical shape is [n_epl, n_layer, n_tokens]; we operate on each
+    //    [n_epl] slice in place.
+    for (int t = 0; t < n_tokens; ++t) {
+        float * base_t = proj_out.data() + (size_t) t * M;
+        for (int l = 0; l < n_layer; ++l) {
+            float * x = base_t + (size_t) l * n_epl;
+            rmsnorm_mul_f32(x, x, m.per_layer_proj_norm.data(), n_epl, eps);
+        }
+    }
+
+    // 3. Look up per_layer_tok_embd[token_ids] * sqrt(n_epl), shape [M, n_tokens].
+    //    per_layer_tok_embd shape: [n_epl * n_layer, n_vocab] in ggml convention,
+    //    row "tok" is the contiguous row of length M = n_epl * n_layer.
+    //    On Q4_K_M E2B/E4B this tensor is Q5_K -- we dequant rows on-demand.
+    const float scale_raw = std::sqrt((float) n_epl);
+    const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+    std::vector<float> ple_row(M);
+    for (int t = 0; t < n_tokens; ++t) {
+        const int tok = token_ids[t];
+        if (tok < 0 || tok >= m.n_vocab) {
+            std::ostringstream ss;
+            ss << "compute_per_layer_inputs: token_ids[" << t << "]=" << tok
+               << " out of range [0," << m.n_vocab << ")";
+            error = ss.str();
+            return false;
+        }
+        dequant_row(m.per_layer_tok_embd_quant, tok, ple_row.data());
+        float * dst = proj_out.data() + (size_t) t * M;
+        for (int i = 0; i < M; ++i) {
+            dst[i] = (dst[i] + ple_row[i] * scale_raw) * inv_sqrt2;
+        }
+    }
+
+    // 4. Permute [n_epl, n_layer, n_tokens] -> [n_epl, n_tokens, n_layer]
+    //    so that per-layer slice extraction is just a single offset.
+    //    src[t * (n_layer * n_epl) + l * n_epl + d]
+    //    -> dst[l * (n_tokens * n_epl) + t * n_epl + d]
+    per_layer_final.assign((size_t) n_layer * n_tokens * n_epl, 0.0f);
+    for (int l = 0; l < n_layer; ++l) {
+        for (int t = 0; t < n_tokens; ++t) {
+            const float * src = proj_out.data()
+                              + (size_t) t * M
+                              + (size_t) l * n_epl;
+            float * dst = per_layer_final.data()
+                        + (size_t) l * n_tokens * n_epl
+                        + (size_t) t * n_epl;
+            std::memcpy(dst, src, (size_t) n_epl * sizeof(float));
+        }
+    }
+    return true;
+}
+
+bool network_forward_f32(const ModelF32 & m,
+                         int n_tokens,
+                         const int32_t * token_ids,
+                         bool last_token_only,
+                         float * logits_out,
+                         std::string & error) {
+    // One-shot delegate to network_step. Single canonical layer-loop
+    // implementation in network_step; positions [0..n_tokens) are
+    // auto-generated. SWA mask is applied inside layer_forward_f32_cached.
+    NetworkState s;
+    if (!network_state_reserve(s, m, n_tokens, error)) return false;
+    return network_step(s, m, n_tokens, token_ids, last_token_only,
+                        logits_out, error);
+}
+
+// ---------------------------------------------------------------------
+// Network self-test
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Canonical label for the active hand-forward mode, so logs match the terms
+// we use when discussing results:
+//   "hand(streaming)" -- hand path with an installed+ready ExpertStore
+//                        (MoE experts pread from a byte-capped LRU pool)
+//   "hand(resident)"  -- hand path reading experts directly from the mmap
+//                        (default; also used for dense models with no store)
+// The reference engine (llama_decode) is always labelled "upstream".
+const char * hand_path_label() {
+    const ExpertStore * s = get_expert_store();
+    return (s && s->ready()) ? "hand(streaming)" : "hand(resident)";
+}
+
+// Helper: run upstream llama_decode on prompt_tokens and return the
+// last-position logits as a std::vector.
+bool upstream_last_token_logits(const llama_model * model,
+                                const std::vector<int32_t> & prompt_tokens,
+                                int n_threads,
+                                std::vector<float> & logits_out,
+                                std::string & error) {
+    const int n_prompt = (int) prompt_tokens.size();
+    const int n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_ctx    = n_prompt + 64;
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "upstream_last_token_logits: llama_init_from_model failed"; return false; }
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    llama_batch batch = llama_batch_get_one(
+        const_cast<int32_t *>(prompt_tokens.data()), n_prompt);
+
+    if (llama_decode(ctx, batch) != 0) {
+        error = "upstream_last_token_logits: llama_decode failed";
+        llama_free(ctx);
+        return false;
+    }
+
+    const float * src = llama_get_logits_ith(ctx, n_prompt - 1);
+    if (!src) { error = "upstream_last_token_logits: llama_get_logits_ith null"; llama_free(ctx); return false; }
+    logits_out.assign(src, src + n_vocab);
+    llama_free(ctx);
+    return true;
+}
+
+// Top-k selection (returns sorted descending indices by value).
+std::vector<int> top_k_indices(const std::vector<float> & logits, int k) {
+    std::vector<int> idx(logits.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+        [&](int a, int b){ return logits[a] > logits[b]; });
+    idx.resize(k);
+    return idx;
+}
+
+} // anonymous namespace
+
+bool network_self_test(const llama_model * model, const Weights & w,
+                       const std::string & prompt, int n_threads,
+                       std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+
+    // -------- Tokenize the prompt --------
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> tokens;
+    tokens.resize(prompt.size() + 8);
+    const int n_tok = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                     tokens.data(), (int) tokens.size(),
+                                     /*add_special=*/true, /*parse_special=*/true);
+    if (n_tok < 0) { error = "network_self_test: tokenize failed"; return false; }
+    tokens.resize(n_tok);
+    if (n_tok > w.n_swa) {
+        std::fprintf(stderr,
+            "gemma4 network_self_test: NOTE: prompt tokenizes to %d tokens > "
+            "n_swa=%d; SWA layers will apply windowed attention.\n",
+            n_tok, w.n_swa);
+    }
+    std::fprintf(stderr, "gemma4 network_self_test: prompt=\"%s\" -> %d tokens (n_vocab=%d)\n",
+                 prompt.c_str(), n_tok, n_vocab);
+
+    // -------- Upstream reference --------
+    std::vector<float> upstream_logits;
+    if (!upstream_last_token_logits(model, tokens, n_threads, upstream_logits, error)) {
+        return false;
+    }
+
+    // -------- Dequant + hand path --------
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+
+    std::vector<float> hand_logits((size_t) n_vocab, 0.0f);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!network_forward_f32(mf, n_tok, tokens.data(),
+                             /*last_token_only=*/true,
+                             hand_logits.data(), error)) {
+        return false;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "gemma4 network_self_test: %s took %.1f ms (single batch, last-token logits)\n",
+                 hand_path_label(), ms);
+
+    // -------- Metrics --------
+    const int k = 10;
+    auto top_h = top_k_indices(hand_logits, k);
+    auto top_u = top_k_indices(upstream_logits, k);
+    const int top1_h = top_h[0];
+    const int top1_u = top_u[0];
+
+    // Rank of upstream top-1 in hand ranking.
+    int rank_top1_u_in_hand = -1;
+    {
+        std::vector<int> idx_full = top_k_indices(hand_logits, n_vocab);
+        for (int r = 0; r < (int) idx_full.size(); ++r) {
+            if (idx_full[r] == top1_u) { rank_top1_u_in_hand = r; break; }
+        }
+    }
+    // Top-5 / top-10 set overlap.
+    auto overlap = [&](int kk){
+        int o = 0;
+        for (int i = 0; i < kk; ++i)
+            for (int j = 0; j < kk; ++j)
+                if (top_h[i] == top_u[j]) { ++o; break; }
+        return o;
+    };
+    const int o5  = overlap(5);
+    const int o10 = overlap(10);
+
+    // Numeric error metrics (full vocab).
+    double sum_sq = 0.0, sum_abs = 0.0, max_abs = 0.0;
+    double dot = 0.0, hh = 0.0, uu = 0.0;
+    for (int v = 0; v < n_vocab; ++v) {
+        const double d = (double) hand_logits[v] - (double) upstream_logits[v];
+        sum_sq  += d * d;
+        sum_abs += std::fabs(d);
+        if (std::fabs(d) > max_abs) max_abs = std::fabs(d);
+        dot += (double) hand_logits[v] * (double) upstream_logits[v];
+        hh  += (double) hand_logits[v]   * (double) hand_logits[v];
+        uu  += (double) upstream_logits[v] * (double) upstream_logits[v];
+    }
+    const double rms      = std::sqrt(sum_sq / n_vocab);
+    const double mean_abs = sum_abs / n_vocab;
+    const double cos_sim  = dot / std::sqrt(hh * uu);
+
+    // Decode top-1 tokens (best-effort; skip on failure).
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+
+    std::fprintf(stderr, "gemma4 network_self_test results (%s vs upstream):\n", hand_path_label());
+    std::fprintf(stderr, "  %-15s top-1 = %d (%s)\n", hand_path_label(), top1_h, piece(top1_h).c_str());
+    std::fprintf(stderr, "  %-15s top-1 = %d (%s)\n", "upstream", top1_u, piece(top1_u).c_str());
+    std::fprintf(stderr, "  match top-1    = %s\n", top1_h == top1_u ? "YES" : "NO");
+    std::fprintf(stderr, "  upstream top-1 rank in %s = %d (of %d)\n",
+                 hand_path_label(), rank_top1_u_in_hand, n_vocab);
+    std::fprintf(stderr, "  top-5  overlap = %d/5\n", o5);
+    std::fprintf(stderr, "  top-10 overlap = %d/10\n", o10);
+    std::fprintf(stderr, "  max_abs  = %.4e\n", max_abs);
+    std::fprintf(stderr, "  mean_abs = %.4e\n", mean_abs);
+    std::fprintf(stderr, "  RMS      = %.4e\n", rms);
+    std::fprintf(stderr, "  cos_sim  = %.6f\n", cos_sim);
+
+    std::fprintf(stderr, "  %-15s top-10:", "upstream");
+    for (int i = 0; i < 10; ++i)
+        std::fprintf(stderr, " %d(%.2f)", top_u[i], (double) upstream_logits[top_u[i]]);
+    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "  %-15s top-10:", hand_path_label());
+    for (int i = 0; i < 10; ++i)
+        std::fprintf(stderr, " %d(%.2f)", top_h[i], (double) hand_logits[top_h[i]]);
+    std::fprintf(stderr, "\n");
+
+    if (top1_h != top1_u) {
+        error = "network_self_test: top-1 token mismatch";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// G3.4b -- greedy decode with persistent KV cache
+// ---------------------------------------------------------------------
+
+bool network_state_reserve(NetworkState & s, const ModelF32 & m,
+                           int cap_seq, std::string & error) {
+    if (cap_seq <= 0) { error = "network_state_reserve: cap_seq<=0"; return false; }
+    s.K_cache.assign(m.n_layer, {});
+    s.V_cache.assign(m.n_layer, {});
+    s.pos_all.clear();
+    s.pos_all.reserve((size_t) cap_seq);
+    s.n_past  = 0;
+    s.cap_seq = cap_seq;
+    for (int il = 0; il < m.n_layer; ++il) {
+        const LayerF32 & L = m.layers[il];
+        if (L.kv_reuse_il >= 0) continue;     // shared-KV layer: no own storage
+        const int n_kv = L.n_head_kv * L.head_dim;
+        s.K_cache[il].assign((size_t) n_kv * cap_seq, 0.0f);
+        s.V_cache[il].assign((size_t) n_kv * cap_seq, 0.0f);
+    }
+    return true;
+}
+
+bool network_step(NetworkState & s, const ModelF32 & m,
+                  int n_new,
+                  const int32_t * token_ids,
+                  bool last_token_only,
+                  float * logits_out,
+                  std::string & error) {
+    return network_step(s, m, n_new, token_ids, last_token_only,
+                        logits_out, /*out_argmax=*/nullptr, error);
+}
+
+bool network_step(NetworkState & s, const ModelF32 & m,
+                  int n_new,
+                  const int32_t * token_ids,
+                  bool last_token_only,
+                  float * logits_out,
+                  int32_t * out_argmax,
+                  std::string & error) {
+    if (n_new <= 0) { error = "network_step: n_new<=0"; return false; }
+    if (s.cap_seq <= 0) { error = "network_step: state not reserved"; return false; }
+    if (s.n_past + n_new > s.cap_seq) {
+        std::ostringstream ss;
+        ss << "network_step: n_past+n_new=" << (s.n_past+n_new)
+           << " exceeds cap_seq=" << s.cap_seq;
+        error = ss.str();
+        return false;
+    }
+    if (!m.tok_embd_quant) { error = "network_step: tok_embd not set"; return false; }
+    if (m.output_norm.empty()) { error = "network_step: output_norm empty"; return false; }
+    if (!m.output_tied_to_embd) {
+        error = "network_step: untied output not supported";
+        return false;
+    }
+    const int n_embd  = m.n_embd;
+    const int n_vocab = m.n_vocab;
+    const int n_epl   = m.n_embd_per_layer;
+    const float eps   = m.rms_eps;
+
+    // Append positions [n_past .. n_past+n_new) to pos_all.
+    for (int i = 0; i < n_new; ++i) s.pos_all.push_back(s.n_past + i);
+    const int n_total = s.n_past + n_new;
+
+    // ---- 1. Input embedding * sqrt(n_embd) ----
+    std::vector<float> inpL((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.embed_ns);
+    const float emb_scale = std::sqrt((float) n_embd);
+    for (int t = 0; t < n_new; ++t) {
+        const int tok = token_ids[t];
+        if (tok < 0 || tok >= n_vocab) {
+            std::ostringstream ss;
+            ss << "network_step: token_ids[" << t << "]=" << tok << " out of range";
+            error = ss.str();
+            return false;
+        }
+        dequant_row(m.tok_embd_quant, tok, inpL.data() + (size_t) t * n_embd);
+        for (int e = 0; e < n_embd; ++e) inpL[(size_t) t * n_embd + e] *= emb_scale;
+    }
+    }
+
+    // ---- 2. PLE preprocessing on the n_new new tokens ----
+    // Skipped entirely on models without per-layer embeddings (26B-A4B MoE:
+    // n_epl == 0). per_layer_final stays empty; the per-layer slice pointer
+    // is unused because layer_forward_f32_cached guards the PLE block.
+    std::vector<float> per_layer_final;
+    if (n_epl > 0) {
+    prof::Scope _s(&prof::g_acc.ple_ns);
+    if (!compute_per_layer_inputs(m, n_new, token_ids, inpL.data(),
+                                  per_layer_final, error)) return false;
+    }
+
+    // ---- 3. Layer loop with cached K/V ----
+    std::vector<float> hidden_out((size_t) n_embd * n_new, 0.0f);
+    { prof::Scope _s(&prof::g_acc.lf_total_ns);
+    for (int il = 0; il < m.n_layer; ++il) {
+        const LayerF32 & L = m.layers[il];
+        const float * slice = per_layer_final.data()
+                            + (size_t) il * n_new * n_epl;
+
+        float * K_buf = nullptr;
+        float * V_buf = nullptr;
+        bool reuse = false;
+        if (L.kv_reuse_il < 0) {
+            K_buf = s.K_cache[il].data();
+            V_buf = s.V_cache[il].data();
+        } else {
+            const int src = L.kv_reuse_il;
+            if (s.K_cache[src].empty() || s.V_cache[src].empty()) {
+                std::ostringstream ss;
+                ss << "network_step: layer " << il << " reuses KV from layer "
+                   << src << " but source has empty storage";
+                error = ss.str();
+                return false;
+            }
+            K_buf = s.K_cache[src].data();
+            V_buf = s.V_cache[src].data();
+            reuse = true;
+        }
+
+        // G7 (prototype) - fused per-layer prefill graph. Only for the prefill
+        // case (n_new > 1) on the qquant path (mm set), non-reuse layers, and
+        // when n_past == 0 (the fused path assumes a fresh prefill). Reuse
+        // layers and decode fall through to the hand path unchanged.
+        const bool use_fused = get_prefill_fused() && n_new > 1 &&
+                               s.n_past == 0 && !reuse && m.mm.pool &&
+                               !L.is_moe_layer;
+        if (use_fused) {
+            if (!layer_forward_fused_prefill(m.mm, L, n_new, m.n_swa,
+                                             inpL.data(), s.pos_all.data(), slice,
+                                             hidden_out.data(),
+                                             K_buf, V_buf, error)) {
+                std::ostringstream ss;
+                ss << "network_step: layer " << il << " (fused): " << error;
+                error = ss.str();
+                return false;
+            }
+        } else
+        if (!layer_forward_f32_cached(L, n_new, s.n_past, m.n_swa,
+                                      inpL.data(), s.pos_all.data(), slice,
+                                      hidden_out.data(),
+                                      K_buf, V_buf, reuse, &m.mm, error)) {
+            std::ostringstream ss;
+            ss << "network_step: layer " << il << ": " << error;
+            error = ss.str();
+            return false;
+        }
+        std::swap(inpL, hidden_out);
+    }
+    }
+
+    // ---- 4. Final output norm on n_new tokens ----
+    { prof::Scope _s(&prof::g_acc.out_norm_ns);
+    for (int t = 0; t < n_new; ++t) {
+        rmsnorm_mul_f32(hidden_out.data() + (size_t) t * n_embd,
+                        inpL.data() + (size_t) t * n_embd,
+                        m.output_norm.data(), n_embd, eps);
+    }
+    std::swap(inpL, hidden_out);
+    }
+
+    // ---- 5. lm_head (tied to tok_embd) ----
+    //
+    // logits[v, tc] = sum_e tok_embd[v, e] * hidden[t_start+tc, e]
+    //
+    // ggml shape of tok_embd is [n_embd, n_vocab] (n_embd innermost).
+    // matmul_qf32 with x = hidden_slice[n_embd, t_count] produces
+    // y[n_vocab, t_count] -- exactly the layout we want.
+    //
+    // The slice [t_start .. t_start+t_count) in inpL is contiguous
+    // (inpL layout is [n_embd, n_new] with n_embd innermost).
+    const int t_start = last_token_only ? n_new - 1 : 0;
+    const int t_count = last_token_only ? 1 : n_new;
+
+    // G6.2 - fused greedy lm_head + argmax fast path. Only when the caller
+    // wants a single greedy token (out_argmax set, last_token_only) and the
+    // fused path is enabled. Computes the argmax directly over the (tied)
+    // output embedding, skipping the full [n_vocab] logit materialization and
+    // the monotonic softcap. No logits are produced in this path.
+    if (out_argmax && last_token_only && gemma4::get_lmhead_fused()) {
+        prof::Scope _s(&prof::g_acc.lm_head_ns);
+        const float * hidden_slice = inpL.data() + (size_t) t_start * n_embd;
+        if (!gemma4::lmhead_argmax_qf32(m.mm, m.tok_embd_quant, hidden_slice,
+                                        n_embd, n_vocab, *out_argmax, error)) {
+            return false;
+        }
+        s.n_past += n_new;
+        return true;
+    }
+
+    { prof::Scope _s(&prof::g_acc.lm_head_ns);
+    const float * hidden_slice = inpL.data() + (size_t) t_start * n_embd;
+    if (!matmul_qf32(m.mm, m.tok_embd_quant, hidden_slice, logits_out,
+                     n_embd, n_vocab, t_count, error)) {
+        return false;
+    }
+    }
+
+    // ---- 6. Final logit softcap ----
+    { prof::Scope _s(&prof::g_acc.softcap_ns);
+    if (m.final_logit_softcap > 0.0f) {
+        const float cap = m.final_logit_softcap;
+        const float inv = 1.0f / cap;
+        const size_t total = (size_t) n_vocab * t_count;
+        for (size_t i = 0; i < total; ++i) {
+            logits_out[i] = cap * std::tanh(logits_out[i] * inv);
+        }
+    }
+    }
+
+    // Convenience argmax over the last token's (softcapped) logits for callers
+    // that requested a greedy token but did not take the fused path above.
+    if (out_argmax) {
+        const float * last = logits_out + (size_t) (t_count - 1) * n_vocab;
+        *out_argmax = (int32_t) (std::max_element(last, last + n_vocab) - last);
+    }
+
+    s.n_past += n_new;
+    return true;
+}
+
+bool network_gen_self_test(const llama_model * model, const Weights & w,
+                           const std::string & prompt, int n_gen,
+                           int n_threads, std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_gen_self_test: n_gen<=0"; return false; }
+
+    // -------- Tokenize prompt --------
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_gen_self_test: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr, "gemma4 network_gen_self_test: prompt=\"%s\" -> %d tokens, n_gen=%d\n",
+                 prompt.c_str(), n_prompt, n_gen);
+
+    // -------- Dequant + reserve state --------
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_gen + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    // -------- Hand path: prefill + greedy decode loop --------
+    std::vector<int32_t> hand_gen;
+    hand_gen.reserve(n_gen);
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+    int32_t next_tok = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, logits.data(), &next_tok, error)) {
+        return false;
+    }
+    int next = next_tok;
+    hand_gen.push_back(next);
+    for (int g = 1; g < n_gen; ++g) {
+        int32_t tok = next;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          logits.data(), &next_tok, error)) return false;
+        next = next_tok;
+        hand_gen.push_back(next);
+    }
+    const double hand_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    // -------- Upstream path: persistent llama_context, greedy decode --------
+    const int n_ctx = n_prompt + n_gen + 32;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "network_gen_self_test: llama_init_from_model failed"; return false; }
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    std::vector<int32_t> up_gen;
+    up_gen.reserve(n_gen);
+    const auto u0 = std::chrono::steady_clock::now();
+    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
+    if (llama_decode(ctx, batch) != 0) {
+        error = "network_gen_self_test: prompt llama_decode failed";
+        llama_free(ctx); return false;
+    }
+    {
+        const float * src = llama_get_logits_ith(ctx, n_prompt - 1);
+        if (!src) { error = "network_gen_self_test: get_logits_ith null"; llama_free(ctx); return false; }
+        int up_next = (int) (std::max_element(src, src + n_vocab) - src);
+        up_gen.push_back(up_next);
+        for (int g = 1; g < n_gen; ++g) {
+            int32_t tok = up_next;
+            llama_batch one = llama_batch_get_one(&tok, 1);
+            if (llama_decode(ctx, one) != 0) {
+                error = "network_gen_self_test: gen llama_decode failed";
+                llama_free(ctx); return false;
+            }
+            const float * s2 = llama_get_logits_ith(ctx, -1);
+            if (!s2) { error = "network_gen_self_test: get_logits_ith(-1) null"; llama_free(ctx); return false; }
+            up_next = (int) (std::max_element(s2, s2 + n_vocab) - s2);
+            up_gen.push_back(up_next);
+        }
+    }
+    const double up_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - u0).count();
+    llama_free(ctx);
+
+    // -------- Compare token-by-token --------
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+
+    std::string hand_text, up_text;
+    int matched = 0;
+    int first_diverge = -1;
+    for (int g = 0; g < n_gen; ++g) {
+        if (hand_gen[g] == up_gen[g]) ++matched;
+        else if (first_diverge < 0) first_diverge = g;
+        hand_text += piece(hand_gen[g]);
+        up_text   += piece(up_gen[g]);
+    }
+
+    std::fprintf(stderr, "gemma4 network_gen_self_test results (%s vs upstream):\n", hand_path_label());
+    std::fprintf(stderr, "  %-15s took %.1f ms (prefill %d + %d gen tokens)\n",
+                 hand_path_label(), hand_ms, n_prompt, n_gen);
+    std::fprintf(stderr, "  %-15s took %.1f ms\n", "upstream", up_ms);
+    std::fprintf(stderr, "  match              %d/%d tokens\n", matched, n_gen);
+    if (first_diverge >= 0) {
+        std::fprintf(stderr, "  first divergence at gen step %d: %s=%d(%s) upstream=%d(%s)\n",
+                     first_diverge, hand_path_label(),
+                     hand_gen[first_diverge], piece(hand_gen[first_diverge]).c_str(),
+                     up_gen[first_diverge],   piece(up_gen[first_diverge]).c_str());
+    }
+    std::fprintf(stderr, "  %-15s text : \"%s\"\n", hand_path_label(), hand_text.c_str());
+    std::fprintf(stderr, "  %-15s text : \"%s\"\n", "upstream", up_text.c_str());
+
+    if (matched != n_gen) {
+        std::ostringstream ss;
+        ss << "network_gen_self_test: " << matched << "/" << n_gen << " tokens matched";
+        error = ss.str();
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Teacher-forced drift diagnostic
+// ---------------------------------------------------------------------
+//
+// Unlike network_gen_self_test (which lets each path pick its own greedy
+// tokens and so compares apples-to-oranges the moment they diverge), this
+// harness feeds BOTH the hand path and upstream the *same* token every step
+// -- upstream's greedy choice -- and reports per-step logits agreement
+// (cos_sim, max_abs, top-1 match). Identical inputs at every step isolate the
+// hand forward's pure numerical drift from token-path divergence, and expose
+// how that drift accumulates through the KV cache across decode steps.
+bool network_drift_self_test(const llama_model * model, const Weights & w,
+                             const std::string & prompt, int n_gen,
+                             int n_threads, std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_drift_self_test: n_gen<=0"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_drift_self_test: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr,
+        "gemma4 network_drift_self_test: prompt=\"%s\" -> %d tokens, n_gen=%d (teacher-forced)\n",
+        prompt.c_str(), n_prompt, n_gen);
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_gen + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    const int n_ctx = n_prompt + n_gen + 32;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = n_ctx;
+    cp.n_batch         = n_ctx;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.no_perf         = true;
+    llama_context * ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+    if (!ctx) { error = "network_drift_self_test: llama_init_from_model failed"; return false; }
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    std::vector<float> hand_logits((size_t) n_vocab, 0.0f);
+
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+
+    // Compare hand vs upstream logits: cos_sim, max_abs, and each side's top-1.
+    auto compare = [&](const float * up, const float * hand,
+                       double & cos, double & maxabs, int & th, int & tu) {
+        double dot = 0.0, hh = 0.0, uu = 0.0, mx = 0.0;
+        int bh = 0, bu = 0;
+        for (int v = 0; v < n_vocab; ++v) {
+            const double h = (double) hand[v], u = (double) up[v];
+            dot += h * u; hh += h * h; uu += u * u;
+            const double d = std::fabs(h - u);
+            if (d > mx) mx = d;
+            if (hand[v] > hand[bh]) bh = v;
+            if (up[v]   > up[bu])   bu = v;
+        }
+        cos = dot / (std::sqrt(hh) * std::sqrt(uu) + 1e-30);
+        maxabs = mx; th = bh; tu = bu;
+    };
+
+    std::fprintf(stderr,
+        "  step |   cos_sim  |  max_abs  | %-15s top-1 | upstream top-1 | flip\n",
+        hand_path_label());
+
+    int    first_flip   = -1;
+    double min_cos       = 1.0;
+    int    flips         = 0;
+
+    auto emit = [&](int step, double cos, double maxabs, int th, int tu) {
+        if (cos < min_cos) min_cos = cos;
+        const bool flip = (th != tu);
+        if (flip) { ++flips; if (first_flip < 0) first_flip = step; }
+        std::fprintf(stderr, "  %4d | %.8f | %.3e | %6d (%-6s) | %6d (%-6s) | %s\n",
+                     step, cos, maxabs,
+                     th, piece(th).c_str(), tu, piece(tu).c_str(),
+                     flip ? "FLIP" : "");
+    };
+
+    // ---- Step 0: prefill both paths on the prompt ----
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, hand_logits.data(), error)) {
+        llama_free(ctx); return false;
+    }
+    {
+        llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_prompt);
+        if (llama_decode(ctx, batch) != 0) {
+            error = "network_drift_self_test: prompt llama_decode failed";
+            llama_free(ctx); return false;
+        }
+    }
+    const float * up = llama_get_logits_ith(ctx, n_prompt - 1);
+    if (!up) { error = "network_drift_self_test: get_logits_ith null"; llama_free(ctx); return false; }
+
+    double cos, maxabs; int th, tu;
+    compare(up, hand_logits.data(), cos, maxabs, th, tu);
+    emit(0, cos, maxabs, th, tu);
+    int teacher = tu;   // feed upstream's greedy choice to both next step
+
+    // ---- Decode loop: feed the SAME teacher token to both paths ----
+    for (int g = 1; g < n_gen; ++g) {
+        int32_t tok = teacher;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          hand_logits.data(), error)) { llama_free(ctx); return false; }
+        llama_batch one = llama_batch_get_one(&tok, 1);
+        if (llama_decode(ctx, one) != 0) {
+            error = "network_drift_self_test: gen llama_decode failed";
+            llama_free(ctx); return false;
+        }
+        const float * up2 = llama_get_logits_ith(ctx, -1);
+        if (!up2) { error = "network_drift_self_test: get_logits_ith(-1) null"; llama_free(ctx); return false; }
+
+        compare(up2, hand_logits.data(), cos, maxabs, th, tu);
+        emit(g, cos, maxabs, th, tu);
+        teacher = tu;
+    }
+    llama_free(ctx);
+
+    std::fprintf(stderr, "gemma4 network_drift_self_test summary (%s vs upstream, teacher-forced):\n",
+                 hand_path_label());
+    std::fprintf(stderr, "  min cos_sim        = %.8f\n", min_cos);
+    std::fprintf(stderr, "  top-1 flips        = %d/%d steps\n", flips, n_gen);
+    if (first_flip >= 0)
+        std::fprintf(stderr, "  first top-1 flip   = step %d\n", first_flip);
+    else
+        std::fprintf(stderr, "  first top-1 flip   = (none; every step top-1 agrees)\n");
+
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// G4.3 -- Cached prefill: save / load drivers
+// ---------------------------------------------------------------------
+//
+// Both drivers run hand-only greedy decode (no upstream comparison) so
+// the cached path can demonstrate equivalence to "warm prefill +
+// continued gen" without paying for a second forward pass via llama.
+// Use --gemma4-network-gen for the upstream comparison gate.
+
+bool network_gen_save_kv(const llama_model * model, const Weights & w,
+                         const std::string & prompt, int n_gen,
+                         int n_threads,
+                         const std::string & save_kv_path,
+                         std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_gen_save_kv: n_gen<=0"; return false; }
+    if (save_kv_path.empty()) { error = "network_gen_save_kv: save_kv_path empty"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_gen_save_kv: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr,
+        "gemma4 save-kv: prompt=\"%s\" -> %d tokens, n_gen=%d, save_kv_path=%s\n",
+        prompt.c_str(), n_prompt, n_gen, save_kv_path.c_str());
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_gen + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+    const auto t_pre0 = std::chrono::steady_clock::now();
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, logits.data(), error)) {
+        return false;
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_pre0).count();
+
+    const int first_gen_token = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+
+    // Save state BEFORE running the rest of the gen loop so the file on
+    // disk is exactly what a fresh load+continue run would consume.
+    const uint64_t prompt_hash = kv_compute_prompt_hash(prompt_tokens);
+    const uint64_t weight_hash = kv_compute_model_weight_hash(model);
+    const auto t_save0 = std::chrono::steady_clock::now();
+    if (!save_kv_to_disk(st, mf, first_gen_token, prompt_hash, weight_hash,
+                         save_kv_path, error)) {
+        return false;
+    }
+    const double save_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_save0).count();
+
+    std::vector<int32_t> gen_tokens;
+    gen_tokens.reserve(n_gen);
+    // first_gen_token is a cache contract -- it goes into the gen
+    // display vector unconditionally (rendered or not is up to the
+    // caller; the on-disk format stores it separately so byte-identical
+    // round trips still work even if it happens to be an EOG token).
+    gen_tokens.push_back(first_gen_token);
+    bool stopped_on_eog = false;
+    int next = first_gen_token;
+    if (llama_vocab_is_eog(vocab, first_gen_token)) {
+        stopped_on_eog = true;
+    }
+    const auto t_gen0 = std::chrono::steady_clock::now();
+    for (int g = 1; !stopped_on_eog && g < n_gen; ++g) {
+        int32_t tok = next;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          logits.data(), error)) return false;
+        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        if (llama_vocab_is_eog(vocab, next)) { stopped_on_eog = true; break; }
+        gen_tokens.push_back(next);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_gen0).count();
+
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+    std::string gen_text;
+    for (int t : gen_tokens) gen_text += piece(t);
+
+    std::fprintf(stderr,
+        "gemma4 save-kv: prefill %.1f ms  save %.1f ms  gen %.1f ms (%d toks)%s\n"
+        "  gen text: \"%s\"\n",
+        prefill_ms, save_ms, gen_ms, (int) gen_tokens.size(),
+        stopped_on_eog ? "  [stopped on EOG]" : "",
+        gen_text.c_str());
+    return true;
+}
+
+bool network_gen_load_kv(const llama_model * model, const Weights & w,
+                         const std::string & prompt, int n_gen,
+                         int n_threads,
+                         const std::string & load_kv_path,
+                         bool strict_model_match,
+                         std::string & error) {
+    if (n_threads <= 0) n_threads = 1;
+    if (n_gen <= 0)     { error = "network_gen_load_kv: n_gen<=0"; return false; }
+    if (load_kv_path.empty()) { error = "network_gen_load_kv: load_kv_path empty"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    // Optional prompt-hash for advisory check.
+    uint64_t expected_prompt_hash = 0;
+    int n_prompt_advisory = 0;
+    if (!prompt.empty()) {
+        std::vector<int32_t> ptok;
+        ptok.resize(prompt.size() + 8);
+        const int n = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                     ptok.data(), (int) ptok.size(),
+                                     /*add_special=*/true, /*parse_special=*/true);
+        if (n > 0) {
+            ptok.resize(n);
+            expected_prompt_hash = kv_compute_prompt_hash(ptok);
+            n_prompt_advisory = n;
+        }
+    }
+
+    std::fprintf(stderr,
+        "gemma4 load-kv: load_kv_path=%s prompt_advisory_tokens=%d strict=%d n_gen=%d\n",
+        load_kv_path.c_str(), n_prompt_advisory, (int) strict_model_match, n_gen);
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+
+    NetworkState st;
+    const uint64_t weight_hash = kv_compute_model_weight_hash(model);
+    int loaded_n_tokens = 0;
+    int first_gen_token = -1;
+    const auto t_load0 = std::chrono::steady_clock::now();
+    if (!load_kv_from_disk(st, mf, load_kv_path,
+                           /*continuation_capacity=*/n_gen + 4,
+                           expected_prompt_hash, weight_hash,
+                           strict_model_match,
+                           loaded_n_tokens, first_gen_token, error)) {
+        return false;
+    }
+    const double load_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_load0).count();
+
+    if (first_gen_token < 0 || first_gen_token >= n_vocab) {
+        std::ostringstream oss;
+        oss << "network_gen_load_kv: invalid first_gen_token=" << first_gen_token;
+        error = oss.str();
+        return false;
+    }
+
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+    std::vector<int32_t> gen_tokens;
+    gen_tokens.reserve(n_gen);
+    // first_gen_token came from the cached prefill -- always render it
+    // so the load-side transcript starts at the same point as the
+    // save-side transcript (cache contract).
+    gen_tokens.push_back(first_gen_token);
+    bool stopped_on_eog = llama_vocab_is_eog(vocab, first_gen_token);
+    int next = first_gen_token;
+    const auto t_gen0 = std::chrono::steady_clock::now();
+    for (int g = 1; !stopped_on_eog && g < n_gen; ++g) {
+        int32_t tok = next;
+        if (!network_step(st, mf, 1, &tok, /*last_token_only=*/true,
+                          logits.data(), error)) return false;
+        next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        if (llama_vocab_is_eog(vocab, next)) { stopped_on_eog = true; break; }
+        gen_tokens.push_back(next);
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_gen0).count();
+
+    auto piece = [&](int t) -> std::string {
+        char buf[64] = {0};
+        int n = llama_token_to_piece(vocab, t, buf, (int) sizeof(buf) - 1, 0, true);
+        if (n <= 0) return std::string("?");
+        return std::string(buf, buf + n);
+    };
+    std::string gen_text;
+    for (int t : gen_tokens) gen_text += piece(t);
+
+    std::fprintf(stderr,
+        "gemma4 load-kv: load %.1f ms  gen %.1f ms (%d toks)  n_past_after_load=%d%s\n"
+        "  gen text: \"%s\"\n",
+        load_ms, gen_ms, (int) gen_tokens.size(), loaded_n_tokens,
+        stopped_on_eog ? "  [stopped on EOG]" : "",
+        gen_text.c_str());
+    return true;
+}
+
+
+// ---------------------------------------------------------------------
+// Profiling driver: prefill + N decode steps with per-stage timing
+// ---------------------------------------------------------------------
+
+bool network_profile(const llama_model * model, const Weights & w,
+                     const std::string & prompt, int n_decode,
+                     int n_threads, std::string & error) {
+    if (n_decode < 0) { error = "network_profile: n_decode<0"; return false; }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<int32_t> prompt_tokens;
+    prompt_tokens.resize(prompt.size() + 8);
+    const int n_prompt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(),
+                                        prompt_tokens.data(), (int) prompt_tokens.size(),
+                                        /*add_special=*/true, /*parse_special=*/true);
+    if (n_prompt < 0) { error = "network_profile: tokenize failed"; return false; }
+    prompt_tokens.resize(n_prompt);
+
+    std::fprintf(stderr, "gemma4 network_profile: prompt=\"%s\" -> %d tokens, n_decode=%d (%s, hand-only)\n",
+                 prompt.c_str(), n_prompt, n_decode, hand_path_label());
+
+    ModelF32 mf;
+    if (!dequant_model(model, w, mf, error, n_threads)) return false;
+    NetworkState st;
+    const int cap = n_prompt + n_decode + 4;
+    if (!network_state_reserve(st, mf, cap, error)) return false;
+
+    const int n_vocab = mf.n_vocab;
+    std::vector<float> logits((size_t) n_vocab, 0.0f);
+
+    // ---- Prefill (n_prompt tokens) ----
+    ExpertStore * store = get_expert_store();
+    profile_reset();
+    profile_set_enabled(true);
+    const auto t_pre0 = std::chrono::steady_clock::now();
+    if (!network_step(st, mf, n_prompt, prompt_tokens.data(),
+                      /*last_token_only=*/true, logits.data(), error)) {
+        profile_set_enabled(false);
+        return false;
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_pre0).count();
+    profile_set_enabled(false);
+    profile_print("prefill", 1, n_prompt);
+    std::fprintf(stderr, "  prefill: %.1f ms (%d tokens, %.1f t/s)\n",
+                 prefill_ms, n_prompt, n_prompt * 1000.0 / prefill_ms);
+    if (store) { store->drain(); store->log_stats("prefill"); store->reset_stats(); }
+
+    if (n_decode <= 0) return true;
+
+    // ---- Decode: N single-token steps ----
+    int32_t next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+    profile_reset();
+    profile_set_enabled(true);
+    const auto t_dec0 = std::chrono::steady_clock::now();
+    for (int g = 0; g < n_decode; ++g) {
+        int32_t nxt = next;
+        if (!network_step(st, mf, 1, &next, /*last_token_only=*/true,
+                          logits.data(), &nxt, error)) {
+            profile_set_enabled(false);
+            return false;
+        }
+        next = nxt;
+    }
+    const double decode_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_dec0).count();
+    profile_set_enabled(false);
+    profile_print("decode", n_decode, n_decode);
+    std::fprintf(stderr, "  decode: %.1f ms (%d tokens, %.2f t/s, %.2f ms/token)\n",
+                 decode_ms, n_decode, n_decode * 1000.0 / decode_ms,
+                 decode_ms / n_decode);
+    if (store) { store->drain(); store->log_stats("decode"); }
+    return true;
+}
+
+} // namespace gemma4

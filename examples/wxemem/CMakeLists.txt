@@ -22,14 +22,35 @@ if (MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# wxememdiff - diff two wxemem --json snapshots and attribute memory growth.
+# Cross-platform (pure C++17 + nlohmann/json); no OS-specific libraries.
+# ---------------------------------------------------------------------------
+add_executable(wxememdiff wxememdiff.cpp)
+install(TARGETS wxememdiff RUNTIME)
+target_compile_features(wxememdiff PRIVATE cxx_std_17)
+target_include_directories(wxememdiff PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+if (MSVC)
+    target_compile_definitions(wxememdiff PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# ---------------------------------------------------------------------------
 # Standalone Windows OS utilities (CPU topology + memory-bandwidth probes).
 # These are self-contained Win32 diagnostics used to investigate NUMA / CCX
 # behaviour (see topo.c and bwtest.c headers). Windows-only.
 #   topo   - dumps LP -> core -> CCX(L3) -> NUMA topology
 #   bwtest - measures aggregate read bandwidth vs thread placement
 #   ccxrun - launches any command with CCX-spread CPU placement (group-aware)
+#   membw  - memory bandwidth test
 # ---------------------------------------------------------------------------
 if (WIN32)
+    add_executable(wxeapiset wxeapiset.cpp)
+    install(TARGETS wxeapiset RUNTIME)
+    target_compile_features(wxeapiset PRIVATE cxx_std_17)
+    if (MSVC)
+        set_property(TARGET wxeapiset PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
     add_executable(topo topo.c)
     install(TARGETS topo RUNTIME)
     target_compile_definitions(topo PRIVATE
@@ -51,6 +72,69 @@ if (WIN32)
     add_executable(ccxrun ccxrun.c)
     install(TARGETS ccxrun RUNTIME)
     target_compile_definitions(ccxrun PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+
+    add_executable(membw membw.cpp)
+    install(TARGETS membw RUNTIME)
+    target_compile_definitions(ccxrun PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+
+    # -----------------------------------------------------------------------
+    # usampler - admin-free user-mode sampling profiler (Very-Sleepy style).
+    # Launches a child process, samples each thread's RIP, then symbolizes
+    # against the child's PDBs (dbghelp) and prints the hottest functions.
+    # Two builds of the same tool:
+    #   usampler   - the C++ implementation (usampler.cpp, C++17)
+    #   usampler_c - the pure-C89 port     (usampler.c) for older toolchains
+    # dbghelp: symbolization; winmm: 1 ms timer resolution.
+    # -----------------------------------------------------------------------
+    add_executable(usampler usampler.cpp)
+    install(TARGETS usampler RUNTIME)
+    target_compile_features(usampler PRIVATE cxx_std_17)
+    target_compile_definitions(usampler PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(usampler PRIVATE dbghelp winmm)
+
+   add_executable(usampler_c usampler.c)
+    install(TARGETS usampler_c RUNTIME)
+    target_compile_definitions(usampler_c PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(usampler_c PRIVATE dbghelp winmm)
+
+    add_executable(usampler_so usampler_so2001.c)
+    install(TARGETS usampler_so RUNTIME)
+    target_compile_features(usampler_so PRIVATE cxx_std_17)
+    target_compile_definitions(usampler_so PRIVATE
+        _WIN32_WINNT=0x0601
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(usampler_so PRIVATE dbghelp)
+
+     # -----------------------------------------------------------------------
+    # cpuid_diag - AVX-512 / AVX512-FP16 CPUID diagnostic. Self-contained C,
+    # no extra libraries (uses <intrin.h> __cpuid/__cpuidex/_xgetbv).
+    # -----------------------------------------------------------------------
+    add_executable(cpuid_diag cpuid_diag.c)
+    install(TARGETS cpuid_diag RUNTIME)
+    target_compile_definitions(cpuid_diag PRIVATE
         _WIN32_WINNT=0x0601
         _CRT_SECURE_NO_WARNINGS
         WIN32_LEAN_AND_MEAN

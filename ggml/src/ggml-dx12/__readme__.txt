@@ -330,133 +330,221 @@ Why Phi-3 Never Hit This
  - Phi-3 has 32 attention heads → after FA, the next PSO switch still had "live" addresses in slots 4/5 by coincidence (more graph 
 nodes between FA and the problematic ops)
 
+=====================================
+
+TDR on Gemma-4
+
+Here's how a single transformer layer flows through decode with the current code. Gemma-4 has 4 KV heads (groups are small for
+K/V/FA):
+
+ CL₁: [NORM]                              ← lightweight, batched
+ CL₂: [Q_proj MUL_MAT]  w=4, post-flush  ← 1024 MR groups, alone
+ CL₃: [K_proj MUL_MAT]  w=2, NO flush    ← 512 MR groups (<1000)
+ CL₄: [V_proj, ROPE, ROPE]  w=2+1+1=4    ← V_proj stays in CL with ROPEs!
+ CL₅: [FA]              w=2, NO flush     ← 4-32 groups, but reads 540 KV entries
+       ↑ next MUL_MAT pre-flushes this
+ CL₆: [O_proj MUL_MAT]  w=4, post-flush  ← alone
+
+The problem: FA has only 4-32 thread groups → weight=2 → doesn't self-flush. It sits in its CL until the next heavy op's pre-flush
+drains it. That's fine. But the actual GPU work inside those few thread groups scales with seq_len (540 KV entries × head_dim ×
+num_heads). Thread group count is a terrible proxy for FA workload.
+
 -----------------------------------------------------------------------------------------------------------------------------------
 
-ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
-Γöé Aspect                Γöé ggml-dx12 (this backend)                                                                                Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Wave variants per     Γöé 1 ΓÇö hardcoded -D WAVE_SIZE=64 for every shader (CMakeLists.txt line 230)                                Γöé
-Γöé shader                Γöé                                                                                                         Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Shader symbol         Γöé g_<name>_dxil (single blob)                                                                             Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé init_shader_blobs()   Γöé Does not exist                                                                                          Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Shader registry       Γöé Static g_shader_blobs map (line 5237) ΓÇö single blob per op, populated at C++ startup                    Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé C++ wave query        Γöé Reads WaveLaneCountMin/Max and logs them, but never uses the values to pick anything                    Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé WARP_SIZE macro       Γöé Resolves to 64 at compile time (because -D WAVE_SIZE=64 is always set)                                  Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Shader wave math      Γöé Inconsistent ΓÇö many shaders use WaveGetLaneCount() at runtime anyway (in ~20 files), ignoring the       Γöé
-Γöé                       Γöé compile-time WARP_SIZE define                                                                           Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé WAVE_SIZE_ATTR macro  Γöé Defined in ggml_common.hlsli, never used by any shader                                                  Γöé
-ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+Option 1: FA always weight=4
+
+ if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+     weight = 4;  // Always treat as heavy regardless of group count
+ }
+
+What changes: FA now post-flushes immediately (w=4 ≥ threshold=4). It gets a completely isolated CL — pre-flushed AND post-flushed.
+
+Impact: One extra close_and_execute() per layer (34 layers = 34 extra flushes per decode step). Each flush is cheap (~5-20µs on
+DX12), so total overhead ≈ 0.2-0.7ms per decode step. At 40 t/s that's ~25ms per step, so overhead is ~1-3%. Negligible.
+
+Complexity: 2-line change. Simple, predictable.
+
+Risk: Very low. We're just flushing more aggressively for FA, which we know is safe.
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Option 2: Scale FA weight by sequence length
+
+ if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+     int seq_len = /* extract from KV cache or node dims */;
+     if (seq_len > 256) weight = 8;
+     else if (seq_len > 64) weight = 4;
+     else weight = 2;
+ }
+
+What changes: FA weight adapts to how much KV data it reads. Short sequences (early decode) batch more freely; long sequences force
+immediate flush.
+
+Impact: Optimal batching — short prompts don't pay unnecessary flush overhead, long prompts are safe.
+
+Complexity: Medium. Need to extract seq_len from either node->src[1]->ne[1] (KV length) or track n_past. Slightly fragile — depends
+on FA tensor layout staying stable across upstream updates.
+
+Risk: Low-medium. If seq_len extraction breaks on a future upstream merge, we fall back to weight=2 (current behavior, occasional
+TDR on long prompts).
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Option 3: wait_for_gpu() after FA in decode
+
+ if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+     bctx->close_and_execute();
+     bctx->wait_for_gpu();  // CPU blocks until FA completes
+     bctx->ensure_cmd_list_open();
+ }
+
+What changes: CPU waits for FA to fully complete before submitting the next CL. This is the nuclear option — guarantees the GPU
+finishes FA before any new work arrives.
+
+Impact: Eliminates TDR risk entirely. But wait_for_gpu() is expensive — it stalls the CPU-GPU pipeline. The GPU sits idle while the
+CPU prepares the next CL. This is what causes the flush=1 performance penalty. 34 waits per decode step could cost 3-5ms total,
+reducing decode from ~40 t/s to ~35 t/s.
+
+Complexity: 3-line change. Simple.
+
+Risk: Low for correctness, but measurable performance hit. This is the same pattern as the model-head flush (which we know is slow
+but necessary there).
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Recommendation
+
+Option 1 is the best trade-off. It's simple, the performance cost is negligible (flush without wait is cheap), and it fully isolates
+FA. The key insight: close_and_execute() submits the CL but doesn't wait — the GPU can start processing immediately while the CPU
+prepares the next dispatch. The overhead is just the CPU-side CL setup cost.
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+┌───────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Aspect                │ ggml-dx12 (this backend)                                                                                │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Wave variants per     │ 1 — hardcoded -D WAVE_SIZE=64 for every shader (CMakeLists.txt line 230)                                │
+│ shader                │                                                                                                         │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shader symbol         │ g_<name>_dxil (single blob)                                                                             │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ init_shader_blobs()   │ Does not exist                                                                                          │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shader registry       │ Static g_shader_blobs map (line 5237) — single blob per op, populated at C++ startup                    │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ C++ wave query        │ Reads WaveLaneCountMin/Max and logs them, but never uses the values to pick anything                    │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ WARP_SIZE macro       │ Resolves to 64 at compile time (because -D WAVE_SIZE=64 is always set)                                  │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shader wave math      │ Inconsistent — many shaders use WaveGetLaneCount() at runtime anyway (in ~20 files), ignoring the       │
+│                       │ compile-time WARP_SIZE define                                                                           │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ WAVE_SIZE_ATTR macro  │ Defined in ggml_common.hlsli, never used by any shader                                                  │
+└───────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 What this actually means
 
 The backend is compiled assuming wave64 but runs on any hardware:
 
  - On AMD RDNA/GCN (real wave64 in compute mode): everything matches. Optimal.
- - On NVIDIA (wave32 ΓÇö half of wave64): shaders compiled with WAVE_SIZE=64 constants are deployed on wave32 hardware. The 
+ - On NVIDIA (wave32 — half of wave64): shaders compiled with WAVE_SIZE=64 constants are deployed on wave32 hardware. The 
 WARP_SIZE-based math (whatever uses it) is wrong by 2x. The shaders using WaveGetLaneCount() are correct but produce less-optimal 
 code.
  - On Intel Xe iGPU (wave16 or wave32 depending on the SKU/SIMD mode): same problem, potentially 4x off in WARP_SIZE-based math.
 
 The reason it doesn't blow up in practice: most performance-critical shaders use WaveGetLaneCount() directly (the runtime path),
-bypassing the broken WARP_SIZE. The compile-time -D WAVE_SIZE=64 is only consequential for shaders that use the WARP_SIZE macro ΓÇö
+bypassing the broken WARP_SIZE. The compile-time -D WAVE_SIZE=64 is only consequential for shaders that use the WARP_SIZE macro —
 and those would silently miscompute on non-wave64 hardware.
 
 The three backends side-by-side
 
-ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
-Γöé Approach        Γöé ggml-dx12 (b612_clean)                                Γöé ggml-dx12x (smosier) Γöé ggml-dx12-main (d3ddk /        Γöé
-Γöé                 Γöé                                                       Γöé                      Γöé sd.cpp)                        Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Build-time wave Γöé 1 (forced w64)                                        Γöé 1 (no -D WAVE_SIZE)  Γöé 3 (w16, w32, w64)              Γöé
-Γöé variants        Γöé                                                       Γöé                      Γöé                                Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Optional FP16   Γöé None                                                  Γöé 4 WMMA shaders       Γöé 6 shaders ├ù wave size          Γöé
-Γöé variants        Γöé                                                       Γöé                      Γöé                                Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Runtime         Γöé None (single blob)                                    Γöé None (single blob)   Γöé init_shader_blobs() picks per  Γöé
-Γöé selection       Γöé                                                       Γöé                      Γöé device wave                    Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé [WaveSize(N)]   Γöé Defined but unused                                    Γöé Not defined          Γöé Used (currently only           Γöé
-Γöé PSO pinning     Γöé                                                       Γöé                      Γöé gated_delta_net.hlsl)          Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Shader wave     Γöé Mixed: WARP_SIZE (=64) Γèò WaveGetLaneCount()           Γöé Pure                 Γöé WARP_SIZE (compile-time        Γöé
-Γöé math            Γöé                                                       Γöé WaveGetLaneCount()   Γöé constant per variant)          Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Correct on      Γöé Only where shader uses WaveGetLaneCount() (most do);  Γöé Yes (always)         Γöé Yes (always; with PSO pinning  Γöé
-Γöé non-wave64 GPUs Γöé shaders depending on WARP_SIZE silently miscompute    Γöé                      Γöé where used)                    Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé Perf on         Γöé Suboptimal (when WaveGetLaneCount path runs) or wrong Γöé Suboptimal (DXC      Γöé Optimal (compile-time          Γöé
-Γöé wave32/wave16   Γöé (when WARP_SIZE path runs)                            Γöé can't fold lane      Γöé constants ΓåÆ unrolling/branch   Γöé
-Γöé GPUs            Γöé                                                       Γöé count)               Γöé elimination)                   Γöé
-ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+┌─────────────────┬───────────────────────────────────────────────────────┬──────────────────────┬────────────────────────────────┐
+│ Approach        │ ggml-dx12 (b612_clean)                                │ ggml-dx12x (smosier) │ ggml-dx12-main (d3ddk /        │
+│                 │                                                       │                      │ sd.cpp)                        │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Build-time wave │ 1 (forced w64)                                        │ 1 (no -D WAVE_SIZE)  │ 3 (w16, w32, w64)              │
+│ variants        │                                                       │                      │                                │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Optional FP16   │ None                                                  │ 4 WMMA shaders       │ 6 shaders × wave size          │
+│ variants        │                                                       │                      │                                │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Runtime         │ None (single blob)                                    │ None (single blob)   │ init_shader_blobs() picks per  │
+│ selection       │                                                       │                      │ device wave                    │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ [WaveSize(N)]   │ Defined but unused                                    │ Not defined          │ Used (currently only           │
+│ PSO pinning     │                                                       │                      │ gated_delta_net.hlsl)          │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Shader wave     │ Mixed: WARP_SIZE (=64) ⊕ WaveGetLaneCount()           │ Pure                 │ WARP_SIZE (compile-time        │
+│ math            │                                                       │ WaveGetLaneCount()   │ constant per variant)          │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Correct on      │ Only where shader uses WaveGetLaneCount() (most do);  │ Yes (always)         │ Yes (always; with PSO pinning  │
+│ non-wave64 GPUs │ shaders depending on WARP_SIZE silently miscompute    │                      │ where used)                    │
+├─────────────────┼───────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────┤
+│ Perf on         │ Suboptimal (when WaveGetLaneCount path runs) or wrong │ Suboptimal (DXC      │ Optimal (compile-time          │
+│ wave32/wave16   │ (when WARP_SIZE path runs)                            │ can't fold lane      │ constants → unrolling/branch   │
+│ GPUs            │                                                       │ count)               │ elimination)                   │
+└─────────────────┴───────────────────────────────────────────────────────┴──────────────────────┴────────────────────────────────┘
 
 So ggml-dx12 (b612_clean original) silently bets on wave64 for correctness; ggml-dx12x (smosier) is correct-everywhere but slower; 
-ggml-dx12-main (d3ddk) is the most engineered ΓÇö three sets of blobs and a small init-time picker.
+ggml-dx12-main (d3ddk) is the most engineered — three sets of blobs and a small init-time picker.
 
-ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
-Γöé Backend          Γöé Blob "carries"           Γöé wave32 GPU result                                                                 Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé ggml-dx12        Γöé wave64 hardcoded via -D  Γöé Correct only where the shader uses WaveGetLaneCount() directly; shaders relying   Γöé
-Γöé (b612_clean)     Γöé WAVE_SIZE=64             Γöé on the WARP_SIZE macro silently miscompute                                        Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé ggml-dx12x       Γöé No wave constant baked   Γöé Correct on any wave width; perf is suboptimal because DXC can't fold the lane     Γöé
-Γöé (smosier)        Γöé in (wave-neutral)        Γöé count                                                                             Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé ggml-dx12-main   Γöé Three separate blobs:    Γöé Binds the w32 blob at init; correct and optimal (constants folded, loops          Γöé
-Γöé (d3ddk)          Γöé w16, w32, w64            Γöé unrolled, optional [WaveSize(32)] PSO pin)                                        Γöé
-ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+┌──────────────────┬──────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ Backend          │ Blob "carries"           │ wave32 GPU result                                                                 │
+├──────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ ggml-dx12        │ wave64 hardcoded via -D  │ Correct only where the shader uses WaveGetLaneCount() directly; shaders relying   │
+│ (b612_clean)     │ WAVE_SIZE=64             │ on the WARP_SIZE macro silently miscompute                                        │
+├──────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ ggml-dx12x       │ No wave constant baked   │ Correct on any wave width; perf is suboptimal because DXC can't fold the lane     │
+│ (smosier)        │ in (wave-neutral)        │ count                                                                             │
+├──────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+│ ggml-dx12-main   │ Three separate blobs:    │ Binds the w32 blob at init; correct and optimal (constants folded, loops          │
+│ (d3ddk)          │ w16, w32, w64            │ unrolled, optional [WaveSize(32)] PSO pin)                                        │
+└──────────────────┴──────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
 
-GGML_DX12 ΓÇö "originals", wave64-targeted
+GGML_DX12 — "originals", wave64-targeted
 
  - Build: single blob per shader, -D WAVE_SIZE=64 hardcoded.
  - Designed for: wave64 hardware (AMD UMA on RDNA3.5 was the development target, yes).
- - Runs on: wave64 GPUs correctly. On wave32/wave16 GPUs it doesn't crash ΓÇö most shaders use WaveGetLaneCount() at runtime ΓÇö but 
+ - Runs on: wave64 GPUs correctly. On wave32/wave16 GPUs it doesn't crash — most shaders use WaveGetLaneCount() at runtime — but 
 any shader using the WARP_SIZE macro for partitioning silently miscomputes. So best to treat it as wave64-only for correctness.
 
-GGML_DX12X ΓÇö Xbox Series X (Scarlett) flavor, wave-neutral
+GGML_DX12X — Xbox Series X (Scarlett) flavor, wave-neutral
 
  - Origin: smosier_b612, which includes Xbox GDKX support (you can see GGML_XBOX paths and the Scarlett shader-compiler discovery 
 in its CMakeLists).
  - Hardware target you mentioned (Xbox Series X = RDNA2 wave64): yes, that's the intended deployment target.
- - But importantly ΓÇö and this is the surprise: the desktop variant compiles wave-neutral DXIL (no -D WAVE_SIZE, no [WaveSize(N)] 
+ - But importantly — and this is the surprise: the desktop variant compiles wave-neutral DXIL (no -D WAVE_SIZE, no [WaveSize(N)] 
 attribute). Every shader uses WaveGetLaneCount() at runtime.
- - Net result: it runs correctly on any DX12 GPU ΓÇö AMD wave64, NVIDIA wave32, Intel Xe wave16/32 ΓÇö but at a small ALU-side perf 
+ - Net result: it runs correctly on any DX12 GPU — AMD wave64, NVIDIA wave32, Intel Xe wave16/32 — but at a small ALU-side perf 
 cost because DXC can't fold the wave count into shifts/unrolled loops.
- - So: Xbox Scarlett is its primary deployment, but it's not restricted to that ΓÇö it's actually the most portable of the three by 
+ - So: Xbox Scarlett is its primary deployment, but it's not restricted to that — it's actually the most portable of the three by 
 accident.
 
-GGML_DX12_MAIN ΓÇö the engineered one
+GGML_DX12_MAIN — the engineered one
 
  - Build: three blobs per shader (w16, w32, w64), plus FP16 variants for select shaders.
  - Runtime: queries WaveLaneCountMin/Max at device init and picks the matching pre-compiled blob.
- - Result: correct + optimal on any DX12 GPU (AMD / NVIDIA / Intel iGPU), at the cost of ~3├ù DXIL footprint in the binary.
+ - Result: correct + optimal on any DX12 GPU (AMD / NVIDIA / Intel iGPU), at the cost of ~3× DXIL footprint in the binary.
 
 Corrected summary
 
-ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
-Γöé Flavor        Γöé Wave handling                       Γöé Primary intent               Γöé Runs correctly on                          Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé DX12          Γöé Hardcoded wave64                    Γöé AMD UMA RDNA3.5 (your dev    Γöé Wave64 only (safe); other widths "mostly   Γöé
-Γöé               Γöé                                     Γöé target)                      Γöé works" but unsafe                          Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé DX12X         Γöé Wave-neutral DXIL (runtime          Γöé Xbox Series X / Scarlett     Γöé Any DX12 GPU (correct but not specialized) Γöé
-Γöé               Γöé WaveGetLaneCount())                 Γöé (RDNA2 wave64)               Γöé                                            Γöé
-Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ
-Γöé DX12_MAIN     Γöé 3 pre-compiled blobs per shader,    Γöé "Anything" ΓÇö desktop AMD /   Γöé Any DX12 GPU, optimally                    Γöé
-Γöé               Γöé runtime picks one                   Γöé NVIDIA / Intel               Γöé                                            Γöé
-ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö┤ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+┌───────────────┬─────────────────────────────────────┬──────────────────────────────┬────────────────────────────────────────────┐
+│ Flavor        │ Wave handling                       │ Primary intent               │ Runs correctly on                          │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────┼────────────────────────────────────────────┤
+│ DX12          │ Hardcoded wave64                    │ AMD UMA RDNA3.5 (your dev    │ Wave64 only (safe); other widths "mostly   │
+│               │                                     │ target)                      │ works" but unsafe                          │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────┼────────────────────────────────────────────┤
+│ DX12X         │ Wave-neutral DXIL (runtime          │ Xbox Series X / Scarlett     │ Any DX12 GPU (correct but not specialized) │
+│               │ WaveGetLaneCount())                 │ (RDNA2 wave64)               │                                            │
+├───────────────┼─────────────────────────────────────┼──────────────────────────────┼────────────────────────────────────────────┤
+│ DX12_MAIN     │ 3 pre-compiled blobs per shader,    │ "Anything" — desktop AMD /   │ Any DX12 GPU, optimally                    │
+│               │ runtime picks one                   │ NVIDIA / Intel               │                                            │
+└───────────────┴─────────────────────────────────────┴──────────────────────────────┴────────────────────────────────────────────┘
 
 So your one-line summaries should read:
 
  - GGML_DX12: dev target was wave64 UMA (RDNA3.5); fastest there, correctness-risky elsewhere.
- - GGML_DX12X: Xbox Scarlett primary target, but the DXIL is wave-neutral so it actually runs correctly anywhere ΓÇö just not as fast
+ - GGML_DX12X: Xbox Scarlett primary target, but the DXIL is wave-neutral so it actually runs correctly anywhere — just not as fast
  as DX12_MAIN.
  - GGML_DX12_MAIN: the portable + tuned one. Runs correctly and at optimal wave width on AMD / NVIDIA / Intel.
 

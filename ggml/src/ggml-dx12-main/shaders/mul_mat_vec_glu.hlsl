@@ -14,15 +14,24 @@
 // node[i+1] (its W is bound as src2 with op1 = byte offset).
 //
 // Bindings:
-//   src0 (t0): W_gate weights, F16, ne00=K, ne01=N
+//   src0 (t0): W_gate weights, F16 or BF16, ne00=K, ne01=N
 //   src1 (t1): x       activation, F32, contiguous, ne10=K
-//   src2 (t2): W_up    weights, F16, same shape and stride as W_gate.
+//   src2 (t2): W_up    weights, F16 or BF16, same shape and stride as W_gate.
 //              Bound at the resource base; W_up's tensor byte offset
 //              is passed in op1.
 //   dst  (u0): y       fused output, F32, ne0=N (= GLU split-mode output width)
 //
 // op_params:
 //   op1 = W_up base byte offset (within src2)
+//
+// RMS_FUSED variant (mul_mat_vec_glu_rms.hlsl):
+//   Folds the preceding RMS_NORM + MUL(norm_weight) into this dispatch.
+//   src1 carries the pre-norm activation x and src6 the norm weight g, so
+//   the fused output is silu(dot(Wg, x*g)/rms) * (dot(Wu, x*g)/rms) with
+//   rms = sqrt(sum(x*x)/K + eps).  The scale is a scalar over the row, so
+//   one pass accumulates both the dot products and sum(x*x).
+//   src6 (t6): g, F32, K elements, tensor byte offset baked into the VA
+//   op14 = eps (float bits)
 //
 // Only SWIGLU is supported; that is the activation used by every
 // LLaMA-class FFN we currently care about.  Other GLU variants would
@@ -38,8 +47,11 @@
 #define GROUP_SIZE 256
 #define NUM_ROWS   2
 
-groupshared float shared_acc[128];
+groupshared float shared_acc[160];
 
+#if defined(WAVE_SIZE) && (GROUP_SIZE >= WAVE_SIZE)
+[WaveSize(WAVE_SIZE)]
+#endif
 [numthreads(GROUP_SIZE, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint tid = gtid.x;
@@ -71,9 +83,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     precise float acc_up0   = 0.0f;
     precise float acc_gate1 = 0.0f;
     precise float acc_up1   = 0.0f;
+#if RMS_FUSED
+    precise float acc_ss = 0.0f;
+#endif
 
     if (x_contiguous && gate_pair_aligned && up_pair_aligned) {
-        // F16 weights + contiguous F32 input — process two rows per group
+        // Packed 16-bit weights + contiguous F32 input - process two rows per group
         // and four K values per participating lane, matching the standalone
         // MR shader's geometry while sharing activation loads across gate/up.
         uint k = tid * 4;
@@ -81,57 +96,97 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             uint4 x4 = src1.Load4(x_base + k * 4);
             float x0 = asfloat(x4.x); float x1 = asfloat(x4.y);
             float x2 = asfloat(x4.z); float x3 = asfloat(x4.w);
-
-#if NATIVE_FP16
-            vector<float16_t,4> wg0 = src0.Load<vector<float16_t,4> >(gate0_base + k * 2);
-            acc_gate0 = mad((float)wg0.x, x0, mad((float)wg0.y, x1,
-                       mad((float)wg0.z, x2, mad((float)wg0.w, x3, acc_gate0))));
-
-            vector<float16_t,4> wu0 = src2.Load<vector<float16_t,4> >(up0_base + k * 2);
-            acc_up0 = mad((float)wu0.x, x0, mad((float)wu0.y, x1,
-                    mad((float)wu0.z, x2, mad((float)wu0.w, x3, acc_up0))));
-
-            vector<float16_t,4> wg1 = src0.Load<vector<float16_t,4> >(gate1_base + k * 2);
-            acc_gate1 = mad((float)wg1.x, x0, mad((float)wg1.y, x1,
-                       mad((float)wg1.z, x2, mad((float)wg1.w, x3, acc_gate1))));
-
-            vector<float16_t,4> wu1 = src2.Load<vector<float16_t,4> >(up1_base + k * 2);
-            acc_up1 = mad((float)wu1.x, x0, mad((float)wu1.y, x1,
-                    mad((float)wu1.z, x2, mad((float)wu1.w, x3, acc_up1))));
-#else
-            uint2 wg0 = src0.Load2(gate0_base + k * 2);
-            acc_gate0 = mad(f16tof32(wg0.x & 0xFFFFu), x0, mad(f16tof32(wg0.x >> 16), x1,
-                       mad(f16tof32(wg0.y & 0xFFFFu), x2, mad(f16tof32(wg0.y >> 16), x3, acc_gate0))));
-
-            uint2 wu0 = src2.Load2(up0_base + k * 2);
-            acc_up0 = mad(f16tof32(wu0.x & 0xFFFFu), x0, mad(f16tof32(wu0.x >> 16), x1,
-                    mad(f16tof32(wu0.y & 0xFFFFu), x2, mad(f16tof32(wu0.y >> 16), x3, acc_up0))));
-
-            uint2 wg1 = src0.Load2(gate1_base + k * 2);
-            acc_gate1 = mad(f16tof32(wg1.x & 0xFFFFu), x0, mad(f16tof32(wg1.x >> 16), x1,
-                       mad(f16tof32(wg1.y & 0xFFFFu), x2, mad(f16tof32(wg1.y >> 16), x3, acc_gate1))));
-
-            uint2 wu1 = src2.Load2(up1_base + k * 2);
-            acc_up1 = mad(f16tof32(wu1.x & 0xFFFFu), x0, mad(f16tof32(wu1.x >> 16), x1,
-                    mad(f16tof32(wu1.y & 0xFFFFu), x2, mad(f16tof32(wu1.y >> 16), x3, acc_up1))));
+#if RMS_FUSED
+            acc_ss = mad(x0, x0, mad(x1, x1, mad(x2, x2, mad(x3, x3, acc_ss))));
+            uint4 g4 = src6.Load4(k * 4);
+            x0 *= asfloat(g4.x); x1 *= asfloat(g4.y);
+            x2 *= asfloat(g4.z); x3 *= asfloat(g4.w);
 #endif
+
+            if (src0_esize == 3) {
+                uint2 wg0 = src0.Load2(gate0_base + k * 2);
+                acc_gate0 = mad(asfloat((wg0.x & 0xFFFFu) << 16), x0,
+                           mad(asfloat(wg0.x & 0xFFFF0000u), x1,
+                           mad(asfloat((wg0.y & 0xFFFFu) << 16), x2,
+                           mad(asfloat(wg0.y & 0xFFFF0000u), x3, acc_gate0))));
+
+                uint2 wu0 = src2.Load2(up0_base + k * 2);
+                acc_up0 = mad(asfloat((wu0.x & 0xFFFFu) << 16), x0,
+                         mad(asfloat(wu0.x & 0xFFFF0000u), x1,
+                         mad(asfloat((wu0.y & 0xFFFFu) << 16), x2,
+                         mad(asfloat(wu0.y & 0xFFFF0000u), x3, acc_up0))));
+
+                uint2 wg1 = src0.Load2(gate1_base + k * 2);
+                acc_gate1 = mad(asfloat((wg1.x & 0xFFFFu) << 16), x0,
+                           mad(asfloat(wg1.x & 0xFFFF0000u), x1,
+                           mad(asfloat((wg1.y & 0xFFFFu) << 16), x2,
+                           mad(asfloat(wg1.y & 0xFFFF0000u), x3, acc_gate1))));
+
+                uint2 wu1 = src2.Load2(up1_base + k * 2);
+                acc_up1 = mad(asfloat((wu1.x & 0xFFFFu) << 16), x0,
+                         mad(asfloat(wu1.x & 0xFFFF0000u), x1,
+                         mad(asfloat((wu1.y & 0xFFFFu) << 16), x2,
+                         mad(asfloat(wu1.y & 0xFFFF0000u), x3, acc_up1))));
+            } else {
+#if NATIVE_FP16
+                vector<float16_t,4> wg0 = src0.Load<vector<float16_t,4> >(gate0_base + k * 2);
+                acc_gate0 = mad((float)wg0.x, x0, mad((float)wg0.y, x1,
+                           mad((float)wg0.z, x2, mad((float)wg0.w, x3, acc_gate0))));
+
+                vector<float16_t,4> wu0 = src2.Load<vector<float16_t,4> >(up0_base + k * 2);
+                acc_up0 = mad((float)wu0.x, x0, mad((float)wu0.y, x1,
+                        mad((float)wu0.z, x2, mad((float)wu0.w, x3, acc_up0))));
+
+                vector<float16_t,4> wg1 = src0.Load<vector<float16_t,4> >(gate1_base + k * 2);
+                acc_gate1 = mad((float)wg1.x, x0, mad((float)wg1.y, x1,
+                           mad((float)wg1.z, x2, mad((float)wg1.w, x3, acc_gate1))));
+
+                vector<float16_t,4> wu1 = src2.Load<vector<float16_t,4> >(up1_base + k * 2);
+                acc_up1 = mad((float)wu1.x, x0, mad((float)wu1.y, x1,
+                        mad((float)wu1.z, x2, mad((float)wu1.w, x3, acc_up1))));
+#else
+                uint2 wg0 = src0.Load2(gate0_base + k * 2);
+                acc_gate0 = mad(f16tof32(wg0.x & 0xFFFFu), x0, mad(f16tof32(wg0.x >> 16), x1,
+                           mad(f16tof32(wg0.y & 0xFFFFu), x2, mad(f16tof32(wg0.y >> 16), x3, acc_gate0))));
+
+                uint2 wu0 = src2.Load2(up0_base + k * 2);
+                acc_up0 = mad(f16tof32(wu0.x & 0xFFFFu), x0, mad(f16tof32(wu0.x >> 16), x1,
+                        mad(f16tof32(wu0.y & 0xFFFFu), x2, mad(f16tof32(wu0.y >> 16), x3, acc_up0))));
+
+                uint2 wg1 = src0.Load2(gate1_base + k * 2);
+                acc_gate1 = mad(f16tof32(wg1.x & 0xFFFFu), x0, mad(f16tof32(wg1.x >> 16), x1,
+                           mad(f16tof32(wg1.y & 0xFFFFu), x2, mad(f16tof32(wg1.y >> 16), x3, acc_gate1))));
+
+                uint2 wu1 = src2.Load2(up1_base + k * 2);
+                acc_up1 = mad(f16tof32(wu1.x & 0xFFFFu), x0, mad(f16tof32(wu1.x >> 16), x1,
+                        mad(f16tof32(wu1.y & 0xFFFFu), x2, mad(f16tof32(wu1.y >> 16), x3, acc_up1))));
+#endif
+            }
         }
         for (; k < K; k++) {
             float x = asfloat(src1.Load(x_base + k * 4));
-            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, 2), x, acc_gate0);
-            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, 2), x, acc_up0);
-            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, 2), x, acc_gate1);
-            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, 2), x, acc_up1);
+#if RMS_FUSED
+            acc_ss = mad(x, x, acc_ss);
+            x *= asfloat(src6.Load(k * 4));
+#endif
+            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, src0_esize), x, acc_gate0);
+            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, src0_esize), x, acc_up0);
+            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, src0_esize), x, acc_gate1);
+            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, src0_esize), x, acc_up1);
         }
     } else {
         // Generic path — handles non-contiguous activation or unaligned
         // weight base (rare for FFN projections but kept for safety).
         for (uint k = tid; k < K; k += GROUP_SIZE) {
             float x = load_auto(src1, x_base + k * nb10, src1_esize);
-            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, 2), x, acc_gate0);
-            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, 2), x, acc_up0);
-            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, 2), x, acc_gate1);
-            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, 2), x, acc_up1);
+#if RMS_FUSED
+            acc_ss = mad(x, x, acc_ss);
+            x *= asfloat(src6.Load(k * 4));
+#endif
+            acc_gate0 = mad(load_auto(src0, gate0_base + k * 2, src0_esize), x, acc_gate0);
+            acc_up0   = mad(load_auto(src2, up0_base   + k * 2, src0_esize), x, acc_up0);
+            acc_gate1 = mad(load_auto(src0, gate1_base + k * 2, src0_esize), x, acc_gate1);
+            acc_up1   = mad(load_auto(src2, up1_base   + k * 2, src0_esize), x, acc_up1);
         }
     }
 
@@ -139,15 +194,21 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     float wave_up0   = WaveActiveSum(acc_up0);
     float wave_gate1 = WaveActiveSum(acc_gate1);
     float wave_up1   = WaveActiveSum(acc_up1);
+#if RMS_FUSED
+    float wave_ss = WaveActiveSum(acc_ss);
+#endif
 
-    uint wave_id   = tid / WARP_SIZE;
-    uint num_waves = GROUP_SIZE / WARP_SIZE;
+    uint wave_id   = tid / WaveGetLaneCount();
+    uint num_waves = (GROUP_SIZE + WaveGetLaneCount() - 1) / WaveGetLaneCount();
 
     if (WaveIsFirstLane()) {
         shared_acc[wave_id]      = wave_gate0;
         shared_acc[32 + wave_id] = wave_up0;
         shared_acc[64 + wave_id] = wave_gate1;
         shared_acc[96 + wave_id] = wave_up1;
+#if RMS_FUSED
+        shared_acc[128 + wave_id] = wave_ss;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -157,6 +218,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             shared_acc[32 + tid] += shared_acc[32 + tid + s];
             shared_acc[64 + tid] += shared_acc[64 + tid + s];
             shared_acc[96 + tid] += shared_acc[96 + tid + s];
+#if RMS_FUSED
+            shared_acc[128 + tid] += shared_acc[128 + tid + s];
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -164,6 +228,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (tid == 0) {
         float gate0 = shared_acc[0];
         float up0   = shared_acc[32];
+#if RMS_FUSED
+        float rms_scale = 1.0f / sqrt(shared_acc[128] / (float)K + asfloat(op14));
+        gate0 *= rms_scale;
+        up0   *= rms_scale;
+#endif
         float result0 = (gate0 / (1.0f + exp(-gate0))) * up0;
         uint off_d0 = offset_4d(row0, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
         store_auto(dst, off_d0, result0, dst_esize);
@@ -171,6 +240,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (row0 + 1 < ne0) {
             float gate1 = shared_acc[64];
             float up1   = shared_acc[96];
+#if RMS_FUSED
+            gate1 *= rms_scale;
+            up1   *= rms_scale;
+#endif
             float result1 = (gate1 / (1.0f + exp(-gate1))) * up1;
             uint off_d1 = offset_4d(row1, 0, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
             store_auto(dst, off_d1, result1, dst_esize);

@@ -5,10 +5,14 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#if defined(LLAMA_B612_API)
+#include "llama_b612.h"
+#endif
 
 #include <cstdint>
 #include <map>
 
+#if !defined(LLAMA_B612_API)
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -58,6 +62,7 @@ LLAMA_API void llama_quant_compute_types(
         ggml_tensor ** tensors,
         ggml_type * result_types,
         size_t n_tensors);
+#endif // !defined(LLAMA_B612_API)
 
 //
 // device memory querying
@@ -83,23 +88,63 @@ struct llama_device_memory_data {
 // TODO: convert to C-style data structure
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
+LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Marks the entries that a joint decision head (clef) reads, the default is 0
+// See https://github.com/ggml-org/llama.cpp/pull/29831 for details
+// A run of entries with the same value is one span, spans must be separated by entries with value 0
+// An option belongs to the last question before it
+// NOTE: kept outside the LLAMA_B612_API guard -- this is upstream-only API with no
+// B612 counterpart in llama_b612.h, and src/models/clef.cpp needs the enum in both builds.
+enum llama_decision_order {
+    LLAMA_DECISION_ORDER_NONE            = 0, // not read by the head
+    LLAMA_DECISION_ORDER_QUESTION_NOUL   = 1, // text of a question
+    LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
+    LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3,
+    LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
+};
+// The embeddings output has one value per entry: row i is the score of option i
+LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
+
+#if !defined(LLAMA_B612_API)
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
-LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+//
+// pre-norm embeddings (hidden state before the final output norm) -- Phi3 fusionOp; no MTP
+//
+
+// Set whether the context outputs pre-norm embeddings or not
+// If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+// If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value, bool masked);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
+
+//
+// nextn embeddings (hidden state before the final output norm) -- upstream NEXTN MTP draft heads
+//
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Select which appended NextN block the DECODER_MTP graph runs (offset past
+// the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+// chain multiple trained NextN heads. Default 0 (first head).
+LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
 // Set whether the context outputs the input embeddings of a specific layer
@@ -115,7 +160,54 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // model/context data extraction
 //
 
+LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
+
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Phi3 Phase C: skip the lm_head matmul (and logits buffer write) on each decode.
+// When enabled, the standard graph's output tensor (post-final-norm hidden state)
+// is exposed via the embeddings buffer (llama_get_embeddings_ith) and the caller
+// is responsible for computing the next token directly from it (see phi3_fused_ops.h).
+// Greedy-only: caller must not invoke sampler chains that need full logits.
+// No-op for non-Phi3 architectures.
+LLAMA_API void llama_set_phi3_fused_lmhead(struct llama_context * ctx, bool value);
+
+// Phi3 Option 1: in-graph fusion of RMSNorm + quantize-to-Q8_K at the two
+// per-layer matmul sites (attn_norm+wqkv and ffn_norm+ffn_up). Enables the
+// downstream `mul_mat` to skip its internal `from_float` step. Combinable
+// with --phi3-fused-lmhead. Greedy-only (no impact on logits values, only
+// on intermediate quantization paths). No-op for non-Phi3 architectures.
+LLAMA_API void llama_set_phi3_fused_decode(struct llama_context * ctx, bool value);
+
+// Look up a model tensor by GGUF tensor name (e.g. "output.weight").
+// Returns nullptr if the tensor is absent (some models tie lm_head to token_embd).
+// The returned pointer is owned by the model; do not free.
+LLAMA_API const struct ggml_tensor * llama_model_get_tensor_by_name(
+        const struct llama_model * model, const char * name);
+
+// B612 / Phi3 hybrid prefill: raw access to the unified KV cache's per-layer
+// K and V tensors. Intended for advanced consumers that want to read the
+// post-prefill KV state and re-pack it into a custom decode-time format
+// (see examples/phi3 hybrid prefill path). Returns nullptr if the context
+// does not use a single unified KV cache (e.g. SWA/iSWA, hybrid memory) or
+// if the requested model-layer index has no KV slot. The returned tensor is
+// owned by the context; use ggml_backend_tensor_get to copy out the data.
+// Layout (single-stream KV cache):
+//   K       : (head_dim, n_head_kv, kv_size)  row-major, fastest dim = head_dim
+//   V trans : (kv_size,  n_head_kv, head_dim) row-major, fastest dim = pos
+//   V !trans: (head_dim, n_head_kv, kv_size)  row-major, fastest dim = head_dim
+// `llama_kv_self_v_trans` tells you which V variant the context is using;
+// it is `!cparams.flash_attn` (true by default on CPU).
+LLAMA_API struct ggml_tensor * llama_kv_self_layer_k(struct llama_context * ctx, int32_t il);
+LLAMA_API struct ggml_tensor * llama_kv_self_layer_v(struct llama_context * ctx, int32_t il);
+LLAMA_API bool                 llama_kv_self_v_trans(const struct llama_context * ctx);
+#endif // !defined(LLAMA_B612_API)

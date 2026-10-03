@@ -53,5 +53,6 @@ void main(uint3 group_id : SV_GroupID, uint local_id : SV_GroupIndex) {
     }
 
     uint off_d = offset_4d(i0, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
+    acc += load_fused_bias(i0, i2, i3);
     store_auto(dst, off_d, acc, dst_esize);
 }

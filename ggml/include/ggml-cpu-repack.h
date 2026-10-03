@@ -4,6 +4,7 @@
 #include "ggml-common.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 
 // GGML internal header
 

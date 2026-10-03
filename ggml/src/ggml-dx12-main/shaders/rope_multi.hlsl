@@ -67,23 +67,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint mode = op_param_uint(2);
     bool is_vision = (mode & 16u) != 0;  // GGML_ROPE_TYPE_VISION = 24 (bit 4)
     bool is_imrope = (mode & 32u) != 0;  // GGML_ROPE_TYPE_IMROPE = 40 (bit 5)
+    uint has_ff = op_param_uint(15);
 
     // Vision ROPE uses n_dims as pair offset; mrope uses n_dims/2
     uint half_dims = is_vision ? n_dims : (n_dims / 2);
 
-    // Passthrough: elements beyond active dims are copied unchanged
+    // Passthrough: elements beyond the rotated range are copied unchanged.
+    // For mrope/imrope: rotated indices are [0, n_dims); copy [n_dims, ne0).
+    // For vision: rotated indices are [0, 2*n_dims); copy [2*n_dims, ne0).
+    uint rot_dims = is_vision ? (n_dims * 2) : n_dims;
     if (pair >= half_dims) {
-        uint pass_a = pair;
-        uint pass_b = pair + half_dims;
+        uint pass_idx = rot_dims + 2 * (pair - half_dims);
+        uint pass_a = pass_idx;
+        uint pass_b = pass_idx + 1;
         if (pass_a < ne0) {
             uint off_a = offset_4d(pass_a, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
             uint od_a  = offset_4d(pass_a, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-            dst.Store(od_a, src0.Load(off_a));
+            float v = load_auto(src0, off_a, src0_esize);
+            store_auto(dst, od_a, v, dst_esize);
         }
         if (pass_b < ne0) {
             uint off_b = offset_4d(pass_b, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
             uint od_b  = offset_4d(pass_b, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-            dst.Store(od_b, src0.Load(off_b));
+            float v = load_auto(src0, off_b, src0_esize);
+            store_auto(dst, od_b, v, dst_esize);
         }
         return;
     }
@@ -151,6 +158,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
         theta_extrap = (float)pos * exp2(-(float)(theta_pair * 2) / (float)n_dims * log2(freq_base));
     }
 
+    // Per-pair frequency scaling (e.g. Llama-3.1, Phi-3 LongRope). Bound when
+    // src2 != null; indexed by absolute pair (matches CPU: freq_factors[i0/2])
+    // for both Vision and MROPE schemes.
+    if (has_ff != 0u) {
+        float ff = asfloat(src2.Load(pair * 4));
+        theta_extrap = theta_extrap / ff;
+    }
+
     const float two_pi = 6.2831853071795864769f;
     float corr_start = floor((float)n_dims * log((float)op_param_uint(4) / (beta_fast * two_pi)) / (2.0f * log(freq_base)));
     float corr_end   = ceil ((float)n_dims * log((float)op_param_uint(4) / (beta_slow * two_pi)) / (2.0f * log(freq_base)));
@@ -162,11 +177,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     uint off_a = offset_4d(idx_a, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
     uint off_b = offset_4d(idx_b, i1, i2, i3, nb00, nb01, nb02, nb03, src0_offset);
-    float x0 = asfloat(src0.Load(off_a));
-    float x1 = asfloat(src0.Load(off_b));
+    float x0 = load_auto(src0, off_a, src0_esize);
+    float x1 = load_auto(src0, off_b, src0_esize);
 
     uint od_a = offset_4d(idx_a, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
     uint od_b = offset_4d(idx_b, i1, i2, i3, nb0, nb1, nb2, nb3, dst_offset);
-    dst.Store(od_a, asuint(x0 * cos_theta - x1 * sin_theta));
-    dst.Store(od_b, asuint(x0 * sin_theta + x1 * cos_theta));
+    store_auto(dst, od_a, x0 * cos_theta - x1 * sin_theta, dst_esize);
+    store_auto(dst, od_b, x0 * sin_theta + x1 * cos_theta, dst_esize);
 }

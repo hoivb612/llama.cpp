@@ -3,8 +3,9 @@
 // Groups channels (ne[2]) into num_groups groups
 #include "ggml_common.hlsli"
 
-groupshared float wave_sums[16];
+groupshared float wave_sums[32];
 
+WAVE_SIZE_ATTR
 [numthreads(256, 1, 1)]
 void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint group = gid.x;  // which (batch, group) pair
@@ -26,8 +27,9 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint spatial = ne00 * ne01;
     uint group_size = spatial * step;
 
-    uint wave_count = 256 / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     // Pass 1: compute mean
     precise float local_sum = 0.0f;
@@ -45,9 +47,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     if (WaveIsFirstLane()) wave_sums[wave_id] = ws;
     GroupMemoryBarrierWithGroupSync();
     float total = 0.0f;
-    if (local_id < wave_count) total = wave_sums[local_id];
-    total = WaveActiveSum(total);
-    if (local_id == 0) wave_sums[0] = total;
+    if (local_id == 0) {
+        float acc = wave_sums[0];
+        for (uint w = 1; w < wave_count; ++w) acc += wave_sums[w];
+        wave_sums[0] = acc;
+    }
     GroupMemoryBarrierWithGroupSync();
     float mean = wave_sums[0] / (float)group_size;
 
@@ -70,9 +74,11 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     if (WaveIsFirstLane()) wave_sums[wave_id] = ws;
     GroupMemoryBarrierWithGroupSync();
     total = 0.0f;
-    if (local_id < wave_count) total = wave_sums[local_id];
-    total = WaveActiveSum(total);
-    if (local_id == 0) wave_sums[0] = total;
+    if (local_id == 0) {
+        float acc = wave_sums[0];
+        for (uint w = 1; w < wave_count; ++w) acc += wave_sums[w];
+        wave_sums[0] = acc;
+    }
     GroupMemoryBarrierWithGroupSync();
     float inv_std = rsqrt(wave_sums[0] / (float)group_size + eps);
 

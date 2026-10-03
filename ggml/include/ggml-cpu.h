@@ -100,6 +100,7 @@ extern "C" {
     GGML_BACKEND_API int ggml_cpu_has_sve        (void);
     GGML_BACKEND_API int ggml_cpu_get_sve_cnt    (void);  // sve vector length in bytes
     GGML_BACKEND_API int ggml_cpu_has_sme        (void);
+    GGML_BACKEND_API int ggml_cpu_has_sme2       (void);
     // other
     GGML_BACKEND_API int ggml_cpu_has_riscv_v    (void);
     GGML_BACKEND_API int ggml_cpu_get_rvv_vlen   (void);  // risc-v vector length in bytes
@@ -126,6 +127,15 @@ extern "C" {
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
 
     GGML_BACKEND_API void ggml_cpu_init(void);
+
+    // B612 CCX-spread affinity: pin the CALLING thread as logical worker `ith`
+    // to a distinct CCX (one-per-core-complex, interleaving processor groups),
+    // matching the placement used for the internal ggml threadpool workers.
+    // No-op unless env GGML_B612_CCX_SPREAD is set (and Windows). Idempotent
+    // per thread (sticky affinity is only issued once). Exposed so auxiliary
+    // worker pools outside the ggml graph (e.g. gemma4's attention pool) can
+    // share the same CCX placement instead of floating onto pinned cores.
+    GGML_BACKEND_API void ggml_b612_ccx_pin_self(int ith);
 
     //
     // CPU backend
@@ -183,6 +193,36 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp16_to_fp32(const ggml_fp16_t *, float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
+
+    GGML_BACKEND_API bool ggml_cpu_allow_tensor_repack();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_ggml();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox_callgraph();
+    GGML_BACKEND_API bool ggml_cpu_tensor_repack_mode_xbox_single_thread();
+    GGML_BACKEND_API bool ggml_cpu_tensor_mulmat_mode_xbox();
+
+    typedef enum ggml_cpu_repack_type {
+        GGML_CPU_REPACK_TYPE_NONE = 0,
+        // Alias to merged ggml_type repack values.
+        GGML_CPU_REPACK_TYPE_Q4_0_X8      = GGML_TYPE_Q4_0_x8,
+        GGML_CPU_REPACK_TYPE_Q4_0_Q8_0_x8 = GGML_TYPE_Q4_0_Q8_0_x8,
+        GGML_CPU_REPACK_TYPE_Q2_K_X8      = GGML_TYPE_Q2_K_x8,
+        GGML_CPU_REPACK_TYPE_Q2_K_Q8_K_x8 = GGML_TYPE_Q2_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q3_K_X8      = GGML_TYPE_Q3_K_x8,
+        GGML_CPU_REPACK_TYPE_Q3_K_Q8_K_x8 = GGML_TYPE_Q3_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q4_K_X8      = GGML_TYPE_Q4_K_x8,
+        GGML_CPU_REPACK_TYPE_Q4_K_Q8_K_x8 = GGML_TYPE_Q4_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q6_K_X8      = GGML_TYPE_Q6_K_x8,
+        GGML_CPU_REPACK_TYPE_Q6_K_Q8_K_x8 = GGML_TYPE_Q6_K_Q8_K_x8,
+        GGML_CPU_REPACK_TYPE_Q8_0_X8      = GGML_TYPE_Q8_0_x8,
+        GGML_CPU_REPACK_TYPE_Q8_0_Q8_0_x8 = GGML_TYPE_Q8_0_Q8_0_x8,
+        GGML_CPU_REPACK_TYPE_COUNT        = GGML_TYPE_COUNT,
+    } ggml_cpu_repack_type_t;
+
+    GGML_BACKEND_API void ggml_cpu_set_tensor_repack_mode(ggml_tensor_repack_mode_t repack_mode);
+    GGML_BACKEND_API void ggml_cpu_repack_tensor_callgraph(struct ggml_cgraph * cgraph);
+
+    extern ggml_tensor_repack_mode_t g_tensor_repack_mode;
 
 #ifdef __cplusplus
 }

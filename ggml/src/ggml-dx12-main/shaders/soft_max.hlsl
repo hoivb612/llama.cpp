@@ -7,9 +7,10 @@
 // Uses wave intrinsics (SM 6.0) for efficient reduction
 #include "ggml_common.hlsli"
 
-groupshared float wave_maxs[16];
-groupshared float wave_sums[16];
+groupshared float wave_maxs[32];
+groupshared float wave_sums[32];
 
+WAVE_SIZE_ATTR
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     uint row = gid.x;
@@ -31,8 +32,10 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
 
     uint local_id = gtid.x;
     bool has_mask = (ne10 > 0);
-    uint wave_count = 256 / WARP_SIZE;
-    uint wave_id = local_id / WARP_SIZE;
+    // Runtime wave width (Intel iGPUs ignore forced [WaveSize(N)]).
+    uint lane_count = WaveGetLaneCount();
+    uint wave_count = (256 + lane_count - 1) / lane_count;
+    uint wave_id = local_id / lane_count;
 
     // ALiBi slope
     float slope = 1.0f;
@@ -73,15 +76,14 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Cross-wave max reduction + broadcast
-    float row_max = -3.402823466e+38f;
-    if (local_id < wave_count) {
-        row_max = wave_maxs[local_id];
+    // Cross-wave max reduction (single-thread fold + shared-mem broadcast).
+    if (local_id == 0) {
+        float acc = wave_maxs[0];
+        for (uint w = 1; w < wave_count; w++) acc = max(acc, wave_maxs[w]);
+        wave_maxs[0] = acc;
     }
-    row_max = WaveActiveMax(row_max);
-    if (local_id == 0) { wave_maxs[0] = row_max; }
     GroupMemoryBarrierWithGroupSync();
-    row_max = wave_maxs[0];
+    float row_max = wave_maxs[0];
 
     // Compute exp and sum
     precise float local_sum = 0.0f;
@@ -102,15 +104,14 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Cross-wave sum reduction + broadcast
-    float total_sum = 0.0f;
-    if (local_id < wave_count) {
-        total_sum = wave_sums[local_id];
+    // Cross-wave sum reduction (single-thread fold + shared-mem broadcast).
+    if (local_id == 0) {
+        float acc = wave_sums[0];
+        for (uint w = 1; w < wave_count; w++) acc += wave_sums[w];
+        wave_sums[0] = acc;
     }
-    total_sum = WaveActiveSum(total_sum);
-    if (local_id == 0) { wave_sums[0] = total_sum; }
     GroupMemoryBarrierWithGroupSync();
-    total_sum = wave_sums[0];
+    float total_sum = wave_sums[0];
 
     // Include sink in sum
     if (has_sinks != 0) {

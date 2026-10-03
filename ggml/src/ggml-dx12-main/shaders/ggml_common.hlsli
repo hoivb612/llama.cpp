@@ -6,6 +6,7 @@
 //   t1: src1 ByteAddressBuffer
 //   u0: dst  RWByteAddressBuffer
 //   t2: src2 ByteAddressBuffer (optional)
+#pragma once
 
 // Shader parameter block - must match dx12_shader_params in ggml-dx12.cpp
 cbuffer ShaderParams : register(b0) {
@@ -119,11 +120,19 @@ float f16_to_f32(uint h) {
 
 // Helper: convert float32 to float16 bits, matching ggml_compute_fp32_to_fp16.
 uint f32_to_f16(float f) {
-    float base = (abs(f) * asfloat(0x77800000u)) * asfloat(0x08800000u);
-
     const uint w = asuint(f);
     const uint shl1_w = w + w;
     const uint sign = w & 0x80000000u;
+
+    // Saturate finite overflow to f16 inf (|f| >= 2^16 = 65536).
+    // NaN handled separately below (shl1_w > 0xFF000000u).
+    // shl1_w >= 0x8F000000u corresponds to |f| >= 65536.
+    if (shl1_w >= 0x8F000000u && shl1_w <= 0xFF000000u) {
+        return (sign >> 16) | 0x7C00u;
+    }
+
+    float base = (abs(f) * asfloat(0x77800000u)) * asfloat(0x08800000u);
+
     uint bias = shl1_w & 0xFF000000u;
     if (bias < 0x71000000u) {
         bias = 0x71000000u;
@@ -251,6 +260,63 @@ float load_fused_bias(uint row, uint i2, uint i3) {
     uint b2 = (op5 > 1u) ? i2 : 0u;
     uint b3 = (op6 > 1u) ? i3 : 0u;
     return asfloat(src2.Load(op1 + row * op2 + b2 * op3 + b3 * op4));
+}
+
+// V-cache SET_ROWS matvec fusion (host gate: DX12_MMV_SET_ROWS_FUSION).
+// When op7 == 1 a standalone M=1 matvec writes each output row directly into
+// the scattered KV cache slot, eliminating the separate SET_ROWS dispatch.
+// The plain-matvec slots op0..op6 (fused bias) and op15 (row-chunk base) are
+// untouched; op7..op13 are consumed only when op7 == 1:
+//   op7  1 = direct-scatter mode        op11 index byte offset (src2/t2)
+//   op8  cache base byte offset         op12 index token stride (bytes)
+//   op9  cache element stride (nb0)     op13 cache esize (2=F16, 4=F32)
+//   op10 cache row stride   (nb1)
+// The row index buffer is bound to src2/t2 (unused by a bias-free standalone
+// matvec). When op7 == 0 both helpers are inert, so shaders that include them
+// keep byte-identical behavior on the normal matvec path.
+bool mmv_scatter_active() { return (op7 & 3u) == 1u; }
+
+void mmv_store_scatter(uint row, uint i1, float val) {
+    int row_idx = asint(src2.Load(op11 + i1 * op12));
+    uint off = op8 + row * op9 + (uint)row_idx * op10;
+    store_auto(dst, off, val, op13);
+}
+
+// Q/K projection post-op ROPE matvec fusion (host gate: DX12_MMV_POSTOP_FUSION
+// and the DX12_MMV_{Q,K}_ROPE_FUSION selectors). op7 selects the post-op an
+// M=1 projection matvec applies to each output row, absorbing the following
+// ROPE (Q) or ROPE+VIEW+SET_ROWS (K) so those dispatches disappear:
+//   op7  0 = plain store        2 = Q ROPE (store to rope output)
+//   op7  1 = V direct scatter   3 = K ROPE + direct scatter into KV cache
+// The fusion only fires bias-free (op0 == 0), so op1..op6 are free for ROPE:
+//   op1 n_dims           op2 mode (0 = NORMAL only)
+//   op3 freq_base (f)    op4 freq_scale (f)
+//   op5 ext_factor (f)   op6 attn_factor (f)
+//   op8 corr_low (f)     op9 corr_high (f)
+//   op10 head_dim (rope ne0)   op11 has_ff
+// Q store (op7 == 2): op12 = rope-out nb0; dst = rope-out, dst_offset = base.
+// K scatter (op7 == 3): op12 = cache nb0, op13 = cache nb1, op14 = cache esize;
+//   dst = KV cache, dst_offset = base, src3.Load(0) = SET_ROWS row index.
+// Positions ride src2 (element 0), freq_factors ride src4 (op11 != 0). The
+// rotation math lives in rope_yarn.hlsli (mmv_rope_pair). When op7 < 2 these
+// helpers are inert, keeping the normal matvec path byte-identical.
+bool mmv_rope_active()         { return (op7 & 3u) >= 2u; }
+bool mmv_rope_scatter_active() { return (op7 & 3u) == 3u; }
+// Opt-in F16 rope-pair de-duplication (host gate DX12_F16_ROPE_ROWS2, fl=63
+// only): op7 bit 2 signals the group owns a full NORMAL rotation pair
+// (row = 2*group_x, row^1 = row+1) and must store BOTH rotated outputs, so the
+// dispatch runs at half the row-group count and no partner dot is recomputed.
+bool mmv_rope_rows2()          { return (op7 & 4u) != 0u; }
+
+void mmv_rope_store(uint row, float val) {
+    if (mmv_rope_scatter_active()) {
+        int row_idx = asint(src3.Load(0));
+        uint off = dst_offset + row * op12 + (uint)row_idx * op13;
+        store_auto(dst, off, val, op14);
+    } else {
+        uint off = dst_offset + row * op12;
+        store_auto(dst, off, val, dst_esize);
+    }
 }
 
 // BF16 store variant — only used by BF16-specific dispatch paths

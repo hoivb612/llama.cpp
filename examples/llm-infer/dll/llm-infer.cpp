@@ -108,6 +108,33 @@ static bool op_diag_callback(struct ggml_tensor * t, bool ask, void * user_data)
     return true;
 }
 
+// Upstream removed common_batch_clear/common_batch_add in favour of the
+// common_batch class, but this file still uses the legacy C llama_batch
+// (llama_batch_init/llama_batch_free/llama_decode), which is unchanged.
+// Keep the two helpers locally so the legacy flow stays byte-identical.
+static void common_batch_clear(struct llama_batch & batch) {
+    batch.n_tokens = 0;
+}
+
+static void common_batch_add(
+                 struct llama_batch & batch,
+                        llama_token   id,
+                          llama_pos   pos,
+    const std::vector<llama_seq_id> & seq_ids,
+                               bool   logits) {
+    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
+
+    batch.token   [batch.n_tokens] = id;
+    batch.pos     [batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
+    }
+    batch.logits  [batch.n_tokens] = logits;
+
+    batch.n_tokens++;
+}
+
 // For SLM 
 llama_model *llm_model;
 llama_context *llm_ctx;
@@ -249,6 +276,12 @@ bool llm_initialize(
 
     // init Llama backend
     llama_backend_init();
+
+    // tensor repack mode: 0=none, 1=ggml, 2=xbox, 3=xbcg, 4=xbox-st, 5=mulmat-xbox
+    llama_set_tensor_repack_mode((ggml_tensor_repack_mode_t) params.tensor_repack_mode);
+    if (params.verbose >= 1) {
+        printf("%s: tensor_repack_mode = %d\n", __func__, params.tensor_repack_mode);
+    }
 
     // Control the default verbosity for llama.cpp
     llama_log_set(default_log_callback, &(params.verbose));
