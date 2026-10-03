@@ -1,3 +1,8 @@
+// upstream pruned transitive STL includes from common headers; include what we use
+#include <algorithm>
+#include <cctype>
+#include <string>
+
 namespace ggml_b612 {
 
 #if defined(_WIN32)

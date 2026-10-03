@@ -194,7 +194,8 @@ static bool run(llama_context * ctx, const common_params & params) {
         return false;
     }
 
-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
+    common_batch batch = common_batch_get_one(ctx, tokens);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("%s : failed to eval\n", __func__);
         return false;
     }
@@ -202,10 +203,14 @@ static bool run(llama_context * ctx, const common_params & params) {
     print_tokenized_prompt(ctx, tokens, params.prompt);
 
     if (params.save_logits) {
-        output_data output {ctx, model, params};
-        std::filesystem::path model_path{params.model.path};
-        std::string model_name{model_path.stem().string()};
-        save_output_data(output, model_name, params.logits_output_dir);
+        try {
+            output_data output {ctx, model, params};
+            std::filesystem::path model_path{params.model.path};
+            std::string model_name{model_path.stem().string()};
+            save_output_data(output, model_name, params.logits_output_dir);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s : error saving logits: %s\n", __func__, e.what());
+        }
     }
 
     return true;
@@ -223,7 +228,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    std::optional<base_callback_data> cb_data;
+    std::optional<common_debug_cb_user_data> cb_data;
     if (!params.save_logits) {
         cb_data.emplace(params, params.tensor_filter);
     }

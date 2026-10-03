@@ -309,11 +309,12 @@ int main(int argc, char ** argv) {
     if (p.split_mode >= 0) {
         model_params.split_mode = (enum llama_split_mode)p.split_mode;
     }
+    // upstream replaced the use_mmap/use_direct_io booleans with a single load_mode enum
     if (p.no_mmap) {
-        model_params.use_mmap = false;
+        model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     }
     if (p.direct_io) {
-        model_params.use_direct_io = true;
+        model_params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
     }
 
     llama_model * model = llama_model_load_from_file(p.model_path.c_str(), model_params);
@@ -422,10 +423,10 @@ int main(int argc, char ** argv) {
             auto sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
             llama_sampler * smpl = llama_sampler_chain_init(sparams);
-            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(128, 1.3f, 0.1f, 0.1f));
+            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 128, 1.3f, 0.1f, 0.1f));
             // DRY: penalizes repeated n-gram sequences
             const char * dry_breakers[] = { "\n", ":", "\"", "*" };
-            llama_sampler_chain_add(smpl, llama_sampler_init_dry(vocab, 2048, 0.8f, 1.75f, 2, 128,
+            llama_sampler_chain_add(smpl, llama_sampler_init_dry(vocab, 0.8f, 1.75f, 2, 128,
                                           dry_breakers, 4));
             llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
             llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1.0f));
