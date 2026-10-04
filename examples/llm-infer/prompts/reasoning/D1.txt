@@ -1,0 +1,79 @@
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the player is facing Mara, who is opening up and realising that they both need to talk about her past and memories to make sense of what is going on in her head. She opens up to the player and want to offer the opportunity to explore different subjects like Family, Home, Trauma or the experimental Treatment going on in the apartment..
+
+Mara then turns to the player, and ask them: "What do you want to talk about?"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is awsering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pick the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+    "a. The player want to talk about her family situation",
+    "b. The player want to talk about her life back at home when she was still a kid",
+    "c. The player want to talk about her trauma",
+    "d. The player want to talk about the treatment that she is going through in this experimental therapy",
+    "e. The player talks about anything else that the previous options or said something out of context or that doesn't fit any of the above options to be relevant to the conversation"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+Let's start with your family dynamics and how they've influenced your life
+How about we delve into your memories of home and see what emotions they bring up
+We could discuss your experiences with trauma and how they've shaped your worldview
+Do you feel comfortable exploring your childhood memories and how they relate to your current struggles
+Maybe we could unpack your feelings about the experimental treatment and how it's affecting you
+What do you remember about the events leading up to your trauma
+Let's talk about any recurring dreams or nightmares you've been having lately
+Have you noticed any triggers or patterns in your behavior that might be linked to past experiences
+How do you feel about confronting your repressed memories head-on
+Let's explore the possibility of finding closure and healing from your past
+What role do you think your family played in shaping your identity
+Have you considered how your past experiences might be influencing your relationships now
+What coping mechanisms have you used in the past to deal with difficult memories
+Let's discuss how your trauma has impacted your self-esteem and confidence
+Do you think revisiting your past could help you make peace with it
+What emotions come up when you think about your childhood
+How do you feel about the idea of integrating your repressed memories into your current understanding of yourself
+Let's talk about any fears or hesitations you have about uncovering your repressed memories
+What do you hope to gain from exploring your past with me
+How can I support you best as we navigate through these memories together
+Let's delve into your childhood memories
+How about discussing your family dynamics
+Exploring your feelings about home might help
+We could talk about your past trauma
+Interested in discussing our therapy progress
+Let's reflect on your emotions and thoughts
+How about exploring your hopes for the future
+Discussing your coping mechanisms could be insightful
+Let's examine how your past affects your present
+We could discuss your experiences with the treatment
+How about sharing your dreams and aspirations
+Let's talk about your support system and friendships
+Discussing your fears might bring clarity
+Exploring your identity could be enlightening
+We could focus on your achievements and strengths
+How about discussing your relationship with yourself
+Let's delve into your coping strategies during tough times
+Talking about your favorite memories might be comforting
+Exploring your passions and interests could be uplifting
+We could discuss your perception of reality and truth
+END_SECTION

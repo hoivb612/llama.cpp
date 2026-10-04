@@ -1,0 +1,78 @@
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the player is facing Mara, who is opening up and realising that they both need to talk about her past and memories to make sense of what is going on in her head. She opens up to the player and want to offer the opportunity to explore different subjects like Family, Home, Trauma or the experimental Treatment going on in the apartment.
+After the player chose to talk about Mara's Family, she starts talking about her family situations, and gets curious about the player's family. They confirmed having siblings and their genders now Mara is asking for more details.
+
+Mara then turns to the player, and ask them: "Did you have your own room when you were young"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is awsering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pick the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+"a. Yes",
+"b. No",
+"z. Something out of context"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+Yes, I was lucky enough to have my own space growing up
+I shared a room with my sibling(s), actually
+I had my own room, but it was always a cozy retreat for me
+Nope, I shared a room with my siblings
+I had my own room, and it was my sanctuary
+I didn't have my own room, but I made the most of the space I had
+Yes, having my own room gave me a sense of independence
+I shared a room with my sibling(s), and it taught me a lot about compromise
+I had my own room, which was a luxury I'm grateful for
+I didn't have my own room, but I cherished the moments of privacy I could find
+Yes, having my own room was like having my own little kingdom
+I shared a room with my sibling(s), and it was both a challenge and a bonding experience
+No, I didn't have my own room, but I made the most of the shared space
+I had my own room, and it was my haven from the chaos of family life
+I shared a room with my sibling(s), and it taught me the importance of respecting boundaries
+Yes, having my own room allowed me to express my individuality
+I didn't have my own room, but it taught me the value of sharing and compromise
+I had my own room, which was my sanctuary for daydreaming and creativity
+Yes, having my own room was a privilege that I cherished
+I shared a room with my sibling(s), and it created a special bond between us
+Yeah, I had my own little space
+I shared with my sibling growing up
+Nope, shared with my brother/sister
+Had my own room, felt like my sanctuary
+Shared a room, had good times though
+Had my own room, but it was small
+Shared with siblings, had bunk beds
+Nope, shared with my younger brother
+Had my own room, decorated it myself
+Shared with my sister, lots of memories
+Had my own room, loved it
+Shared with siblings, felt crowded sometimes
+Shared a room, but made it cozy
+Had my own room, cherished my privacy
+Shared with siblings, had to compromise
+Shared with my older sister, had fun
+Had my own room, it was my haven
+Shared with siblings, had our own spaces
+Had my own room, made it my own
+Shared with siblings, had our moments
+END_SECTION

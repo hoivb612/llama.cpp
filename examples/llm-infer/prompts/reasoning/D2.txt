@@ -1,0 +1,81 @@
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the player is facing Mara, who is opening up and realizing that they both need to talk about her past and memories to make sense of what is going on in her head. She opens up to the player and want to offer the opportunity to explore different subjects like Family, Home, Trauma or the experimental Treatment going on in the apartment.
+After the player chose to talk about Mara's Family, she starts talking about her family situations, and gets curious about the player's family
+
+Mara then turns to the player, and ask them: "Do you have any siblings?"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is answering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pick the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+"a. The player mentions having one or multiple brothers only",
+"b. The player mentions having one or multiple sisters only",
+"c. The player mentions having a mix of brothers and sisters",
+"d. The player simply state that they have one or multiple siblings without mentioning genders",
+"e. The player states that they don't have any siblings, insinuating they're an only child",
+"z. The player mentions something out of context or that doesn't fit any of the above options enough to be at least 70% sure of it"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+Yes, I have a younger sister who's always been my closest confidante
+I'm an only child, so I never experienced having siblings, but I imagine it's quite a unique bond
+I have an older brother who's been a huge influence on my life
+No, I don't have any siblings, but I've always wished for a brother or sister to share experiences with
+I come from a big family with three siblings, and each relationship is so different and special
+I have a twin sister, and our connection is unlike any other
+Growing up, I had two brothers, and we were always getting into mischief together
+I have a stepsister whom I've grown close to over the years
+I have an older sister who's been like a second mother to me
+I have a half-brother whom I've only recently gotten to know, but our bond is growing stronger
+I have a stepsibling who's been a great source of support and friendship
+I have a younger brother who's my partner-in-crime in navigating life's challenges
+I have a stepsister, and while our relationship had its ups and downs, we've grown closer as we've gotten older
+I have a stepsibling who's more like a best friend than family
+I have a half-sister who lives across the country, but we still manage to stay connected
+I have a twin brother, and we've always had a special bond that's hard to describe
+I have two stepsiblings, and our blended family dynamic has its challenges but also its rewards
+I have a younger sister who's always looked up to me, and I've tried to be a positive influence in her life
+I have an older brother who's been like a mentor to me, guiding me through life's twists and turns
+I have a stepsister whom I've grown to appreciate more and more as we've gotten older
+Yeah, I have an older sister
+Nope, I'm an only child
+Two brothers, actually, both younger than me
+I'm the youngest of four siblings
+I have a stepsister and a stepbrother
+Just one sister, she's my best friend
+I come from a big family of six
+One brother, we're polar opposites
+Two sisters, they drive me crazy sometimes
+I have a twin brother, believe it or not
+I'm the middle child, stuck between two
+My sister is like a second mom to me
+I have a stepsister who's like my sister
+Only child, but I've got cousins galore
+I grew up with three stepbrothers, chaos
+Just me and my younger brother, tight bond
+I have a stepsister, complicated family dynamics
+Three sisters, it's never dull at home
+I have two half-siblings, distant relationship
+I have a stepsister, we're close despite everything
+END_SECTION

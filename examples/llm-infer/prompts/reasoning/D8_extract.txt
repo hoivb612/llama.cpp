@@ -1,0 +1,169 @@
+# D8 ENSEMBLE - generative EXTRACTION stage.
+#
+# This file is deliberately NOT a classifier prompt. The model's job is to pull
+# structured facts out of the utterance; the classification is done afterwards
+# in code (see examples/llm-infer/laya/d8_ensemble.py).
+#
+# Derived from reasoning/D8.txt. The ONLY change is the required JSON schema:
+# the original asked for {answer, justification} -- answer FIRST, which in an
+# autoregressive model means the verdict is emitted before any reasoning token
+# exists. The justification is then causally downstream of the decision and
+# cannot inform it, which is why the original confabulates ("correctly
+# identified the phone number for 'Josie'" about Sophie's 849456).
+#
+# Measured on Gemma-4-E4B-it Q4_K_M, 8 threads, 40 utterances:
+#
+#   variant                      score    a/b/c/d digit classes
+#   reasoning/D8.txt (orig)      27.8%    10/26   answer-first, no scratchpad
+#   justification-first only     33.3%    12/26   unstable: 16/40 unparseable
+#   this file, model's `answer`  61.1%    22/26
+#   this file, code-mapped       72.2%    26/26   <-- take the FIELDS, not the answer
+#
+# The jump from 61.1 to 72.2 costs nothing: it is the same run, re-scored by
+# ignoring the model's own `answer` and mapping `player_number` through the
+# phonebook in code. The model extracts digits correctly on 36/40 utterances
+# (every labeled one) but only agrees with the table on 30/40 -- it is a
+# reliable reader and an unreliable look-er-upper. Let it read; look up in code.
+#
+# A `proposes_other_person` field was tried here and REMOVED: it caught 8/10
+# deflections but produced 12/30 false positives, a net loss. Deflection ('z')
+# is supplied instead by the Laya guard battery in
+# prompts/reasoning_laya/laya_D8_guarded.txt, which gets 6/10 at zero false
+# positives because its thresholds sit under a measured FP floor. Detection and
+# calibration are different capabilities.
+#
+# ---------------------------------------------------------------------------
+# WHY THE ROUTING GOES THIS WAY (read before changing the split)
+#
+# The intuitive assumption is that the scorer handles the mechanical classes
+# and the generative model handles the ones needing understanding. D8 measures
+# the exact opposite:
+#
+#   subtask              nature     decision model      SLM (E4B)
+#   z deflections        SEMANTIC   6/10 at 0 FP        0/10
+#   a/b/c/d digits       SYMBOLIC   no usable signal    26/26
+#   Mara, 18 utterances  SEMANTIC   18/18               --
+#
+# D8 is built to force that distinction. Rows 16-30 ('c') and rows 31-40 ('z')
+# reuse the SAME phone numbers -- row 26 "Is Josie's number 960564?" and row 31
+# "Why don't we ring Nicky B? His number is 960564" are identical on digits and
+# opposite on label. Nothing but meaning separates them, and that is the class
+# the scorer gets and the SLM misses completely.
+#
+# The converse was tested directly and is not a wording problem. See
+# prompts/reasoning_laya/laya_D8_spelled.txt: eight probes asking about digit
+# content in spelled-out form ("ends in eighty-four") produced a best margin of
+# -0.107, every probe peaked on class 'a' regardless of what it asked about,
+# and cross-probe correlation averaged r=0.806. The probes were not reading
+# digits; they were all reading one shared utterance-level factor. The encoder
+# does not represent digit identity in any direction the scoring head can read.
+#
+# Generalisation to carry forward as the model family evolves:
+#   scorers    - strong on holistic utterance-level gist (intent, stance,
+#                deflection, tone). Weak-to-absent on compositional symbol
+#                work (compare two strings, index a table, carry a value).
+#   SLMs       - strong on extraction, copying and sequential symbol
+#                manipulation. Weak on producing a CALIBRATED single-shot
+#                judgement; they detect well and threshold badly.
+#
+# So: symbols -> generative, gist -> scorer, decision -> code. Routed the other
+# way round the ensemble scores WORSE than either model alone.
+#
+# When a new decision model arrives, re-measure this split before trusting it
+# -- analyze_probes.py reports the margin per (probe, class); a negative margin
+# means no threshold exists at any wording, which is the signal to move that
+# subtask out of the scorer entirely rather than keep tuning prompts.
+# ---------------------------------------------------------------------------
+#
+# Do not "tidy" the schema. These numbers are for this exact wording.
+
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the Player and Mara are exploring a visual representation of her childhood memories, There's a phone, and a phonebook with a list of numbers and name next to them. The list reads:
+Home - 01738 857761
+Dad - 079 3040 6588
+Sophie T - 849456
+Josie A - 585584
+Nicky B - 960564
+Tanya R - 0141 9496 0903
+Barry T - 960194
+
+Mara then turns to the player, and ask them: "What's Josie's phone number?"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is awsering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pich the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these fields, IN EXACTLY THIS ORDER. Fill each field before moving to the next:
+* player_number: the exact phone number the Player said, copied digit for digit, or "none" if they gave no number
+* number_owner: scan the phonebook list above for that exact number. Write the name next to it, or "not on the list" if no row matches
+* josie_number: the number written next to "Josie A" in the phonebook list
+* same_as_josie: "yes" if player_number is identical to josie_number, otherwise "no"
+* answer: the option you chose to respond to Mara
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+    "a. Home (01738857761)",
+    "b. They spell a number from the list",
+    "c. They spell a number that is NOT on the list",
+    "d. Josie (585584)",
+    "e. The player mentions they don't know and want to leave",
+    "z. Something out of context or that doesn't fit any of the above options enough to be at least 70% sure of it"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+Josie's number is 585584, I remember it clearly
+Let me see... Josie's number is 585584, I'm sure
+It's 585584, I recall dialing it for you once
+Josie's number? Easy, it's 585584, no doubt
+I think Josie's number is 585584, give it a try
+It's 585584, I have a good memory for numbers
+Josie's number? Oh, it's 585584, definitely
+Josie's number? Yeah, it's 585584, I'm pretty sure
+Josie's number is 585584, remember dialing it often
+"Oh, I know Josie's number by heart, it's 585584
+Josie's number? Um, it's 585594, I think
+Isn't it 585584? Or was it 585594
+Josie's number... um, 585584, or maybe 585594
+Oh, it's 585584, or wait, was it 585594
+I believe it's 585584, or maybe 585594, not sure
+Josie's number? I think it's 960564, try that
+Um, Josie's number? Maybe it's 0141 9496 0903
+Josie's number... uh, isn't it 960194
+I remember now, Josie's number is 079 3040 6588
+Josie's number? It's gotta be 01738 857761, right
+Josie's number? Let me think... it's 849456, right
+Hmm, Josie's number, is it 960194 by any chance
+Josie's number... could it be 0141 9496 0903
+Thinking... Josie's number, maybe it's 01738 857761
+Josie's number? I'm guessing it's 079 3040 6588
+Is Josie's number 960564? That's my best guess
+Josie's number, um... perhaps it's 01738 857761
+Thinking hard... Josie's number, could it be 079 3040 6588
+Josie's number, let's see... 960564, maybe
+"Josie's number? Could it be 0141 9496 0903
+Why don't we ring Nicky B? His number is 960564
+Let's try Tanya R, her number is 0141 9496 0903
+Barry T might know something, his number is 960194
+Sophie T could have insights, her number is 849456
+What about calling Dad? His number is 079 3040 6588
+Let's reach out to Home, its number is 01738 857761
+Perhaps Nicky B might help, his number is 960564
+Tanya R's number is 0141 9496 0903, let's try her
+Barry T might have information, his number is 960194
+Sophie T's number is 849456, let's see if she knows
+END_SECTION

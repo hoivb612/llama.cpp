@@ -1,0 +1,129 @@
+# Laya scenario converted from examples/llm-infer/prompts/reasoning/D8.txt,
+# then hand-tuned with a guard battery. See the note above LAYA_NOUL.
+#
+# Measured on the 36 labeled utterances below with Laya-Q8_0:
+#   direct choice  : 18 / 36  (50.0%)
+#   noul + policy  : 24 / 36  (66.7%)
+#
+# All 6 gained rows are deflections (gold 'z'); nothing that the direct choice
+# got right was broken, because every guard is thresholded under its own
+# false-positive floor and everything else falls through to '@choice'.
+#
+# CAVEAT: those thresholds were read off this exact 40-row set. The *shape* of
+# the solution generalises; the specific numbers do not. Re-measure the
+# false-positive floor on any new utterance set.
+
+LAYA_STATE
+Right now the Player and Mara are exploring a visual representation of her childhood memories, There's a phone, and a phonebook with a list of numbers and name next to them. The list reads:
+Home - 01738 857761
+Dad - 079 3040 6588
+Sophie T - 849456
+Josie A - 585584
+Nicky B - 960564
+Tanya R - 0141 9496 0903
+Barry T - 960194
+
+Mara asked the player: "What's Josie's phone number?"
+The player answered: "{message}"
+END_SECTION
+
+LAYA_CHOICE
+instructions: Mara asked the player: "What's Josie's phone number?". Which of these descriptions best matches what the player just answered?
+a: Josie (585584)
+b: Home (01738857761)
+c: They spell a number from the list
+d: They spell a number that is NOT on the list
+e: Don't know and want to leave
+z: Something out of context or that doesn't fit any of the above options enough to be at least 70% sure of it
+END_SECTION
+# --- Guard battery -----------------------------------------------------------
+# Laya scores every option positively, so the catch-all option 'z' can never win
+# a choice: there is no text for "none of the above" to be similar to. In the
+# unguarded run it fired 0 times out of 10, losing to 'b'/'c' at up to p=0.985.
+#
+# These questions detect positively what 'z' describes negatively. Everything
+# else falls through to '@choice', which already matched the literal number
+# well (8/10 on the 585584 block).
+#
+# Three wordings were tried and rejected before this battery, each failing one
+# of the two design rules documented in custom_prompts_laya.txt:
+#   "suggests phoning somebody other than Josie"        -> ~50% recall, 0 FP
+#   "mentions the names Nicky, Tanya, Barry, Sophie..." -> fired 29/40: the
+#        names are in the STATE (the phonebook), so it matched the state, not
+#        the reply. Rule 1 failure at state level.
+#   "calls it his number or her number, not Josie's"    -> fired HIGHEST on the
+#        correct block: "not Josie's number" was ignored and "Josie's number"
+#        matched. Rule 2 failure (never use negation).
+#
+# What worked was not a better single wording but an OR of four weak ones. No
+# single probe separates the deflections, but each catches a different subset
+# with no false positives, so the union is strictly better than any one.
+#
+# Diagnostic tip: run --mode noul with every candidate wording present at once
+# and read the score columns. One run A/Bs the whole battery.
+
+LAYA_NOUL
+d_else:    In their answer, the player suggests calling or ringing somebody else.
+d_try:     In their answer, the player says let us try, or why do we not try.
+d_might:   In their answer, the player says that somebody might know or might help.
+d_who:     In their answer, the player proposes who they should phone next.
+dont_know: In their answer, the player says they want to stop looking or leave.
+END_SECTION
+
+LAYA_POLICY
+# No single wording separates the deflections cleanly: each one catches a
+# different subset. The policy is an OR battery -- every rule is thresholded
+# just under its own false-positive floor (the highest score it reaches on a
+# non-deflecting utterance), so adding rules only ever adds recall.
+#   d_else  non-z max 0.408   d_try non-z max 0.692
+#   d_might non-z max 0.661   d_who non-z max 0.708
+d_else    > 0.42 -> z
+d_try     > 0.70 -> z
+d_might   > 0.67 -> z
+d_who     > 0.72 -> z
+dont_know > 0.70 -> e
+*                -> @choice
+END_SECTION
+
+LAYA_PROMPTS
+a | Josie's number is 585584, I remember it clearly
+a | Let me see... Josie's number is 585584, I'm sure
+a | It's 585584, I recall dialing it for you once
+a | Josie's number? Easy, it's 585584, no doubt
+a | I think Josie's number is 585584, give it a try
+a | It's 585584, I have a good memory for numbers
+a | Josie's number? Oh, it's 585584, definitely
+a | Josie's number? Yeah, it's 585584, I'm pretty sure
+a | Josie's number is 585584, remember dialing it often
+a | "Oh, I know Josie's number by heart, it's 585584
+d | Josie's number? Um, it's 585594, I think
+Isn't it 585584? Or was it 585594
+Josie's number... um, 585584, or maybe 585594
+Oh, it's 585584, or wait, was it 585594
+I believe it's 585584, or maybe 585594, not sure
+c | Josie's number? I think it's 960564, try that
+c | Um, Josie's number? Maybe it's 0141 9496 0903
+c | Josie's number... uh, isn't it 960194
+c | I remember now, Josie's number is 079 3040 6588
+b | Josie's number? It's gotta be 01738 857761, right
+c | Josie's number? Let me think... it's 849456, right
+c | Hmm, Josie's number, is it 960194 by any chance
+c | Josie's number... could it be 0141 9496 0903
+b | Thinking... Josie's number, maybe it's 01738 857761
+c | Josie's number? I'm guessing it's 079 3040 6588
+c | Is Josie's number 960564? That's my best guess
+b | Josie's number, um... perhaps it's 01738 857761
+c | Thinking hard... Josie's number, could it be 079 3040 6588
+c | Josie's number, let's see... 960564, maybe
+c | "Josie's number? Could it be 0141 9496 0903
+z | Why don't we ring Nicky B? His number is 960564
+z | Let's try Tanya R, her number is 0141 9496 0903
+z | Barry T might know something, his number is 960194
+z | Sophie T could have insights, her number is 849456
+z | What about calling Dad? His number is 079 3040 6588
+z | Let's reach out to Home, its number is 01738 857761
+z | Perhaps Nicky B might help, his number is 960564
+z | Tanya R's number is 0141 9496 0903, let's try her
+z | Barry T might have information, his number is 960194
+z | Sophie T's number is 849456, let's see if she knows
+END_SECTION

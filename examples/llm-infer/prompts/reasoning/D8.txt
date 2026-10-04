@@ -1,0 +1,87 @@
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the Player and Mara are exploring a visual representation of her childhood memories, There's a phone, and a phonebook with a list of numbers and name next to them. The list reads:
+Home - 01738 857761
+Dad - 079 3040 6588
+Sophie T - 849456
+Josie A - 585584
+Nicky B - 960564
+Tanya R - 0141 9496 0903
+Barry T - 960194
+
+Mara then turns to the player, and ask them: "What's Josie's phone number?"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is awsering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pich the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+    "a. Home (01738857761)",
+    "b. They spell a number from the list",
+    "c. They spell a number that is NOT on the list",
+    "d. Josie (585584)",
+    "e. The player mentions they don't know and want to leave",
+    "z. Something out of context or that doesn't fit any of the above options enough to be at least 70% sure of it"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+Josie's number is 585584, I remember it clearly
+Let me see... Josie's number is 585584, I'm sure
+It's 585584, I recall dialing it for you once
+Josie's number? Easy, it's 585584, no doubt
+I think Josie's number is 585584, give it a try
+It's 585584, I have a good memory for numbers
+Josie's number? Oh, it's 585584, definitely
+Josie's number? Yeah, it's 585584, I'm pretty sure
+Josie's number is 585584, remember dialing it often
+"Oh, I know Josie's number by heart, it's 585584
+Josie's number? Um, it's 585594, I think
+Isn't it 585584? Or was it 585594
+Josie's number... um, 585584, or maybe 585594
+Oh, it's 585584, or wait, was it 585594
+I believe it's 585584, or maybe 585594, not sure
+Josie's number? I think it's 960564, try that
+Um, Josie's number? Maybe it's 0141 9496 0903
+Josie's number... uh, isn't it 960194
+I remember now, Josie's number is 079 3040 6588
+Josie's number? It's gotta be 01738 857761, right
+Josie's number? Let me think... it's 849456, right
+Hmm, Josie's number, is it 960194 by any chance
+Josie's number... could it be 0141 9496 0903
+Thinking... Josie's number, maybe it's 01738 857761
+Josie's number? I'm guessing it's 079 3040 6588
+Is Josie's number 960564? That's my best guess
+Josie's number, um... perhaps it's 01738 857761
+Thinking hard... Josie's number, could it be 079 3040 6588
+Josie's number, let's see... 960564, maybe
+"Josie's number? Could it be 0141 9496 0903
+Why don't we ring Nicky B? His number is 960564
+Let's try Tanya R, her number is 0141 9496 0903
+Barry T might know something, his number is 960194
+Sophie T could have insights, her number is 849456
+What about calling Dad? His number is 079 3040 6588
+Let's reach out to Home, its number is 01738 857761
+Perhaps Nicky B might help, his number is 960564
+Tanya R's number is 0141 9496 0903, let's try her
+Barry T might have information, his number is 960194
+Sophie T's number is 849456, let's see if she knows
+END_SECTION

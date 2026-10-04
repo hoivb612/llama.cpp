@@ -1,0 +1,80 @@
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the player is facing Mara, who is opening up and realising that they both need to talk about her past and memories to make sense of what is going on in her head. She opens up to the player and want to offer the opportunity to explore different subjects like Family, Home, Trauma or the experimental Treatment going on in the apartment.
+After the player chose to talk about Mara's Family, she starts talking about her famili situations, and gets curious about the player's family. They confirmed having siblings and their genders now mara is asking for more details.
+
+Mara then turns to the player, and ask them: "Older or younger than you?"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is awsering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pick the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+"a. Older than the player",
+"b. Siblings are younger that the player",
+"c. Twins, the same age",
+"d. They're in between them",
+"z. Something out of context"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+I have both an older and a younger sibling
+I have an older sibling
+My sibling is older than me
+I'm the older one in my sibling dynamic
+I have a younger sibling
+My sibling is younger than me
+I'm the younger one in my sibling relationship
+I have both older and younger siblings
+My sibling is older than me by a few years
+I have a younger sibling who looks up to me
+My sibling is younger than me but has always been mature beyond their years
+I'm the older sibling, but my younger sibling often takes charge in certain situations
+I have an older sibling who's always been like a mentor to me
+My sibling is younger than me, but we're quite close despite the age gap
+I'm the younger one, but my older sibling has always been protective of me
+My sibling is older, but we've always been equals in our relationship
+I have a younger sibling who keeps me on my toes
+I'm the older one, but my younger sibling has a wisdom beyond their years
+My sibling is younger, but they've always been my rock in tough times
+I have an older sibling who's been a guiding light for me throughout my life
+I've got an older brother, actually
+Younger sister, keeps me on my toes
+Older sister, she's like a second mom
+Two younger brothers, double trouble
+Older brother, but we're like best friends
+Younger brother, always looking up to me
+Older sister, she's my rock, really
+Younger sister, the baby of the family
+I'm the oldest, with a younger sister
+Younger brother, he's a handful, but fun
+Older brother, but I'm the responsible one
+I have a younger sister, quite the character
+Older sister, she's my partner in crime
+Two younger sisters, we're a trio
+Older brother, always teasing, but protective
+Younger sister, the princess of the family
+Older sister, she paved the way for me
+I have a younger brother, full of energy
+Older brother, he's like a mentor to me
+Younger sister, she's my sidekick in everything
+END_SECTION

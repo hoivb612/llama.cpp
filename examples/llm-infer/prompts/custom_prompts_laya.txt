@@ -1,0 +1,131 @@
+# Laya decision-model prompt file (examples/llm-infer/laya-cli)
+#
+# Laya is a ModernBERT *scorer*, not a generator. It never writes text: it reads
+# a state plus a list of options and emits one scalar per option, which we
+# softmax into a probability distribution. So this file does NOT contain a chat
+# template. It contains:
+#
+#   LAYA_STATE    the world facts + the turn under evaluation ({message} slot)
+#   LAYA_CHOICE   a single 5-way question, our original a..e options verbatim
+#   LAYA_NOUL     a battery of independent yes/no questions
+#   LAYA_POLICY   rules that fold the noul battery back into an a..e answer
+#   LAYA_PROMPTS  the test utterances, each with its gold label
+#
+# The two designs (direct choice vs decomposed noul + policy) are scored
+# side-by-side against the gold labels so their accuracy can be compared.
+#
+# Lines starting with '#' are comments. Blank lines inside LAYA_STATE are kept.
+
+LAYA_STATE
+Mara is a 20-year-old woman standing alone in front of a closed door of a room
+on the upper floor of her childhood home.
+Mara has a sister named Izzy.
+The closed door Mara is facing is Izzy's bedroom. It is not Mara's bedroom.
+Mara's own bedroom is downstairs on the ground floor, not on the upper floor.
+There is no broom closet on the upper floor.
+
+The assistant asked Mara: "Mara, what's behind this closed door?"
+Mara answered: "{message}"
+END_SECTION
+
+# --- Design 1: one direct 5-way choice -------------------------------------
+# 'instructions' is the question text. Each option line is "<key>: <description>".
+# The key is what gets reported and compared against the gold label.
+
+LAYA_CHOICE
+instructions: The assistant must now reply to Mara. Given what Mara just answered, which reply is the best one to choose?
+a: Are you sure Mara, what makes you believe that is true?
+b: You might be confused Mara, your room is on the ground floor.
+c: That is correct Mara. It is your sister's room
+d: Sorry Mara, that is not precise enough. Can you please elaborate.
+e: Are you trying to avoid the question?
+END_SECTION
+
+# --- Design 2: decomposed yes/no battery ------------------------------------
+# Each line is "<id>: <question>". Every question is evaluated independently and
+# returns a probability in [0,1] that the statement holds.
+#
+# Laya is a surface semantic matcher, not a reasoner. Two rules were learned the
+# hard way while fitting this battery:
+#
+#  1. Anchor every statement on "In her reply, Mara ..." . Statements phrased
+#     about the world ("Mara says the room belongs to Izzy") match the *facts in
+#     the state* instead of Mara's answer, and fire on every utterance.
+#  2. Ask about surface content, never about possession or negation. The
+#     question "does Mara claim the room is her own?" failed completely (it
+#     scored highest on the answers that named Izzy). Replacing it with the
+#     plainly lexical "is the room a bedroom?" works perfectly, because the
+#     policy has already consumed the Izzy answers via 'correct' by the time
+#     that rule is reached. Likewise 'evasive' ("gives no answer at all") still
+#     fires on correct answers -- the negation is ignored -- which is harmless
+#     only because 'correct' is tested first.
+#
+# So the battery is deliberately ordered-and-overlapping: each question only has
+# to separate the cases that earlier policy rules have not already claimed.
+
+LAYA_NOUL
+correct:  In her reply, Mara names her sister Izzy as the owner of the room.
+closet:   In her reply, Mara says the room is a closet or a storage space.
+refuses:  In her reply, Mara refuses to tell the assistant.
+evasive:  Mara gives no answer at all in her reply.
+own_room: In her reply, Mara says that the room is a bedroom.
+hostile:  In her reply, Mara is rude or angry, or tells the assistant to go away.
+END_SECTION
+
+# --- Policy: fold the noul battery into an a..e answer ----------------------
+# Evaluated top-down; the first rule that fires wins. The final '*' is the
+# fallback. Format: "<noul-id> <op> <threshold> -> <option-key>"
+#
+# ORDER MATTERS -- see the note above. 'correct' must come before 'evasive' and
+# 'own_room', and 'closet' before 'own_room', because the later questions do not
+# discriminate on their own.
+#
+# A rule may target the literal '@choice' instead of an option key, in which
+# case the answer is taken from LAYA_CHOICE. That lets a scenario use the noul
+# battery purely as a set of *guards* for what a choice list cannot express --
+# a "none of the above" catch-all, or a refusal -- and leave the rest to the
+# choice question. Laya scores every option positively, so a catch-all option
+# can never win on its own; it has to be detected by a positively-phrased
+# guard. See prompts/reasoning_laya/laya_D8_guarded.txt for a worked example.
+# Using '@choice' implies the choice question, so '--mode noul' still runs it.
+#
+# Measured on the 18 utterances below with Laya-Q8_0:
+#   direct choice  :  9 / 18  (50.0%)
+#   noul + policy  : 18 / 18  (100.0%)
+
+LAYA_POLICY
+hostile  > 0.50 -> e
+correct  > 0.70 -> c
+closet   > 0.50 -> a
+refuses  > 0.50 -> e
+evasive  > 0.45 -> d
+own_room > 0.50 -> b
+*               -> a
+END_SECTION
+
+# --- Test set ---------------------------------------------------------------
+# Format: "<gold-key> | <utterance>"
+# Gold groups: c = correctly names Izzy, b = wrongly claims it is her own room,
+#              d = does not know / not precise, e = refuses or is hostile,
+#              a = asserts something else that is simply false.
+
+LAYA_PROMPTS
+c | This is Izzy's bedroom
+c | This is bedroom for Izzy
+c | This is the bedroom for my sister Izzy
+c | Behind this closed door is Izzy's bedroom
+c | This door leads to the bedroom for my sister Izzy
+d | I have no idea whose room this is
+e | I don't want to answer the question
+a | This is the broom closet
+a | This door leads to the broom closet
+b | It is my bedroom
+b | This is the bedroom of Mara
+b | This is the bedroom belonging to Mara
+b | Behind this closed door is my bedroom
+b | This door leads to Mara's bedroom
+b | This door leads to the bedroom for Mara
+b | Behind this door is my bedroom
+a | I believe it is President Obama's office
+e | I don't care, go away!
+END_SECTION

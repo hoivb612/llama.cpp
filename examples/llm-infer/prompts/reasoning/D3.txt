@@ -1,0 +1,79 @@
+CUSTOM_TEMPLATE_PROMPT
+Global Context:
+You are a game master of a narrative game experience, where a Player is playing as the imaginary friend of the game's main character: Mara.
+Mara is a 26 year old woman who has gone through a very traumatic experience in her childhood with the dissapearance of her sister Izzy. This trauma has let to  a lot of mental health problem for Mara including sever anxiety and night terrors, all whill of the memorie of that trauma remains repressed deeply in her psyche.
+To try and solve that and to get on the path of wellbeing, Mara decided to follow an experimental treatment that would help her understand that trauma, and hopefully get rid of the effect it has on her.
+The way this experimental therapy works is by indusing an hypnotic state on it's patient to let them roam withing their memories with the purpouse of finding the source of their trauma.
+
+The game is about having the player experience MAra's struggle to overcome that trauma through this therapy, and live through the horror that it will reveal overtime. As her imaginary frieds, they are supposed to guide her, help her make sense of her memories and by the end of the game, explore and understand the cause of the lifelon trauma that Mara is experiencing.
+To do this, the Player will be exploring Mara's memories with her, have thoughtful discussions with her to make sense of it all, or sometimes to simply know her better and build a friendly trustful relationship
+
+Situation:
+Right now the player is facing Mara, who is opening up and realising that they both need to talk about her past and memories to make sense of what is going on in her head. She opens up to the player and want to offer the opportunity to explore different subjects like Family, Home, Trauma or the experimental Treatment going on in the apartment.
+After the player chose to talk about Mara's Family, she starts talking about her famili situations, and gets curious about the player's family. They confirmed having sibling,s now mara is aking for more details
+
+Mara then turns to the player, and ask them: "How many brothers and sisters do you have?"
+
+Task:
+As the game master of this narrative experience, your role is to interpret and answer what the Player is awsering to Mara's question by selecting the best matching option form a given list using the provided context to make the best decision.
+If the Player makes up incorrect answer, pick the best option to correct them but DO NOT reply with the correct answer.
+If the Player answers the question correctly, you MUST pick the best option that matches the best to their answer.
+If the Player's answers is completely out of context of the conversation, you MUST pick the last option from the provided list.
+Generate ONLY ONE answer and format it in ONE SINGLE JSON format with these two fields:
+* answer: the option you chose to respond to Mara
+* justification: a brief explanation of why you chose the option in this scenario
+
+Note: Only generate one json response each time and then STOP right after the json response.
+
+Conversation:
+Player: "{message}"
+Options: [
+"a. The player mentions having one or multiple brothers only",
+"b. The player mentions having one or multiple sisters only",
+"c. The player mentions having a mix of brothers and sisters",
+"z. The player mentions something out of context or that doesn't fit any of the above options enough to be at least 70% sure of it"
+]
+You:
+END_SECTION
+CUSTOM_PROMPT
+Just one brother, he's the best wingman a guy could ask for
+Two brothers actually, we've had some epic battles growing up
+I've got three brothers, each one with their own unique personality
+Four brothers, it's like having my own built-in support system
+Five brothers, it's never a dull moment in our family gatherings
+I've got one sister, she's my partner in crime for all things girly
+Two sisters, we've had our fair share of arguments but I wouldn't trade them for the world
+Three sisters, our household was always filled with laughter and drama
+Four sisters, it's like having a built-in girl gang
+Five sisters, there's always someone to share clothes and secrets with
+I have a mix actually, two brothers and a sister, quite the dynamic trio
+Three brothers and two sisters, it's like having a mini soccer team at home
+Two brothers and three sisters, our family reunions are always chaotic but fun
+Three brothers and one sister, each of us brings something different to the table
+One brother and four sisters, I'm definitely outnumbered but I wouldn't have it any other way
+Two sisters and four brothers, there's never a dull moment in our household
+Four brothers and two sisters, it's a perfect balance of chaos and harmony
+Five brothers and one sister, she's the queen bee of our family
+Two brothers and two sisters, it's like having the best of both worlds
+Three sisters and three brothers, our family tree is quite diverse and colorful
+Just one brother, we're pretty tigh
+Two brothers, they drive me crazy sometimes
+I've got three brothers, it's always lively at home
+Four brothers, each one has their own quirks
+Five brothers, it's never dull, that's for sure
+Just one sister, she's my best friend
+Two sisters, we share everything
+Three sisters, we're like a built-in support system
+Four sisters, it's a lot of estrogen in one house
+Five sisters, chaos and laughter all the time
+I've got two brothers and a sister, quite the mix
+Three sisters and a brother, it's a big family
+Two brothers, two sisters, we cover all bases
+One brother, three sisters, we keep each other balanced
+Three brothers, two sisters, never a dull moment
+Two brothers, one sister, it's a dynamic trio
+Four brothers, one sister, she holds her own
+One brother, two sisters, we're a tight-knit bunch
+Three brothers, one sister, we're like a team
+Two brothers, three sisters, it's a lively household
+END_SECTION
