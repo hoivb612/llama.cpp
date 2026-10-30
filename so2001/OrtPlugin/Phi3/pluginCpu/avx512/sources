@@ -1,0 +1,40 @@
+TARGETPLATFORM=windows
+TARGETTYPE=LIBRARY
+TARGETNAME=fusioncpu-avx512
+
+USE_MSVCRT=1
+USE_UNICRT=1
+
+USE_STL=1
+STL_VER=STL_VER_CURRENT
+USE_STD_CPP20=1
+
+USE_NATIVE_EH=1
+
+GUARD=0
+INIT_ALL_OPTIN=0
+
+# This is the ONLY translation unit compiled with AVX-512 codegen. The rest of
+# the DLL stays at x64 baseline so it loads on non-AVX-512 CPUs; callers gate
+# every entry on a runtime HasAvx512f() / HasAvx512Vnni() check.
+USER_C_FLAGS = \
+    $(USER_C_FLAGS) \
+    /arch:AVX512 \
+    /fp:fast \
+
+!if !defined(MSC_OPTIMIZATION)
+MSC_OPTIMIZATION=/O2 /Ob1
+!endif
+
+# ORTDROP = the Xbox_uGC_StaticBins vPack payload, pulled once in pass 0 by the shared
+# OrtDrop staging dir. The flat ORT headers come from $(ORTDROP)\inc; This dir gates 
+# pass 1 on OrtDrop|PASS0.
+ORTDROP=$(PROJECT_OBJ_ROOT)\so2001\OrtPlugin\Phi3\OrtDrop\$(O)\drop\OrtDrop
+
+INCLUDES = \
+    $(INCLUDES); \
+    $(PROJECT_ROOT)\so2001\OrtPlugin\Phi3\pluginCpu; \
+    $(ORTDROP)\inc; \
+
+SOURCES = \
+    ..\matmulnbits_avx512.cpp \

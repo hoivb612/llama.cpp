@@ -1,0 +1,5 @@
+DIRS = \
+    OrtDrop{amd64} \
+    pluginCpu{amd64} \
+    pluginCpu_C{amd64} \
+    exe{amd64} \

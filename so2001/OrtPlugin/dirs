@@ -1,0 +1,3 @@
+DIRS = \
+    tokenizers{amd64} \
+    Phi3{amd64} \

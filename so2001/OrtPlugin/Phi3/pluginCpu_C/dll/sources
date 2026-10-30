@@ -1,0 +1,44 @@
+TARGETPLATFORM=windows
+TARGETTYPE=DYNLINK
+TARGETNAME=onnxruntime_providers_fusioncpu
+
+USE_MSVCRT=1
+USE_UNICRT=1
+
+GUARD=0
+INIT_ALL_OPTIN=0
+
+DLLDEF = onnxruntime_providers_fusioncpu.def
+
+# The DLL itself stays at x64 baseline (SSE2) so it loads on non-AVX-512 CPUs.
+# All AVX-512 codegen is isolated in the fusioncpu-avx512.lib static library and
+# is only entered after a runtime CPU-feature check.
+USER_C_FLAGS = \
+    $(USER_C_FLAGS) \
+    /fp:fast \
+
+!if !defined(MSC_OPTIMIZATION)
+MSC_OPTIMIZATION=/O2 /Ob1
+!endif
+
+# ORTDROP is staged in pass 0 by the shared OrtDrop project. The C ABI headers
+# (onnxruntime_c_api.h and onnxruntime_ep_c_api.h) are consumed directly.
+ORTDROP=$(PROJECT_OBJ_ROOT)\so2001\OrtPlugin\Phi3\OrtDrop\$(O)\drop\OrtDrop
+
+INCLUDES = \
+    $(INCLUDES); \
+    $(PROJECT_ROOT)\so2001\OrtPlugin\Phi3\pluginCpu_C; \
+    $(ORTDROP)\inc; \
+
+TARGETLIBS = \
+    $(TARGETLIBS) \
+    $(PROJECT_OBJ_ROOT)\so2001\OrtPlugin\Phi3\pluginCpu_C\avx512\$(O)\fusioncpu-avx512.lib \
+    $(CLIENTCORE_EXTERNAL_SDK_LIB_PATH)\kernel32.lib \
+    $(ONECORE_EXTERNAL_SDK_LIB_PATH)\ntdll.lib \
+
+SOURCES = \
+    ..\dllmain.c \
+    ..\fusion_cpu_ep_factory.c \
+    ..\fusion_cpu_ep.c \
+    ..\fusion_cpu_ep_sync.c \
+    ..\fusion_cpu_extra_ops.c \

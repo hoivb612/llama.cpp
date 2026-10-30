@@ -1,0 +1,5 @@
+LIBRARY onnxruntime_providers_fusioncpu.dll
+
+EXPORTS
+    CreateEpFactories
+    ReleaseEpFactory

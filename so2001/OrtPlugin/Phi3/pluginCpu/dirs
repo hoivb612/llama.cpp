@@ -1,0 +1,4 @@
+DIRS = \
+    avx512{amd64} \
+    dll{amd64} \
+    test{amd64} \

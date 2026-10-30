@@ -1,0 +1,21 @@
+TARGETPLATFORM=windows
+TARGETNAME=ortdrop
+TARGETTYPE=LIBRARY
+
+# This directory exists only to pull the Xbox_uGC_StaticBins vPack ONCE into a shared
+# object-tree location that every OrtPlugin consumer references: the FusionCPU plugin DLL
+# (pluginCpu\dll), its AVX-512 helper lib (pluginCpu\avx512), and the phi3 test harness
+# (exe). The vPack carries the prebuilt onnxruntime.lib + Rust tokenizers_c.lib, the flat ORT
+# headers, and the runtime DLLs. The pull is a pass-0 prebuild step (NTTARGETFILE0 ->
+# makefile.inc). It is named OrtDrop to match the vPack's payload folder.
+#
+# It is a real LIBRARY target (not NOTARGET) so that $(O) expands to the arch subdir
+# (objfre\amd64) inside makefile.inc -- a NOTARGET dir gets a stripped makefile where $(O)
+# is empty, which sends the pull to an unsanctioned path and trips the build analyzer
+# (ABT3000). ortdrop.cpp is a placeholder TU; the produced ortdrop.lib is unused.
+NTTARGETFILE0= \
+    $(NTTARGETFILE0) \
+    PullOrtDrop \
+
+SOURCES = \
+    ortdrop.cpp \

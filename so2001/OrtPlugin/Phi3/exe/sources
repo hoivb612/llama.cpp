@@ -1,0 +1,61 @@
+TARGETPLATFORM=windows
+TARGETTYPE=PROGRAM
+TARGETNAME=phi3
+TARGET_DESTINATION=b612
+
+UMTYPE=console
+UMENTRY=main
+
+USE_MSVCRT=1
+USE_UNICRT=1
+
+USE_STL=1
+STL_VER=STL_VER_CURRENT
+USE_STD_CPP20=1
+
+USE_NATIVE_EH=1
+
+GUARD=0
+INIT_ALL_OPTIN=0
+
+USER_C_FLAGS = \
+    $(USER_C_FLAGS) \
+    /fp:fast \
+
+!if !defined(MSC_OPTIMIZATION)
+MSC_OPTIMIZATION=/O2 /Ob1
+!endif
+
+MUI=0
+MUI_COMMENT=No localizable resources
+
+# ORTDROP = the Xbox_uGC_StaticBins vPack payload, pulled once in pass 0 by the shared
+# OrtDrop staging dir (gamecore\so2001\OrtPlugin\Phi3\OrtDrop). Provides the ORT headers
+# (inc), the prebuilt onnxruntime.lib + Rust tokenizers_c.lib (lib), and runtime DLLs (bin).
+# This dir gates its pass 1 on OrtDrop|PASS0 via sources.dep.
+ORTDROP=$(PROJECT_OBJ_ROOT)\so2001\OrtPlugin\Phi3\OrtDrop\$(O)\drop\OrtDrop
+
+INCLUDES = \
+    $(INCLUDES); \
+    $(PROJECT_ROOT)\so2001\OrtPlugin\Phi3\exe; \
+    $(ORTDROP)\inc; \
+    $(PROJECT_ROOT)\so2001\OrtPlugin\tokenizers\inc; \
+
+# tokenizers_cpp.lib is built from source (gamecore\so2001\OrtPlugin\tokenizers) so the
+# C++ glue stays matched to our fork's special_tokens headers. onnxruntime.lib and the Rust
+# tokenizers_c.lib come from the Xbox_uGC_StaticBins vPack drop ($(ORTDROP)\lib). The Rust
+# tokenizers_c.lib additionally requires bcrypt/iphlpapi/psapi/ws2_32/ntdll/userenv at link time.
+TARGETLIBS = \
+    $(TARGETLIBS) \
+    $(ORTDROP)\lib\onnxruntime.lib \
+    $(PROJECT_OBJ_ROOT)\so2001\OrtPlugin\tokenizers\$(O)\tokenizers_cpp.lib \
+    $(ORTDROP)\lib\tokenizers_c.lib \
+    $(CLIENTCORE_EXTERNAL_SDK_LIB_PATH)\kernel32.lib \
+    $(ONECORE_EXTERNAL_SDK_LIB_PATH)\ntdll.lib \
+    $(ONECORE_EXTERNAL_SDK_LIB_PATH)\ws2_32.lib \
+    $(ONECORE_EXTERNAL_SDK_LIB_PATH)\bcrypt.lib \
+    $(ONECORE_EXTERNAL_SDK_LIB_PATH)\iphlpapi.lib \
+    $(ONECORE_EXTERNAL_SDK_LIB_PATH)\userenv.lib \
+
+SOURCES = \
+    phi3.cpp \

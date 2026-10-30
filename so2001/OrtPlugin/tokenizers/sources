@@ -1,0 +1,41 @@
+TARGETPLATFORM=windows
+TARGETTYPE=LIBRARY
+TARGETNAME=tokenizers_cpp
+
+USE_MSVCRT=1
+USE_UNICRT=1
+
+USE_STL=1
+STL_VER=STL_VER_CURRENT
+USE_STD_CPP20=1
+
+USE_NATIVE_EH=1
+
+GUARD=0
+INIT_ALL_OPTIN=0
+
+# Model-agnostic C++ wrapper over the Rust tokenizers_c library (mlc-ai/tokenizers-cpp).
+# Only the HuggingFace path (Tokenizer::FromBlobJSON) is built here; the SentencePiece
+# and RWKV-World translation units pull in extra third-party deps (sentencepiece, msgpack)
+# that are not yet vendored under Razzle. The actual tokenization symbols live in the
+# prebuilt Rust tokenizers_c.lib, which consumers must also link.
+#
+# /wd4100: the base Tokenizer's default (non-special-token) overloads in tokenizers_cpp.h
+# intentionally ignore their add_special_tokens/skip_special_tokens params (they fall back to
+# the 1-arg form), tripping C4100 under /W4 /WX. The header + .cc are vendored verbatim (and
+# ship in the incoming vPack), so we suppress at the build spec instead of editing the source.
+USER_C_FLAGS = \
+    $(USER_C_FLAGS) \
+    /fp:fast \
+    /wd4100 \
+
+!if !defined(MSC_OPTIMIZATION)
+MSC_OPTIMIZATION=/O2 /Ob1
+!endif
+
+INCLUDES = \
+    $(INCLUDES); \
+    $(PROJECT_ROOT)\so2001\OrtPlugin\tokenizers\inc; \
+
+SOURCES = \
+    huggingface_tokenizer.cc \

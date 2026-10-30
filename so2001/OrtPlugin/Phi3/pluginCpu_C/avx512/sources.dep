@@ -1,0 +1,2 @@
+BUILD_PASS1_CONSUMES= \
+    gamecore\so2001\OrtPlugin\Phi3\OrtDrop|PASS0 \
